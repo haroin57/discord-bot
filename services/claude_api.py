@@ -62,9 +62,10 @@ def get_client() -> anthropic.Anthropic:
         api_key=None,
         auth_token=tokens["accessToken"],
         default_headers={
-            "x-app": "discord-bot",
-            "User-Agent": "discord-bot/1.0",
+            "x-app": "cli",
+            "User-Agent": "claude-code/1.0",
             "X-Claude-Code-Session-Id": session_id,
+            "anthropic-beta": "oauth-2025-04-20",
         },
         timeout=600.0,
         max_retries=2,
@@ -114,21 +115,19 @@ def _stream_sync(api_client: anthropic.Anthropic, history: list[dict], response_
 
     for attempt in range(MAX_RETRIES):
         try:
-            with api_client.messages.stream(
+            with api_client.beta.messages.stream(
                 model=CLAUDE_MODEL,
                 max_tokens=CLAUDE_MAX_TOKENS,
                 system=SYSTEM_PROMPT,
                 messages=messages,
-                extra_headers={
-                    "x-client-request-id": client_request_id,
-                    "anthropic-beta": ",".join([
-                        "claude-code-20250219",
-                        "oauth-2025-04-20",
-                        "interleaved-thinking-2025-05-14",
-                        "context-management-2025-06-27",
-                        "prompt-caching-scope-2026-01-05",
-                    ]),
-                },
+                betas=[
+                    "claude-code-20250219",
+                    "oauth-2025-04-20",
+                    "interleaved-thinking-2025-05-14",
+                    "context-management-2025-06-27",
+                    "prompt-caching-scope-2026-01-05",
+                ],
+                extra_headers={"x-client-request-id": client_request_id},
             ) as stream:
                 last_event_time = time.monotonic()
                 for text in stream.text_stream:

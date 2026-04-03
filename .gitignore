@@ -4,3 +4,5 @@ __pycache__/
 .env
 .state/
 .claude/
+.omc/
+.env.example
