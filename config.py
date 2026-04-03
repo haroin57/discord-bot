@@ -100,3 +100,42 @@ def load_system_prompt() -> str:
 
 SYSTEM_PROMPT = os.environ.get("BOT_SYSTEM_PROMPT") or load_system_prompt()
 BOT_ROLE_IDS: set[int] = set()  # populated at runtime by bot.py on_ready
+
+# ---------------------------------------------------------------------------
+# MCP Servers (API key不要のもの)
+# ---------------------------------------------------------------------------
+MCP_SERVERS: dict = {
+    "context7": {
+        "command": "npx",
+        "args": ["-y", "@upstash/context7-mcp"],
+    },
+    "playwright": {
+        "command": "npx",
+        "args": ["@playwright/mcp@latest"],
+    },
+}
+
+# API key付きMCPは .env にキーがある場合のみ追加
+_brave_key = os.environ.get("BRAVE_API_KEY")
+if _brave_key:
+    MCP_SERVERS["brave-search"] = {
+        "command": "npx",
+        "args": ["-y", "@anthropic-ai/mcp-server-brave-search"],
+        "env": {"BRAVE_API_KEY": _brave_key},
+    }
+
+_tavily_key = os.environ.get("TAVILY_API_KEY")
+if _tavily_key:
+    MCP_SERVERS["tavily"] = {
+        "command": "npx",
+        "args": ["-y", "tavily-mcp"],
+        "env": {"TAVILY_API_KEY": _tavily_key},
+    }
+
+_github_token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
+if _github_token:
+    MCP_SERVERS["github"] = {
+        "type": "http",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "headers": {"Authorization": f"Bearer {_github_token}"},
+    }
