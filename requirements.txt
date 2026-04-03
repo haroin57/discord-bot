@@ -1,0 +1,4 @@
+discord.py>=2.7
+python-dotenv>=1.0
+claude-code-sdk>=0.0.25
+aiohttp>=3.9
