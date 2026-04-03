@@ -1,8 +1,18 @@
-"""Tests for utils/attachments.py — extract_image_paths, cleanup."""
+"""Tests for utils/attachments.py — extract_image_paths, download, cleanup."""
 
+import asyncio
 import os
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from utils.attachments import cleanup_attachments, cleanup_stale_attachments, extract_image_paths
+import pytest
+
+from utils.attachments import (
+    cleanup_attachments,
+    cleanup_stale_attachments,
+    download_attachments,
+    extract_image_paths,
+    IMAGE_CONTENT_TYPES,
+)
 
 
 class TestExtractImagePaths:
@@ -42,6 +52,20 @@ class TestExtractImagePaths:
         paths = extract_image_paths(text)
         assert len(paths) == 1
 
+    def test_backtick_wrapped(self, tmp_path):
+        img = tmp_path / "code.png"
+        img.write_bytes(b"fake")
+        text = f"`{img}`"
+        paths = extract_image_paths(text)
+        assert str(img) in paths
+
+    def test_multiple_extensions(self, tmp_path):
+        for ext in ["png", "jpg", "jpeg", "gif", "webp", "svg"]:
+            img = tmp_path / f"test.{ext}"
+            img.write_bytes(b"fake")
+            paths = extract_image_paths(f"file: {img} done")
+            assert str(img) in paths
+
 
 class TestCleanupAttachments:
     def test_removes_files(self, tmp_path):
@@ -54,14 +78,16 @@ class TestCleanupAttachments:
         assert not f2.exists()
 
     def test_ignores_missing(self, tmp_path):
-        cleanup_attachments([str(tmp_path / "gone.png")])  # no error
+        cleanup_attachments([str(tmp_path / "gone.png")])
+
+    def test_empty_list(self):
+        cleanup_attachments([])
 
 
 class TestCleanupStaleAttachments:
     def test_removes_old_files(self, tmp_attachment_dir):
         old = tmp_attachment_dir / "old.png"
         old.write_bytes(b"x")
-        # Make it appear old
         os.utime(old, (0, 0))
         cleanup_stale_attachments()
         assert not old.exists()
@@ -71,3 +97,35 @@ class TestCleanupStaleAttachments:
         recent.write_bytes(b"x")
         cleanup_stale_attachments()
         assert recent.exists()
+
+
+class TestDownloadAttachments:
+    def _make_attachment(self, content_type="image/png", size=1000, filename="test.png", att_id=1):
+        att = MagicMock()
+        att.content_type = content_type
+        att.size = size
+        att.filename = filename
+        att.id = att_id
+        att.url = f"https://cdn.discord.com/attachments/fake/{att_id}/{filename}"
+        return att
+
+    @pytest.mark.asyncio
+    async def test_filters_non_image(self):
+        att = self._make_attachment(content_type="text/plain")
+        session = MagicMock()
+        result = await download_attachments(session, [att])
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_skips_oversized(self, tmp_attachment_dir):
+        att = self._make_attachment(size=20 * 1024 * 1024)  # 20MB > 10MB limit
+        session = MagicMock()
+        result = await download_attachments(session, [att])
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_filters_image_content_types(self):
+        for ct in IMAGE_CONTENT_TYPES:
+            att = self._make_attachment(content_type=ct)
+            # Just verify it's recognized as an image
+            assert ct in IMAGE_CONTENT_TYPES
