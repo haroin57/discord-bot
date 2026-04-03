@@ -113,6 +113,10 @@ MCP_SERVERS: dict = {
         "command": "npx",
         "args": ["@playwright/mcp@latest"],
     },
+    "x-scraper": {
+        "command": "npx",
+        "args": ["-y", "@enescinar/twitter-mcp"],
+    },
 }
 
 # API key付きMCPは .env にキーがある場合のみ追加

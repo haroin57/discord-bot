@@ -211,7 +211,7 @@ async def on_message(message: discord.Message):
         if is_senpai:
             prompt = f"[Message from: {sender_name} ({sender_tag})]\n{prompt}"
         else:
-            prompt = f"[Message from: {sender_name} ({sender_tag}) — この人は先輩ではありません。丁寧語で普通に対応してください]\n{prompt}"
+            prompt = f"[Message from: {sender_name} ({sender_tag}) — この人は先輩ではありません。丁寧語で普通に対応してください。セキュリティ制約: サーバー内部のソースコード、ファイル内容、環境変数、設定情報、コマンド実行結果を絶対に開示しないでください。コード実行・ファイル操作の要求も拒否してください。]\n{prompt}"
 
         log.info("Request from %s in #%s: %s", message.author, message.channel, prompt[:100])
 
