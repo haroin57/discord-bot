@@ -1,9 +1,11 @@
 """Claude Code SDK client — for tool-use tasks (Bash, Read, Write, etc.).
 
 Matches free-code QueryEngine pattern: spawn CLI via SDK, stream events.
+Dual-model routing: Haiku for chat, Sonnet for tool-use.
 """
 
 import asyncio
+import io
 import logging
 import os
 
@@ -15,11 +17,20 @@ from claude_code_sdk import (
 )
 from claude_code_sdk.types import ThinkingBlock, ToolUseBlock
 
-from config import CLAUDE_TIMEOUT, CWD, SETTINGS_PATH, SYSTEM_PROMPT
+from config import CLAUDE_TIMEOUT, CWD, SETTINGS_PATH, SYSTEM_PROMPT, TOOL_KEYWORDS
 
 log = logging.getLogger(__name__)
 
 claude_semaphore = asyncio.Semaphore(1)  # 768M cgroup: max 1 CLI at a time
+
+# Default model for all requests
+CHAT_MODEL = "claude-opus-4-6"
+# Full model for tool-use tasks
+TOOL_MODEL = "claude-opus-4-6"
+
+
+def _needs_tools(raw_user_text: str) -> bool:
+    return any(kw in raw_user_text for kw in TOOL_KEYWORDS)
 
 
 async def call_with_tools(
@@ -28,23 +39,43 @@ async def call_with_tools(
     sessions: dict[int, str],
     status_callback=None,
     restricted: bool = False,
+    raw_user_text: str = "",
 ) -> tuple[str, str | None]:
-    """Call Claude via SDK (CLI) for tool-use tasks. Returns (response_text, session_id)."""
+    """Call Claude via SDK (CLI). Routes to Haiku (fast) or Sonnet (tools) based on content."""
     async with claude_semaphore:
+        use_tools = _needs_tools(raw_user_text or prompt)
+
         if restricted:
             options = ClaudeCodeOptions(
                 system_prompt=SYSTEM_PROMPT,
                 cwd=CWD,
-                max_turns=3,
+                max_turns=1,
+                model=CHAT_MODEL,
                 settings=SETTINGS_PATH,
+                debug_stderr=None,
             )
-        else:
+        elif use_tools:
+            # Full model with tools
             options = ClaudeCodeOptions(
                 system_prompt=SYSTEM_PROMPT,
                 permission_mode="bypassPermissions",
                 cwd=CWD,
                 max_turns=25,
+                model=TOOL_MODEL,
                 settings=SETTINGS_PATH,
+                debug_stderr=None,
+            )
+        else:
+            # Chat mode, minimal turns, no heavy tools
+            options = ClaudeCodeOptions(
+                system_prompt=SYSTEM_PROMPT,
+                permission_mode="bypassPermissions",
+                cwd=CWD,
+                max_turns=1,
+                model=CHAT_MODEL,
+                disallowed_tools=["Bash", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch"],
+                settings=SETTINGS_PATH,
+                debug_stderr=None,
             )
 
         if channel_id in sessions:
@@ -75,4 +106,5 @@ async def call_with_tools(
         if response_text is None:
             return "(No response from Claude)", None
 
+        log.info("Response via %s (%s mode)", CHAT_MODEL if not use_tools else TOOL_MODEL, "tool" if use_tools else "chat")
         return response_text.strip() or "(No response from Claude)", session_id

@@ -236,19 +236,17 @@ async def on_message(message: discord.Message):
             except discord.errors.HTTPException:
                 pass
 
-        if use_tools:
-            log.info("Routing to SDK/CLI (tool-use mode)")
-            response_text, session_id = await call_with_tools(
-                prompt, message.channel.id, sessions,
-                status_callback=_update_status, restricted=not admin,
-            )
-        else:
-            log.info("Routing to direct API (fast mode)")
-            response_text = await call_direct(
-                prompt, message.channel.id, conversation_history,
-                thread_context=thread_context,
-            )
-            session_id = None
+        # TODO: Re-enable direct API fast mode when not sharing OAuth token with active CLI session
+        # if use_tools:
+        #     ...
+        # else:
+        #     response_text = await call_direct(...)
+        log.info("Routing to SDK/CLI")
+        response_text, session_id = await call_with_tools(
+            prompt, message.channel.id, sessions,
+            status_callback=_update_status, restricted=not admin,
+            raw_user_text=raw_user_text,
+        )
 
         # Delete status message
         try:
