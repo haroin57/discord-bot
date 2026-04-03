@@ -74,10 +74,14 @@ def format_embed(embed: discord.Embed) -> str:
 # ---------------------------------------------------------------------------
 # Thread context (free-code: initialMessages from history)
 # ---------------------------------------------------------------------------
+MAX_CONTEXT_CHARS = 8000
+
+
 async def fetch_thread_context(thread: discord.Thread, before_message: discord.Message) -> str:
-    """Fetch past messages in a thread and format them inline."""
+    """Fetch past messages in a thread and format them inline (capped at MAX_CONTEXT_CHARS)."""
     lines: list[str] = []
     count = 0
+    total_chars = 0
     async for msg in thread.history(limit=THREAD_HISTORY_LIMIT, before=before_message, oldest_first=True):
         count += 1
         author = msg.author.display_name
@@ -91,7 +95,12 @@ async def fetch_thread_context(thread: discord.Thread, before_message: discord.M
             extras.append(f"[Attachment: {att.filename}]")
         body = content + ("\n" + "\n".join(extras) if extras else "")
         if body.strip():
-            lines.append(f"{author}: {body.strip()}")
+            line = f"{author}: {body.strip()}"
+            if total_chars + len(line) > MAX_CONTEXT_CHARS:
+                lines.append("(...truncated...)")
+                break
+            total_chars += len(line)
+            lines.append(line)
 
     if not lines:
         return ""

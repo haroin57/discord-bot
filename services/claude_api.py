@@ -89,10 +89,12 @@ def normalize_messages(history: list[dict]) -> list[dict]:
             if isinstance(prev_content, str) and isinstance(curr_content, str):
                 normalized[-1]["content"] = prev_content + "\n\n" + curr_content
             elif isinstance(prev_content, list) and isinstance(curr_content, list):
-                tool_results = [b for b in prev_content + curr_content
-                                if isinstance(b, dict) and b.get("type") == "tool_result"]
-                other_blocks = [b for b in prev_content + curr_content
-                                if not (isinstance(b, dict) and b.get("type") == "tool_result")]
+                tool_results = []
+                other_blocks = []
+                for b in prev_content:
+                    (tool_results if isinstance(b, dict) and b.get("type") == "tool_result" else other_blocks).append(b)
+                for b in curr_content:
+                    (tool_results if isinstance(b, dict) and b.get("type") == "tool_result" else other_blocks).append(b)
                 normalized[-1]["content"] = tool_results + other_blocks
             else:
                 normalized.append(msg)
@@ -105,7 +107,7 @@ def normalize_messages(history: list[dict]) -> list[dict]:
 # Streaming (free-code: queryModelWithStreaming)
 # ---------------------------------------------------------------------------
 MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 10.0  # seconds (10s → 20s → 40s)
+RETRY_BACKOFF_BASE = 10.0  # seconds: 10*2^0=10, 10*2^1=20, 10*2^2=40
 
 
 def _stream_sync(api_client: anthropic.Anthropic, history: list[dict], response_chunks: list[str]) -> None:
@@ -143,7 +145,7 @@ def _stream_sync(api_client: anthropic.Anthropic, history: list[dict], response_
             return  # success
         except anthropic.RateLimitError:
             if attempt < MAX_RETRIES - 1:
-                wait = RETRY_BACKOFF_BASE ** (attempt + 1)
+                wait = RETRY_BACKOFF_BASE * (2 ** attempt)
                 log.warning("Rate limited (attempt %d/%d), retrying in %.0fs", attempt + 1, MAX_RETRIES, wait)
                 time.sleep(wait)
                 response_chunks.clear()

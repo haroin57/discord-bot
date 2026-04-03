@@ -17,7 +17,7 @@ from claude_code_sdk import (
 )
 from claude_code_sdk.types import ThinkingBlock, ToolUseBlock
 
-from config import CLAUDE_TIMEOUT, CWD, SETTINGS_PATH, SYSTEM_PROMPT, TOOL_KEYWORDS
+from config import CLAUDE_TIMEOUT, CWD, SETTINGS_PATH, SYSTEM_PROMPT, needs_tools
 
 log = logging.getLogger(__name__)
 
@@ -28,9 +28,6 @@ CHAT_MODEL = "claude-opus-4-6"
 # Full model for tool-use tasks
 TOOL_MODEL = "claude-opus-4-6"
 
-
-def _needs_tools(raw_user_text: str) -> bool:
-    return any(kw in raw_user_text for kw in TOOL_KEYWORDS)
 
 
 async def call_with_tools(
@@ -43,7 +40,7 @@ async def call_with_tools(
 ) -> tuple[str, str | None]:
     """Call Claude via SDK (CLI). Routes to Haiku (fast) or Sonnet (tools) based on content."""
     async with claude_semaphore:
-        use_tools = _needs_tools(raw_user_text or prompt)
+        use_tools = needs_tools(raw_user_text or prompt)
 
         if restricted:
             options = ClaudeCodeOptions(

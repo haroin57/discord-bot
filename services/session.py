@@ -104,12 +104,14 @@ def load_all_history() -> OrderedDict[int, list[dict]]:
 # ---------------------------------------------------------------------------
 def trim_history(history: list[dict], max_pairs: int = MAX_MESSAGES_PER_CHANNEL) -> None:
     """Trim history to max_pairs user/assistant exchanges, keeping pairs intact."""
-    while len(history) > max_pairs * 2:
-        if len(history) >= 2 and history[0]["role"] == "user" and history[1]["role"] == "assistant":
-            history.pop(0)
-            history.pop(0)
-        else:
-            history.pop(0)
+    max_entries = max_pairs * 2
+    if len(history) <= max_entries:
+        return
+    start = len(history) - max_entries
+    # Ensure we start on a user message (pair boundary)
+    while start < len(history) and history[start]["role"] != "user":
+        start += 1
+    del history[:start]
 
 
 def fix_history_integrity(history: list[dict]) -> None:

@@ -52,10 +52,9 @@ async def _download_one(session: aiohttp.ClientSession, att) -> str | None:
     try:
         async with session.get(att.url) as resp:
             if resp.status == 200:
-                chunks: list[bytes] = []
-                async for chunk in resp.content.iter_chunked(64 * 1024):
-                    chunks.append(chunk)
-                await asyncio.to_thread(_write_file, dest, b"".join(chunks))
+                with open(dest, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        f.write(chunk)
                 log.info("Downloaded attachment: %s -> %s", att.filename, dest)
                 return dest
     except Exception as e:

@@ -75,6 +75,13 @@ TOOL_KEYWORDS = [
     "再起動して", "systemctl", "systemd",
     "調べて", "検索して", "ググって", "ブラウズ",
 ]
+import re as _re
+TOOL_KEYWORDS_RE = _re.compile("|".join(_re.escape(kw) for kw in TOOL_KEYWORDS))
+
+
+def needs_tools(text: str) -> bool:
+    """Check if text contains tool-use trigger keywords."""
+    return bool(TOOL_KEYWORDS_RE.search(text))
 
 # ---------------------------------------------------------------------------
 # System prompt

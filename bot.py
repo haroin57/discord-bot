@@ -19,7 +19,7 @@ from config import (
     COOLDOWN_SECONDS,
     DISCORD_TOKEN,
     MAX_COOLDOWN_ENTRIES,
-    TOOL_KEYWORDS,
+    needs_tools,
 )
 from services.claude_api import call_direct
 from services.claude_sdk import call_with_tools
@@ -62,9 +62,6 @@ async def get_http_session() -> aiohttp.ClientSession:
 def is_admin(user: discord.User | discord.Member) -> bool:
     return user.id in ADMIN_USER_IDS
 
-
-def _needs_tools(raw_user_text: str) -> bool:
-    return any(kw in raw_user_text for kw in TOOL_KEYWORDS)
 
 
 def _purge_cooldowns() -> None:
@@ -219,7 +216,7 @@ async def on_message(message: discord.Message):
         log.info("Request from %s in #%s: %s", message.author, message.channel, prompt[:100])
 
         # Route: tool-use keywords or attachments → SDK/CLI, otherwise → direct API
-        use_tools = _needs_tools(raw_user_text) or bool(image_paths)
+        use_tools = needs_tools(raw_user_text) or bool(image_paths)
         admin = is_admin(message.author)
 
         status_msg = await message.reply("⏳ 考え中..." if use_tools else "⚡ 応答中...")
@@ -255,7 +252,7 @@ async def on_message(message: discord.Message):
             pass
 
         if session_id:
-            update_session(sessions, message.channel.id, session_id)
+            await asyncio.to_thread(update_session, sessions, message.channel.id, session_id)
 
         # Extract image file paths from response
         response_images = extract_image_paths(response_text)
