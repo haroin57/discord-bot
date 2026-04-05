@@ -113,10 +113,6 @@ MCP_SERVERS: dict = {
         "command": "npx",
         "args": ["@playwright/mcp@latest"],
     },
-    "x-scraper": {
-        "command": "npx",
-        "args": ["-y", "@enescinar/twitter-mcp"],
-    },
 }
 
 # API key付きMCPは .env にキーがある場合のみ追加
@@ -127,6 +123,12 @@ if _brave_key:
         "args": ["-y", "@anthropic-ai/mcp-server-brave-search"],
         "env": {"BRAVE_API_KEY": _brave_key},
     }
+
+# X (Twitter) scraper MCP
+MCP_SERVERS["x-scraper"] = {
+    "command": "/home/ubuntu/free-code/x-scraper/.venv/bin/python",
+    "args": ["/home/ubuntu/free-code/x-scraper/mcp_server.py"],
+}
 
 _tavily_key = os.environ.get("TAVILY_API_KEY")
 if _tavily_key:

@@ -19,7 +19,6 @@ from config import (
     COOLDOWN_SECONDS,
     DISCORD_TOKEN,
     MAX_COOLDOWN_ENTRIES,
-    needs_tools,
 )
 from services.claude_api import call_direct
 from services.claude_sdk import call_with_tools
@@ -32,6 +31,7 @@ from utils.attachments import (
 )
 from utils.discord_helpers import (
     build_mention_regex,
+    fetch_channel_context,
     fetch_thread_context,
     resolve_message_links,
     split_message,
@@ -179,6 +179,8 @@ async def on_message(message: discord.Message):
         async def _fetch_thread():
             if isinstance(message.channel, discord.Thread):
                 return await fetch_thread_context(message.channel, message)
+            if not is_dm:
+                return await fetch_channel_context(message.channel, message)
             return ""
 
         reply_task = asyncio.create_task(_fetch_reply())
@@ -215,11 +217,9 @@ async def on_message(message: discord.Message):
 
         log.info("Request from %s in #%s: %s", message.author, message.channel, prompt[:100])
 
-        # Route: tool-use keywords or attachments → SDK/CLI, otherwise → direct API
-        use_tools = needs_tools(raw_user_text) or bool(image_paths)
         admin = is_admin(message.author)
 
-        status_msg = await message.reply("⏳ 考え中..." if use_tools else "⚡ 応答中...")
+        status_msg = await message.reply("⏳ 考え中...")
         last_status_update = 0.0
 
         async def _update_status(text: str):
@@ -233,12 +233,7 @@ async def on_message(message: discord.Message):
             except discord.errors.HTTPException:
                 pass
 
-        # TODO: Re-enable direct API fast mode when not sharing OAuth token with active CLI session
-        # if use_tools:
-        #     ...
-        # else:
-        #     response_text = await call_direct(...)
-        log.info("Routing to SDK/CLI")
+        log.info("Routing to SDK/CLI (restricted=%s)", not admin)
         response_text, session_id = await call_with_tools(
             prompt, message.channel.id, sessions,
             status_callback=_update_status, restricted=not admin,

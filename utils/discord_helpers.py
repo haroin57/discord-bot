@@ -107,6 +107,40 @@ async def fetch_thread_context(thread: discord.Thread, before_message: discord.M
     return f"[Thread: {thread.name} - past {count} messages]\n" + "\n".join(lines) + "\n[End of thread history]"
 
 
+CHANNEL_CONTEXT_LIMIT = 10
+
+
+async def fetch_channel_context(channel, before_message: discord.Message) -> str:
+    """Fetch recent messages in a regular channel (capped at MAX_CONTEXT_CHARS)."""
+    lines: list[str] = []
+    total_chars = 0
+    count = 0
+    async for msg in channel.history(limit=CHANNEL_CONTEXT_LIMIT, before=before_message):
+        count += 1
+        author = msg.author.display_name
+        content = msg.content or ""
+        extras: list[str] = []
+        for embed in msg.embeds:
+            formatted = format_embed(embed)
+            if formatted:
+                extras.append(formatted)
+        for att in msg.attachments:
+            extras.append(f"[Attachment: {att.filename}]")
+        body = content + ("\n" + "\n".join(extras) if extras else "")
+        if body.strip():
+            line = f"{author}: {body.strip()}"
+            if total_chars + len(line) > MAX_CONTEXT_CHARS:
+                lines.append("(...truncated...)")
+                break
+            total_chars += len(line)
+            lines.append(line)
+
+    if not lines:
+        return ""
+    lines.reverse()
+    return f"[Channel recent {count} messages]\n" + "\n".join(lines) + "\n[End of channel history]"
+
+
 # ---------------------------------------------------------------------------
 # Message link resolution
 # ---------------------------------------------------------------------------
