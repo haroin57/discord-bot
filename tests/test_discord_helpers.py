@@ -163,12 +163,15 @@ class TestResolveMessageLinks:
         mock_msg.embeds = []
         mock_msg.attachments = []
         mock_channel.name = "general"
+        # guild=None avoids the guild-id equality check; requester=None
+        # skips the confused-deputy read-permission check.
+        mock_channel.guild = None
 
         mock_client.get_channel = MagicMock(return_value=mock_channel)
         mock_channel.fetch_message = AsyncMock(return_value=mock_msg)
 
         text = "Check this: https://discord.com/channels/111/222/333"
-        result = await resolve_message_links(mock_client, text)
+        result = await resolve_message_links(mock_client, text, requester=None)
         assert "TestUser" in result
         assert "referenced content" in result
 

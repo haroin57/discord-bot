@@ -14,11 +14,31 @@ from utils.attachments import (
     IMAGE_CONTENT_TYPES,
 )
 
+# Valid magic bytes for each supported format. `extract_image_paths` now
+# rejects files whose content doesn't match a known image header (prevents
+# extension-spoofing exfiltration of .env etc.), so test fixtures need real
+# headers.
+_MAGIC = {
+    "png": b"\x89PNG\r\n\x1a\n" + b"\x00" * 8,
+    "jpg": b"\xff\xd8\xff\xe0" + b"\x00" * 8,
+    "jpeg": b"\xff\xd8\xff\xe0" + b"\x00" * 8,
+    "gif": b"GIF89a" + b"\x00" * 8,
+    "webp": b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 4,
+    "svg": b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+}
+
+
+@pytest.fixture
+def allowed_tmp(tmp_path, monkeypatch):
+    """Allow `tmp_path` as a valid image dir for the duration of the test."""
+    monkeypatch.setattr("utils.attachments.ALLOWED_IMAGE_DIRS", (str(tmp_path),))
+    return tmp_path
+
 
 class TestExtractImagePaths:
-    def test_finds_path_in_text(self, tmp_path):
-        img = tmp_path / "test.png"
-        img.write_bytes(b"fake")
+    def test_finds_path_in_text(self, allowed_tmp):
+        img = allowed_tmp / "test.png"
+        img.write_bytes(_MAGIC["png"])
         text = f"画像は {img} に保存しました。"
         paths = extract_image_paths(text)
         assert str(img) in paths
@@ -27,44 +47,59 @@ class TestExtractImagePaths:
         text = "画像は /tmp/nonexistent_abc123.png です"
         assert extract_image_paths(text) == []
 
-    def test_markdown_syntax(self, tmp_path):
-        img = tmp_path / "out.png"
-        img.write_bytes(b"fake")
+    def test_markdown_syntax(self, allowed_tmp):
+        img = allowed_tmp / "out.png"
+        img.write_bytes(_MAGIC["png"])
         text = f"![diagram]({img})"
         paths = extract_image_paths(text)
         assert str(img) in paths
 
-    def test_caps_at_max(self, tmp_path, monkeypatch):
+    def test_caps_at_max(self, allowed_tmp, monkeypatch):
         monkeypatch.setattr("utils.attachments.MAX_RESPONSE_IMAGES", 2)
         imgs = []
         for i in range(5):
-            img = tmp_path / f"img{i}.png"
-            img.write_bytes(b"fake")
+            img = allowed_tmp / f"img{i}.png"
+            img.write_bytes(_MAGIC["png"])
             imgs.append(str(img))
         text = " ".join(imgs)
         paths = extract_image_paths(text)
         assert len(paths) == 2
 
-    def test_deduplicates(self, tmp_path):
-        img = tmp_path / "dup.png"
-        img.write_bytes(b"fake")
+    def test_deduplicates(self, allowed_tmp):
+        img = allowed_tmp / "dup.png"
+        img.write_bytes(_MAGIC["png"])
         text = f"{img} and again {img}"
         paths = extract_image_paths(text)
         assert len(paths) == 1
 
-    def test_backtick_wrapped(self, tmp_path):
-        img = tmp_path / "code.png"
-        img.write_bytes(b"fake")
+    def test_backtick_wrapped(self, allowed_tmp):
+        img = allowed_tmp / "code.png"
+        img.write_bytes(_MAGIC["png"])
         text = f"`{img}`"
         paths = extract_image_paths(text)
         assert str(img) in paths
 
-    def test_multiple_extensions(self, tmp_path):
+    def test_multiple_extensions(self, allowed_tmp):
         for ext in ["png", "jpg", "jpeg", "gif", "webp", "svg"]:
-            img = tmp_path / f"test.{ext}"
-            img.write_bytes(b"fake")
+            img = allowed_tmp / f"test.{ext}"
+            img.write_bytes(_MAGIC[ext])
             paths = extract_image_paths(f"file: {img} done")
             assert str(img) in paths
+
+    def test_rejects_extension_spoofing(self, allowed_tmp):
+        """A file with .png extension but non-image content must be rejected."""
+        fake = allowed_tmp / "secret.png"
+        fake.write_bytes(b"THIS IS NOT AN IMAGE")
+        paths = extract_image_paths(f"see {fake}")
+        assert paths == []
+
+    def test_rejects_path_outside_allow_list(self, tmp_path, monkeypatch):
+        """Paths not under ALLOWED_IMAGE_DIRS must be rejected."""
+        monkeypatch.setattr("utils.attachments.ALLOWED_IMAGE_DIRS", ("/nonexistent",))
+        img = tmp_path / "outside.png"
+        img.write_bytes(_MAGIC["png"])
+        paths = extract_image_paths(f"see {img}")
+        assert paths == []
 
 
 class TestCleanupAttachments:

@@ -10,6 +10,11 @@ import os
 import tempfile
 import time
 
+try:
+    import psutil  # for orphan claude CLI cleanup
+except ImportError:  # pragma: no cover
+    psutil = None
+
 from claude_code_sdk import (
     AssistantMessage,
     ClaudeCodeOptions,
@@ -18,11 +23,47 @@ from claude_code_sdk import (
 )
 from claude_code_sdk.types import ThinkingBlock, ToolUseBlock
 
-from config import CLAUDE_TIMEOUT, CWD, MCP_SERVERS, SETTINGS_PATH, SYSTEM_PROMPT
+from config import (
+    ADMIN_MAX_TURNS as _CONFIG_ADMIN_MAX_TURNS,
+    ATTACHMENT_DIR,
+    CLAUDE_MAX_ATTEMPTS,
+    CLAUDE_MAX_BACKOFF_S,
+    CLAUDE_MAX_PARALLEL,
+    CLAUDE_TIMEOUT,
+    CLAUDE_TRANSIENT_MAX_ATTEMPTS,
+    CWD,
+    MCP_SERVERS,
+    RESTRICTED_ANTHROPIC_API_KEY,
+    RESTRICTED_CLAUDE_MAX_PARALLEL,
+    RESTRICTED_SYSTEM_PROMPT,
+    SETTINGS_PATH,
+    STATE_DIR,
+    SYSTEM_PROMPT,
+    pick_mcp_servers,
+)
 
 log = logging.getLogger(__name__)
 
-claude_semaphore = asyncio.Semaphore(1)  # max 1 CLI at a time
+# Limit concurrent Claude CLI subprocesses. 2GB RAM can't host 32 × ~200MB.
+claude_semaphore = asyncio.Semaphore(CLAUDE_MAX_PARALLEL)
+# Separate, tighter pool for non-admin calls so a hostile user cannot
+# starve the admin concurrency budget (H-3).
+restricted_claude_semaphore = asyncio.Semaphore(RESTRICTED_CLAUDE_MAX_PARALLEL)
+
+# Working directory that restricted (non-admin) callers are confined to.
+# Anything outside this tree must not be reachable via the Read tool.
+RESTRICTED_CWD = ATTACHMENT_DIR
+
+# Defence-in-depth: even with allowed_tools=[] / mcp_servers={}, explicitly
+# deny every dangerous built-in. If the SDK adds a new tool that bypasses
+# allow-list semantics (it shouldn't, but be paranoid), this list catches it.
+_RESTRICTED_DENY_LIST = [
+    "Bash", "BashOutput", "KillBash",
+    "Write", "Edit", "MultiEdit", "NotebookEdit",
+    "Glob", "Grep",
+    "WebFetch", "WebSearch",
+    "Task", "Agent", "SlashCommand", "ExitPlanMode", "TodoWrite",
+]
 
 # ---------------------------------------------------------------------------
 # Model
@@ -34,7 +75,10 @@ MODEL = "claude-opus-4-6"
 # ---------------------------------------------------------------------------
 TIMEOUT = CLAUDE_TIMEOUT  # 10 min
 RESTRICTED_MAX_TURNS = 8
-ADMIN_MAX_TURNS = 25
+# Sourced from config so it can be tuned via env. The previous hard-coded
+# 999 let one CLI invocation hold ~500MB of node/MCP children for the full
+# CLAUDE_TIMEOUT window — see services/claude_sdk.py review.
+ADMIN_MAX_TURNS = _CONFIG_ADMIN_MAX_TURNS
 
 # ---------------------------------------------------------------------------
 # Session resume
@@ -46,9 +90,9 @@ _session_timestamps: dict[int, float] = {}
 # Retry — exponential backoff (free-code: withRetry)
 # ---------------------------------------------------------------------------
 BASE_BACKOFF_S = 3
-MAX_BACKOFF_S = 30
-DEFAULT_MAX_ATTEMPTS = 3
-TRANSIENT_MAX_ATTEMPTS = 5
+MAX_BACKOFF_S = CLAUDE_MAX_BACKOFF_S
+DEFAULT_MAX_ATTEMPTS = CLAUDE_MAX_ATTEMPTS
+TRANSIENT_MAX_ATTEMPTS = CLAUDE_TRANSIENT_MAX_ATTEMPTS
 
 # ---------------------------------------------------------------------------
 # Error classification (free-code: shouldRetry + getAssistantMessageFromError)
@@ -57,6 +101,7 @@ _RATE_LIMIT_PATTERNS = ("rate_limit", "rate-limit", "429", "too many requests", 
 _OVERLOAD_PATTERNS = ("overloaded", "529", "server_overload")
 _AUTH_PATTERNS = ("authentication failed", "401 unauthorized", "403 forbidden", "invalid api key", "token revoked", "not logged in")
 _CONTEXT_PATTERNS = ("too long", "token limit", "exceed context limit", "max_tokens exceed")
+_MAX_TURNS_PATTERNS = ("max_turns", "max turns", "turn limit")
 
 
 def _classify_error(err_str: str, stderr_tail: str) -> str:
@@ -69,6 +114,11 @@ def _classify_error(err_str: str, stderr_tail: str) -> str:
         return "auth"
     if any(p in combined for p in _CONTEXT_PATTERNS):
         return "context_overflow"
+    if any(p in combined for p in _MAX_TURNS_PATTERNS):
+        return "max_turns"
+    # exit code 1 with partial response = likely max_turns or completed with tool use
+    if "exit code 1" in combined.lower():
+        return "cli_exit"
     return "unknown"
 
 
@@ -78,6 +128,8 @@ def _error_message(error_type: str) -> str:
         "overloaded": "🔄 サーバーが混雑しています。しばらく待ってから再試行してください。",
         "auth": "🔑 認証エラーが発生しました。管理者に連絡してください。",
         "context_overflow": "📝 メッセージが長すぎます。短くして送り直してください。",
+        "max_turns": "🔄 ターン上限に達しました。もう一度話しかけてください。",
+        "cli_exit": "⚠️ 処理が中断されました。もう一度試してください。",
     }.get(error_type, "❌ 内部エラーが発生しました。再試行してください。")
 
 
@@ -106,7 +158,23 @@ def _clear_session_time(channel_id: int) -> None:
 # ---------------------------------------------------------------------------
 # Stderr capture
 # ---------------------------------------------------------------------------
+def _read_stderr_buffer(fileobj) -> str:
+    """Read captured stderr from a SpooledTemporaryFile."""
+    if fileobj is None:
+        return ""
+    try:
+        fileobj.flush()
+        fileobj.seek(0)
+        raw = fileobj.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        return raw[-50000:] if len(raw) > 50000 else raw
+    except Exception:
+        return ""
+
+
 def _read_stderr_file(path: str | None) -> str:
+    """Legacy helper kept for tests — read a stderr file from disk by path."""
     if not path:
         return ""
     try:
@@ -117,17 +185,87 @@ def _read_stderr_file(path: str | None) -> str:
         return ""
 
 
-def _cleanup_stderr(fileobj, path: str | None) -> None:
+def _cleanup_stderr(fileobj, path: str | None = None, *, keep: bool = False) -> None:
     try:
         if fileobj and not fileobj.closed:
             fileobj.close()
     except Exception:
         pass
+    # Legacy path cleanup (no longer used since we switched to SpooledTemporaryFile)
+    if keep or not path:
+        return
     try:
-        if path and os.path.isfile(path):
+        if os.path.isfile(path):
             os.unlink(path)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Orphan claude CLI cleanup (free-code: withProcessGroup)
+# ---------------------------------------------------------------------------
+# Substring patterns matched against descendant cmdlines so we can also
+# clean up MCP child processes that the Claude CLI spawned. Without this,
+# `mcp-server-memory`, `playwright/mcp`, brave-search-mcp etc. can stay
+# orphaned (we observed `memory-service` reaching SIGKILL during cleanup).
+_MCP_CMDLINE_PATTERNS = (
+    "claude-code",
+    "/claude/bin/",
+    "mcp-server-",
+    "@modelcontextprotocol/server-",
+    "@playwright/mcp",
+    "playwright-mcp",
+    "brave-search-mcp",
+    "@upstash/context7-mcp",
+    "context7-mcp",
+    "x-scraper/mcp_server.py",
+    "scholarly-mcp/server.py",
+    "news-curator/mcp_server.py",
+    "papermcp",
+    "tavily-mcp",
+)
+
+
+def kill_orphan_claude_cli() -> int:
+    """SIGTERM → SIGKILL any descendant claude CLI / MCP processes. Returns count killed."""
+    if psutil is None:
+        return 0
+    killed = 0
+    try:
+        me = psutil.Process(os.getpid())
+        targets = []
+        for child in me.children(recursive=True):
+            try:
+                name = (child.name() or "").lower()
+                cmdline = " ".join(child.cmdline() or []).lower()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            # Match the Node.js `claude` CLI itself …
+            if name == "claude":
+                targets.append(child)
+                continue
+            # … and any MCP child process whose cmdline mentions a known
+            # MCP entrypoint. This is intentionally substring-based because
+            # cmdlines vary (npx wrappers, .venv pythons, etc.).
+            if any(pat in cmdline for pat in _MCP_CMDLINE_PATTERNS):
+                targets.append(child)
+        if not targets:
+            return 0
+        for p in targets:
+            try:
+                p.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        gone, alive = psutil.wait_procs(targets, timeout=2)
+        for p in alive:
+            try:
+                p.kill()
+            except psutil.NoSuchProcess:
+                pass
+        killed = len(targets)
+    except Exception as exc:
+        log.debug("kill_orphan_claude_cli failed: %s", exc)
+    return killed
 
 
 # ---------------------------------------------------------------------------
@@ -142,42 +280,63 @@ async def call_with_tools(
     raw_user_text: str = "",
 ) -> tuple[str, str | None]:
     """Call Claude via SDK. Model decides tool usage (free-code QueryEngine pattern)."""
-    async with claude_semaphore:
+    # H-3: pick the correct concurrency slot so non-admins can't starve
+    # the admin pool.
+    sema = restricted_claude_semaphore if restricted else claude_semaphore
+    async with sema:
         if restricted:
+            # Non-admin callers operate on a strict **allow-list**:
+            #   - No MCP servers at all (playwright / brave / github / x-scraper
+            #     would otherwise let a user read local files or exfiltrate
+            #     data via arbitrary URLs).
+            #   - `permission_mode="default"` (not bypassPermissions) so the CLI
+            #     itself refuses tool calls that aren't explicitly allowed.
+            #   - Only Read, and only if the prompt actually references an image.
+            #   - cwd isolated to the shared attachment tmpdir to limit where a
+            #     successful Read can reach.
+            #   - If BOT_RESTRICTED_ANTHROPIC_API_KEY is configured, the CLI
+            #     subprocess inherits that key via env — so non-admin calls
+            #     burn a dedicated, separately-billed quota rather than the
+            #     owner's OAuth subscription.
             has_images = "Use the Read tool to view this image" in prompt
-            disallowed = [
-                "Bash", "Write", "Edit", "Glob", "Grep",
-                "WebFetch", "WebSearch", "Agent",
-            ]
-            if not has_images:
-                disallowed.append("Read")
+            restricted_env: dict[str, str] = {}
+            if RESTRICTED_ANTHROPIC_API_KEY:
+                restricted_env["ANTHROPIC_API_KEY"] = RESTRICTED_ANTHROPIC_API_KEY
+                # Unset OAuth so the CLI doesn't prefer it over the API key.
+                restricted_env["ANTHROPIC_AUTH_TOKEN"] = ""
             options = ClaudeCodeOptions(
-                system_prompt=SYSTEM_PROMPT,
-                permission_mode="bypassPermissions",
-                cwd=CWD,
+                system_prompt=RESTRICTED_SYSTEM_PROMPT,
+                permission_mode="default",
+                cwd=RESTRICTED_CWD,
                 max_turns=RESTRICTED_MAX_TURNS,
                 model=MODEL,
-                disallowed_tools=disallowed,
-                mcp_servers=MCP_SERVERS,
-                settings=SETTINGS_PATH,
+                allowed_tools=(["Read"] if has_images else []),
+                disallowed_tools=_RESTRICTED_DENY_LIST,
+                mcp_servers={},
+                settings=None,  # don't inherit admin-level settings
+                env=restricted_env,
             )
         else:
-            # Full mode: model decides what tools to use
+            # Admin mode: model decides what tools to use, but we hand the
+            # SDK only the MCP servers this request is likely to need so we
+            # don't pay the chromium / scholarly / web-mcp startup cost on
+            # every reply. raw_user_text falls back to prompt if missing.
+            chosen_mcp = pick_mcp_servers(raw_user_text or prompt)
             options = ClaudeCodeOptions(
                 system_prompt=SYSTEM_PROMPT,
                 permission_mode="bypassPermissions",
                 cwd=CWD,
                 max_turns=ADMIN_MAX_TURNS,
                 model=MODEL,
-                mcp_servers=MCP_SERVERS,
+                mcp_servers=chosen_mcp,
                 settings=SETTINGS_PATH,
             )
 
-        # Session resume — only if fresh
-        if channel_id in sessions and _is_session_fresh(channel_id):
-            options.resume = sessions[channel_id]
-        elif channel_id in sessions:
-            log.info("Skipping stale session resume for channel %d", channel_id)
+        # Session resume disabled — CLI rejects sdk-py entrypoint sessions
+        # (Session xxx filtered from /resume: entrypoint=sdk-py)
+        # Resume attempts waste 90s+ before falling back to fresh anyway.
+        if channel_id in sessions:
+            log.debug("Session resume disabled for SDK entrypoint (ch=%d)", channel_id)
 
         response_text: str | None = None
         session_id: str | None = None
@@ -190,8 +349,11 @@ async def call_with_tools(
             stderr_fileobj = None
             stderr_path: str | None = None
             try:
-                fd, stderr_path = tempfile.mkstemp(prefix="claude_stderr_")
-                stderr_fileobj = os.fdopen(fd, "wb")
+                # In-memory buffer that spills to disk only when >1MB.
+                # Avoids creating a new tempfile per attempt.
+                stderr_fileobj = tempfile.SpooledTemporaryFile(
+                    max_size=1024 * 1024, mode="w+b", prefix="claude_stderr_"
+                )
                 options.debug_stderr = stderr_fileobj
                 options.extra_args = {"debug-to-stderr": None}
 
@@ -217,11 +379,16 @@ async def call_with_tools(
                 break  # success
 
             except TimeoutError:
-                _cleanup_stderr(stderr_fileobj, None)
+                stderr_tail = _read_stderr_buffer(stderr_fileobj)
+                _cleanup_stderr(stderr_fileobj)
                 stderr_fileobj = None
-                stderr_tail = _read_stderr_file(stderr_path)
                 if stderr_tail:
                     log.warning("SDK timeout (attempt %d) stderr tail:\n%s", attempt + 1, stderr_tail)
+
+                # Ensure the CLI subprocess doesn't stay orphaned holding RAM.
+                killed = kill_orphan_claude_cli()
+                if killed:
+                    log.warning("Killed %d orphan claude CLI process(es) after timeout", killed)
 
                 if attempt == 0 and options.resume:
                     log.warning("Session resume timed out for ch=%d, retrying fresh", channel_id)
@@ -234,16 +401,27 @@ async def call_with_tools(
                 return f"⏰ タイムアウトしました（{TIMEOUT // 60}分制限）", None
 
             except Exception as e:
-                _cleanup_stderr(stderr_fileobj, None)
+                stderr_tail = _read_stderr_buffer(stderr_fileobj)
+                _cleanup_stderr(stderr_fileobj)
                 stderr_fileobj = None
-                stderr_tail = _read_stderr_file(stderr_path)
 
                 err_str = str(e)[:500]
                 error_type = _classify_error(err_str, stderr_tail)
 
+                # Save stderr for debugging — only on the first few attempts to
+                # avoid flooding .state/ with hundreds of files under retry storms.
+                if stderr_tail and attempt < 3:
+                    debug_path = os.path.join(STATE_DIR, f"stderr_ch{channel_id}.log")
+                    try:
+                        with open(debug_path, "w", encoding="utf-8") as fh:
+                            fh.write(stderr_tail)
+                        log.info("Saved stderr to %s", debug_path)
+                    except Exception:
+                        pass
+
                 if stderr_tail:
                     log.error("SDK error (attempt %d, type=%s): %s\nstderr tail:\n%s",
-                              attempt + 1, error_type, err_str, stderr_tail)
+                              attempt + 1, error_type, err_str, stderr_tail[-3000:])
                 else:
                     log.error("SDK error (attempt %d, type=%s): %s",
                               attempt + 1, error_type, err_str, exc_info=True)
@@ -254,7 +432,11 @@ async def call_with_tools(
                     log.info("Transient error (%s), extending to %d attempts", error_type, max_attempts)
 
                 # Non-retryable errors
-                if error_type in ("auth", "context_overflow"):
+                if error_type in ("auth", "context_overflow", "max_turns", "cli_exit"):
+                    # cli_exit with partial response: return what we got
+                    if error_type == "cli_exit" and response_text:
+                        log.info("CLI exited with partial response, returning it")
+                        break
                     return _error_message(error_type), None
 
                 # Clear broken session
@@ -274,7 +456,7 @@ async def call_with_tools(
                 await asyncio.sleep(backoff)
 
             finally:
-                _cleanup_stderr(stderr_fileobj, stderr_path)
+                _cleanup_stderr(stderr_fileobj)
 
         if response_text is None:
             return "(No response from Claude)", None

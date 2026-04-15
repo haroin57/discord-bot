@@ -11,12 +11,51 @@ Reference: free-code/src/services/oauth/client.ts
 import json
 import logging
 import os
+import stat
 import tempfile
 import time
 
 import aiohttp
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# H-2: permission verification helpers
+# ---------------------------------------------------------------------------
+# Any process that shares the `~/.claude` directory with us can otherwise
+# race our atomic-rename (TOCTOU) or read the refreshed token. Refuse to
+# write credentials back to disk unless the directory AND the existing file
+# are restricted to the current user.
+
+_CREDS_DIR_MODE_MASK = 0o077   # group/other must have no bits set
+_CREDS_FILE_MODE_MASK = 0o077
+
+
+def _verify_path_privacy(path: str, *, is_dir: bool) -> bool:
+    """Return True iff `path` is owned by us and g/o perms are clear."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return True  # nothing to verify yet — the first write will create it
+    except OSError as exc:
+        log.error("Cannot stat %s: %s", path, exc)
+        return False
+
+    if st.st_uid != os.getuid():
+        log.error(
+            "Refusing to touch %s: owner=%d but we are uid=%d",
+            path, st.st_uid, os.getuid(),
+        )
+        return False
+    mode = stat.S_IMODE(st.st_mode)
+    mask = _CREDS_DIR_MODE_MASK if is_dir else _CREDS_FILE_MODE_MASK
+    if mode & mask:
+        log.error(
+            "Refusing to touch %s: mode=%#o grants g/o access (mask %#o)",
+            path, mode, mask,
+        )
+        return False
+    return True
 
 # ---------------------------------------------------------------------------
 # Constants (from free-code/src/constants/oauth.ts)
@@ -41,6 +80,14 @@ EXPIRY_BUFFER_MS = 5 * 60 * 1000
 _access_token: str | None = None
 _refresh_token: str | None = None
 _expires_at: int = 0  # epoch ms
+_http_session: aiohttp.ClientSession | None = None
+
+
+async def _get_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session
 
 
 def _read_credentials() -> dict | None:
@@ -55,8 +102,25 @@ def _read_credentials() -> dict | None:
 
 
 def _save_credentials(access: str, refresh: str, expires_at: int, extra: dict | None = None) -> None:
-    """Write updated tokens back to the credentials file (atomic write)."""
+    """Write updated tokens back to the credentials file (atomic write).
+
+    H-2 defence:
+      * verify ``~/.claude`` is owned by us and has no g/o bits before
+        we create a temp file in it (otherwise a co-tenant could race us
+        to the ``os.replace``)
+      * verify any existing ``.credentials.json`` is also privately-owned
+        so we're not overwriting a file attached to someone else
+      * fchmod the new fd to 0o600 BEFORE any content lands in it
+    """
     try:
+        creds_dir = os.path.dirname(CREDENTIALS_PATH)
+        if not _verify_path_privacy(creds_dir, is_dir=True):
+            log.error("Refusing to save credentials: %s is not private", creds_dir)
+            return
+        if not _verify_path_privacy(CREDENTIALS_PATH, is_dir=False):
+            log.error("Refusing to overwrite credentials: %s is not private", CREDENTIALS_PATH)
+            return
+
         try:
             with open(CREDENTIALS_PATH) as f:
                 data = json.load(f)
@@ -71,16 +135,21 @@ def _save_credentials(access: str, refresh: str, expires_at: int, extra: dict | 
             oauth.update(extra)
         data["claudeAiOauth"] = oauth
 
-        # Atomic write: temp file → rename to avoid corruption on concurrent access
-        creds_dir = os.path.dirname(CREDENTIALS_PATH)
+        # Atomic write: fd → chmod → write → rename. Order matters: we
+        # tighten permissions BEFORE writing any token bytes so there is
+        # no window in which another reader could grab plaintext tokens
+        # from an 0o600-untightened tempfile.
         fd, tmp_path = tempfile.mkstemp(dir=creds_dir, suffix=".tmp")
         try:
+            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f)
-            os.chmod(tmp_path, 0o600)
             os.replace(tmp_path, CREDENTIALS_PATH)
         except BaseException:
-            os.unlink(tmp_path)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
             raise
     except Exception as exc:
         log.warning("Failed to save OAuth credentials: %s", exc)
@@ -108,19 +177,19 @@ async def refresh_token() -> bool:
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                TOKEN_URL,
-                json=body,
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    log.error("OAuth token refresh failed (%d): %s", resp.status, text)
-                    return False
+        session = await _get_session()
+        async with session.post(
+            TOKEN_URL,
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                log.error("OAuth token refresh failed (%d): %s", resp.status, text)
+                return False
 
-                data = await resp.json()
+            data = await resp.json()
 
         new_access = data["access_token"]
         new_refresh = data.get("refresh_token", _refresh_token)
@@ -131,8 +200,7 @@ async def refresh_token() -> bool:
         _refresh_token = new_refresh
         _expires_at = new_expires_at
 
-        # Update env var so any new Anthropic clients pick it up
-        os.environ["ANTHROPIC_AUTH_TOKEN"] = _access_token
+        # auth_token is injected directly via SDK patch, no env var needed
 
         # Persist to disk
         _save_credentials(_access_token, _refresh_token, _expires_at)
@@ -188,8 +256,9 @@ def _patch_anthropic_sdk() -> None:
         _orig_init = anthropic.Anthropic.__init__
 
         def _oauth_init(self, **kwargs):
-            # Drop api_key — we use auth_token via env
+            # Drop api_key — we use auth_token directly (NOT env var)
             kwargs.pop("api_key", None)
+            kwargs["auth_token"] = _access_token
             # Merge beta header
             headers = dict(kwargs.pop("default_headers", None) or {})
             existing_beta = headers.get("anthropic-beta", "")
@@ -231,9 +300,10 @@ def init() -> bool:
         log.error("No access token in credentials")
         return False
 
-    # Set env var for Anthropic SDK (picked up automatically)
-    os.environ["ANTHROPIC_AUTH_TOKEN"] = _access_token
-    # Remove ANTHROPIC_API_KEY if set to avoid conflicts
+    # Do NOT set ANTHROPIC_AUTH_TOKEN env var — it leaks to CLI subprocesses
+    # and causes "OAuth authentication is currently not supported" errors.
+    # Instead, the SDK monkey-patch injects auth_token directly.
+    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
     os.environ.pop("ANTHROPIC_API_KEY", None)
 
     # Patch the SDK
