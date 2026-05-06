@@ -29,14 +29,17 @@ from config import (
     RESTRICTED_DAILY_QUOTA,
 )
 from services.claude_sdk import call_with_tools, kill_orphan_claude_cli
-from services.mem0_service import add_memories, format_memories_for_prompt, search_memories
+from services.mem0_service import add_memories, format_memories_for_prompt, search_memories, search_memories_multi
 from services.session import load_sessions, update_session
 from utils.attachments import (
     cleanup_attachments,
     cleanup_stale_attachments,
     download_attachments,
+    download_text_attachments,
     extract_file_paths,
     extract_image_paths,
+    is_attach_ignored,
+    normalize_image_filenames,
     strip_attached_paths,
 )
 from utils.discord_helpers import (
@@ -47,7 +50,8 @@ from utils.discord_helpers import (
     split_message,
     strip_mention,
 )
-from utils.markdown_parser import TextSegment, TableSegment, has_tables, parse_segments
+from utils.markdown_parser import TextSegment, TableSegment, MathSegment, has_tables, has_math, parse_segments
+from utils.math_renderer import render_math_image
 from utils.table_renderer import render_table_image
 
 log = logging.getLogger(__name__)
@@ -152,6 +156,53 @@ def _sanitize_untrusted_text(text: str) -> str:
 def _wrap_untrusted(text: str) -> str:
     """Wrap untrusted text in an XML tag the model is told to treat as data."""
     return f"<untrusted_user_input>\n{text}\n</untrusted_user_input>"
+
+
+_JP_STOP_WORDS = frozenset(
+    "の は が を に で と も か な へ や て だ です ます した して "
+    "する ある いる なる れる られる せる させる ない よう から まで "
+    "こと もの ため ので のに けど けれど って という といった "
+    "これ それ あれ ここ そこ あそこ この その あの どの "
+    "私 僕 俺 あなた 彼 彼女 先輩 さん ちゃん くん".split()
+)
+_EN_STOP_WORDS = frozenset(
+    "a an the is are was were be been being have has had do does did "
+    "will would shall should may might can could and but or nor for "
+    "so yet at by to from in on of with about into through after "
+    "before between under over this that these those it its i me my "
+    "we our you your he his she her they them their what which who".split()
+)
+
+
+def _build_mem0_queries(text: str, max_queries: int = 3) -> list[str]:
+    """Build multiple search queries from user text for better Mem0 recall.
+
+    Returns 1-3 queries:
+      1. Full text (always)
+      2. Keyword-only query (stop words removed) — if meaningfully different
+      3. First sentence / clause — if text has multiple sentences
+    """
+    queries: list[str] = [text]
+
+    # --- keyword query ---
+    # For Japanese: extract kanji compounds + katakana words separately
+    # For English: split on spaces and remove stop words
+    jp_terms = re.findall(r"[\u4e00-\u9fff]{2,}|[\u30a0-\u30ff\uff66-\uff9f]{2,}", text)
+    en_words = re.findall(r"[a-zA-Z]{2,}", text.lower())
+    en_keywords = [w for w in en_words if w not in _EN_STOP_WORDS]
+    keywords = jp_terms + en_keywords
+    if keywords:
+        kw_query = " ".join(keywords)
+        if kw_query != text.strip() and len(kw_query) >= 4:
+            queries.append(kw_query)
+
+    # --- first sentence / clause ---
+    sentences = re.split(r"[。！？\.\!\?\n]+", text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if len(sentences) >= 2 and sentences[0] != text.strip():
+        queries.append(sentences[0])
+
+    return queries[:max_queries]
 
 
 def _cap_text(text: str, limit: int) -> str:
@@ -291,7 +342,7 @@ async def _send_segmented(
 
     segments = parse_segments(response_text)
     is_first = True
-    table_images: list[str] = []
+    rendered_images: list[str] = []
 
     for seg in segments:
         if isinstance(seg, TextSegment):
@@ -309,7 +360,7 @@ async def _send_segmented(
         elif isinstance(seg, TableSegment):
             img_path = await render_table_image(seg.markdown, caption=seg.caption)
             if img_path:
-                table_images.append(img_path)
+                rendered_images.append(img_path)
                 f = discord.File(img_path)
                 try:
                     if is_first:
@@ -330,12 +381,35 @@ async def _send_segmented(
                     else:
                         await message.channel.send(chunk)
 
+        elif isinstance(seg, MathSegment):
+            img_path = await render_math_image(seg.latex, display_mode=seg.display_mode)
+            if img_path:
+                rendered_images.append(img_path)
+                f = discord.File(img_path)
+                try:
+                    if is_first:
+                        await message.reply(file=f)
+                        is_first = False
+                    else:
+                        await message.channel.send(file=f)
+                finally:
+                    f.close()
+            else:
+                # Fallback: send math as raw LaTeX text
+                log.warning("Math render failed, falling back to text")
+                fallback = f"`{seg.latex}`" if not seg.display_mode else f"```\n{seg.latex}\n```"
+                if is_first:
+                    await message.reply(fallback)
+                    is_first = False
+                else:
+                    await message.channel.send(fallback)
+
     # Send any extracted file attachments at the end
     if attach_files:
         await message.channel.send(files=attach_files)
 
-    # Cleanup rendered table images
-    for p in table_images:
+    # Cleanup rendered images (tables + math)
+    for p in rendered_images:
         try:
             _os.remove(p)
         except OSError:
@@ -361,14 +435,44 @@ async def on_message(message: discord.Message):
         if not mentioned:
             return
 
+    # Privilege is decided HERE, from the Discord author ID — never from
+    # message content. All downstream behaviour branches on this variable.
+    caller_is_admin = is_admin(message.author)
+
+    # --- Quick command: delete replied-to message (admin only) ---
+    content_stripped = message.content.strip().lower()
+    # Match: mention + delete keyword, or just the keyword in DMs
+    delete_keywords = {"!delete", "削除", "消して", "delete"}
+    # Strip bot mention from content for keyword matching
+    bare_text = strip_mention(message.content, bot.user.id).strip().lower() if not is_dm else content_stripped
+    if bare_text in delete_keywords and message.reference and message.reference.message_id:
+        if not caller_is_admin:
+            await message.reply("❌ この操作はadminユーザーのみ使用できます。")
+            return
+        try:
+            ref_msg = message.reference.cached_message
+            if ref_msg is None:
+                ref_msg = await message.channel.fetch_message(message.reference.message_id)
+            await ref_msg.delete()
+            # Also delete the command message itself for cleanliness
+            try:
+                await message.delete()
+            except discord.errors.HTTPException:
+                pass
+            log.info("Deleted message %s (requested by admin %s)", ref_msg.id, message.author.id)
+        except discord.errors.NotFound:
+            await message.reply("⚠️ そのメッセージはもう存在しません。")
+        except discord.errors.Forbidden:
+            await message.reply("⚠️ そのメッセージを削除する権限がありません。")
+        except Exception as e:
+            log.warning("Failed to delete message: %s", e)
+            await message.reply(f"❌ 削除に失敗しました: {e}")
+        return
+
     try:
         await message.add_reaction("👀")
     except discord.errors.Forbidden:
         pass
-
-    # Privilege is decided HERE, from the Discord author ID — never from
-    # message content. All downstream behaviour branches on this variable.
-    caller_is_admin = is_admin(message.author)
 
     # Tiered rate limiting: non-admins get a much stricter cooldown so they
     # can't flood the shared Claude quota or memory budget.
@@ -454,8 +558,9 @@ async def on_message(message: discord.Message):
         # Non-admins can only RECALL memories from their own user space; writes
         # are disabled later in _mem0_store to block poisoning.
         if len(raw_user_text) >= MEM0_MIN_QUERY_LENGTH:
+            mem0_queries = _build_mem0_queries(raw_user_text)
             mem0_task: asyncio.Task | None = asyncio.create_task(
-                search_memories(raw_user_text, mem0_user_id, limit=5)
+                search_memories_multi(mem0_queries, mem0_user_id, limit=8)
             )
         else:
             mem0_task = None
@@ -464,6 +569,7 @@ async def on_message(message: discord.Message):
         all_attachments = list(message.attachments) + ref_attachments
         http_session = await get_http_session()
         image_paths = await download_attachments(http_session, all_attachments)
+        text_attachments = await download_text_attachments(http_session, all_attachments)
         resolved_prompt = await link_task
         thread_context = await thread_task
 
@@ -485,6 +591,13 @@ async def on_message(message: discord.Message):
                 f"- {p} (Use the Read tool to view this image)" for p in image_paths
             )
             parts.append(f"<attached_images>\n{image_instructions}\n</attached_images>")
+        if text_attachments:
+            for fname, content in text_attachments:
+                safe_fname = _sanitize_untrusted_text(fname)
+                safe_content = _sanitize_untrusted_text(content)
+                parts.append(
+                    f"<attached_file name=\"{safe_fname}\">\n{safe_content}\n</attached_file>"
+                )
 
         untrusted_block = _wrap_untrusted("\n\n".join(parts))
 
@@ -559,7 +672,10 @@ async def on_message(message: discord.Message):
 
             Never drops the most recent text: if called within the cool-down,
             schedule a delayed edit (cancelling any previously pending one).
+            Discord message limit is 2000 chars — truncate to stay safe.
             """
+            if len(text) > 1990:
+                text = text[:1990] + "…"
             nonlocal last_status_update
             now_mono = time.monotonic()
             elapsed = now_mono - last_status_update
@@ -609,14 +725,33 @@ async def on_message(message: discord.Message):
         # Only admin callers may write to long-term memory. Non-admin writes
         # would let an attacker plant persistent "facts" that later sessions
         # inject into the prompt (C-7 poisoning).
+        # Include recent thread/channel context so Mem0's LLM extractor can
+        # pick up facts from the surrounding conversation, not just the
+        # single user↔assistant turn.
         if caller_is_admin:
+            # Capture thread_context at closure time (it's already resolved)
+            _ctx_for_mem0 = thread_context or ""
+
             async def _mem0_store():
                 try:
-                    msgs = [
-                        {"role": "user", "content": raw_user_text},
-                        {"role": "assistant", "content": response_text},
-                    ]
-                    await add_memories(msgs, mem0_user_id)
+                    msgs: list[dict[str, str]] = []
+                    # Prepend recent conversation context as a system message
+                    # so Mem0's fact extractor sees the full conversational flow
+                    if _ctx_for_mem0:
+                        msgs.append({
+                            "role": "system",
+                            "content": (
+                                "[Recent conversation context]\n"
+                                + _ctx_for_mem0
+                                + "\n[End of context]"
+                            ),
+                        })
+                    msgs.append({"role": "user", "content": raw_user_text})
+                    msgs.append({"role": "assistant", "content": response_text})
+                    await add_memories(msgs, mem0_user_id, metadata={
+                        "channel_id": str(message.channel.id),
+                        "channel_name": getattr(message.channel, "name", "DM"),
+                    })
                 except Exception as exc:
                     log.debug("Mem0 store failed (non-fatal): %s", exc)
 
@@ -628,8 +763,12 @@ async def on_message(message: discord.Message):
         attach_files: list[discord.File] = []
         attached_paths: list[str] = []
         if caller_is_admin:
-            # Images first
-            for img_path in extract_image_paths(response_text):
+            # Normalize bare filenames to full paths before extraction
+            response_text = normalize_image_filenames(response_text)
+            # Images first (admin mode: broader allow-list)
+            for img_path in extract_image_paths(response_text, admin=True):
+                if is_attach_ignored(img_path):
+                    continue
                 try:
                     attach_files.append(discord.File(img_path))
                     attached_paths.append(img_path)
@@ -638,21 +777,22 @@ async def on_message(message: discord.Message):
                     log.warning("Failed to attach image %s: %s", img_path, e)
             # Then any other file type (admin only)
             for file_path in extract_file_paths(response_text):
+                if is_attach_ignored(file_path):
+                    continue
                 try:
                     attach_files.append(discord.File(file_path))
                     attached_paths.append(file_path)
                     log.info("Attaching file: %s", file_path)
                 except Exception as e:
                     log.warning("Failed to attach file %s: %s", file_path, e)
-            # Strip successfully attached file paths from the response text
-            if attached_paths:
-                response_text = strip_attached_paths(response_text, attached_paths)
+            # Keep file paths in the response text (don't strip them)
 
         try:
-            if len(response_text) > 8000 and not has_tables(response_text):
+            _has_rich = has_tables(response_text) or has_math(response_text)
+            if len(response_text) > 8000 and not _has_rich:
                 all_files = [discord.File(io.StringIO(response_text), filename="response.md")] + attach_files
                 await message.reply("Response is too long, sending as file(s):", files=all_files)
-            elif has_tables(response_text):
+            elif _has_rich:
                 await _send_segmented(message, response_text, attach_files)
             else:
                 chunks = split_message(response_text)

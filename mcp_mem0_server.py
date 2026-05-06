@@ -72,21 +72,37 @@ async def add(
     user_message: str,
     assistant_message: str,
     user_id: str = DEFAULT_USER_ID,
+    context: str = "",
 ) -> str:
     """Store a conversation turn so Mem0 can extract new long-term facts.
 
     Mem0's LLM extractor (Claude Haiku via OAuth) will distill durable
     facts from the exchange and store them keyed by user_id.
 
+    For richer extraction, pass recent conversation context (e.g. the
+    last few messages in the thread) via the `context` parameter. This
+    helps Mem0 pick up facts that only make sense in context.
+
     Args:
         user_message: The user's message text.
         assistant_message: The assistant's reply text.
         user_id: Mem0 user key (default: 先輩's Discord ID).
+        context: Optional recent conversation context to prepend.
+            Include the last few messages leading up to this exchange
+            so Mem0's extractor can understand the full conversational flow.
     """
-    msgs = [
-        {"role": "user", "content": user_message},
-        {"role": "assistant", "content": assistant_message},
-    ]
+    msgs: list[dict[str, str]] = []
+    if context:
+        msgs.append({
+            "role": "system",
+            "content": (
+                "[Recent conversation context]\n"
+                + context
+                + "\n[End of context]"
+            ),
+        })
+    msgs.append({"role": "user", "content": user_message})
+    msgs.append({"role": "assistant", "content": assistant_message})
     result = await add_memories(msgs, user_id=user_id)
     if not result:
         return "(mem0 add failed — see server logs)"

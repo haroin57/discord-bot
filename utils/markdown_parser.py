@@ -1,13 +1,17 @@
-"""Markdown table detection and segment splitting.
+"""Markdown table and math detection and segment splitting.
 
-Splits Claude responses into text and table segments so that tables
-can be rendered as images while text is sent as regular Discord messages.
+Splits Claude responses into text, table, and math segments so that tables
+and math expressions can be rendered as images while text is sent as regular
+Discord messages.
 """
 
 import re
 from dataclasses import dataclass
 
-__all__ = ["TextSegment", "TableSegment", "Segment", "parse_segments", "has_tables"]
+__all__ = [
+    "TextSegment", "TableSegment", "MathSegment", "Segment",
+    "parse_segments", "has_tables", "has_math",
+]
 
 
 @dataclass
@@ -21,7 +25,14 @@ class TableSegment:
     caption: str = ""
 
 
-Segment = TextSegment | TableSegment
+@dataclass
+class MathSegment:
+    """A LaTeX math expression to be rendered as an image."""
+    latex: str
+    display_mode: bool = True  # True for $$..$$, False for $..$ (block vs inline)
+
+
+Segment = TextSegment | TableSegment | MathSegment
 
 # ---------------------------------------------------------------------------
 # Regex: matches Markdown tables (header + separator + data rows).
@@ -36,6 +47,28 @@ TABLE_RE = re.compile(
 
 # Fenced code block (``` ... ```)
 _CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```", re.MULTILINE)
+
+# ---------------------------------------------------------------------------
+# Math detection: $$ ... $$ (display) and $ ... $ (inline)
+# ---------------------------------------------------------------------------
+# Display math: $$ on its own line (or surrounded by whitespace)
+DISPLAY_MATH_RE = re.compile(
+    r"(\$\$\n[\s\S]*?\n\$\$"       # $$ on own lines
+    r"|\$\$[^\$]+?\$\$)",           # $$ inline $$
+    re.MULTILINE,
+)
+
+# Inline math: single $ ... $ (not preceded/followed by $)
+INLINE_MATH_RE = re.compile(
+    r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)",
+)
+
+# Combined: find all math (display first, then inline)
+_ALL_MATH_RE = re.compile(
+    r"(\$\$[\s\S]*?\$\$"           # display math $$...$$
+    r"|(?<!\$)\$(?!\$)(?!\s)(.+?)(?<!\s)(?<!\$)\$(?!\$))",  # inline $...$
+    re.MULTILINE,
+)
 
 
 def _mask_code_blocks(text: str) -> str:
@@ -52,11 +85,48 @@ def has_tables(text: str) -> bool:
     return bool(TABLE_RE.search(masked))
 
 
+def has_math(text: str) -> bool:
+    """Lightweight check: does the text contain LaTeX math expressions?"""
+    masked = _mask_code_blocks(text)
+    return bool(_ALL_MATH_RE.search(masked))
+
+
+def _split_math_in_text(text: str) -> list[Segment]:
+    """Split a text fragment into Text and Math segments."""
+    masked = _mask_code_blocks(text)
+    segments: list[Segment] = []
+    last_end = 0
+
+    for m in _ALL_MATH_RE.finditer(masked):
+        start, end = m.start(), m.end()
+        before = text[last_end:start]
+        if before.strip():
+            segments.append(TextSegment(content=before))
+
+        raw_match = text[start:end]
+        if raw_match.startswith("$$"):
+            # Display math — strip $$ delimiters
+            latex = raw_match[2:-2].strip()
+            segments.append(MathSegment(latex=latex, display_mode=True))
+        else:
+            # Inline math — strip $ delimiters
+            latex = raw_match[1:-1].strip()
+            segments.append(MathSegment(latex=latex, display_mode=False))
+        last_end = end
+
+    remaining = text[last_end:]
+    if remaining.strip():
+        segments.append(TextSegment(content=remaining))
+
+    return segments
+
+
 def parse_segments(text: str) -> list[Segment]:
-    """Split response text into Text and Table segments.
+    """Split response text into Text, Table, and Math segments.
 
     Tables inside fenced code blocks are ignored. If a heading (### ...)
     immediately precedes a table, it is absorbed as the table caption.
+    Math expressions ($..$ and $$..$$) are also extracted.
     """
     masked = _mask_code_blocks(text)
     segments: list[Segment] = []
@@ -74,7 +144,8 @@ def parse_segments(text: str) -> list[Segment]:
             before = before[: heading_match.start()].rstrip()
 
         if before.strip():
-            segments.append(TextSegment(content=before))
+            # Check for math in the text before the table
+            segments.extend(_split_math_in_text(before))
 
         # Use the *original* text for the table content (not masked)
         segments.append(TableSegment(markdown=text[start:end], caption=caption))
@@ -82,6 +153,7 @@ def parse_segments(text: str) -> list[Segment]:
 
     remaining = text[last_end:]
     if remaining.strip():
-        segments.append(TextSegment(content=remaining))
+        # Check for math in remaining text
+        segments.extend(_split_math_in_text(remaining))
 
     return segments

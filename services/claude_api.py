@@ -173,6 +173,50 @@ MAX_RETRIES = 6
 RETRY_BACKOFF_BASE = 15.0  # seconds: 15*2^0=15, 15*2^1=30, ..., 15*2^5=480
 
 
+def _build_cached_system(system_prompt: str) -> list[dict]:
+    """Wrap system prompt with cache_control for Anthropic prompt caching.
+
+    The server caches the KV state for this prefix (5-min TTL). Consecutive
+    requests with the same system prompt skip re-encoding those tokens,
+    cutting input cost by ~90% on the static portion.
+    """
+    return [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+
+
+def _inject_cache_breakpoints(messages: list[dict]) -> list[dict]:
+    """Add a cache breakpoint to the second-to-last user message.
+
+    This lets the API cache all tokens up to that point, so the next turn
+    only processes the latest user message + assistant reply as new tokens.
+    We target the second-to-last user turn (not the last) because the last
+    one is the new input that changes every request.
+    """
+    if len(messages) < 4:
+        return messages
+    # Find the second-to-last user message
+    user_indices = [i for i, m in enumerate(messages) if m["role"] == "user"]
+    if len(user_indices) < 2:
+        return messages
+    target_idx = user_indices[-2]
+    # Deep-copy only the target message to avoid mutating the original history
+    messages = list(messages)
+    msg = dict(messages[target_idx])
+    content = msg["content"]
+    if isinstance(content, str):
+        msg["content"] = [
+            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}},
+        ]
+    elif isinstance(content, list):
+        # Clone the last block and add cache_control
+        content = list(content)
+        last_block = dict(content[-1])
+        last_block["cache_control"] = {"type": "ephemeral"}
+        content[-1] = last_block
+        msg["content"] = content
+    messages[target_idx] = msg
+    return messages
+
+
 def _stream_once(api_client: anthropic.Anthropic, messages: list[dict], system_prompt: str, response_chunks: list[str]) -> None:
     """Single streaming attempt. No retry. Called from to_thread."""
     client_request_id = str(uuid.uuid4())
@@ -186,11 +230,14 @@ def _stream_once(api_client: anthropic.Anthropic, messages: list[dict], system_p
     if ":" in attribution_value:
         attribution_value = attribution_value.split(":", 1)[1].strip().rstrip(";")
 
+    cached_system = _build_cached_system(system_prompt)
+    cached_messages = _inject_cache_breakpoints(messages)
+
     with api_client.beta.messages.stream(
         model=CLAUDE_MODEL,
         max_tokens=CLAUDE_MAX_TOKENS,
-        system=system_prompt,
-        messages=messages,
+        system=cached_system,
+        messages=cached_messages,
         betas=MODEL_BETAS,
         metadata=_get_metadata(),
         extra_headers={
@@ -209,6 +256,19 @@ def _stream_once(api_client: anthropic.Anthropic, messages: list[dict], system_p
                 break
             last_event_time = now
             response_chunks.append(text)
+        # Log cache performance from the final message usage
+        final_msg = stream.get_final_message()
+        if final_msg and final_msg.usage:
+            usage = final_msg.usage
+            cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+            cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            input_tokens = getattr(usage, "input_tokens", 0) or 0
+            log.info(
+                "Prompt cache: input=%d cache_read=%d cache_create=%d hit_rate=%.0f%%",
+                input_tokens, cache_read, cache_create,
+                (cache_read / (input_tokens + cache_read + cache_create) * 100)
+                if (input_tokens + cache_read + cache_create) > 0 else 0,
+            )
 
 
 # ---------------------------------------------------------------------------

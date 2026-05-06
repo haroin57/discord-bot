@@ -21,7 +21,14 @@ from claude_code_sdk import (
     ResultMessage,
     query,
 )
-from claude_code_sdk.types import ThinkingBlock, ToolUseBlock
+from claude_code_sdk.types import (
+    SystemMessage,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
 
 from config import (
     ADMIN_MAX_TURNS as _CONFIG_ADMIN_MAX_TURNS,
@@ -269,6 +276,42 @@ def kill_orphan_claude_cli() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Discord status hint — summarize tool input for the status message
+# ---------------------------------------------------------------------------
+def _tool_input_hint(name: str, inp: dict | None) -> str:
+    """Return a short human-readable hint for the Discord status message."""
+    if not inp:
+        return ""
+    try:
+        n = name.split("__")[-1] if "__" in name else name  # strip mcp prefix
+        if n in ("Bash", "BashOutput"):
+            return inp.get("command", "")
+        if n in ("Read",):
+            return inp.get("file_path", "")
+        if n in ("Edit", "Write", "MultiEdit"):
+            return inp.get("file_path", "")
+        if n in ("Glob",):
+            return inp.get("pattern", "")
+        if n in ("Grep",):
+            return inp.get("pattern", "")
+        if n in ("WebFetch", "navigate"):
+            return inp.get("url", "")
+        if n in ("WebSearch", "brave_web_search", "brave_local_search"):
+            return inp.get("query", "")
+        if n in ("search_x",):
+            return inp.get("query", "")
+        if n in ("Agent",):
+            return inp.get("description", "")
+        # Generic: show first string value
+        for v in inp.values():
+            if isinstance(v, str) and v:
+                return v
+        return ""
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # Main entry point — free-code pattern: no keyword routing
 # ---------------------------------------------------------------------------
 async def call_with_tools(
@@ -332,11 +375,14 @@ async def call_with_tools(
                 settings=SETTINGS_PATH,
             )
 
-        # Session resume disabled — CLI rejects sdk-py entrypoint sessions
-        # (Session xxx filtered from /resume: entrypoint=sdk-py)
-        # Resume attempts waste 90s+ before falling back to fresh anyway.
-        if channel_id in sessions:
-            log.debug("Session resume disabled for SDK entrypoint (ch=%d)", channel_id)
+        # Session resume disabled — MCP server configuration varies per
+        # request (pick_mcp_servers selects servers based on user text),
+        # but CLI resume restores the original session's MCP servers.
+        # Mismatched servers (e.g. claude.ai proxy servers from a previous
+        # session) cause auth errors and immediate exit code 1.
+        # KV cache benefits are handled by prompt caching (cache_control)
+        # on the direct API path instead.
+        options.resume = None
 
         response_text: str | None = None
         session_id: str | None = None
@@ -364,18 +410,82 @@ async def call_with_tools(
                 log.info("SDK attempt %d/%d (timeout=%ds, resume=%s)",
                          attempt + 1, max_attempts, timeout, bool(options.resume))
 
+                turn_count = 0
+                tool_count = 0
+                t_start = time.monotonic()
+
                 async with asyncio.timeout(timeout):
                     async for msg in query(prompt=prompt, options=options):
-                        if isinstance(msg, AssistantMessage) and status_callback:
+                        # --- SystemMessage ---
+                        if isinstance(msg, SystemMessage):
+                            log.info("[ch=%d] 📡 system: subtype=%s",
+                                     channel_id, msg.subtype)
+
+                        # --- AssistantMessage (thinking / tool_use / text) ---
+                        elif isinstance(msg, AssistantMessage):
                             for block in msg.content:
                                 if isinstance(block, ThinkingBlock) and block.thinking:
-                                    summary = block.thinking[:80].replace("\n", " ")
-                                    await status_callback(f"💭 {summary}")
+                                    summary = block.thinking[:200].replace("\n", " ")
+                                    log.info("[ch=%d] 💭 thinking: %s%s",
+                                             channel_id, summary,
+                                             "…" if len(block.thinking) > 200 else "")
+                                    if status_callback:
+                                        await status_callback(f"💭 {summary}")
+
                                 elif isinstance(block, ToolUseBlock):
-                                    await status_callback(f"🔧 {block.name}")
+                                    tool_count += 1
+                                    # Summarize input (truncate large payloads)
+                                    inp = str(block.input) if block.input else ""
+                                    inp_summary = inp[:200] + ("…" if len(inp) > 200 else "")
+                                    log.info("[ch=%d] 🔧 tool_use #%d: %s(%s)",
+                                             channel_id, tool_count, block.name, inp_summary)
+                                    # Discord status: tool name + short input hint
+                                    if status_callback:
+                                        hint = _tool_input_hint(block.name, block.input)
+                                        await status_callback(
+                                            f"🔧 {block.name}" + (f"  `{hint}`" if hint else "")
+                                        )
+
+                                elif isinstance(block, TextBlock) and block.text:
+                                    preview = block.text[:150].replace("\n", " ")
+                                    log.info("[ch=%d] 📝 text: %s%s",
+                                             channel_id, preview,
+                                             "…" if len(block.text) > 150 else "")
+                                    if status_callback:
+                                        await status_callback(f"📝 応答を生成中")
+
+                        # --- UserMessage (tool results flowing back) ---
+                        elif isinstance(msg, UserMessage):
+                            for block in (msg.content if isinstance(msg.content, list) else []):
+                                if isinstance(block, ToolResultBlock):
+                                    status = "❌ error" if block.is_error else "✅ ok"
+                                    content_str = str(block.content) if block.content else ""
+                                    preview = content_str[:200].replace("\n", " ")
+                                    log.info("[ch=%d] 📨 tool_result [%s]: %s%s",
+                                             channel_id, status, preview,
+                                             "…" if len(content_str) > 200 else "")
+                                    if status_callback:
+                                        if block.is_error:
+                                            await status_callback(f"❌ ツールエラー")
+                                        else:
+                                            await status_callback(f"📨 結果を受信")
+
+                        # --- ResultMessage (final) ---
                         elif isinstance(msg, ResultMessage):
                             response_text = msg.result if hasattr(msg, "result") else str(msg)
                             session_id = msg.session_id if hasattr(msg, "session_id") else None
+                            elapsed = time.monotonic() - t_start
+                            cost_str = f"${msg.total_cost_usd:.4f}" if msg.total_cost_usd else "n/a"
+                            usage_in = msg.usage.get("input_tokens", 0) if msg.usage else 0
+                            usage_out = msg.usage.get("output_tokens", 0) if msg.usage else 0
+                            log.info(
+                                "[ch=%d] ✅ done: turns=%d tools=%d "
+                                "elapsed=%.1fs api=%.1fs cost=%s "
+                                "tokens_in=%d tokens_out=%d error=%s",
+                                channel_id, msg.num_turns, tool_count,
+                                elapsed, msg.duration_api_ms / 1000,
+                                cost_str, usage_in, usage_out, msg.is_error,
+                            )
                 break  # success
 
             except TimeoutError:
@@ -437,6 +547,16 @@ async def call_with_tools(
                     if error_type == "cli_exit" and response_text:
                         log.info("CLI exited with partial response, returning it")
                         break
+                    # Resume failure (e.g. stale session with incompatible MCP
+                    # servers): clear session and retry fresh instead of giving up.
+                    if error_type == "cli_exit" and options.resume:
+                        log.warning("Session resume failed (cli_exit) for ch=%d, retrying fresh", channel_id)
+                        if channel_id in sessions:
+                            del sessions[channel_id]
+                        _clear_session_time(channel_id)
+                        options.resume = None
+                        await asyncio.sleep(BASE_BACKOFF_S)
+                        continue
                     return _error_message(error_type), None
 
                 # Clear broken session
@@ -464,5 +584,6 @@ async def call_with_tools(
         if session_id:
             _record_session_time(channel_id)
 
-        log.info("Response via %s (restricted=%s)", MODEL, restricted)
+        log.info("Response via %s (restricted=%s) len=%d",
+                 MODEL, restricted, len(response_text))
         return response_text.strip() or "(No response from Claude)", session_id

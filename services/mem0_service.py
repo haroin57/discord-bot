@@ -12,12 +12,32 @@ import asyncio
 import logging
 import os
 
-from services.oauth_manager import ensure_valid_token, init as oauth_init
+from services.oauth_manager import ensure_valid_token, get_access_token, init as oauth_init
 
 log = logging.getLogger(__name__)
 
+MEM0_RELEVANCE_THRESHOLD = 0.3  # Drop memories with score below this
+
 _mem0_instance = None
 _init_attempted = False
+_last_token: str | None = None
+
+
+def _refresh_mem0_client_token() -> None:
+    """Update the auth_token on Mem0's internal Anthropic client after OAuth refresh."""
+    global _last_token
+    current = get_access_token()
+    if current and current != _last_token and _mem0_instance is not None:
+        try:
+            # Mem0 stores the Anthropic client at .llm.client
+            llm = getattr(_mem0_instance, "llm", None)
+            client = getattr(llm, "client", None) if llm else None
+            if client and hasattr(client, "auth_token"):
+                client.auth_token = current
+                _last_token = current
+                log.debug("Refreshed Mem0 Anthropic client token")
+        except Exception as e:
+            log.debug("Failed to refresh Mem0 client token: %s", e)
 
 
 def _build_config() -> dict:
@@ -94,19 +114,49 @@ def _get_mem0():
 # Public async API
 # ------------------------------------------------------------------
 
-async def search_memories(query: str, user_id: str, limit: int = 5) -> list[dict]:
-    """Semantic search for relevant memories."""
+async def search_memories(query: str, user_id: str, limit: int = 8) -> list[dict]:
+    """Semantic search for relevant memories with relevance filtering."""
     mem = _get_mem0()
     if not mem:
         return []
     try:
         await ensure_valid_token()  # refresh OAuth if needed
+        _refresh_mem0_client_token()
         raw = await asyncio.to_thread(mem.search, query=query, user_id=user_id, limit=limit)
         results = raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
-        return results
+        # Filter out low-relevance results
+        filtered = [
+            r for r in results
+            if r.get("score") is None or r.get("score", 0) >= MEM0_RELEVANCE_THRESHOLD
+        ]
+        return filtered
     except Exception as exc:
         log.warning("Mem0 search error: %s", exc)
         return []
+
+
+async def search_memories_multi(
+    queries: list[str], user_id: str, limit: int = 8
+) -> list[dict]:
+    """Search with multiple queries and merge deduplicated results."""
+    if not queries:
+        return []
+    tasks = [search_memories(q, user_id, limit=limit) for q in queries]
+    all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    seen_ids: set[str] = set()
+    merged: list[dict] = []
+    for result_set in all_results:
+        if isinstance(result_set, Exception):
+            continue
+        for r in result_set:
+            mid = r.get("id", r.get("memory", ""))
+            if mid not in seen_ids:
+                seen_ids.add(mid)
+                merged.append(r)
+
+    merged.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return merged[:limit]
 
 
 async def add_memories(
@@ -118,8 +168,13 @@ async def add_memories(
         return None
     try:
         await ensure_valid_token()  # refresh OAuth if needed
+        _refresh_mem0_client_token()
+        import time as _time
+        default_meta = {"timestamp": int(_time.time())}
+        if metadata:
+            default_meta.update(metadata)
         result = await asyncio.to_thread(
-            mem.add, messages, user_id=user_id, metadata=metadata or {}
+            mem.add, messages, user_id=user_id, metadata=default_meta
         )
         count = len(result.get("results", [])) if isinstance(result, dict) else 0
         if count:
@@ -137,6 +192,7 @@ async def get_all_memories(user_id: str) -> list[dict]:
         return []
     try:
         await ensure_valid_token()  # refresh OAuth if needed
+        _refresh_mem0_client_token()
         raw = await asyncio.to_thread(mem.get_all, user_id=user_id)
         return raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
     except Exception as exc:
@@ -151,6 +207,7 @@ async def delete_memory(memory_id: str) -> bool:
         return False
     try:
         await ensure_valid_token()  # refresh OAuth if needed
+        _refresh_mem0_client_token()
         await asyncio.to_thread(mem.delete, memory_id)
         return True
     except Exception as exc:

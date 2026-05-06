@@ -6,6 +6,7 @@ import time
 from collections import OrderedDict
 from urllib.parse import urlparse
 
+import aiohttp
 import discord
 
 from config import (
@@ -110,6 +111,18 @@ def format_embed(embed: discord.Embed) -> str:
 # ---------------------------------------------------------------------------
 MAX_CONTEXT_CHARS = 8000
 
+# 3-layer context hierarchy
+LAYER1_COUNT = 3       # Recent messages: full text
+LAYER2_COUNT = 12      # Earlier messages: summarized
+LAYER2_MAX_CHARS = 150 # Max chars per Layer 2 message
+
+
+def _summarize_message(body: str, max_chars: int = LAYER2_MAX_CHARS) -> str:
+    """Layer 2: truncate message to first max_chars characters."""
+    if len(body) <= max_chars:
+        return body
+    return body[:max_chars] + " [...]"
+
 
 def _should_include_msg(msg: discord.Message, caller_is_admin: bool) -> bool:
     """Filter rule for context fetchers.
@@ -123,53 +136,121 @@ def _should_include_msg(msg: discord.Message, caller_is_admin: bool) -> bool:
     return msg.author.id not in ADMIN_USER_IDS
 
 
+def _format_msg_body(msg: discord.Message) -> str:
+    """Extract full body text from a Discord message (content + embeds + attachments)."""
+    content = msg.content or ""
+    extras: list[str] = []
+    for embed in msg.embeds:
+        formatted = format_embed(embed)
+        if formatted:
+            extras.append(formatted)
+    for att in msg.attachments:
+        extras.append(f"[Attachment: {att.filename}]")
+    body = content + ("\n" + "\n".join(extras) if extras else "")
+    return body.strip()
+
+
+def _build_layered_lines(
+    messages: list[tuple[str, str]],
+    *,
+    oldest_first: bool = True,
+) -> tuple[list[str], int]:
+    """Build layered context lines from (author, body) pairs.
+
+    Messages must be in chronological order (oldest first).
+    Returns (lines, total_chars).
+
+    Layer 1 (last LAYER1_COUNT): full text
+    Layer 2 (preceding LAYER2_COUNT): summarized
+    """
+    total = len(messages)
+    layer2_start = max(0, total - LAYER1_COUNT - LAYER2_COUNT)
+    layer1_start = max(0, total - LAYER1_COUNT)
+
+    layer2_lines: list[str] = []
+    layer1_lines: list[str] = []
+    total_chars = 0
+
+    for i, (author, body) in enumerate(messages):
+        if not body:
+            continue
+        if i < layer2_start:
+            # Layer 3: skip (Mem0 covers)
+            continue
+        elif i < layer1_start:
+            # Layer 2: summarized
+            line = f"{author}: {_summarize_message(body)}"
+            if total_chars + len(line) > MAX_CONTEXT_CHARS:
+                layer2_lines.append("(...truncated...)")
+                break
+            total_chars += len(line)
+            layer2_lines.append(line)
+        else:
+            # Layer 1: full text
+            line = f"{author}: {body}"
+            if total_chars + len(line) > MAX_CONTEXT_CHARS:
+                layer1_lines.append("(...truncated...)")
+                break
+            total_chars += len(line)
+            layer1_lines.append(line)
+
+    lines: list[str] = []
+    if layer2_lines:
+        lines.append("--- earlier (summary) ---")
+        lines.extend(layer2_lines)
+    if layer1_lines:
+        if layer2_lines:
+            lines.append("--- recent (full) ---")
+        lines.extend(layer1_lines)
+
+    return lines, total_chars
+
+
 async def fetch_thread_context(
     thread: discord.Thread,
     before_message: discord.Message,
     *,
     caller_is_admin: bool = False,
 ) -> str:
-    """Fetch past messages in a thread and format them inline (capped at MAX_CONTEXT_CHARS)."""
-    # Cache is partitioned on caller_is_admin so an admin view never leaks
-    # into a non-admin caller via a shared cache entry.
+    """Fetch past messages in a thread with layered context (capped at MAX_CONTEXT_CHARS).
+
+    Layer 1 (last 3 messages): full text for conversational continuity.
+    Layer 2 (messages 4-15): summarized to ~150 chars each.
+    Layer 3 (16+): omitted — Mem0 long-term memory covers older context.
+    """
     cache_key = (thread.id, before_message.id, bool(caller_is_admin))
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    lines: list[str] = []
-    count = 0
-    total_chars = 0
-    async for msg in thread.history(limit=THREAD_HISTORY_LIMIT, before=before_message, oldest_first=True):
+
+    # Collect messages in chronological order (oldest_first=True)
+    collected: list[tuple[str, str]] = []
+    async for msg in thread.history(
+        limit=LAYER1_COUNT + LAYER2_COUNT,
+        before=before_message,
+        oldest_first=True,
+    ):
         if not _should_include_msg(msg, caller_is_admin):
             continue
-        count += 1
-        author = msg.author.display_name
-        content = msg.content or ""
-        extras: list[str] = []
-        for embed in msg.embeds:
-            formatted = format_embed(embed)
-            if formatted:
-                extras.append(formatted)
-        for att in msg.attachments:
-            extras.append(f"[Attachment: {att.filename}]")
-        body = content + ("\n" + "\n".join(extras) if extras else "")
-        if body.strip():
-            line = f"{author}: {body.strip()}"
-            if total_chars + len(line) > MAX_CONTEXT_CHARS:
-                lines.append("(...truncated...)")
-                break
-            total_chars += len(line)
-            lines.append(line)
+        body = _format_msg_body(msg)
+        if body:
+            collected.append((msg.author.display_name, body))
 
-    if not lines:
+    if not collected:
         _cache_set(cache_key, "")
         return ""
-    result = f"[Thread: {thread.name} - past {count} messages]\n" + "\n".join(lines) + "\n[End of thread history]"
+
+    lines, _ = _build_layered_lines(collected, oldest_first=True)
+    result = (
+        f"[Thread: {thread.name} - past {len(collected)} messages]\n"
+        + "\n".join(lines)
+        + "\n[End of thread history]"
+    )
     _cache_set(cache_key, result)
     return result
 
 
-CHANNEL_CONTEXT_LIMIT = 10
+CHANNEL_CONTEXT_LIMIT = LAYER1_COUNT + LAYER2_COUNT  # 15
 
 
 async def fetch_channel_context(
@@ -178,41 +259,38 @@ async def fetch_channel_context(
     *,
     caller_is_admin: bool = False,
 ) -> str:
-    """Fetch recent messages in a regular channel (capped at MAX_CONTEXT_CHARS)."""
+    """Fetch recent messages in a channel with layered context (capped at MAX_CONTEXT_CHARS).
+
+    Layer 1 (last 3 messages): full text for conversational continuity.
+    Layer 2 (messages 4-15): summarized to ~150 chars each.
+    Layer 3 (16+): omitted — Mem0 long-term memory covers older context.
+    """
     cache_key = (channel.id, before_message.id, bool(caller_is_admin))
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    lines: list[str] = []
-    total_chars = 0
-    count = 0
+
+    # channel.history default is newest-first, collect then reverse
+    collected_rev: list[tuple[str, str]] = []
     async for msg in channel.history(limit=CHANNEL_CONTEXT_LIMIT, before=before_message):
         if not _should_include_msg(msg, caller_is_admin):
             continue
-        count += 1
-        author = msg.author.display_name
-        content = msg.content or ""
-        extras: list[str] = []
-        for embed in msg.embeds:
-            formatted = format_embed(embed)
-            if formatted:
-                extras.append(formatted)
-        for att in msg.attachments:
-            extras.append(f"[Attachment: {att.filename}]")
-        body = content + ("\n" + "\n".join(extras) if extras else "")
-        if body.strip():
-            line = f"{author}: {body.strip()}"
-            if total_chars + len(line) > MAX_CONTEXT_CHARS:
-                lines.append("(...truncated...)")
-                break
-            total_chars += len(line)
-            lines.append(line)
+        body = _format_msg_body(msg)
+        if body:
+            collected_rev.append((msg.author.display_name, body))
 
-    if not lines:
+    if not collected_rev:
         _cache_set(cache_key, "")
         return ""
-    lines.reverse()
-    result = f"[Channel recent {count} messages]\n" + "\n".join(lines) + "\n[End of channel history]"
+
+    # Reverse to chronological order for layering
+    collected_rev.reverse()
+    lines, _ = _build_layered_lines(collected_rev, oldest_first=True)
+    result = (
+        f"[Channel recent {len(collected_rev)} messages]\n"
+        + "\n".join(lines)
+        + "\n[End of channel history]"
+    )
     _cache_set(cache_key, result)
     return result
 
@@ -229,6 +307,13 @@ _ALLOWED_DISCORD_HOSTS = frozenset({
     "ptb.discord.com",
     "canary.discord.com",
 })
+# Text content types to download inline when resolving message links.
+_INLINE_TEXT_TYPES = frozenset({
+    "text/plain", "text/csv", "text/markdown", "text/html", "text/xml",
+    "application/json", "application/xml", "application/javascript",
+})
+_MAX_LINK_TEXT_BYTES = 100 * 1024  # 100KB cap
+
 DISCORD_MSG_URL_RE = re.compile(
     r"https?://[\w.@:]*?discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)"
 )
@@ -324,7 +409,24 @@ async def _resolve_one_link(
             formatted = format_embed(embed)
             if formatted:
                 parts.append(formatted)
+        # Download text attachments inline (e.g. message.txt from long Discord messages)
         for attachment in msg.attachments:
+            content_type = (attachment.content_type or "").split(";")[0].strip().lower()
+            if content_type in _INLINE_TEXT_TYPES and (attachment.size or 0) <= _MAX_LINK_TEXT_BYTES:
+                try:
+                    async with aiohttp.ClientSession() as sess:
+                        async with sess.get(attachment.url, allow_redirects=False) as resp:
+                            if resp.status == 200:
+                                data = await resp.read()
+                                if len(data) <= _MAX_LINK_TEXT_BYTES:
+                                    try:
+                                        text = data.decode("utf-8")
+                                    except UnicodeDecodeError:
+                                        text = data.decode("latin-1")
+                                    parts.append(f"[Attachment: {attachment.filename}]\n{text}")
+                                    continue
+                except Exception as e:
+                    log.warning("Failed to download linked attachment %s: %s", attachment.filename, e)
             parts.append(f"[Attachment: {attachment.filename}]")
 
         log.info("Resolved message link: guild=%s ch=%s msg=%s", guild_id, channel_id, message_id)

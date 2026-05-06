@@ -1,6 +1,7 @@
 """Attachment download/cleanup and image path extraction."""
 
 import asyncio
+import fnmatch
 import logging
 import os
 import re
@@ -20,9 +21,37 @@ from config import (
     MAX_RESPONSE_IMAGES,
 )
 
+# Broader allow-list for admin users. Admin requests are already gated in
+# bot.py so we can safely allow /home/ubuntu here while still enforcing
+# magic-byte checks to prevent extension-spoofing.
+ADMIN_IMAGE_DIRS = ALLOWED_IMAGE_DIRS + ("/home/ubuntu",)
+
+# Directories to search when resolving bare image filenames to full paths.
+_IMAGE_SEARCH_DIRS = (
+    "/tmp/table_renders",
+    "/tmp/math_renders",
+    "/tmp/mermaid_output",
+    "/tmp/discord_bot_attachments",
+    "/home/ubuntu",
+)
+
 log = logging.getLogger(__name__)
 
 IMAGE_CONTENT_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+
+# Text-based content types that can be downloaded and inlined into the prompt.
+TEXT_CONTENT_TYPES = {
+    "text/plain",
+    "text/csv",
+    "text/markdown",
+    "text/html",
+    "text/xml",
+    "application/json",
+    "application/xml",
+    "application/javascript",
+}
+MAX_TEXT_ATTACHMENT_BYTES = 100 * 1024  # 100KB cap for inline text
+MAX_TEXT_ATTACHMENTS = 3
 
 # First bytes of supported image formats. Used by extract_image_paths to
 # reject files whose extension was faked to sneak a secret past the filter.
@@ -69,6 +98,39 @@ ADMIN_FILE_DIRS = ("/home/ubuntu", "/tmp")
 MAX_FILE_ATTACH_BYTES = 24 * 1024 * 1024
 MAX_FILE_ATTACHMENTS = 5
 
+# Path to .attachignore file (glob patterns, one per line, # comments)
+_ATTACHIGNORE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".attachignore")
+
+
+def _load_attachignore() -> list[str]:
+    """Load ignore patterns from .attachignore file."""
+    if not os.path.isfile(_ATTACHIGNORE_PATH):
+        return []
+    patterns: list[str] = []
+    try:
+        with open(_ATTACHIGNORE_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    patterns.append(line)
+    except OSError:
+        pass
+    return patterns
+
+
+def is_attach_ignored(path: str) -> bool:
+    """Check if a file path matches any .attachignore pattern."""
+    patterns = _load_attachignore()
+    if not patterns:
+        return False
+    real = os.path.realpath(path)
+    for pat in patterns:
+        # Support both exact paths and glob patterns
+        if fnmatch.fnmatch(real, pat) or fnmatch.fnmatch(os.path.basename(real), pat):
+            log.info("Skipping attach-ignored file: %s (pattern: %s)", path, pat)
+            return True
+    return False
+
 
 def _has_image_magic(path: str) -> bool:
     """True only if the file's first bytes match a known image format.
@@ -86,15 +148,52 @@ def _has_image_magic(path: str) -> bool:
     return any(head.startswith(m) for m in _IMAGE_MAGIC_PREFIXES)
 
 
-def extract_image_paths(text: str) -> list[str]:
+def normalize_image_filenames(text: str) -> str:
+    """Resolve bare image filenames to full paths by searching known directories.
+
+    E.g. ``nikkei225_butterfly.png`` -> ``/home/ubuntu/nikkei225_butterfly.png``
+    Only replaces when exactly one match is found to avoid ambiguity.
+    """
+    # Match bare filenames (not starting with /) that look like images
+    bare_re = re.compile(
+        r"(?<![/\w])(\b[\w._-]+\.(?:png|jpg|jpeg|gif|webp|svg))\b",
+    )
+    replacements: dict[str, str] = {}
+    for m in bare_re.finditer(text):
+        fname = m.group(1)
+        if fname in replacements:
+            continue
+        # Don't touch if it's already preceded by a slash (part of a path)
+        start = m.start()
+        if start > 0 and text[start - 1] == "/":
+            continue
+        # Search known dirs for this filename
+        candidates = []
+        for d in _IMAGE_SEARCH_DIRS:
+            full = os.path.join(d, fname)
+            if os.path.isfile(full):
+                candidates.append(full)
+        if len(candidates) == 1:
+            replacements[fname] = candidates[0]
+            log.info("Normalized bare filename %s -> %s", fname, candidates[0])
+    for fname, full_path in replacements.items():
+        text = text.replace(fname, full_path)
+    return text
+
+
+def extract_image_paths(text: str, *, admin: bool = False) -> list[str]:
     """Extract existing image file paths from response text (capped + hardened).
 
     Hardening vs the naive version:
       - `ALLOWED_IMAGE_DIRS` is narrow (attachment tmp + mermaid output)
       - Paths are realpath-resolved so symlinks can't escape the allowed dirs
       - Files must match an image magic-byte prefix (no extension spoofing)
+
+    When *admin* is True, the broader ADMIN_IMAGE_DIRS allow-list is used,
+    which includes /home/ubuntu. Magic-byte checks are still enforced.
     """
-    allowed_real = tuple(os.path.realpath(d) for d in ALLOWED_IMAGE_DIRS)
+    dirs = ADMIN_IMAGE_DIRS if admin else ALLOWED_IMAGE_DIRS
+    allowed_real = tuple(os.path.realpath(d) for d in dirs)
     paths: list[str] = []
     seen: set[str] = set()
     for m in IMAGE_PATH_RE.finditer(text):
@@ -283,6 +382,58 @@ def cleanup_attachments(paths: list[str]) -> None:
             os.remove(p)
         except OSError:
             pass
+
+
+async def _download_text_one(session: aiohttp.ClientSession, att) -> tuple[str, str] | None:
+    """Download a single text attachment and return (filename, content)."""
+    size = att.size or 0
+    if size > MAX_TEXT_ATTACHMENT_BYTES:
+        log.warning("Skipping oversized text attachment %s (%d bytes)", att.filename, size)
+        return None
+    if not _host_is_allowed(att.url):
+        log.warning("Rejecting non-allow-listed text attachment URL: %s", att.url)
+        return None
+    async with _download_semaphore:
+        try:
+            async with session.get(att.url, allow_redirects=False) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.read()
+                if len(data) > MAX_TEXT_ATTACHMENT_BYTES:
+                    log.warning("Text attachment %s too large after download", att.filename)
+                    return None
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    text = data.decode("latin-1")
+                log.info("Downloaded text attachment: %s (%d bytes)", att.filename, len(data))
+                return (att.filename or "attachment.txt", text)
+        except Exception as e:
+            log.warning("Failed to download text attachment %s: %s", att.filename, e)
+    return None
+
+
+async def download_text_attachments(
+    http_session: aiohttp.ClientSession, attachments: list
+) -> list[tuple[str, str]]:
+    """Download text-based attachments and return list of (filename, content).
+
+    Filters by TEXT_CONTENT_TYPES; Discord auto-converts long messages to
+    message.txt with content_type text/plain; charset=utf-8.
+    """
+    text_atts = []
+    for a in attachments:
+        if not a.content_type:
+            continue
+        base_type = a.content_type.split(";")[0].strip().lower()
+        if base_type in TEXT_CONTENT_TYPES:
+            text_atts.append(a)
+    if not text_atts:
+        return []
+    if len(text_atts) > MAX_TEXT_ATTACHMENTS:
+        text_atts = text_atts[:MAX_TEXT_ATTACHMENTS]
+    results = await asyncio.gather(*[_download_text_one(http_session, a) for a in text_atts])
+    return [r for r in results if r]
 
 
 def cleanup_stale_attachments() -> None:

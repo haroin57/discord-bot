@@ -83,7 +83,7 @@ RESTRICTED_ANTHROPIC_API_KEY = os.environ.get("BOT_RESTRICTED_ANTHROPIC_API_KEY"
 
 # Retry policy — reasonable bounds (was 999/999 which blocked for hours)
 CLAUDE_MAX_ATTEMPTS = int(os.environ.get("CLAUDE_MAX_ATTEMPTS", "5"))
-CLAUDE_TRANSIENT_MAX_ATTEMPTS = int(os.environ.get("CLAUDE_TRANSIENT_MAX_ATTEMPTS", "8"))
+CLAUDE_TRANSIENT_MAX_ATTEMPTS = int(os.environ.get("CLAUDE_TRANSIENT_MAX_ATTEMPTS", "4"))
 CLAUDE_MAX_BACKOFF_S = int(os.environ.get("CLAUDE_MAX_BACKOFF_S", "60"))
 
 # Stream quality (free-code: queryModelWithStreaming)
@@ -104,7 +104,9 @@ MERMAID_OUTPUT_DIR = os.environ.get("MERMAID_OUTPUT_DIR", "/tmp/mermaid_output")
 os.makedirs(MERMAID_OUTPUT_DIR, exist_ok=True)
 TABLE_RENDERS_DIR = os.environ.get("TABLE_RENDERS_DIR", "/tmp/table_renders")
 os.makedirs(TABLE_RENDERS_DIR, exist_ok=True)
-ALLOWED_IMAGE_DIRS = (ATTACHMENT_DIR, MERMAID_OUTPUT_DIR, "/tmp/discord_bot_attachments", TABLE_RENDERS_DIR)
+MATH_RENDERS_DIR = os.environ.get("MATH_RENDERS_DIR", "/tmp/math_renders")
+os.makedirs(MATH_RENDERS_DIR, exist_ok=True)
+ALLOWED_IMAGE_DIRS = (ATTACHMENT_DIR, MERMAID_OUTPUT_DIR, "/tmp/discord_bot_attachments", TABLE_RENDERS_DIR, MATH_RENDERS_DIR)
 
 # Only these hosts are allowed as attachment download sources.
 ALLOWED_ATTACHMENT_HOSTS = frozenset({
@@ -257,8 +259,23 @@ MCP_SERVERS_HEAVY: dict = {
     },
 }
 
+# MEMORY tier — mem0 MCP server wrapping the shared ChromaDB long-term memory.
+# ChromaDB + OpenAI embedding client init is ~100-200MB; only load when the
+# user's text suggests Claude should actually recall/store memories.
+MCP_SERVERS_MEMORY: dict = {
+    "mem0": {
+        "command": "/home/ubuntu/discord-bot/.venv/bin/python",
+        "args": ["/home/ubuntu/discord-bot/mcp_mem0_server.py"],
+    },
+}
+
 # Union (used as a default + by code paths that just need to know "all configured")
-MCP_SERVERS: dict = {**MCP_SERVERS_BASE, **MCP_SERVERS_WEB, **MCP_SERVERS_HEAVY}
+MCP_SERVERS: dict = {
+    **MCP_SERVERS_BASE,
+    **MCP_SERVERS_WEB,
+    **MCP_SERVERS_HEAVY,
+    **MCP_SERVERS_MEMORY,
+}
 
 
 # Keyword sets used by pick_mcp_servers(). Cheap substring scans on the
@@ -274,14 +291,20 @@ _HEAVY_TRIGGERS = (
     "playwright", "puppeteer", "render", "webページを開",
     "サイトを開", "アクセスして",
 )
+_MEMORY_TRIGGERS = (
+    "記憶", "覚えて", "覚えとい", "覚えてる", "思い出", "忘れた", "忘れない",
+    "mem0", "memory", "remember", "recall", "過去の",
+    "前に話した", "前に言った", "以前", "昔話した",
+)
 
 
 def pick_mcp_servers(raw_user_text: str) -> dict:
     """Return the minimal MCP server set needed for this request.
 
-    BASE is always loaded. WEB / HEAVY tiers are added only when the user
-    text actually mentions something that would need them. The huge win is
-    NOT loading playwright (~500MB chromium) on every chat reply.
+    BASE is always loaded. WEB / HEAVY / MEMORY tiers are added only when the
+    user text actually mentions something that would need them. The huge win
+    is NOT loading playwright (~500MB chromium) or ChromaDB on every chat
+    reply.
     """
     text = (raw_user_text or "").lower()
     servers = dict(MCP_SERVERS_BASE)
@@ -289,7 +312,15 @@ def pick_mcp_servers(raw_user_text: str) -> dict:
         servers.update(MCP_SERVERS_WEB)
     if any(kw.lower() in text for kw in _HEAVY_TRIGGERS):
         servers.update(MCP_SERVERS_HEAVY)
+    if any(kw.lower() in text for kw in _MEMORY_TRIGGERS):
+        servers.update(MCP_SERVERS_MEMORY)
     return servers
+
+# ---------------------------------------------------------------------------
+# Web API
+# ---------------------------------------------------------------------------
+WEB_API_PORT = int(os.environ.get("WEB_API_PORT", "3002"))
+WEB_API_CORS_ORIGINS = os.environ.get("WEB_API_CORS_ORIGINS", "http://localhost:3001").split(",")
 
 # ---------------------------------------------------------------------------
 # DGM (Darwin Gödel Machine)

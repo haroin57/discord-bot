@@ -1,0 +1,54 @@
+# .attachignore — patterns for files that should NOT be attached to Discord
+# Supports glob patterns (fnmatch) and matches against both full path and basename.
+# One pattern per line. Lines starting with # are comments.
+
+# Discord Bot
+/home/ubuntu/discord-bot/*
+
+# News Curator
+/home/ubuntu/news-curator/*
+
+# Kanae Scheduler
+/home/ubuntu/kanae-scheduler/*
+
+# Kanae Contact
+/home/ubuntu/kanae-contact/*
+
+# Kanae Voice MCP
+/home/ubuntu/kanae-voice-mcp/*
+
+# Happy Server / Daemon
+/home/ubuntu/happy-server/*
+
+# English App
+/home/ubuntu/english-app/*
+
+# Scholarly MCP
+/home/ubuntu/scholarly-mcp/*
+
+# Free Code
+/home/ubuntu/free-code/*
+/home/ubuntu/free-code-cli/*
+
+# Timetable API
+/opt/timetable/*
+
+# Cloudflared config
+/etc/cloudflared/*
+
+# Environment / secret files
+.env
+.env.*
+*.env
+.env.dev.enc
+.env.prd.enc
+credentials.json
+*.key
+*.pem
+*.secret
+
+# General: Python/Node source in service dirs
+*.pyc
+__pycache__/*
+node_modules/*
+.venv/*
