@@ -119,7 +119,9 @@ def main():
         raise SystemExit(1) from e
 
     _acquire_pidlock()
-    cleanup_stale_attachments()
+    # cleanup_stale_attachments moved into bot.on_ready (Phase G/D5) so the
+    # event loop is available; running it sync here blocked startup on a
+    # large tmpdir.
 
     # Import bot here to trigger setup and event registration
     from bot import bot

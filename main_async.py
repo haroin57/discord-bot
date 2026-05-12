@@ -109,7 +109,7 @@ async def main() -> None:
         raise SystemExit(1) from e
 
     _acquire_pidlock()
-    cleanup_stale_attachments()
+    # cleanup_stale_attachments now scheduled from bot.on_ready (Phase G/D5).
 
     from bot import bot
     from web_api import WebAPI
