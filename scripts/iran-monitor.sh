@@ -15,6 +15,10 @@ fi
 
 CHANNEL_ID="1488369795807055964"
 BOT_TOKEN="${DISCORD_TOKEN:?DISCORD_TOKEN environment variable is required}"
+if [[ -z "${BOT_TOKEN// /}" ]]; then
+    echo "ERROR: DISCORD_TOKEN is whitespace-only" >&2
+    exit 1
+fi
 NOTIFY_USER="<@1037285234200297522>"  # b0nchichi (お父さん)
 LOG="/tmp/iran-monitor.log"
 LOCK="/tmp/iran-monitor.lock"

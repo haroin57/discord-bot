@@ -18,10 +18,11 @@ def validate_discord_token() -> str:
 
     Returns the token so callers can use the return value directly.
     """
-    if not DISCORD_TOKEN:
+    if not DISCORD_TOKEN or not DISCORD_TOKEN.strip():
         raise RuntimeError(
-            "DISCORD_TOKEN environment variable is required but not set. "
-            "Configure it in .env or the process environment before starting the bot."
+            "DISCORD_TOKEN environment variable is required but not set "
+            "(or contains only whitespace). Configure it in .env or the "
+            "process environment before starting the bot."
         )
     return DISCORD_TOKEN
 
