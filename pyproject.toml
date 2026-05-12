@@ -1,0 +1,29 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+# Custom markers. Tests marked `integration` spawn real subprocesses,
+# touch the network, or otherwise have significantly higher cost than
+# unit tests. They are skipped by default; opt in with
+#   pytest -m integration
+# or
+#   pytest -m ""
+# (the empty filter disables exclusion).
+markers = [
+    "integration: real subprocess / network test, skipped by default",
+]
+
+# Default to excluding `integration`-marked tests. The bot's test suite is
+# otherwise mock-heavy and runs in ~1-2 s; the dgm sandbox subprocess tests
+# add ~10-25 s when included.
+addopts = "-m 'not integration'"
+
+[tool.coverage.run]
+branch = true
+source = ["."]
+omit = [
+    "tests/*",
+    "scripts/*",
+    ".venv/*",
+    "*.bak.*",
+]

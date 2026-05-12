@@ -458,7 +458,15 @@ class TestCheckImports:
         assert result is not None
 
 
+@pytest.mark.integration
 class TestRunSandboxed:
+    """Spawns a real `python` subprocess per test (DGM sandbox isolation).
+
+    Each test is +2–5 s wall-clock and the timeout test forces a 1 s stall.
+    Excluded from the default `pytest` run via the `integration` marker;
+    opt in with `pytest -m integration` or `pytest -m ""`.
+    """
+
     @pytest.mark.asyncio
     async def test_successful_run(self):
         from dgm.sandbox import run_sandboxed
