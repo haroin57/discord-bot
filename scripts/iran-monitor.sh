@@ -4,8 +4,21 @@
 
 set -euo pipefail
 
+# Load .env if present (DISCORD_TOKEN, etc.)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${SCRIPT_DIR}/../.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "${SCRIPT_DIR}/../.env"
+    set +a
+fi
+
 CHANNEL_ID="1488369795807055964"
-BOT_TOKEN="MTQ4OTE3ODY4NDM5MTgxNzMzNg.G3mT8F.uvstX6OApUmjZdraxK08q5i6_Mdarve-OwOYy4"
+BOT_TOKEN="${DISCORD_TOKEN:?DISCORD_TOKEN environment variable is required}"
+if [[ -z "${BOT_TOKEN// /}" ]]; then
+    echo "ERROR: DISCORD_TOKEN is whitespace-only" >&2
+    exit 1
+fi
 NOTIFY_USER="<@1037285234200297522>"  # b0nchichi (お父さん)
 LOG="/tmp/iran-monitor.log"
 LOCK="/tmp/iran-monitor.lock"

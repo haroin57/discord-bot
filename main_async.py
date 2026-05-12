@@ -14,7 +14,7 @@ import os
 import queue
 import sys
 
-from config import BOT_DIR, DISCORD_TOKEN, STATE_DIR, WEB_API_PORT
+from config import BOT_DIR, DISCORD_TOKEN, STATE_DIR, WEB_API_PORT, validate_discord_token
 from utils.attachments import cleanup_stale_attachments
 
 _LOG_LEVEL = os.environ.get("BOT_LOG_LEVEL", "INFO").upper()
@@ -101,10 +101,12 @@ def _acquire_pidlock() -> None:
 async def main() -> None:
     _setup_logging()
 
-    if not DISCORD_TOKEN:
-        print("ERROR: DISCORD_TOKEN is not set. Create a .env file with:")
-        print("  DISCORD_TOKEN=your_discord_bot_token_here")
-        raise SystemExit(1)
+    try:
+        validate_discord_token()
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        print("  Create a .env file with: DISCORD_TOKEN=your_discord_bot_token_here")
+        raise SystemExit(1) from e
 
     _acquire_pidlock()
     cleanup_stale_attachments()

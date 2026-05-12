@@ -5,7 +5,20 @@
 
 set -euo pipefail
 
-BOT_TOKEN="MTQ4OTE3ODY4NDM5MTgxNzMzNg.G3mT8F.uvstX6OApUmjZdraxK08q5i6_Mdarve-OwOYy4"
+# Load .env if present (DISCORD_TOKEN, etc.)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${SCRIPT_DIR}/../.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "${SCRIPT_DIR}/../.env"
+    set +a
+fi
+
+BOT_TOKEN="${DISCORD_TOKEN:?DISCORD_TOKEN environment variable is required}"
+if [[ -z "${BOT_TOKEN// /}" ]]; then
+    echo "ERROR: DISCORD_TOKEN is whitespace-only" >&2
+    exit 1
+fi
 USER_ID="573489206240870410"  # haroin（先輩）
 LOG="/tmp/toeic-reminder.log"
 
