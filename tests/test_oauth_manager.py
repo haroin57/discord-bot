@@ -11,8 +11,10 @@ Already-covered in other suites (not duplicated here):
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
+import sys
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -27,17 +29,43 @@ import pytest
 def _reset_oauth_globals(monkeypatch):
     """Reset services.oauth_manager module globals before each test.
 
-    monkeypatch.setattr is used so all changes are rolled back automatically
-    at teardown — even if the test under execution writes directly to the
-    module attribute (e.g. ``om._access_token = "new-access"``).
-    """
-    import services.oauth_manager as om
+    Some test files (e.g. test_mem0_client.py) inject a fake module into
+    sys.modules["services.oauth_manager"] at import time.  When those tests
+    run first the real module is replaced and subsequent tests see a stub
+    without the expected attributes.  We force-reload the real module here
+    and re-register it in sys.modules so every test in this file always
+    operates on the genuine implementation.
 
-    monkeypatch.setattr(om, "_access_token", None)
-    monkeypatch.setattr(om, "_refresh_token", None)
-    monkeypatch.setattr(om, "_expires_at", 0)
-    monkeypatch.setattr(om, "_http_session", None)
-    monkeypatch.setattr(om, "_patched", False)
+    monkeypatch.setattr is used for all globals so changes are rolled back
+    automatically at teardown — even direct assignments like
+    ``om._access_token = "new-access"`` made inside test bodies.
+    """
+    # Force the real module to be loaded (not a stub left by another test file).
+    import services.oauth_manager as om
+    real_mod = importlib.import_module("services.oauth_manager")
+    # If what's in sys.modules is NOT the real module (no _access_token attr),
+    # reload to get the genuine implementation.
+    if not hasattr(real_mod, "_access_token"):
+        real_mod = importlib.reload(
+            importlib.import_module("services.oauth_manager")
+        )
+    # Ensure sys.modules always points to the real module for the duration.
+    original_module = sys.modules.get("services.oauth_manager")
+    sys.modules["services.oauth_manager"] = real_mod
+
+    monkeypatch.setattr(real_mod, "_access_token", None)
+    monkeypatch.setattr(real_mod, "_refresh_token", None)
+    monkeypatch.setattr(real_mod, "_expires_at", 0)
+    monkeypatch.setattr(real_mod, "_http_session", None)
+    monkeypatch.setattr(real_mod, "_patched", False)
+
+    yield
+
+    # Restore whatever was in sys.modules before this fixture ran.
+    if original_module is not None:
+        sys.modules["services.oauth_manager"] = original_module
+    else:
+        sys.modules.pop("services.oauth_manager", None)
 
 
 # ---------------------------------------------------------------------------

@@ -12,42 +12,60 @@ import pytest
 # Stub heavy deps that client.py imports at module level or lazily
 # ---------------------------------------------------------------------------
 
-# services.oauth_manager — mock before client.py is imported
-_oauth_mod = types.ModuleType("services.oauth_manager")
-_oauth_mod.ensure_valid_token = AsyncMock(return_value=None)
-_oauth_mod.get_access_token = MagicMock(return_value="test-token-abc")
-_oauth_mod.init = MagicMock(return_value=True)
-if "services.oauth_manager" not in sys.modules:
-    sys.modules["services.oauth_manager"] = _oauth_mod
-else:
-    _existing_oauth = sys.modules["services.oauth_manager"]
-    _existing_oauth.ensure_valid_token = AsyncMock(return_value=None)
-    _existing_oauth.get_access_token = MagicMock(return_value="test-token-abc")
-    _existing_oauth.init = MagicMock(return_value=True)
+# IMPORTANT: do NOT replace `config`, `services.oauth_manager`, `mem0`, or
+# `anthropic` in sys.modules with bare stubs — that clobbers them for every
+# other test file in the same pytest session. Load the real modules and
+# override only the specific callables/attributes we need, restoring them
+# in a module-scoped finalizer.
 
-# config.STATE_DIR — needed by _build_config
-if "config" not in sys.modules:
-    _cfg_mod = types.ModuleType("config")
-    _cfg_mod.STATE_DIR = "/tmp/test_mem0_state"
-    sys.modules["config"] = _cfg_mod
+# Real config — required so `from config import ADMIN_USER_IDS` etc still
+# work for unrelated tests (test_web_api, test_bot ...). We override
+# STATE_DIR per-test via monkeypatch instead of stubbing the whole module.
+import config as _REAL_CONFIG  # noqa: E402
 
-# mem0.Memory — stubbed lazily via patch inside tests
-_mem0_pkg = types.ModuleType("mem0")
-_mem0_pkg.Memory = MagicMock()
+# Real oauth_manager — override only the callables we mock here, then
+# restore originals at module teardown.
+import services.oauth_manager as _REAL_OAUTH  # noqa: E402
+_OAUTH_OVERRIDES = {
+    "ensure_valid_token": AsyncMock(return_value=None),
+    "get_access_token": MagicMock(return_value="test-token-abc"),
+    "init": MagicMock(return_value=True),
+}
+_ORIGINAL_OAUTH_ATTRS = {
+    name: getattr(_REAL_OAUTH, name, None) for name in _OAUTH_OVERRIDES
+}
+for _k, _v in _OAUTH_OVERRIDES.items():
+    setattr(_REAL_OAUTH, _k, _v)
+
+# mem0.Memory — only stub if the real `mem0` package is not installed.
+# Tests that need a specific Memory mock use patch.dict("sys.modules", ...)
+# inside the test body to scope the override.
 if "mem0" not in sys.modules:
+    _mem0_pkg = types.ModuleType("mem0")
+    _mem0_pkg.Memory = MagicMock()
     sys.modules["mem0"] = _mem0_pkg
 
-# anthropic.AsyncAnthropic — stubbed lazily
-_anthropic_mod = types.ModuleType("anthropic")
-_anthropic_mod.AsyncAnthropic = MagicMock()
-if "anthropic" not in sys.modules:
-    sys.modules["anthropic"] = _anthropic_mod
+# anthropic.AsyncAnthropic — real anthropic is installed (claude_code_sdk
+# depends on it), so just leave the real module in place.
 
 # Now import the module under test.
-# Reload to pick up the stubs above (in case a previous test file loaded it).
 import services.mem0.client as client_mod  # noqa: E402
 
 importlib.reload(client_mod)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _restore_oauth_after_module():
+    """Restore real services.oauth_manager callables after this file's tests."""
+    yield
+    for _k, _orig in _ORIGINAL_OAUTH_ATTRS.items():
+        if _orig is not None:
+            setattr(_REAL_OAUTH, _k, _orig)
+        else:
+            try:
+                delattr(_REAL_OAUTH, _k)
+            except AttributeError:
+                pass
 
 
 # ---------------------------------------------------------------------------
