@@ -935,65 +935,10 @@ class TestSessionAdditional:
         msgs = load_history_channel(43)
         assert len(msgs) == 2
 
-    def test_load_all_history_skips_non_jsonl(self, tmp_state_dir):
-        """Line 89-90: non-.jsonl files in history dir are ignored."""
-        from services.session import load_all_history, append_jsonl
-        import config
-
-        # Create a valid JSONL
-        append_jsonl(100, {"role": "user", "content": "a"})
-        append_jsonl(100, {"role": "assistant", "content": "b"})
-
-        # Create a non-jsonl file
-        non_jsonl = os.path.join(config.HISTORY_DIR, "notes.txt")
-        with open(non_jsonl, "w") as f:
-            f.write("not a jsonl file\n")
-
-        # Create a file with non-numeric name
-        bad_name = os.path.join(config.HISTORY_DIR, "bad.jsonl")
-        with open(bad_name, "w") as f:
-            f.write('{"role":"user","content":"test"}\n')
-
-        result = load_all_history()
-        assert 100 in result
-        # "bad" can't be parsed as int, so ValueError is caught
-
-    def test_load_all_history_value_error_on_filename(self, tmp_state_dir):
-        """Lines 95-96: ValueError when filename cannot be converted to int."""
-        from services.session import load_all_history
-        import config
-
-        bad_name = os.path.join(config.HISTORY_DIR, "notanumber.jsonl")
-        with open(bad_name, "w") as f:
-            f.write('{"role":"user","content":"test"}\n')
-
-        # Should not raise, caught by except (FileNotFoundError, ValueError)
-        result = load_all_history()
-        assert isinstance(result, OrderedDict)
-
-    def test_load_all_history_missing_dir(self, tmp_state_dir, monkeypatch):
-        """Lines 95-96: FileNotFoundError when history dir does not exist."""
-        monkeypatch.setattr("services.session.HISTORY_DIR", "/nonexistent/path")
-        from services.session import load_all_history
-
-        result = load_all_history()
-        assert result == OrderedDict()
-
-    def test_load_all_history_evicts_excess(self, tmp_state_dir, monkeypatch):
-        """Lines 97-98: evict oldest when exceeding MAX_HISTORY."""
-        from services.session import load_all_history, append_jsonl
-        monkeypatch.setattr("services.session.MAX_HISTORY", 2)
-
-        for ch in [1, 2, 3]:
-            append_jsonl(ch, {"role": "user", "content": f"msg-{ch}"})
-            append_jsonl(ch, {"role": "assistant", "content": f"reply-{ch}"})
-
-        result = load_all_history()
-        assert len(result) == 2
-        # Channel 1 should have been evicted (oldest)
-        assert 1 not in result
-        assert 2 in result
-        assert 3 in result
+    # `load_all_history` / `LazyHistory` were removed in Phase D (perf overhaul).
+    # The function was only referenced by these tests, never by production
+    # code, so the tests went with it. Coverage of `load_history_channel`
+    # itself is provided by the JSONLHistory tests above.
 
     def test_fix_history_removes_multiple_leading_assistant(self):
         """Line 113+: fix_history_integrity removes all leading assistant messages."""
