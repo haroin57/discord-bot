@@ -10,7 +10,35 @@ Reuses discord-bot's services.mem0_service which handles OAuth + config.
 import asyncio
 import logging
 import os
+import re
 import sys
+
+# Discord snowflake IDs are 17-19 digits today and can grow to 22 within the
+# 64-bit unsigned range. Accept that range as the user_id format gate so we
+# don't let arbitrary strings flow into the Mem0 user-key dimension.
+_USER_ID_PATTERN = re.compile(r"^\d{15,22}$")
+
+# Upper bound on per-call limit so a caller cannot ask for a 999999-row
+# result that exhausts memory and stalls the MCP server.
+_MAX_LIMIT = 500
+
+
+def _validated_user_id(user_id: str) -> str:
+    """Reject malformed user_id strings before they reach Mem0."""
+    if not isinstance(user_id, str) or not _USER_ID_PATTERN.match(user_id):
+        raise ValueError(
+            f"invalid user_id (expected 15-22 digit Discord snowflake): {user_id!r}"
+        )
+    return user_id
+
+
+def _clamped_limit(limit: int) -> int:
+    """Clamp limit into [1, _MAX_LIMIT]."""
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(n, _MAX_LIMIT))
 
 # Ensure discord-bot root is on path so we can import services.*
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -90,6 +118,11 @@ async def search(
         smart: When True, use rewriting+reranking pipeline. Adds ~2 Haiku
             calls of latency in exchange for higher hit rate.
     """
+    try:
+        user_id = _validated_user_id(user_id)
+    except ValueError as e:
+        return f"(rejected: {e})"
+    limit = _clamped_limit(limit)
     if smart:
         memories = await search_memories_smart(
             query=query, user_id=user_id, limit=limit,
@@ -125,6 +158,10 @@ async def add(
             Include the last few messages leading up to this exchange
             so Mem0's extractor can understand the full conversational flow.
     """
+    try:
+        user_id = _validated_user_id(user_id)
+    except ValueError as e:
+        return f"(rejected: {e})"
     msgs: list[dict[str, str]] = []
     if context:
         msgs.append({
@@ -155,6 +192,11 @@ async def list_all(user_id: str = DEFAULT_USER_ID, limit: int = 50) -> str:
         limit: Max number of memories to return (default 50). The full
             count is huge; raise this only when you really need it.
     """
+    try:
+        user_id = _validated_user_id(user_id)
+    except ValueError as e:
+        return f"(rejected: {e})"
+    limit = _clamped_limit(limit)
     memories = await get_all_memories(user_id=user_id)
     if not memories:
         return f"(no memories stored for user={user_id})"
