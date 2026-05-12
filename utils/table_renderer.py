@@ -179,7 +179,13 @@ async def render_table_image(
     """Render a Markdown table as a PNG image. Returns the file path, or None on failure."""
     os.makedirs(output_dir, exist_ok=True)
 
-    table_hash = hashlib.md5(md_table.encode()).hexdigest()[:12]
+    # Cache key includes a template/sanitizer version so previously-rendered
+    # PNGs that may have contained injected HTML are not served after the
+    # bleach allowlist + caption escape was added. Bump _TEMPLATE_VERSION on
+    # every sanitizer / template change.
+    _TEMPLATE_VERSION = "2"  # bumped when bleach + html.escape were added
+    cache_key = f"v{_TEMPLATE_VERSION}:{md_table}:{caption}"
+    table_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
     out_path = os.path.join(output_dir, f"table_{table_hash}.png")
 
     # Cache hit
