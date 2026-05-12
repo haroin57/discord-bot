@@ -51,9 +51,10 @@ OTHER_SPEAKER_PATTERN = re.compile(
 )
 
 # Hard cap on the O(n²) intra-week near-dup pair check. At N=200 the loop
-# does ~20k SequenceMatcher comparisons (≈0.5 s); above that the cost grows
-# faster than weekly cadence permits. If new_in_week exceeds this, the loop
-# is skipped and the report logs the cap so we know to revisit.
+# does ~20k SequenceMatcher comparisons (≈0.2 s at ~10 μs/cmp on 200-char
+# strings); above that the cost grows faster than weekly cadence permits.
+# If new_in_week exceeds this, the loop is skipped and the report logs
+# the cap so we know to revisit with a MinHash / TF-IDF pre-filter.
 MAX_NEAR_DUP_N = 200
 
 
@@ -247,11 +248,15 @@ async def main() -> None:
 
     # P5: alert criterion — 1件は引用文脈の可能性、2件以上で異常
     alert = len(other_speaker_hits) >= 2
+    near_dup_summary = (
+        "SKIPPED" if near_dup_skipped_reason is not None
+        else str(len(near_dup_pairs))
+    )
     print(
         f"wrote {args.out}  total={total} untagged_new={len(untagged_new)} "
         f"growing={len(growing)} archive_cand={len(archive_candidates)} "
         f"gate_v2={gate_version_counts.get('v2', 0)} "
-        f"other_speaker={len(other_speaker_hits)} near_dup={len(near_dup_pairs)} "
+        f"other_speaker={len(other_speaker_hits)} near_dup={near_dup_summary} "
         f"{'ALERT' if alert else 'ok'}"
     )
     if alert:

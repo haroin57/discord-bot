@@ -1,7 +1,8 @@
 # Development & test dependencies. Install with
-#   pip install -r requirements.txt -r requirements-dev.txt
-# These are NOT shipped to the production runtime (the bot's venv only needs
-# `requirements.txt`).
+#   pip install -r requirements-dev.txt
+# (this file pulls runtime via `-r requirements.txt` below — no need to pass
+# both files). NOT shipped to the production runtime; the bot's venv only
+# needs `requirements.txt`.
 
 -r requirements.txt
 

@@ -33,3 +33,31 @@ def tmp_attachment_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("config.ATTACHMENT_DIR", str(att_dir))
     monkeypatch.setattr("utils.attachments.ATTACHMENT_DIR", str(att_dir))
     return att_dir
+
+
+@pytest.fixture(autouse=True)
+def _isolate_bot_state():
+    """Reset bot.py module-level mutable state between every test.
+
+    `bot.cooldowns` and `bot._daily_quota` are OrderedDicts mutated by the
+    on_message hot path. Without isolation, test order influences outcomes
+    and pytest-xdist (introduced in this PR) makes the order non-deterministic
+    within a worker. Importing `bot` is best-effort: pure-utility tests that
+    do not import bot will skip the reset silently.
+    """
+    try:
+        import bot as _bot
+    except Exception:
+        yield
+        return
+    cooldowns = getattr(_bot, "cooldowns", None)
+    daily_quota = getattr(_bot, "_daily_quota", None)
+    if cooldowns is not None:
+        cooldowns.clear()
+    if daily_quota is not None:
+        daily_quota.clear()
+    yield
+    if cooldowns is not None:
+        cooldowns.clear()
+    if daily_quota is not None:
+        daily_quota.clear()
