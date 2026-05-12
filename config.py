@@ -266,12 +266,23 @@ BOT_ROLE_IDS: set[int] = set()  # populated at runtime by bot.py on_ready
 # by _DOCS_TRIGGERS in pick_mcp_servers().
 MCP_SERVERS_BASE: dict = {}
 
+# SRE-H6: pinned MCP npx package versions. Bump these explicitly via PR;
+# never use @latest in production (npm registry compromise / silent updates
+# would execute arbitrary code in MCP subprocess context). Versions captured
+# 2026-05-13 from npm registry; review and bump quarterly.
+_MCP_NPX_PINS = {
+    "context7": "2.2.5",       # @upstash/context7-mcp
+    "brave-search": "2.0.80",  # @brave/brave-search-mcp-server
+    "tavily": "0.2.19",        # tavily-mcp
+    "playwright": "0.0.75",    # @playwright/mcp
+}
+
 # Docs MCP (Upstash context7) — only spawn when the user message mentions
 # docs / library / API reference keywords.
 MCP_SERVERS_DOCS: dict = {
     "context7": {
         "command": "npx",
-        "args": ["-y", "@upstash/context7-mcp"],
+        "args": ["-y", f"@upstash/context7-mcp@{_MCP_NPX_PINS['context7']}"],
     },
 }
 
@@ -298,7 +309,7 @@ _brave_key = os.environ.get("BRAVE_API_KEY")
 if _brave_key:
     MCP_SERVERS_WEB["brave-search"] = {
         "command": "npx",
-        "args": ["-y", "@brave/brave-search-mcp-server"],
+        "args": ["-y", f"@brave/brave-search-mcp-server@{_MCP_NPX_PINS['brave-search']}"],
         "env": {"BRAVE_API_KEY": _brave_key},
     }
 
@@ -306,7 +317,7 @@ _tavily_key = os.environ.get("TAVILY_API_KEY")
 if _tavily_key:
     MCP_SERVERS_WEB["tavily"] = {
         "command": "npx",
-        "args": ["-y", "tavily-mcp"],
+        "args": ["-y", f"tavily-mcp@{_MCP_NPX_PINS['tavily']}"],
         "env": {"TAVILY_API_KEY": _tavily_key},
     }
 
@@ -314,7 +325,7 @@ if _tavily_key:
 MCP_SERVERS_HEAVY: dict = {
     "playwright": {
         "command": "npx",
-        "args": ["@playwright/mcp@latest"],
+        "args": [f"@playwright/mcp@{_MCP_NPX_PINS['playwright']}"],
     },
 }
 

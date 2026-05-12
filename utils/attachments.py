@@ -526,15 +526,33 @@ async def download_text_attachments(
 
 
 def cleanup_stale_attachments() -> None:
-    """Remove leftover attachment files older than 1 hour."""
-    if not os.path.isdir(ATTACHMENT_DIR):
-        return
+    """Remove temp files older than 1h from attachment + render directories.
+
+    SRE-M1: extended to cover /tmp/{mermaid,table,math}_renders too — these
+    are content-addressed PNGs/HTMLs that previously accumulated indefinitely.
+    """
+    # Import lazily so monkeypatch in tests can override config.MERMAID_OUTPUT_DIR etc.
+    import config as _cfg
+    dirs_to_clean = [
+        _cfg.ATTACHMENT_DIR,
+        _cfg.MERMAID_OUTPUT_DIR,
+        _cfg.TABLE_RENDERS_DIR,
+        _cfg.MATH_RENDERS_DIR,
+    ]
     now = time.time()
-    for fname in os.listdir(ATTACHMENT_DIR):
-        fpath = os.path.join(ATTACHMENT_DIR, fname)
+    threshold = 3600
+    for d in dirs_to_clean:
+        if not d or not os.path.isdir(d):
+            continue
         try:
-            if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > 3600:
-                os.remove(fpath)
-                log.info("Cleaned up stale attachment: %s", fpath)
+            entries = os.listdir(d)
         except OSError:
-            pass
+            continue
+        for fname in entries:
+            fpath = os.path.join(d, fname)
+            try:
+                if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > threshold:
+                    os.remove(fpath)
+                    log.info("Cleaned up stale file: %s", fpath)
+            except OSError:
+                pass

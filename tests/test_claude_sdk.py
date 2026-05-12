@@ -1077,3 +1077,90 @@ class TestSecurityFixes:
         assert info is None
         # The query was called once (attempt 0), then budget check blocked attempt 1
         assert call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# SRE-C1, SRE-C5, SRE-H5
+# ---------------------------------------------------------------------------
+
+class TestSRECriticals:
+    @pytest.mark.asyncio
+    async def test_cancellederror_invokes_kill_orphan(self):
+        """SRE-C1: CancelledError during stream must call kill_orphan_claude_cli."""
+        async def cancelling_query(*args, **kwargs):
+            raise asyncio.CancelledError()
+            yield  # make it a generator
+
+        with patch("services.claude_sdk.query", side_effect=cancelling_query):
+            with patch("services.claude_sdk.kill_orphan_claude_cli", return_value=1) as mock_kill:
+                from services.claude_sdk import call_with_tools
+                with pytest.raises(asyncio.CancelledError):
+                    await call_with_tools("hello", 200001, {}, raw_user_text="hello")
+                mock_kill.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_status_callback_exception_swallowed(self):
+        """SRE-C5: exception raised inside status_callback must not propagate."""
+        from claude_code_sdk import AssistantMessage
+        from claude_code_sdk.types import ToolUseBlock
+
+        exploding_callback = AsyncMock(side_effect=RuntimeError("discord API down"))
+
+        async def tool_query(*args, **kwargs):
+            am = MagicMock(spec=AssistantMessage)
+            block = MagicMock(spec=ToolUseBlock)
+            block.name = "Bash"
+            block.input = {"command": "ls"}
+            am.content = [block]
+            yield am
+            yield _make_result_msg(result="done", session_id="s-c5")
+
+        with patch("services.claude_sdk.query", side_effect=tool_query):
+            from services.claude_sdk import call_with_tools
+            # Must not raise even though the callback always raises
+            text, info = await call_with_tools(
+                "run it", 200002, {},
+                status_callback=exploding_callback,
+                raw_user_text="run it",
+            )
+            assert text == "done"
+
+    @pytest.mark.asyncio
+    async def test_stream_idle_raises_timeout(self):
+        """SRE-H5: stream stall watchdog raises TimeoutError when stream goes idle."""
+        import services.claude_sdk as sdk
+
+        # Patch thresholds to very small values so the test runs fast
+        original_idle = sdk.STREAM_IDLE_TIMEOUT_S
+        original_stall = sdk.STREAM_STALL_THRESHOLD_S
+        sdk.STREAM_IDLE_TIMEOUT_S = 0.05   # 50 ms idle → timeout
+        sdk.STREAM_STALL_THRESHOLD_S = 0.01
+
+        try:
+            async def stalling_query(*args, **kwargs):
+                # Yield one message then stall forever
+                from claude_code_sdk import ResultMessage
+                msg = MagicMock(spec=ResultMessage)
+                msg.result = "first"
+                msg.session_id = "s-h5"
+                msg.total_cost_usd = 0.0
+                msg.usage = {"input_tokens": 1, "output_tokens": 1}
+                msg.num_turns = 1
+                msg.duration_api_ms = 100
+                msg.is_error = False
+                yield msg
+                # Sleep "forever" — watchdog should fire and cancel us
+                await asyncio.sleep(100)
+
+            with patch("services.claude_sdk.query", side_effect=stalling_query):
+                with patch("services.claude_sdk.kill_orphan_claude_cli", return_value=0):
+                    from services.claude_sdk import call_with_tools
+                    # The watchdog fires a TimeoutError which hits the existing
+                    # TimeoutError handler and returns the timeout message.
+                    text, info = await call_with_tools(
+                        "hello", 200003, {}, raw_user_text="hello"
+                    )
+                    assert "⏰" in text or info is None
+        finally:
+            sdk.STREAM_IDLE_TIMEOUT_S = original_idle
+            sdk.STREAM_STALL_THRESHOLD_S = original_stall

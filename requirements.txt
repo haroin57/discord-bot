@@ -1,8 +1,13 @@
 # Runtime dependencies — pinned to compatible ranges with upper bounds so a
 # breaking or compromised major release does not auto-install.
+#
+# For production deploys use `pip install -r requirements.lock` (frozen).
+# requirements.txt is the human-edited source of truth; regenerate the lock
+# via `pip-compile` or `pip freeze --all > requirements.lock`.
 discord.py>=2.7,<3.0
 python-dotenv>=1.0,<2.0
-claude-code-sdk>=0.0.25,<1.0
+claude-code-sdk==0.0.25            # SRE-H7: exact pin; bypassPermissions is SDK-internal
+anthropic>=0.88.0,<1.0             # SRE-H7: surface the transitive dep so upgrades are visible
 aiohttp>=3.9,<4.0
 mem0ai>=1.0,<2.0                 # TODO: bump to >=2.0 once stable lands (fixes CVE-2026-7597, currently only in 2.0.0b2)
 chromadb>=1.0,<2.0
