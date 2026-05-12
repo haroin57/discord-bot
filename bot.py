@@ -75,6 +75,10 @@ _http_session: aiohttp.ClientSession | None = None
 # silently swallowed.
 _background_tasks: set[asyncio.Task] = set()
 
+# Phase G/D5: one-shot guard so the on_ready cleanup doesn't fire again on
+# every Discord reconnect (which is otherwise harmless but wasteful).
+_cleanup_scheduled: bool = False
+
 
 def _track_task(coro, *, name: str | None = None) -> asyncio.Task:
     """Schedule a fire-and-forget coroutine and track it for GC + error logging."""
@@ -276,11 +280,16 @@ async def on_ready():
     # D5: cleanup_stale_attachments was previously called synchronously from
     # main.py before bot.run(). For a tmpdir with thousands of files the
     # scan+stat loop blocked startup. Schedule it as a fire-and-forget
-    # background task here so the bot is reachable while it runs.
-    _track_task(
-        asyncio.to_thread(cleanup_stale_attachments),
-        name="cleanup_stale_attachments",
-    )
+    # background task here so the bot is reachable while it runs. on_ready
+    # fires on every reconnect; the _cleanup_scheduled guard ensures we
+    # only run cleanup once per process lifetime.
+    global _cleanup_scheduled
+    if not _cleanup_scheduled:
+        _cleanup_scheduled = True
+        _track_task(
+            asyncio.to_thread(cleanup_stale_attachments),
+            name="cleanup_stale_attachments",
+        )
 
 
 # ---------------------------------------------------------------------------

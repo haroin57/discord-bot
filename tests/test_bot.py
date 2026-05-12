@@ -887,7 +887,9 @@ class TestMain:
 
     def test_valid_token_runs_bot(self, monkeypatch):
         monkeypatch.setattr("main.DISCORD_TOKEN", "fake-token-123")
-        monkeypatch.setattr("main.cleanup_stale_attachments", lambda: None)
+        # Phase G/D5: cleanup_stale_attachments no longer called from
+        # main.main(); it is scheduled inside bot.on_ready. The earlier
+        # monkeypatch here patched a now-removed call path.
 
         import main as main_mod
         # main() does `from bot import bot; bot.run(...)` — patch bot.bot at source
