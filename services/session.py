@@ -99,9 +99,32 @@ def update_session(
         # No running loop — direct sync save (tests / one-shot CLI usage).
         save_sessions(sessions)
         return
-    task = loop.create_task(asyncio.to_thread(save_sessions, sessions))
+    # Snapshot the dict on the event-loop thread (single bytecode op under
+    # the GIL) so the worker thread's `.items()` iteration in save_sessions
+    # cannot race with a concurrent update_session() mutation, which would
+    # otherwise raise "dictionary changed size during iteration".
+    snapshot = OrderedDict(sessions)
+    task = loop.create_task(asyncio.to_thread(save_sessions, snapshot))
     _save_tasks.add(task)
-    task.add_done_callback(_save_tasks.discard)
+    task.add_done_callback(_on_save_done)
+
+
+def _on_save_done(task: asyncio.Task) -> None:
+    """Discard the task ref and surface any save error to the logger.
+
+    Without this, an exception from save_sessions (disk full, permission
+    error, etc.) would be deferred to GC as "Task exception was never
+    retrieved" — silent in unattended Discord bots.
+    """
+    _save_tasks.discard(task)
+    if task.cancelled():
+        return
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exc is not None:
+        log.error("save_sessions failed: %s", exc, exc_info=(type(exc), exc, exc.__traceback__))
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +167,9 @@ def _tail_jsonl(path: str, max_entries: int) -> list[dict]:
             f.seek(0, os.SEEK_END)
             size = f.tell()
             chunk = 8192
+            # `append` + single `reverse()` is strictly O(n) total. The
+            # `insert(0, ...)` alternative is O(N) per call → O(N²) overall
+            # (negligible at typical sizes but the cleaner idiom).
             chunks: list[bytes] = []
             lines_found = 0
             pos = size
@@ -153,9 +179,10 @@ def _tail_jsonl(path: str, max_entries: int) -> list[dict]:
                 pos -= read_size
                 f.seek(pos)
                 buf = f.read(read_size)
-                chunks.insert(0, buf)
+                chunks.append(buf)
                 # Count newlines in the new chunk only — total grows monotonically.
                 lines_found += buf.count(b"\n")
+            chunks.reverse()
             text = b"".join(chunks).decode("utf-8", errors="replace")
     except OSError:
         return []
