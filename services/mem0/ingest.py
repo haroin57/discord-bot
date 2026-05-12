@@ -57,7 +57,7 @@ async def add_memories(
         # overwrite trust-relevant keys (gate_version, timestamp, importance,
         # category, tags). New caller-controlled keys must be added here
         # explicitly.
-        _ALLOWED_CALLER_META = {"channel_id", "channel_name"}
+        _ALLOWED_CALLER_META = {"channel_id", "channel_name", "source"}
         base_meta = {
             "timestamp": int(_time.time()),
             "gate_version": "v2" if MEM0_GATE_ENABLED else "v1",
@@ -116,8 +116,14 @@ async def add_memories(
         # context_hint is INTENTIONALLY excluded from legacy_msgs even when
         # MEM0_LEGACY_CONTEXT is on. The Phase 1 root cause (other-speaker
         # contamination) was the system-message channel-history path; we keep
-        # it sealed here regardless of which gate is enabled.
-        legacy_msgs = messages or []
+        # it sealed here regardless of which gate is enabled. Also filter the
+        # caller-supplied `messages` to user/assistant roles only so a future
+        # caller that passes a raw list with role=system can't re-introduce
+        # the contamination vector.
+        if messages:
+            legacy_msgs = [m for m in messages if m.get("role") in ("user", "assistant")]
+        else:
+            legacy_msgs = []
         if not legacy_msgs:
             if user_text:
                 legacy_msgs.append({"role": "user", "content": user_text})
