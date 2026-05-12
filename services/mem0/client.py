@@ -14,6 +14,45 @@ _mem0_instance = None
 _init_attempted = False
 _last_token: str | None = None
 
+# Shared AsyncAnthropic client for Haiku-backed extraction / rewrite / rerank
+# calls. Re-created only when the OAuth token actually rotates, so the
+# underlying httpx pool / TLS session is reused across all three call sites
+# (services/mem0/extract.py, services/mem0/search.py).
+_async_anthropic_client = None
+_async_anthropic_token: str | None = None
+# Serializes (rare) singleton (re)construction so two concurrent callers from
+# asyncio.gather cannot both race past the None check and each build a fresh
+# AsyncAnthropic. Once initialized the lock is only contended on token
+# rotation, which happens at most every ~hour — negligible overhead.
+_async_anthropic_lock = asyncio.Lock()
+
+
+async def get_anthropic_client():
+    """Return a singleton AsyncAnthropic client, refreshing only on token change.
+
+    Returns None if the OAuth token cannot be obtained — callers must handle
+    that as a soft failure and fall back to their best-effort behavior.
+    """
+    global _async_anthropic_client, _async_anthropic_token
+    oauth_init()  # idempotent
+    await ensure_valid_token()
+    token = get_access_token()
+    if not token:
+        return None
+    # Fast path: no rebuild needed.
+    if _async_anthropic_client is not None and token == _async_anthropic_token:
+        return _async_anthropic_client
+    # Slow path: build (or rebuild after token rotation) under a lock so two
+    # concurrent callers cannot both construct a fresh client.
+    async with _async_anthropic_lock:
+        # Re-check after acquiring the lock — another coroutine may have
+        # already built the right client while we were waiting.
+        if _async_anthropic_client is None or token != _async_anthropic_token:
+            from anthropic import AsyncAnthropic
+            _async_anthropic_client = AsyncAnthropic(auth_token=token)
+            _async_anthropic_token = token
+    return _async_anthropic_client
+
 
 def _refresh_mem0_client_token() -> None:
     """Update the auth_token on Mem0's internal Anthropic client after OAuth refresh."""
@@ -106,15 +145,24 @@ def _get_mem0():
 # Low-level housekeeping (direct Mem0 access — used by weekly_mem0_compact.py)
 # ---------------------------------------------------------------------------
 
-async def get_all_memories(user_id: str) -> list[dict]:
-    """Retrieve all memories for a user."""
+async def get_all_memories(user_id: str, limit: int | None = None) -> list[dict]:
+    """Retrieve memories for a user.
+
+    `limit` is forwarded to Mem0 / ChromaDB so the underlying query can stop
+    early instead of fetching the entire collection and slicing in Python.
+    Pass None (default) to fetch all (used by the weekly housekeeping cron;
+    avoid on hot paths).
+    """
     mem = _get_mem0()
     if not mem:
         return []
     try:
         await ensure_valid_token()  # refresh OAuth if needed
         _refresh_mem0_client_token()
-        raw = await asyncio.to_thread(mem.get_all, user_id=user_id)
+        kwargs: dict = {"user_id": user_id}
+        if limit is not None:
+            kwargs["limit"] = limit
+        raw = await asyncio.to_thread(mem.get_all, **kwargs)
         return raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
     except Exception as exc:
         log.warning("Mem0 get_all error: %s", exc)
