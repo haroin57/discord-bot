@@ -67,6 +67,9 @@ ATTACHMENT_DL_CONCURRENCY = int(os.environ.get("ATTACHMENT_DL_CONCURRENCY", "3")
 THREAD_HISTORY_LIMIT = int(os.environ.get("THREAD_HISTORY_LIMIT", "50"))
 THREAD_CONTEXT_CACHE_TTL_S = int(os.environ.get("THREAD_CONTEXT_CACHE_TTL_S", "30"))
 THREAD_CONTEXT_CACHE_MAX = int(os.environ.get("THREAD_CONTEXT_CACHE_MAX", "20"))
+CROSS_THREAD_CONTEXT_MESSAGES = int(os.environ.get("CROSS_THREAD_CONTEXT_MESSAGES", "5"))
+MAX_CROSS_THREAD_CONTEXTS = int(os.environ.get("MAX_CROSS_THREAD_CONTEXTS", "3"))
+MAX_CROSS_THREAD_CHARS = int(os.environ.get("MAX_CROSS_THREAD_CHARS", "3000"))
 MEM0_MIN_QUERY_LENGTH = int(os.environ.get("MEM0_MIN_QUERY_LENGTH", "20"))
 
 # Claude CLI concurrency — 2GB RAM server can safely run ~2 CLIs in parallel
@@ -298,6 +301,11 @@ _MEMORY_TRIGGERS = (
 )
 
 
+def get_mcp_servers_by_keys(keys: list[str]) -> dict:
+    """Reconstruct MCP server config dict from a list of server name keys."""
+    return {k: v for k, v in MCP_SERVERS.items() if k in keys}
+
+
 def pick_mcp_servers(raw_user_text: str) -> dict:
     """Return the minimal MCP server set needed for this request.
 
@@ -337,6 +345,20 @@ DGM_LLM_MODEL_MUTATION = os.environ.get("DGM_LLM_MODEL_MUTATION", "claude-haiku-
 DGM_LLM_MODEL_META = os.environ.get("DGM_LLM_MODEL_META", "claude-haiku-4-5-20251001")
 DGM_DB_PATH = os.path.join(STATE_DIR, "dgm.db")
 DGM_ARCHIVE_GRID = int(os.environ.get("DGM_ARCHIVE_GRID", "4"))  # NxN MAP-Elites grid
+
+# Mem0 quality-improvement flags (added 2026-05-12, see plans/partitioned-wibbling-sifakis.md)
+def _bool_env(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.lower() in ("1", "true", "yes", "on")
+MEM0_LEGACY_CONTEXT = _bool_env("MEM0_LEGACY_CONTEXT", False)             # P1: True で旧 channel-history 流入挙動に戻す
+MEM0_GATE_ENABLED = _bool_env("MEM0_GATE_ENABLED", True)                   # P2: False で Mem0 標準抽出にフォールバック
+MEM0_GATE_MIN_IMPORTANCE = int(os.environ.get("MEM0_GATE_MIN_IMPORTANCE", "3"))
+MEM0_GATE_MODEL = os.environ.get("MEM0_GATE_MODEL", "claude-haiku-4-5-20251001")
+MEM0_CLIENT_DEDUP_ENABLED = _bool_env("MEM0_CLIENT_DEDUP_ENABLED", True)   # P2.5
+MEM0_CLIENT_DEDUP_THRESHOLD = float(os.environ.get("MEM0_CLIENT_DEDUP_THRESHOLD", "0.85"))
+MEM0_SMART_SEARCH = _bool_env("MEM0_SMART_SEARCH", True)                   # P3
 
 _github_token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
 if _github_token:

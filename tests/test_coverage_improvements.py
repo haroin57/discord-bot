@@ -638,7 +638,7 @@ class TestCallDirect:
         monkeypatch.setattr("services.claude_api._stream_sync", fake_stream)
 
         conversation = OrderedDict()
-        result = await call_direct("Hello", 999, conversation, thread_context="Thread ctx")
+        result = await call_direct("Hello", 999, conversation, conv_context="Thread ctx")
 
         assert result == "Response text"
         history = conversation[999]
@@ -741,7 +741,7 @@ class TestCallDirect:
             {"role": "user", "content": "old"},
             {"role": "assistant", "content": "old reply"},
         ]
-        result = await call_direct("new", 1, conversation, thread_context="ctx")
+        result = await call_direct("new", 1, conversation, conv_context="ctx")
         assert result == "Reply"
         # Thread context should NOT be seeded for existing channels
         assert not any(
@@ -943,14 +943,20 @@ class TestCallWithToolsErrorPaths:
             msg = MagicMock(spec=ResultMessage)
             msg.result = "recovered"
             msg.session_id = "new-sess"
+            msg.total_cost_usd = 0.01
+            msg.usage = {"input_tokens": 100, "output_tokens": 50}
+            msg.num_turns = 1
+            msg.duration_api_ms = 1000
+            msg.is_error = False
             yield msg
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
-        sessions = {1: "old-session"}
+        from services.session import SessionInfo
+        sessions = {1: SessionInfo(session_id="old-session", mcp_server_keys=["context7", "scholarly"])}
         sdk_mod._session_timestamps[1] = time.monotonic()  # make it fresh
 
-        text, sid = await sdk_mod.call_with_tools(
+        text, info = await sdk_mod.call_with_tools(
             "hello", 1, sessions, raw_user_text="hello"
         )
         assert text == "recovered"
@@ -1039,11 +1045,16 @@ class TestCallWithToolsErrorPaths:
             msg = MagicMock(spec=ResultMessage)
             msg.result = "finally"
             msg.session_id = None
+            msg.total_cost_usd = 0.01
+            msg.usage = {"input_tokens": 100, "output_tokens": 50}
+            msg.num_turns = 1
+            msg.duration_api_ms = 1000
+            msg.is_error = False
             yield msg
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
-        text, sid = await sdk_mod.call_with_tools(
+        text, info = await sdk_mod.call_with_tools(
             "hello", 1, {}, raw_user_text="hello"
         )
         assert text == "finally"
@@ -1136,16 +1147,22 @@ class TestCallWithToolsErrorPaths:
             msg = MagicMock(spec=ResultMessage)
             msg.result = "done"
             msg.session_id = "new-session-id"
+            msg.total_cost_usd = 0.01
+            msg.usage = {"input_tokens": 100, "output_tokens": 50}
+            msg.num_turns = 1
+            msg.duration_api_ms = 1000
+            msg.is_error = False
             yield msg
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
         sessions = {}
-        text, sid = await sdk_mod.call_with_tools(
+        text, info = await sdk_mod.call_with_tools(
             "hello", 42, sessions, raw_user_text="hello"
         )
         assert text == "done"
-        assert sid == "new-session-id"
+        assert info is not None
+        assert info.session_id == "new-session-id"
         # Session time should be recorded
         assert 42 in sdk_mod._session_timestamps
 

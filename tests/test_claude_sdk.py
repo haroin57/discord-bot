@@ -36,11 +36,12 @@ class TestCallWithTools:
 
         with patch("services.claude_sdk.query", side_effect=fake_query):
             from services.claude_sdk import call_with_tools
-            text, sid = await call_with_tools(
+            text, info = await call_with_tools(
                 "hello", 1, {}, raw_user_text="hello"
             )
             assert text == "テスト応答"
-            assert sid == "sess-123"
+            assert info is not None
+            assert info.session_id == "sess-123"
 
     @pytest.mark.asyncio
     async def test_timeout_returns_message(self):
@@ -51,7 +52,7 @@ class TestCallWithTools:
         with patch("services.claude_sdk.query", side_effect=slow_query):
             with patch("services.claude_sdk.CLAUDE_TIMEOUT", 1):
                 from services.claude_sdk import call_with_tools
-                text, sid = await call_with_tools(
+                text, info = await call_with_tools(
                     "hello", 1, {}, raw_user_text="hello"
                 )
                 assert "timed out" in text.lower() or "⏰" in text
@@ -64,11 +65,11 @@ class TestCallWithTools:
 
         with patch("services.claude_sdk.query", side_effect=error_query):
             from services.claude_sdk import call_with_tools
-            text, sid = await call_with_tools(
+            text, info = await call_with_tools(
                 "hello", 1, {}, raw_user_text="hello"
             )
             assert "❌" in text
-            assert sid is None
+            assert info is None
 
     @pytest.mark.asyncio
     async def test_no_response_returns_fallback(self):
@@ -78,7 +79,7 @@ class TestCallWithTools:
 
         with patch("services.claude_sdk.query", side_effect=empty_query):
             from services.claude_sdk import call_with_tools
-            text, sid = await call_with_tools(
+            text, info = await call_with_tools(
                 "hello", 1, {}, raw_user_text="hello"
             )
             assert "No response" in text
@@ -112,3 +113,190 @@ class TestCallWithTools:
                 raw_user_text="実行して"
             )
             callback.assert_called()
+
+
+class TestSessionResume:
+    """Test thread session resume logic."""
+
+    @pytest.mark.asyncio
+    async def test_resume_when_thread_and_session_fresh(self):
+        """When is_thread=True and session is fresh with matching MCP, resume is used."""
+        from collections import OrderedDict
+        from services.session import SessionInfo
+        from services.claude_sdk import _record_session_time
+
+        sessions = OrderedDict()
+        sessions[100] = SessionInfo(
+            session_id="existing-sess",
+            mcp_server_keys=["context7", "scholarly"],
+        )
+        _record_session_time(100)  # Mark as fresh
+
+        captured_options = {}
+
+        async def spy_query(*args, **kwargs):
+            captured_options["resume"] = kwargs.get("options", args[0] if args else None)
+            from claude_code_sdk import ResultMessage
+            msg = MagicMock(spec=ResultMessage)
+            msg.result = "resumed"
+            msg.session_id = "existing-sess"
+            msg.total_cost_usd = 0.01
+            msg.usage = {"input_tokens": 100, "output_tokens": 50}
+            msg.num_turns = 1
+            msg.duration_api_ms = 1000
+            msg.is_error = False
+            yield msg
+
+        with patch("services.claude_sdk.query", side_effect=spy_query) as mock_q:
+            from services.claude_sdk import call_with_tools
+            text, info = await call_with_tools(
+                "hello", 100, sessions,
+                raw_user_text="hello",
+                is_thread=True,
+            )
+            assert text == "resumed"
+            # Verify resume was set on the options
+            call_args = mock_q.call_args
+            options = call_args.kwargs.get("options") or call_args[1].get("options")
+            assert options.resume == "existing-sess"
+
+    @pytest.mark.asyncio
+    async def test_resume_works_for_channels_too(self):
+        """Resume works for regular channels (not just threads)."""
+        from collections import OrderedDict
+        from services.session import SessionInfo
+        from services.claude_sdk import _record_session_time
+
+        sessions = OrderedDict()
+        sessions[100] = SessionInfo(
+            session_id="existing-sess",
+            mcp_server_keys=["context7", "scholarly"],
+        )
+        _record_session_time(100)
+
+        async def spy_query(*args, **kwargs):
+            from claude_code_sdk import ResultMessage
+            msg = MagicMock(spec=ResultMessage)
+            msg.result = "resumed"
+            msg.session_id = "existing-sess"
+            msg.total_cost_usd = 0.01
+            msg.usage = {"input_tokens": 100, "output_tokens": 50}
+            msg.num_turns = 1
+            msg.duration_api_ms = 1000
+            msg.is_error = False
+            yield msg
+
+        with patch("services.claude_sdk.query", side_effect=spy_query) as mock_q:
+            from services.claude_sdk import call_with_tools
+            text, info = await call_with_tools(
+                "hello", 100, sessions,
+                raw_user_text="hello",
+                is_thread=False,
+            )
+            call_args = mock_q.call_args
+            options = call_args.kwargs.get("options") or call_args[1].get("options")
+            assert options.resume == "existing-sess"
+
+    @pytest.mark.asyncio
+    async def test_no_resume_when_mcp_mismatch(self):
+        """When new message needs MCP servers not in stored session, start fresh."""
+        from collections import OrderedDict
+        from services.session import SessionInfo
+        from services.claude_sdk import _record_session_time
+
+        sessions = OrderedDict()
+        sessions[100] = SessionInfo(
+            session_id="existing-sess",
+            mcp_server_keys=["context7", "scholarly"],  # no web servers
+        )
+        _record_session_time(100)
+
+        async def spy_query(*args, **kwargs):
+            from claude_code_sdk import ResultMessage
+            msg = MagicMock(spec=ResultMessage)
+            msg.result = "fresh"
+            msg.session_id = "new-sess"
+            msg.total_cost_usd = 0.01
+            msg.usage = {"input_tokens": 100, "output_tokens": 50}
+            msg.num_turns = 1
+            msg.duration_api_ms = 1000
+            msg.is_error = False
+            yield msg
+
+        with patch("services.claude_sdk.query", side_effect=spy_query) as mock_q:
+            from services.claude_sdk import call_with_tools
+            # "検索して" triggers web MCP servers
+            text, info = await call_with_tools(
+                "検索して", 100, sessions,
+                raw_user_text="検索して",
+                is_thread=True,
+            )
+            call_args = mock_q.call_args
+            options = call_args.kwargs.get("options") or call_args[1].get("options")
+            assert options.resume is None
+            # Old session should be cleared
+            assert 100 not in sessions
+
+    @pytest.mark.asyncio
+    async def test_no_resume_when_restricted(self):
+        """Non-admin (restricted) never gets resume."""
+        from collections import OrderedDict
+        from services.session import SessionInfo
+        from services.claude_sdk import _record_session_time
+
+        sessions = OrderedDict()
+        sessions[100] = SessionInfo(
+            session_id="existing-sess",
+            mcp_server_keys=["context7"],
+        )
+        _record_session_time(100)
+
+        async def spy_query(*args, **kwargs):
+            from claude_code_sdk import ResultMessage
+            msg = MagicMock(spec=ResultMessage)
+            msg.result = "restricted"
+            msg.session_id = None
+            msg.total_cost_usd = 0.01
+            msg.usage = {"input_tokens": 100, "output_tokens": 50}
+            msg.num_turns = 1
+            msg.duration_api_ms = 1000
+            msg.is_error = False
+            yield msg
+
+        with patch("services.claude_sdk.query", side_effect=spy_query) as mock_q:
+            from services.claude_sdk import call_with_tools
+            text, info = await call_with_tools(
+                "hello", 100, sessions,
+                raw_user_text="hello",
+                is_thread=True,
+                restricted=True,
+            )
+            call_args = mock_q.call_args
+            options = call_args.kwargs.get("options") or call_args[1].get("options")
+            assert options.resume is None
+
+    @pytest.mark.asyncio
+    async def test_returns_session_info_with_mcp_keys(self):
+        """Successful call returns SessionInfo with MCP keys."""
+        async def fake_query(*args, **kwargs):
+            from claude_code_sdk import ResultMessage
+            msg = MagicMock(spec=ResultMessage)
+            msg.result = "done"
+            msg.session_id = "new-sess"
+            msg.total_cost_usd = 0.01
+            msg.usage = {"input_tokens": 100, "output_tokens": 50}
+            msg.num_turns = 1
+            msg.duration_api_ms = 1000
+            msg.is_error = False
+            yield msg
+
+        with patch("services.claude_sdk.query", side_effect=fake_query):
+            from services.claude_sdk import call_with_tools
+            text, info = await call_with_tools(
+                "hello", 1, {},
+                raw_user_text="hello",
+                is_thread=True,
+            )
+            assert info is not None
+            assert info.session_id == "new-sess"
+            assert "context7" in info.mcp_server_keys  # BASE always included

@@ -278,7 +278,7 @@ async def call_direct(
     prompt: str,
     channel_id: int,
     conversation_history: dict[int, list[dict]],
-    thread_context: str = "",
+    conv_context: str = "",
 ) -> str:
     """Call Claude API directly with streaming. No CLI, no tools."""
     import asyncio
@@ -299,8 +299,8 @@ async def call_direct(
     fix_history_integrity(history)
 
     # Seed new channels with thread context (free-code: initialMessages)
-    if is_new and thread_context:
-        history.append({"role": "user", "content": f"[過去のスレッド履歴]\n{thread_context}"})
+    if is_new and conv_context:
+        history.append({"role": "user", "content": f"[過去のスレッド履歴]\n{conv_context}"})
         history.append({"role": "assistant", "content": "了解しました。スレッドの文脈を把握しました。"})
 
     user_msg = {"role": "user", "content": prompt}

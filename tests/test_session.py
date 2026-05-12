@@ -4,6 +4,7 @@ import json
 from collections import OrderedDict
 
 from services.session import (
+    SessionInfo,
     append_jsonl,
     fix_history_integrity,
     load_all_history,
@@ -17,21 +18,45 @@ from services.session import (
 
 class TestSessions:
     def test_save_and_load(self, tmp_state_dir):
-        s = OrderedDict([(1, "sess-a"), (2, "sess-b")])
+        s: OrderedDict[int, SessionInfo] = OrderedDict([
+            (1, SessionInfo(session_id="sess-a", mcp_server_keys=["context7"])),
+            (2, SessionInfo(session_id="sess-b", mcp_server_keys=["brave-search"])),
+        ])
         save_sessions(s)
         loaded = load_sessions()
-        assert loaded == s
+        assert loaded[1].session_id == "sess-a"
+        assert loaded[1].mcp_server_keys == ["context7"]
+        assert loaded[2].session_id == "sess-b"
 
     def test_load_missing_file(self, tmp_state_dir):
         assert load_sessions() == OrderedDict()
 
+    def test_load_backward_compat(self, tmp_state_dir):
+        """Old format (plain string values) should still load."""
+        import config
+        with open(config.SESSIONS_PATH, "w") as f:
+            json.dump({"1": "old-sess-id", "2": "old-sess-id-2"}, f)
+        loaded = load_sessions()
+        assert loaded[1].session_id == "old-sess-id"
+        assert loaded[1].mcp_server_keys == []
+        assert loaded[2].session_id == "old-sess-id-2"
+
     def test_update_session_lru(self, tmp_state_dir):
-        s = OrderedDict()
+        s: OrderedDict[int, SessionInfo] = OrderedDict()
         for i in range(105):
-            update_session(s, i, f"sess-{i}")
+            update_session(s, i, SessionInfo(session_id=f"sess-{i}"))
         assert len(s) == 100
         assert 0 not in s  # oldest evicted
         assert 104 in s
+
+    def test_update_session_stores_mcp_keys(self, tmp_state_dir):
+        s: OrderedDict[int, SessionInfo] = OrderedDict()
+        info = SessionInfo(session_id="s1", mcp_server_keys=["context7", "brave-search"])
+        update_session(s, 42, info)
+        assert s[42].mcp_server_keys == ["context7", "brave-search"]
+        # Verify it persists to disk
+        loaded = load_sessions()
+        assert loaded[42].mcp_server_keys == ["context7", "brave-search"]
 
 
 class TestJSONLHistory:

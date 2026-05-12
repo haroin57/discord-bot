@@ -27,9 +27,9 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 from services.mem0_service import (  # noqa: E402
     add_memories,
     delete_memory,
-    format_memories_for_prompt,
     get_all_memories,
     search_memories,
+    search_memories_smart,
 )
 
 # Log to stderr only — stdout is reserved for MCP protocol
@@ -44,27 +44,61 @@ log = logging.getLogger("mem0-mcp")
 # Discord botとClaude Codeで同じIDを使えば記憶を共有できる
 DEFAULT_USER_ID = "573489206240870410"
 
+
+def _format_for_mcp(memories: list[dict], limit: int | None = None) -> str:
+    """MCP-safe formatter without bracketed boundary markers.
+
+    The previous formatter used "[Mem0 — ...]" / "[End of Mem0 memories]"
+    which Claude's CLI sometimes interpreted as a stop boundary, causing
+    the assistant to halt after receiving the tool result.
+    """
+    lines = []
+    for m in memories:
+        text = m.get("memory", m.get("text", ""))
+        if text:
+            lines.append(f"- {text}")
+    if limit is not None and len(lines) > limit:
+        truncated = len(lines) - limit
+        lines = lines[:limit]
+        lines.append(f"(+{truncated} more — narrow your query to see them)")
+    return "\n".join(lines) if lines else ""
+
+
 mcp = FastMCP("mem0")
 
 
 @mcp.tool()
-async def search(query: str, limit: int = 5, user_id: str = DEFAULT_USER_ID) -> str:
+async def search(
+    query: str, limit: int = 5,
+    user_id: str = DEFAULT_USER_ID, smart: bool = True,
+) -> str:
     """Semantic search against the shared Mem0 long-term memory.
 
     Returns a formatted block of relevant memories for the given query.
     Use this when you want to recall facts about 先輩 (preferences,
     past decisions, ongoing projects, personal details).
 
+    When `smart=True` (default), the query is first rewritten by Haiku into
+    canonical-keyword variants, searched in parallel, and the merged candidates
+    are LLM-reranked. Disable with `smart=False` for plain vector search.
+
     Args:
         query: Natural language query describing what you want to recall.
         limit: Max number of memories to return (default 5).
         user_id: Mem0 user key. Defaults to 先輩's Discord ID so results
             are shared with the Discord bot.
+        smart: When True, use rewriting+reranking pipeline. Adds ~2 Haiku
+            calls of latency in exchange for higher hit rate.
     """
-    memories = await search_memories(query=query, user_id=user_id, limit=limit)
+    if smart:
+        memories = await search_memories_smart(
+            query=query, user_id=user_id, limit=limit,
+        )
+    else:
+        memories = await search_memories(query=query, user_id=user_id, limit=limit)
     if not memories:
         return f"(no memories found for query: {query!r})"
-    return format_memories_for_prompt(memories)
+    return _format_for_mcp(memories)
 
 
 @mcp.tool()
@@ -111,16 +145,20 @@ async def add(
 
 
 @mcp.tool()
-async def list_all(user_id: str = DEFAULT_USER_ID) -> str:
-    """List every memory Mem0 holds for the given user.
+async def list_all(user_id: str = DEFAULT_USER_ID, limit: int = 50) -> str:
+    """List memories Mem0 holds for the given user (truncated to `limit`).
+
+    Use `search` for targeted lookups — list_all is for sampling/overview.
 
     Args:
         user_id: Mem0 user key (default: 先輩's Discord ID).
+        limit: Max number of memories to return (default 50). The full
+            count is huge; raise this only when you really need it.
     """
     memories = await get_all_memories(user_id=user_id)
     if not memories:
         return f"(no memories stored for user={user_id})"
-    return format_memories_for_prompt(memories)
+    return _format_for_mcp(memories, limit=limit)
 
 
 @mcp.tool()

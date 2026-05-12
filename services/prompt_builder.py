@@ -115,7 +115,7 @@ class PromptBuilder:
         is_admin: bool,
         mem0_user_id: str,
         *,
-        thread_context: str = "",
+        conv_context: str = "",
         reply_context: str = "",
         image_paths: list[str] | None = None,
         text_attachments: list[tuple[str, str]] | None = None,
@@ -132,8 +132,8 @@ class PromptBuilder:
         safe_user_text = PromptBuilder.sanitize(raw_text)
 
         parts: list[str] = []
-        if thread_context:
-            parts.append(PromptBuilder.sanitize(thread_context))
+        if conv_context:
+            parts.append(PromptBuilder.sanitize(conv_context))
         if reply_context:
             parts.append(reply_context)  # caller must sanitize before passing
         parts.append(safe_user_text)
