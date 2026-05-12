@@ -894,7 +894,10 @@ async def on_message(message: discord.Message):
                 f.close()
 
     except Exception:
-        log.exception("Error processing message from %s in #%s", message.author, message.channel)
+        log.exception(
+            "Error processing message from user ...%s in #%s",
+            str(message.author.id)[-4:], message.channel,
+        )
         await message.reply("❌ エラーが発生しました。")
     finally:
         sema.release()
