@@ -175,8 +175,20 @@ MAX_RETRIES = 6
 # during which the user saw no activity (no status_callback wired here) and
 # Discord's typing indicator long expired. 5.0 gives a worst-case sum of
 # ~315 s (5+10+20+40+80+160) which still rides through transient 429 bursts
-# but keeps the UX bearable.
-RETRY_BACKOFF_BASE = float(os.environ.get("CLAUDE_API_RETRY_BACKOFF_BASE", "5.0"))
+# but keeps the UX bearable. Guarded against a malformed env var so a typo
+# in systemd EnvironmentFile does not crash the bot at import time.
+def _retry_backoff_base() -> float:
+    raw = os.environ.get("CLAUDE_API_RETRY_BACKOFF_BASE", "5.0")
+    try:
+        return float(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "Invalid CLAUDE_API_RETRY_BACKOFF_BASE=%r, falling back to 5.0", raw,
+        )
+        return 5.0
+
+
+RETRY_BACKOFF_BASE = _retry_backoff_base()
 
 
 def _build_cached_system(system_prompt: str) -> list[dict]:
