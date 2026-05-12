@@ -26,7 +26,13 @@ NoNewPrivileges=yes
 PrivateTmp=no
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/ubuntu/discord-bot /home/ubuntu/.local/state/discord-bot /tmp/discord_bot_attachments /tmp/mermaid_output /tmp/table_renders /tmp/math_renders
+# ReadWritePaths: allow writes to (a) the bot's own source/state dirs,
+# (b) /tmp paths the bot renders into, AND (c) caches/configs that the
+# Claude Code CLI subprocess + npx-launched MCP servers (brave-search,
+# context7, playwright) need at runtime. Without .npm and .claude here,
+# npm cache writes fail with EROFS, brave-search MCP cannot start, and
+# Claude Code's plugin orphan cleanup fails — pushing the CLI to exit 1.
+ReadWritePaths=/home/ubuntu/discord-bot /home/ubuntu/.local/state/discord-bot /home/ubuntu/.npm /home/ubuntu/.claude /home/ubuntu/.cache /tmp/discord_bot_attachments /tmp/mermaid_output /tmp/table_renders /tmp/math_renders
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
