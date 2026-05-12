@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 from services.mem0.client import _get_mem0, _refresh_mem0_client_token
-from services.mem0.extract import _classify_for_metadata, extract_facts_for_self
+from services.mem0.extract import extract_facts_for_self
 from services.mem0.search import search_memories
 from services.oauth_manager import ensure_valid_token
 
@@ -70,7 +70,10 @@ async def add_memories(
         # ── 2. Gate path (P2): Haiku → filter → infer=False raw insert ──
         if MEM0_GATE_ENABLED:
             facts = await extract_facts_for_self(user_text, assistant_text, context_hint)
-            kept: list[dict] = []
+
+            # Cheap synchronous filter pass first — drops obvious non-self /
+            # low-importance facts without firing any ChromaDB queries.
+            candidates: list[dict] = []
             skip_low = skip_other = skip_dup = 0
             for f in facts:
                 if f.get("speaker") != "self":
@@ -79,15 +82,34 @@ async def add_memories(
                 if int(f.get("importance", 0)) < MEM0_GATE_MIN_IMPORTANCE:
                     skip_low += 1
                     continue
-                if MEM0_CLIENT_DEDUP_ENABLED:
-                    near = await search_memories(f["text"], user_id, limit=3)
+                candidates.append(f)
+
+            # Parallel near-dup check: previously each candidate awaited its
+            # own search serially. asyncio.gather lets ChromaDB embed+query
+            # all candidates concurrently and cuts per-ingest latency from
+            # O(N * ~150ms) to O(~150ms).
+            kept: list[dict] = candidates
+            if MEM0_CLIENT_DEDUP_ENABLED and candidates:
+                dedup_results = await asyncio.gather(
+                    *(search_memories(f["text"], user_id, limit=3) for f in candidates),
+                    return_exceptions=True,
+                )
+                kept = []
+                for f, near in zip(candidates, dedup_results):
+                    if isinstance(near, Exception):
+                        # Fail-open: if the search errored, do not silently
+                        # drop a potentially novel fact. Log via search itself.
+                        kept.append(f)
+                        continue
                     if any((r.get("score") or 0) >= MEM0_CLIENT_DEDUP_THRESHOLD for r in near):
                         skip_dup += 1
-                        continue
-                kept.append(f)
+                    else:
+                        kept.append(f)
 
-            results = []
-            for f in kept:
+            # Parallel raw insert: same rationale — three ChromaDB writes in
+            # serial added ~3 x latency. asyncio.gather them and tolerate
+            # individual failures via return_exceptions.
+            async def _insert_one(f: dict):
                 fact_meta = dict(base_meta)
                 fact_meta.update({
                     "category":    f.get("category"),
@@ -96,14 +118,18 @@ async def add_memories(
                     "tags":        f.get("tags") or [],
                 })
                 try:
-                    res = await asyncio.to_thread(
+                    return await asyncio.to_thread(
                         mem.add,
                         [{"role": "user", "content": f["text"]}],
                         user_id=user_id, metadata=fact_meta, infer=False,
                     )
-                    results.append(res)
                 except Exception as e:
                     log.warning("Mem0 raw insert failed: %s", e)
+                    return None
+
+            insert_results = await asyncio.gather(*(_insert_one(f) for f in kept)) if kept else []
+            results = [r for r in insert_results if r is not None]
+
             log.info(
                 "Mem0 gate: facts=%d kept=%d skip(low=%d,other=%d,dup=%d) user=...%s",
                 len(facts), len(kept), skip_low, skip_other, skip_dup, str(user_id)[-4:],
@@ -129,9 +155,11 @@ async def add_memories(
                 legacy_msgs.append({"role": "user", "content": user_text})
             if assistant_text:
                 legacy_msgs.append({"role": "assistant", "content": assistant_text})
-        cls = await _classify_for_metadata(legacy_msgs)
-        if cls:
-            base_meta.update(cls)
+        # _classify_for_metadata() was previously fired here, adding a second
+        # Haiku call on top of Mem0's own internal extractor. The gate path
+        # (above) is the canonical source of taxonomy metadata; in legacy
+        # fallback we accept the simpler Mem0 default and skip the redundant
+        # classifier so this path costs 1 LLM call, not 2.
         result = await asyncio.to_thread(
             mem.add, legacy_msgs, user_id=user_id, metadata=base_meta
         )

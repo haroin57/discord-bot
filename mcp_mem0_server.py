@@ -98,7 +98,7 @@ mcp = FastMCP("mem0")
 @mcp.tool()
 async def search(
     query: str, limit: int = 5,
-    user_id: str = DEFAULT_USER_ID, smart: bool = True,
+    user_id: str = DEFAULT_USER_ID, smart: bool = False,
 ) -> str:
     """Semantic search against the shared Mem0 long-term memory.
 
@@ -106,9 +106,11 @@ async def search(
     Use this when you want to recall facts about 先輩 (preferences,
     past decisions, ongoing projects, personal details).
 
-    When `smart=True` (default), the query is first rewritten by Haiku into
-    canonical-keyword variants, searched in parallel, and the merged candidates
-    are LLM-reranked. Disable with `smart=False` for plain vector search.
+    Plain vector search is the default. Pass `smart=True` for the higher-cost
+    pipeline that (1) rewrites the query into canonical-keyword variants via
+    Haiku, (2) runs multi-query parallel search, and (3) LLM-reranks the
+    merged candidates. Smart mode adds ~1-3 s of latency from two extra Haiku
+    round-trips; enable it only when default search misses what you need.
 
     Args:
         query: Natural language query describing what you want to recall.
@@ -116,7 +118,7 @@ async def search(
         user_id: Mem0 user key. Defaults to 先輩's Discord ID so results
             are shared with the Discord bot.
         smart: When True, use rewriting+reranking pipeline. Adds ~2 Haiku
-            calls of latency in exchange for higher hit rate.
+            calls of latency in exchange for higher hit rate. Default: False.
     """
     try:
         user_id = _validated_user_id(user_id)
@@ -197,7 +199,11 @@ async def list_all(user_id: str = DEFAULT_USER_ID, limit: int = 50) -> str:
     except ValueError as e:
         return f"(rejected: {e})"
     limit = _clamped_limit(limit)
-    memories = await get_all_memories(user_id=user_id)
+    # Pass `limit` down to ChromaDB instead of fetching the full collection
+    # and slicing in Python. With ~860+ memories the prior behavior allocated
+    # the full list before discarding most of it; this stops the underlying
+    # query early.
+    memories = await get_all_memories(user_id=user_id, limit=limit)
     if not memories:
         return f"(no memories stored for user={user_id})"
     return _format_for_mcp(memories, limit=limit)

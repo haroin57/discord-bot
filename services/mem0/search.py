@@ -90,13 +90,10 @@ _RERANK_PROMPT = """以下のMem0検索結果のうち、ユーザーの元ク�
 async def _rewrite_query(query: str) -> list[str]:
     """Expand a user query into canonical-keyword variants via Haiku."""
     try:
-        from anthropic import AsyncAnthropic
-        oauth_init()  # idempotent — load credentials + patch SDK
-        await ensure_valid_token()
-        token = get_access_token()
-        if not token:
+        from services.mem0.client import get_anthropic_client
+        client = await get_anthropic_client()
+        if client is None:
             return []
-        client = AsyncAnthropic(auth_token=token)
         resp = await client.messages.create(
             model=os.environ.get("MEM0_REWRITE_MODEL", "claude-haiku-4-5-20251001"),
             max_tokens=200,
@@ -124,16 +121,13 @@ async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> 
     if len(memories) <= top_k:
         return memories
     try:
-        from anthropic import AsyncAnthropic
-        oauth_init()  # idempotent — load credentials + patch SDK
-        await ensure_valid_token()
-        token = get_access_token()
-        if not token:
+        from services.mem0.client import get_anthropic_client
+        client = await get_anthropic_client()
+        if client is None:
             return memories[:top_k]
         candidates = "\n".join(
             f"{i+1}: {m.get('memory','')[:120]}" for i, m in enumerate(memories)
         )
-        client = AsyncAnthropic(auth_token=token)
         resp = await client.messages.create(
             model=os.environ.get("MEM0_RERANK_MODEL", "claude-haiku-4-5-20251001"),
             max_tokens=200,

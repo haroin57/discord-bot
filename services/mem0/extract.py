@@ -41,11 +41,9 @@ async def _classify_for_metadata(messages: list[dict]) -> dict:
     Returns empty dict on any failure — callers must treat it as best-effort.
     """
     try:
-        from anthropic import AsyncAnthropic
-        oauth_init()  # idempotent — load credentials + patch SDK
-        await ensure_valid_token()
-        token = get_access_token()
-        if not token:
+        from services.mem0.client import get_anthropic_client
+        client = await get_anthropic_client()
+        if client is None:
             return {}
         conv_parts = []
         for m in messages or []:
@@ -58,7 +56,6 @@ async def _classify_for_metadata(messages: list[dict]) -> dict:
         if not conv_parts:
             return {}
         conv = "\n".join(conv_parts)
-        client = AsyncAnthropic(auth_token=token)
         resp = await client.messages.create(
             model=os.environ.get("MEM0_CLASSIFY_MODEL", "claude-haiku-4-5-20251001"),
             max_tokens=200,
@@ -151,14 +148,11 @@ async def extract_facts_for_self(
     Empty list on any failure (caller should fall back to Mem0 standard path).
     """
     try:
-        from anthropic import AsyncAnthropic
-        oauth_init()
-        await ensure_valid_token()
-        token = get_access_token()
-        if not token:
+        from services.mem0.client import get_anthropic_client
+        client = await get_anthropic_client()
+        if client is None:
             return []
         from config import MEM0_GATE_MODEL  # local import to allow .env reload
-        client = AsyncAnthropic(auth_token=token)
         resp = await client.messages.create(
             model=MEM0_GATE_MODEL,
             max_tokens=600,
