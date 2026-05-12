@@ -173,8 +173,8 @@ class PromptBuilder:
                             f"</retrieved_memories>\n\n{prompt}"
                         )
                         log.info(
-                            "Mem0: injected %d memories for user %s",
-                            len(mem_results), mem0_user_id,
+                            "Mem0: injected %d memories for user ...%s",
+                            len(mem_results), str(mem0_user_id)[-4:],
                         )
             except Exception as e:
                 log.warning("Mem0 recall failed (non-fatal): %s", e)

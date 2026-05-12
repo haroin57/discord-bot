@@ -337,4 +337,4 @@ async def call_direct(
         log.error("Direct API error: %s", e, exc_info=True)
         if history and history[-1]["role"] == "user":
             history.pop()
-        return f"❌ API error: {e}"
+        return "❌ APIエラーが発生しました。少し待って再試行してください。"
