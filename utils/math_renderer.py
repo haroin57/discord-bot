@@ -80,12 +80,14 @@ setTimeout(async () => {
       const page = await browser.newPage();
       await page.setViewport({ width: 800, height: 600, deviceScaleFactor: 2 });
 
-      const html = fs.readFileSync(htmlPath, 'utf8');
-      // Phase B1: 'domcontentloaded' instead of 'networkidle0'. With the
-      // local KaTeX bundle below replacing the CDN load, every cache-miss
-      // render no longer waits 1-3 s (or up to 15 s on CDN outage) for
-      // network quiescence.
-      await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 5000 });
+      // Phase B1: navigate to the html file via `file://` instead of
+      // `setContent`. The HTML template references katex.min.{css,js} via
+      // absolute `file://` URLs; from a `setContent`-loaded page the origin
+      // is `about:blank` and Chromium blocks cross-origin sub-resources,
+      // which would silently skip the KaTeX load and produce blank math.
+      // Navigating to a real `file://` URL gives the page a same-origin
+      // base so KaTeX loads correctly.
+      await page.goto('file://' + htmlPath, { waitUntil: 'domcontentloaded', timeout: 5000 });
 
       const el = await page.$('.math-container');
       if (!el) { process.exit(1); }

@@ -101,7 +101,11 @@ body {
   background: #2b2d31;
   margin: 0;
   padding: 20px;
-  font-family: 'Noto Sans JP', 'Segoe UI', Arial, sans-serif;
+  /* 'Noto Sans JP' is the Google Fonts web name (now offline post B1).
+     'Noto Sans CJK JP' / 'Noto Sans CJK' are the system family names for
+     /usr/share/fonts/opentype/noto/NotoSansCJK-*.ttc — without them,
+     Japanese glyphs fall through to DejaVu/Liberation and render as tofu. */
+  font-family: 'Noto Sans JP', 'Noto Sans CJK JP', 'Noto Sans CJK', 'Segoe UI', Arial, sans-serif;
 }
 .table-container {
   display: inline-block;
