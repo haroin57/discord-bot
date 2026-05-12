@@ -323,8 +323,10 @@ _MEMORY_TRIGGERS = tuple(kw.lower() for kw in (
     "前に話した", "前に言った", "以前", "昔話した",
 ))
 _PAPER_TRIGGERS = tuple(kw.lower() for kw in (
-    "論文", "paper", "scholar", "arxiv", "学術", "引用文献",
-    "citation", "google scholar",
+    # "scholar" without a qualifier was a false-positive risk (matches
+    # "scholarship", "scholar's", etc.). Use disambiguated forms only.
+    "論文", "paper", "arxiv", "学術", "引用文献", "citation",
+    "google scholar", "semantic scholar", "scholar.google",
 ))
 
 
