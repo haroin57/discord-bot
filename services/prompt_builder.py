@@ -137,7 +137,11 @@ class PromptBuilder:
         if conv_context:
             parts.append(PromptBuilder.sanitize(conv_context))
         if reply_context:
-            parts.append(reply_context)  # caller must sanitize before passing
+            # Sanitize here defensively — earlier callers documented that
+            # they sanitize before passing, but a future caller (e.g. the
+            # web API) might forget. Sanitize is idempotent, so applying
+            # it again on already-sanitized text is safe.
+            parts.append(PromptBuilder.sanitize(reply_context))
         parts.append(safe_user_text)
         if image_paths:
             image_instructions = "\n".join(

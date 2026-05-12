@@ -242,7 +242,16 @@ intents.message_content = True
 # keeps the last 1000 messages from every channel/guild it sees in RAM.
 # 200 is more than enough for `message.reference.cached_message` lookups,
 # and trims tens of MB off the resident set on long-running instances.
-bot = commands.Bot(command_prefix="!", intents=intents, max_messages=200)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    max_messages=200,
+    # Default to suppressing @everyone / @here / @role pings on every outgoing
+    # message. Echoing user-controlled text that contains "@everyone" should
+    # not page the whole server. Per-message overrides can still pass
+    # allowed_mentions=AllowedMentions(users=True) when explicitly intended.
+    allowed_mentions=discord.AllowedMentions.none(),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -590,8 +599,15 @@ async def on_message(message: discord.Message):
                 snap_author = getattr(snap_msg, "author", None)
                 author_name = getattr(snap_author, "display_name", "Unknown") if snap_author else "Unknown"
                 if snap_content:
+                    # Sanitize both pieces at construction time. The outer
+                    # _sanitize_untrusted_text() call on the full assembled
+                    # context already covers this transitively, but applying
+                    # it directly here keeps the defense-in-depth tight even
+                    # if the surrounding code is later refactored.
+                    safe_author = _sanitize_untrusted_text(author_name)
+                    safe_snap = _sanitize_untrusted_text(snap_content)
                     fwd_parts.append(
-                        f"[Forwarded message by {author_name}]\n{snap_content}"
+                        f"[Forwarded message by {safe_author}]\n{safe_snap}"
                     )
             if fwd_parts:
                 forwarded_context = "\n\n".join(fwd_parts)
@@ -607,7 +623,11 @@ async def on_message(message: discord.Message):
             # context, and attachments.
             parts: list[str] = []
             if reply_context:
-                parts.append(reply_context)
+                # Sanitize at this layer too for consistency with the other
+                # context variables — the inner pieces are already sanitized
+                # at construction, but applying once more is idempotent and
+                # survives future refactoring.
+                parts.append(_sanitize_untrusted_text(reply_context))
             parts.append(safe_user_text)
             if image_paths:
                 image_instructions = "\n".join(
@@ -661,7 +681,9 @@ async def on_message(message: discord.Message):
                     f"</forwarded_messages>"
                 )
             if reply_context:
-                parts.append(reply_context)
+                # Idempotent outer sanitize for parity with conv_context /
+                # cross_thread_context / forwarded_context just above.
+                parts.append(_sanitize_untrusted_text(reply_context))
             parts.append(safe_user_text)
             if image_paths:
                 image_instructions = "\n".join(
