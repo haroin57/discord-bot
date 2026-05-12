@@ -463,7 +463,18 @@ async def call_with_tools(
             max_size=1024 * 1024, mode="w+b", prefix="claude_stderr_"
         )
         options.debug_stderr = stderr_fileobj
-        options.extra_args = {"debug-to-stderr": None}
+        # --strict-mcp-config: only use the MCP servers we explicitly pass via
+        # mcp_servers=. Without this flag the CLI also loads the user-level
+        # ~/.claude.json mcpServers, which contains stale SSE endpoints
+        # (brave-search/papermcp/browser-rendering on localhost:801x) and
+        # Anthropic builtin remote MCPs (claude.ai Drive/Gmail/Calendar) that
+        # fail with mcp_unauthorized_no_token and push the CLI into exit-code-1.
+        # This affects only the subprocess we spawn; `claude` invoked directly
+        # by the user (e.g. 先輩 in a terminal) still sees the global config.
+        options.extra_args = {
+            "debug-to-stderr": None,
+            "strict-mcp-config": None,
+        }
 
         for attempt in range(TRANSIENT_MAX_ATTEMPTS):
             if attempt >= max_attempts:
