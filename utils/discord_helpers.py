@@ -13,6 +13,9 @@ from config import (
     ADMIN_USER_IDS,
     BOT_KEYWORDS,
     BOT_ROLE_IDS,
+    CROSS_THREAD_CONTEXT_MESSAGES,
+    MAX_CROSS_THREAD_CHARS,
+    MAX_CROSS_THREAD_CONTEXTS,
     MAX_RESOLVED_LINKS,
     THREAD_CONTEXT_CACHE_MAX,
     THREAD_CONTEXT_CACHE_TTL_S,
@@ -109,11 +112,11 @@ def format_embed(embed: discord.Embed) -> str:
 # ---------------------------------------------------------------------------
 # Thread context (free-code: initialMessages from history)
 # ---------------------------------------------------------------------------
-MAX_CONTEXT_CHARS = 8000
+MAX_CONTEXT_CHARS = 20000
 
 # 3-layer context hierarchy
-LAYER1_COUNT = 3       # Recent messages: full text
-LAYER2_COUNT = 12      # Earlier messages: summarized
+LAYER1_COUNT = 15      # Recent messages: full text
+LAYER2_COUNT = 10      # Earlier messages: summarized
 LAYER2_MAX_CHARS = 150 # Max chars per Layer 2 message
 
 
@@ -376,6 +379,8 @@ async def _resolve_one_link(
     discord_client: discord.Client,
     match: re.Match,
     requester,
+    *,
+    caller_is_admin: bool = False,
 ) -> tuple[re.Match, str | None]:
     verified = _parse_and_verify_url(match.group(0))
     if verified is None:
@@ -393,7 +398,8 @@ async def _resolve_one_link(
             )
             return match, None
         # Authorization: the requester must be able to read the target channel.
-        if requester is not None and not _requester_can_read(channel, requester):
+        # Admin users bypass this check — they have full access by definition.
+        if not caller_is_admin and requester is not None and not _requester_can_read(channel, requester):
             log.warning(
                 "Rejecting message-link resolution: user=%s lacks read access to channel=%s",
                 getattr(requester, "id", "?"), channel_id,
@@ -429,6 +435,47 @@ async def _resolve_one_link(
                     log.warning("Failed to download linked attachment %s: %s", attachment.filename, e)
             parts.append(f"[Attachment: {attachment.filename}]")
 
+        # If the resolved message is in a thread, fetch surrounding context
+        if isinstance(channel, discord.Thread):
+            try:
+                thread_ctx_lines: list[str] = []
+                # Fetch messages around the referenced message
+                before_msgs: list[tuple[str, str]] = []
+                async for m in channel.history(
+                    limit=CROSS_THREAD_CONTEXT_MESSAGES,
+                    before=msg,
+                    oldest_first=False,
+                ):
+                    if requester is not None and not _requester_can_read(channel, requester):
+                        break
+                    body = _format_msg_body(m)
+                    if body:
+                        before_msgs.append((m.author.display_name, body))
+                before_msgs.reverse()  # chronological order
+
+                after_msgs: list[tuple[str, str]] = []
+                async for m in channel.history(
+                    limit=CROSS_THREAD_CONTEXT_MESSAGES,
+                    after=msg,
+                    oldest_first=True,
+                ):
+                    body = _format_msg_body(m)
+                    if body:
+                        after_msgs.append((m.author.display_name, body))
+
+                all_ctx = before_msgs + [(msg.author.display_name, _format_msg_body(msg))] + after_msgs
+                ctx_lines, _ = _build_layered_lines(all_ctx, oldest_first=True)
+                if ctx_lines:
+                    parts.append(
+                        f"\n[Thread context from #{getattr(channel, 'name', channel_id)} "
+                        f"({len(all_ctx)} messages around referenced)]\n"
+                        + "\n".join(ctx_lines)
+                        + "\n[End of cross-thread context]"
+                    )
+                log.info("Cross-thread context fetched: thread=%s msgs=%d", channel.name, len(all_ctx))
+            except Exception as e:
+                log.warning("Failed to fetch cross-thread context for %s: %s", channel_id, e)
+
         log.info("Resolved message link: guild=%s ch=%s msg=%s", guild_id, channel_id, message_id)
         return match, "\n".join(parts)
     except Exception as e:
@@ -441,6 +488,7 @@ async def resolve_message_links(
     text: str,
     *,
     requester=None,
+    caller_is_admin: bool = False,
 ) -> str:
     """Find Discord message URLs in text, fetch content in parallel, and inline them.
 
@@ -455,9 +503,97 @@ async def resolve_message_links(
 
     matches = matches[:MAX_RESOLVED_LINKS]
     results = await asyncio.gather(*[
-        _resolve_one_link(discord_client, m, requester) for m in matches
+        _resolve_one_link(discord_client, m, requester, caller_is_admin=caller_is_admin)
+        for m in matches
     ])
     for match, replacement in reversed(results):
         if replacement is not None:
             text = text[:match.start()] + replacement + text[match.end():]
     return text
+
+
+# ---------------------------------------------------------------------------
+# Channel mention → cross-thread context resolution
+# ---------------------------------------------------------------------------
+_CHANNEL_MENTION_RE = re.compile(r"<#(\d+)>")
+
+
+async def resolve_channel_mention_contexts(
+    discord_client: discord.Client,
+    text: str,
+    *,
+    current_channel_id: int,
+    requester=None,
+    caller_is_admin: bool = False,
+) -> str:
+    """Detect <#channel_id> mentions that point to threads and fetch their context.
+
+    Returns a formatted string of cross-thread contexts (empty string if none).
+    Skips the current channel/thread to avoid duplication.
+    """
+    import asyncio
+
+    mentions = _CHANNEL_MENTION_RE.findall(text)
+    if not mentions:
+        return ""
+
+    # Deduplicate and exclude current channel
+    seen: set[int] = set()
+    channel_ids: list[int] = []
+    for cid_str in mentions:
+        cid = int(cid_str)
+        if cid == current_channel_id or cid in seen:
+            continue
+        seen.add(cid)
+        channel_ids.append(cid)
+
+    channel_ids = channel_ids[:MAX_CROSS_THREAD_CONTEXTS]
+    if not channel_ids:
+        return ""
+
+    async def _fetch_one(cid: int) -> str | None:
+        try:
+            channel = discord_client.get_channel(cid) or await discord_client.fetch_channel(cid)
+            if channel is None:
+                return None
+            if not isinstance(channel, discord.Thread):
+                return None
+            # Permission check
+            if requester is not None and not _requester_can_read(channel, requester):
+                log.warning(
+                    "Rejecting channel-mention context: user=%s lacks access to thread=%s",
+                    getattr(requester, "id", "?"), cid,
+                )
+                return None
+
+            collected: list[tuple[str, str]] = []
+            async for msg in channel.history(
+                limit=CROSS_THREAD_CONTEXT_MESSAGES * 2,
+                oldest_first=False,
+            ):
+                if not _should_include_msg(msg, caller_is_admin):
+                    continue
+                body = _format_msg_body(msg)
+                if body:
+                    collected.append((msg.author.display_name, body))
+            if not collected:
+                return None
+
+            collected.reverse()  # chronological
+            lines, _ = _build_layered_lines(collected, oldest_first=True)
+            result = (
+                f"[Cross-thread context: #{channel.name} ({len(collected)} recent messages)]\n"
+                + "\n".join(lines)
+                + "\n[End of cross-thread context]"
+            )
+            if len(result) > MAX_CROSS_THREAD_CHARS:
+                result = result[:MAX_CROSS_THREAD_CHARS] + "\n[...truncated...]"
+            log.info("Channel-mention context fetched: thread=%s msgs=%d", channel.name, len(collected))
+            return result
+        except Exception as e:
+            log.warning("Failed to fetch channel-mention context for %s: %s", cid, e)
+            return None
+
+    results = await asyncio.gather(*[_fetch_one(cid) for cid in channel_ids])
+    contexts = [r for r in results if r]
+    return "\n\n".join(contexts)

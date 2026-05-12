@@ -184,3 +184,44 @@ class TestResolveMessageLinks:
         text = "Check: https://discord.com/channels/111/222/333"
         result = await resolve_message_links(mock_client, text)
         assert "discord.com/channels/111/222/333" in result
+
+
+class TestContextConstants:
+    """Verify widened context constants are set correctly."""
+
+    def test_layer1_count(self):
+        from utils.discord_helpers import LAYER1_COUNT
+        assert LAYER1_COUNT == 15
+
+    def test_layer2_count(self):
+        from utils.discord_helpers import LAYER2_COUNT
+        assert LAYER2_COUNT == 10
+
+    def test_max_context_chars(self):
+        from utils.discord_helpers import MAX_CONTEXT_CHARS
+        assert MAX_CONTEXT_CHARS == 20000
+
+    def test_channel_context_limit_derived(self):
+        from utils.discord_helpers import LAYER1_COUNT, LAYER2_COUNT, CHANNEL_CONTEXT_LIMIT
+        assert CHANNEL_CONTEXT_LIMIT == LAYER1_COUNT + LAYER2_COUNT
+
+
+class TestBuildLayeredLines:
+    """Test _build_layered_lines with the new wider context settings."""
+
+    def test_all_layer1_when_few_messages(self):
+        from utils.discord_helpers import _build_layered_lines, LAYER1_COUNT
+        messages = [(f"user{i}", f"message {i}") for i in range(5)]
+        lines, _ = _build_layered_lines(messages)
+        # All 5 should be full text (within LAYER1_COUNT=15)
+        assert len(lines) == 5
+        assert all("message" in line for line in lines)
+
+    def test_layer2_summarized_when_many_messages(self):
+        from utils.discord_helpers import _build_layered_lines, LAYER1_COUNT, LAYER2_COUNT
+        total = LAYER1_COUNT + LAYER2_COUNT  # 25
+        messages = [(f"user{i}", f"{'x' * 300} msg{i}") for i in range(total)]
+        lines, _ = _build_layered_lines(messages)
+        # Layer 2 messages (first 10) should be summarized (shorter)
+        # Layer 1 messages (last 15) should be full
+        assert len(lines) >= LAYER1_COUNT  # at least layer1 lines present

@@ -8,6 +8,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
+from dataclasses import dataclass, field
 
 from config import (
     HISTORY_DIR,
@@ -21,24 +22,54 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# SDK session IDs (channel_id -> session_id for --resume)
+# SessionInfo — rich metadata per channel session
 # ---------------------------------------------------------------------------
-def load_sessions() -> OrderedDict[int, str]:
+@dataclass
+class SessionInfo:
+    session_id: str
+    mcp_server_keys: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# SDK session IDs (channel_id -> SessionInfo for --resume)
+# ---------------------------------------------------------------------------
+def load_sessions() -> OrderedDict[int, SessionInfo]:
     try:
         with open(SESSIONS_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        return OrderedDict((int(k), v) for k, v in data.items())
+        result: OrderedDict[int, SessionInfo] = OrderedDict()
+        for k, v in data.items():
+            if isinstance(v, str):
+                # Backward compat: old format was plain session_id string
+                result[int(k)] = SessionInfo(session_id=v)
+            elif isinstance(v, dict):
+                result[int(k)] = SessionInfo(
+                    session_id=v["session_id"],
+                    mcp_server_keys=v.get("mcp_server_keys", []),
+                )
+        return result
     except (FileNotFoundError, json.JSONDecodeError):
         return OrderedDict()
 
 
-def save_sessions(s: OrderedDict[int, str]) -> None:
+def save_sessions(s: OrderedDict[int, SessionInfo]) -> None:
+    data = {
+        str(k): {
+            "session_id": v.session_id,
+            "mcp_server_keys": v.mcp_server_keys,
+        }
+        for k, v in s.items()
+    }
     with open(SESSIONS_PATH, "w", encoding="utf-8") as f:
-        json.dump({str(k): v for k, v in s.items()}, f)
+        json.dump(data, f)
 
 
-def update_session(sessions: OrderedDict[int, str], channel_id: int, session_id: str) -> None:
-    sessions[channel_id] = session_id
+def update_session(
+    sessions: OrderedDict[int, SessionInfo],
+    channel_id: int,
+    info: SessionInfo,
+) -> None:
+    sessions[channel_id] = info
     sessions.move_to_end(channel_id)
     while len(sessions) > MAX_SESSIONS:
         sessions.popitem(last=False)

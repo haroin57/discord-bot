@@ -46,8 +46,10 @@ from config import (
     SETTINGS_PATH,
     STATE_DIR,
     SYSTEM_PROMPT,
+    get_mcp_servers_by_keys,
     pick_mcp_servers,
 )
+from services.session import SessionInfo
 
 log = logging.getLogger(__name__)
 
@@ -317,11 +319,12 @@ def _tool_input_hint(name: str, inp: dict | None) -> str:
 async def call_with_tools(
     prompt: str,
     channel_id: int,
-    sessions: dict[int, str],
+    sessions: dict[int, "SessionInfo"],
     status_callback=None,
     restricted: bool = False,
     raw_user_text: str = "",
-) -> tuple[str, str | None]:
+    is_thread: bool = False,
+) -> tuple[str, "SessionInfo | None"]:
     """Call Claude via SDK. Model decides tool usage (free-code QueryEngine pattern)."""
     # H-3: pick the correct concurrency slot so non-admins can't starve
     # the admin pool.
@@ -375,17 +378,36 @@ async def call_with_tools(
                 settings=SETTINGS_PATH,
             )
 
-        # Session resume disabled — MCP server configuration varies per
-        # request (pick_mcp_servers selects servers based on user text),
-        # but CLI resume restores the original session's MCP servers.
-        # Mismatched servers (e.g. claude.ai proxy servers from a previous
-        # session) cause auth errors and immediate exit code 1.
-        # KV cache benefits are handled by prompt caching (cache_control)
-        # on the direct API path instead.
-        options.resume = None
+        # Session resume — enabled for threads only. MCP server config is
+        # stored per session so we can restore the exact same set on resume.
+        # For non-threads / non-admin, resume stays disabled.
+        if not restricted:
+            info = sessions.get(channel_id)
+            if info and _is_session_fresh(channel_id):
+                needed_keys = set(chosen_mcp.keys())
+                stored_keys = set(info.mcp_server_keys)
+                if needed_keys <= stored_keys:
+                    # All needed MCP servers are in the stored session → resume
+                    options.resume = info.session_id
+                    options.mcp_servers = get_mcp_servers_by_keys(info.mcp_server_keys)
+                    log.info("Resuming session %s for ch=%d (mcp=%s)",
+                             info.session_id[:12], channel_id, stored_keys)
+                else:
+                    # New MCP servers needed → start fresh
+                    log.info("MCP mismatch for ch=%d (need=%s, have=%s), starting fresh",
+                             channel_id, needed_keys - stored_keys, stored_keys)
+                    del sessions[channel_id]
+                    _clear_session_time(channel_id)
+                    options.resume = None
+            else:
+                options.resume = None
+        else:
+            options.resume = None
 
         response_text: str | None = None
         session_id: str | None = None
+        # Track the MCP keys used for this invocation (for SessionInfo)
+        active_mcp_keys: list[str] = list(options.mcp_servers.keys()) if options.mcp_servers else []
         max_attempts = DEFAULT_MAX_ATTEMPTS
 
         for attempt in range(TRANSIENT_MAX_ATTEMPTS):
@@ -581,9 +603,11 @@ async def call_with_tools(
         if response_text is None:
             return "(No response from Claude)", None
 
+        result_info: SessionInfo | None = None
         if session_id:
             _record_session_time(channel_id)
+            result_info = SessionInfo(session_id=session_id, mcp_server_keys=active_mcp_keys)
 
         log.info("Response via %s (restricted=%s) len=%d",
                  MODEL, restricted, len(response_text))
-        return response_text.strip() or "(No response from Claude)", session_id
+        return response_text.strip() or "(No response from Claude)", result_info
