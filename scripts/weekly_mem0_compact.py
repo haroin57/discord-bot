@@ -52,9 +52,22 @@ def _parse_dt(value: str | None) -> datetime | None:
 
 
 async def main() -> None:
+    # Default report location: XDG state dir, mode 700, so the report
+    # (which contains memory text excerpts) is not world-readable in /tmp.
+    state_dir = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    state_dir = os.path.join(state_dir, "discord-bot")
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    # makedirs mode only applies on create; chmod enforces 0o700 even when the
+    # directory pre-existed with looser permissions (e.g. 0o755 from a prior run).
+    try:
+        os.chmod(state_dir, 0o700)
+    except OSError:
+        pass
+    default_out = os.path.join(state_dir, f"mem0_compact_{datetime.now().strftime('%Y%m%d')}.md")
+
     p = argparse.ArgumentParser()
     p.add_argument("--user-id", default=DEFAULT_USER_ID)
-    p.add_argument("--out", default=f"/tmp/mem0_compact_{datetime.now().strftime('%Y%m%d')}.md")
+    p.add_argument("--out", default=default_out)
     p.add_argument("--window-days", type=int, default=7)
     p.add_argument("--cold-days", type=int, default=60)
     args = p.parse_args()
@@ -201,7 +214,13 @@ async def main() -> None:
         lines.append(f"- ... +{len(near_dup_pairs)-20} more")
 
     report = "\n".join(lines)
-    with open(args.out, "w", encoding="utf-8") as f:
+    # Report contains memory text excerpts that may include PII. Open with an
+    # explicit 0o600 mode (owner read/write only) so a malicious local user
+    # cannot read it via /tmp or pre-create a symlink to redirect the write.
+    # O_NOFOLLOW refuses to follow any pre-existing symlink at args.out.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    fd = os.open(args.out, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(report)
 
     # P5: alert criterion — 1件は引用文脈の可能性、2件以上で異常
