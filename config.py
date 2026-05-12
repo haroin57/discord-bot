@@ -11,6 +11,21 @@ load_dotenv()
 # Discord
 # ---------------------------------------------------------------------------
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
+
+
+def validate_discord_token() -> str:
+    """Ensure DISCORD_TOKEN is set; raise at startup rather than connect with empty string.
+
+    Returns the token so callers can use the return value directly.
+    """
+    if not DISCORD_TOKEN:
+        raise RuntimeError(
+            "DISCORD_TOKEN environment variable is required but not set. "
+            "Configure it in .env or the process environment before starting the bot."
+        )
+    return DISCORD_TOKEN
+
+
 COOLDOWN_SECONDS = int(os.environ.get("BOT_COOLDOWN", "5"))
 # Non-admin callers get a stricter rate limit to prevent quota/cost DoS.
 RESTRICTED_COOLDOWN_SECONDS = int(os.environ.get("BOT_RESTRICTED_COOLDOWN", "30"))
