@@ -780,6 +780,7 @@ async def on_message(message: discord.Message):
             status_callback=_update_status, restricted=not admin,
             raw_user_text=raw_user_text,
             is_thread=is_thread,
+            has_image_attachment=bool(image_paths),
         )
 
         # Cancel any pending delayed status edit before deleting the message.

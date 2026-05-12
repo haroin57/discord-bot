@@ -324,6 +324,7 @@ async def call_with_tools(
     restricted: bool = False,
     raw_user_text: str = "",
     is_thread: bool = False,
+    has_image_attachment: bool = False,
 ) -> tuple[str, "SessionInfo | None"]:
     """Call Claude via SDK. Model decides tool usage (free-code QueryEngine pattern)."""
     # H-3: pick the correct concurrency slot so non-admins can't starve
@@ -337,14 +338,17 @@ async def call_with_tools(
             #     data via arbitrary URLs).
             #   - `permission_mode="default"` (not bypassPermissions) so the CLI
             #     itself refuses tool calls that aren't explicitly allowed.
-            #   - Only Read, and only if the prompt actually references an image.
+            #   - Only Read, and only if the caller explicitly signaled that
+            #     image attachments are present. The previous string-match on
+            #     the prompt was bypassable by a non-admin user typing the
+            #     literal sentinel "Use the Read tool to view this image".
             #   - cwd isolated to the shared attachment tmpdir to limit where a
             #     successful Read can reach.
             #   - If BOT_RESTRICTED_ANTHROPIC_API_KEY is configured, the CLI
             #     subprocess inherits that key via env — so non-admin calls
             #     burn a dedicated, separately-billed quota rather than the
             #     owner's OAuth subscription.
-            has_images = "Use the Read tool to view this image" in prompt
+            has_images = has_image_attachment
             restricted_env: dict[str, str] = {}
             if RESTRICTED_ANTHROPIC_API_KEY:
                 restricted_env["ANTHROPIC_API_KEY"] = RESTRICTED_ANTHROPIC_API_KEY
