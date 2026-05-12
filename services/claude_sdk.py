@@ -414,20 +414,26 @@ async def call_with_tools(
         active_mcp_keys: list[str] = list(options.mcp_servers.keys()) if options.mcp_servers else []
         max_attempts = DEFAULT_MAX_ATTEMPTS
 
+        # Phase F3: allocate the stderr buffer once outside the retry loop;
+        # truncate it at the start of each attempt and close it exactly
+        # once after the loop. Previously the SpooledTemporaryFile was
+        # created inside the loop body and a per-iteration `finally`
+        # cleaned it up, so each retry re-allocated state.
+        stderr_fileobj = tempfile.SpooledTemporaryFile(
+            max_size=1024 * 1024, mode="w+b", prefix="claude_stderr_"
+        )
+        options.debug_stderr = stderr_fileobj
+        options.extra_args = {"debug-to-stderr": None}
+
         for attempt in range(TRANSIENT_MAX_ATTEMPTS):
             if attempt >= max_attempts:
                 break
 
-            stderr_fileobj = None
             stderr_path: str | None = None
             try:
-                # In-memory buffer that spills to disk only when >1MB.
-                # Avoids creating a new tempfile per attempt.
-                stderr_fileobj = tempfile.SpooledTemporaryFile(
-                    max_size=1024 * 1024, mode="w+b", prefix="claude_stderr_"
-                )
-                options.debug_stderr = stderr_fileobj
-                options.extra_args = {"debug-to-stderr": None}
+                # Reset the reused stderr buffer to empty for this attempt.
+                stderr_fileobj.seek(0)
+                stderr_fileobj.truncate()
 
                 timeout = TIMEOUT
                 if attempt == 0 and options.resume:
@@ -452,9 +458,13 @@ async def call_with_tools(
                             for block in msg.content:
                                 if isinstance(block, ThinkingBlock) and block.thinking:
                                     summary = block.thinking[:200].replace("\n", " ")
-                                    log.info("[ch=%d] 💭 thinking: %s%s",
-                                             channel_id, summary,
-                                             "…" if len(block.thinking) > 200 else "")
+                                    # F1: demote per-block stream logs to DEBUG.
+                                    # A 30-turn task with 5 tools/turn produced
+                                    # 150+ log.info lines on the hot path; the
+                                    # default logger writes synchronously.
+                                    log.debug("[ch=%d] 💭 thinking: %s%s",
+                                              channel_id, summary,
+                                              "…" if len(block.thinking) > 200 else "")
                                     if status_callback:
                                         await status_callback(f"💭 {summary}")
 
@@ -463,8 +473,9 @@ async def call_with_tools(
                                     # Summarize input (truncate large payloads)
                                     inp = str(block.input) if block.input else ""
                                     inp_summary = inp[:200] + ("…" if len(inp) > 200 else "")
-                                    log.info("[ch=%d] 🔧 tool_use #%d: %s(%s)",
-                                             channel_id, tool_count, block.name, inp_summary)
+                                    # F1: per-block log → DEBUG (was INFO).
+                                    log.debug("[ch=%d] 🔧 tool_use #%d: %s(%s)",
+                                              channel_id, tool_count, block.name, inp_summary)
                                     # Discord status: tool name + short input hint
                                     if status_callback:
                                         hint = _tool_input_hint(block.name, block.input)
@@ -474,9 +485,10 @@ async def call_with_tools(
 
                                 elif isinstance(block, TextBlock) and block.text:
                                     preview = block.text[:150].replace("\n", " ")
-                                    log.info("[ch=%d] 📝 text: %s%s",
-                                             channel_id, preview,
-                                             "…" if len(block.text) > 150 else "")
+                                    # F1: per-block log → DEBUG (was INFO).
+                                    log.debug("[ch=%d] 📝 text: %s%s",
+                                              channel_id, preview,
+                                              "…" if len(block.text) > 150 else "")
                                     if status_callback:
                                         await status_callback(f"📝 応答を生成中")
 
@@ -487,9 +499,10 @@ async def call_with_tools(
                                     status = "❌ error" if block.is_error else "✅ ok"
                                     content_str = str(block.content) if block.content else ""
                                     preview = content_str[:200].replace("\n", " ")
-                                    log.info("[ch=%d] 📨 tool_result [%s]: %s%s",
-                                             channel_id, status, preview,
-                                             "…" if len(content_str) > 200 else "")
+                                    # F1: per-block log → DEBUG (was INFO).
+                                    log.debug("[ch=%d] 📨 tool_result [%s]: %s%s",
+                                              channel_id, status, preview,
+                                              "…" if len(content_str) > 200 else "")
                                     if status_callback:
                                         if block.is_error:
                                             await status_callback(f"❌ ツールエラー")
@@ -516,8 +529,9 @@ async def call_with_tools(
 
             except TimeoutError:
                 stderr_tail = _read_stderr_buffer(stderr_fileobj)
-                _cleanup_stderr(stderr_fileobj)
-                stderr_fileobj = None
+                # Phase F3: don't close the buffer here — it's reused on
+                # `continue` and closed once after the loop (or before
+                # an early `return` below).
                 if stderr_tail:
                     log.warning("SDK timeout (attempt %d) stderr tail:\n%s", attempt + 1, stderr_tail)
 
@@ -534,12 +548,12 @@ async def call_with_tools(
                     options.resume = None
                     await asyncio.sleep(BASE_BACKOFF_S)
                     continue
+                _cleanup_stderr(stderr_fileobj)
                 return f"⏰ タイムアウトしました（{TIMEOUT // 60}分制限）", None
 
             except Exception as e:
                 stderr_tail = _read_stderr_buffer(stderr_fileobj)
-                _cleanup_stderr(stderr_fileobj)
-                stderr_fileobj = None
+                # See TimeoutError handler — single cleanup at loop exit.
 
                 err_str = str(e)[:500]
                 error_type = _classify_error(err_str, stderr_tail)
@@ -583,6 +597,7 @@ async def call_with_tools(
                         options.resume = None
                         await asyncio.sleep(BASE_BACKOFF_S)
                         continue
+                    _cleanup_stderr(stderr_fileobj)
                     return _error_message(error_type), None
 
                 # Clear broken session
@@ -593,6 +608,7 @@ async def call_with_tools(
                 options.resume = None
 
                 if attempt >= max_attempts - 1:
+                    _cleanup_stderr(stderr_fileobj)
                     return _error_message(error_type), None
 
                 backoff = min(BASE_BACKOFF_S * (2 ** attempt), MAX_BACKOFF_S)
@@ -601,8 +617,10 @@ async def call_with_tools(
                     await status_callback(f"🔄 リトライ中... ({attempt + 1}/{max_attempts})")
                 await asyncio.sleep(backoff)
 
-            finally:
-                _cleanup_stderr(stderr_fileobj)
+        # Phase F3: single cleanup after the retry loop exits normally.
+        # Each `return` path inside the loop above already cleaned up before
+        # returning, so we only need this for the success-break case.
+        _cleanup_stderr(stderr_fileobj)
 
         if response_text is None:
             return "(No response from Claude)", None
