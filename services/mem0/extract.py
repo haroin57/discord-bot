@@ -89,6 +89,31 @@ async def _classify_for_metadata(messages: list[dict]) -> dict:
 # them with infer=False. This replaces Mem0's built-in (English `Prefers ~`)
 # extractor for the senpai user_id, fixing dedup bloat + multi-speaker mixing.
 # ---------------------------------------------------------------------------
+# XML-block closing tags an attacker could embed in user_text/assistant_text/context_hint
+# to "break out" of the fenced block in _EXTRACT_PROMPT below. We strip these before format().
+_EXTRACT_XML_BREAKOUT_TAGS = (
+    "</context_hint>",
+    "</user_text>",
+    "</assistant_text>",
+)
+
+
+def _strip_extract_breakout_tags(s: str) -> str:
+    """Remove XML closing tags an attacker might use to escape the prompt template.
+
+    Case-insensitive; preserves all other content. Safe to apply to legitimate
+    user text because these exact tag literals are not natural Japanese/English.
+    """
+    if not s:
+        return s
+    out = s
+    for tag in _EXTRACT_XML_BREAKOUT_TAGS:
+        # Case-insensitive replace via re for robustness
+        import re as _re
+        out = _re.sub(_re.escape(tag), "", out, flags=_re.IGNORECASE)
+    return out
+
+
 _EXTRACT_PROMPT = """以下の会話ターンから、長期記憶として保存すべき「先輩(本人)に関する事実」だけを抽出してください。
 
 <context_hint>
@@ -138,9 +163,9 @@ async def extract_facts_for_self(
             model=MEM0_GATE_MODEL,
             max_tokens=600,
             messages=[{"role": "user", "content": _EXTRACT_PROMPT.format(
-                context_hint=(context_hint or "(none)")[:1000],
-                user_text=(user_text or "")[:2000],
-                assistant_text=(assistant_text or "")[:2000],
+                context_hint=_strip_extract_breakout_tags(context_hint or "(none)")[:1000],
+                user_text=_strip_extract_breakout_tags(user_text or "")[:2000],
+                assistant_text=_strip_extract_breakout_tags(assistant_text or "")[:2000],
             )}],
         )
         text = resp.content[0].text.strip()

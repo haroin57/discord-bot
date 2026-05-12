@@ -53,12 +53,19 @@ async def add_memories(
         await ensure_valid_token()
         _refresh_mem0_client_token()
         import time as _time
+        # Caller-supplied metadata is allowlisted before merging so it cannot
+        # overwrite trust-relevant keys (gate_version, timestamp, importance,
+        # category, tags). New caller-controlled keys must be added here
+        # explicitly.
+        _ALLOWED_CALLER_META = {"channel_id", "channel_name", "source"}
         base_meta = {
             "timestamp": int(_time.time()),
             "gate_version": "v2" if MEM0_GATE_ENABLED else "v1",
         }
         if metadata:
-            base_meta.update(metadata)
+            for k, v in metadata.items():
+                if k in _ALLOWED_CALLER_META and k not in base_meta:
+                    base_meta[k] = v
 
         # ── 2. Gate path (P2): Haiku → filter → infer=False raw insert ──
         if MEM0_GATE_ENABLED:
@@ -106,10 +113,18 @@ async def add_memories(
             }}
 
         # ── 3. Legacy path: Mem0 standard fact extraction (fallback) ──
-        legacy_msgs = messages or []
+        # context_hint is INTENTIONALLY excluded from legacy_msgs even when
+        # MEM0_LEGACY_CONTEXT is on. The Phase 1 root cause (other-speaker
+        # contamination) was the system-message channel-history path; we keep
+        # it sealed here regardless of which gate is enabled. Also filter the
+        # caller-supplied `messages` to user/assistant roles only so a future
+        # caller that passes a raw list with role=system can't re-introduce
+        # the contamination vector.
+        if messages:
+            legacy_msgs = [m for m in messages if m.get("role") in ("user", "assistant")]
+        else:
+            legacy_msgs = []
         if not legacy_msgs:
-            if context_hint:
-                legacy_msgs.append({"role": "system", "content": context_hint})
             if user_text:
                 legacy_msgs.append({"role": "user", "content": user_text})
             if assistant_text:
