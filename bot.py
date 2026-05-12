@@ -54,6 +54,7 @@ from utils.discord_helpers import (
 )
 from utils.markdown_parser import TextSegment, TableSegment, MathSegment, has_tables, has_math, mask_code_blocks, parse_segments
 from utils.math_renderer import render_math_image
+from utils.response_sanitizer import strip_numeric_inline_code
 from utils.table_renderer import render_table_image
 
 log = logging.getLogger(__name__)
@@ -824,6 +825,12 @@ async def on_message(message: discord.Message):
             is_thread=is_thread,
             has_image_attachment=bool(image_paths),
         )
+
+        # Strip backticks Claude sometimes wraps around pure numeric/currency
+        # tokens (e.g. `746,404`, `300K-`). Discord renders inline code as a
+        # white-boxed block which makes figure-heavy replies hard to read.
+        # Real code (`range(10)`, `os.path`, `/tmp/foo.png`) is preserved.
+        response_text = strip_numeric_inline_code(response_text)
 
         # Cancel any pending delayed status edit before deleting the message.
         pending_status_task = _pending_status.get("task")
