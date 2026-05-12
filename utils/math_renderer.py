@@ -215,7 +215,10 @@ try {{
   katex.render({latex_json}, document.getElementById('math-target'), {{
     displayMode: {display_mode},
     throwOnError: false,
-    trust: true,
+    // trust: false (KaTeX default) prevents \\href, \\url, \\includegraphics
+    // and \\htmlClass from receiving attacker-controlled values that could
+    // execute javascript: URLs inside the Puppeteer page.
+    trust: false,
     strict: false,
   }});
 }} catch(e) {{
@@ -240,8 +243,12 @@ async def render_math_image(
     """Render a LaTeX expression as a PNG image. Returns the file path, or None on failure."""
     os.makedirs(output_dir, exist_ok=True)
 
-    # Cache key includes display mode
-    cache_key = f"{latex}:{'display' if display_mode else 'inline'}"
+    # Cache key includes display mode and a template version so a change to
+    # HTML_TEMPLATE / KaTeX options (e.g. trust:true -> trust:false) busts
+    # previously-cached PNGs that may have been rendered with insecure
+    # settings. Bump _TEMPLATE_VERSION on every template/option change.
+    _TEMPLATE_VERSION = "2"  # bumped when trust:true -> trust:false
+    cache_key = f"v{_TEMPLATE_VERSION}:{latex}:{'display' if display_mode else 'inline'}"
     math_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
     out_path = os.path.join(output_dir, f"math_{math_hash}.png")
 
