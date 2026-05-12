@@ -110,6 +110,9 @@ class BrowserDaemon:
                     self._read_response(proc, request_id),
                     timeout=self.render_timeout,
                 )
+            except asyncio.CancelledError:
+                await asyncio.shield(self._kill_process())
+                raise
             except Exception:
                 await self._kill_process()
                 raise
