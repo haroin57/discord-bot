@@ -22,15 +22,23 @@ jobs:
             pip install -r requirements.txt
           fi
           pip install -r requirements-dev.txt 2>/dev/null || true
-      - name: pytest (security-focused subset)
+      - name: pytest (security + SRE focused suite)
         env:
           DISCORD_TOKEN: dummy_test_token
           ADMIN_USER_IDS: "1234567890"
         run: |
+          # Include SRE remediation tests (signal handler, atomic write,
+          # health snapshot, structured log, render cleanup, etc.) so
+          # the C/H fixes have CI coverage going forward.
           pytest tests/test_attachments.py tests/test_web_api.py \
                  tests/test_session.py tests/test_sentinel.py \
                  tests/test_rate_limit.py tests/test_mem0_extract_format.py \
                  tests/test_mem0_search.py tests/test_discord_helpers.py \
+                 tests/test_correlation.py tests/test_correlation_integration.py \
+                 tests/test_health.py tests/test_structured_log.py \
+                 tests/test_render_cleanup.py tests/test_sre_critical_integration.py \
+                 tests/test_git_hooks.py tests/test_backup_state.py \
+                 tests/test_oauth_manager.py tests/test_main_async.py \
                  -x -q
       - name: Conflict-marker scan
         run: |

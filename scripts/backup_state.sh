@@ -13,6 +13,20 @@ BACKUP_ROOT="${HOME}/.local/state/discord-bot/backups"
 DATE="$(date +%F)"
 DEST="${BACKUP_ROOT}/${DATE}"
 
+mkdir -p "${BACKUP_ROOT}"
+chmod 700 "${BACKUP_ROOT}"
+
+# M-2: prevent two concurrent cron-fired instances from racing on the
+# rotation tail-rm or rsync target. flock -n exits non-zero immediately
+# if another instance already holds the lock; we treat that as a clean
+# no-op so cron doesn't keep firing failure mail.
+LOCK_FILE="${BACKUP_ROOT}/backup.lock"
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+    echo "[$(date -Iseconds)] another backup is running; exiting"
+    exit 0
+fi
+
 mkdir -p "${DEST}"
 chmod 700 "${DEST}"
 

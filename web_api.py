@@ -36,6 +36,14 @@ from config import (
 from services.claude_sdk import call_with_tools
 from services.prompt_builder import PromptBuilder
 from services.session import load_history_channel, load_sessions, update_session
+try:
+    from services.correlation import new_request_id, get_request_id
+except ImportError:  # pragma: no cover — defensive fallback
+    def new_request_id() -> str:
+        return ""
+
+    def get_request_id() -> str:
+        return ""
 
 log = logging.getLogger(__name__)
 
@@ -64,8 +72,11 @@ class WebAPI:
 
         # session_token -> {discord_id, username, ...}
         self._session_cache: dict[str, dict] = {}
-        # session_token -> asyncio.Lock (SRE-C6: dedup concurrent misses)
-        self._verify_locks: dict[str, asyncio.Lock] = {}
+        # session_token -> asyncio.Lock (SRE-C6: dedup concurrent misses).
+        # OrderedDict so eviction is FIFO insert-order, not arbitrary; we
+        # only evict on insert so an in-progress lock holder can never have
+        # its lock dropped mid-await (review H-SEC-2).
+        self._verify_locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
         # discord_id (str) -> last request epoch seconds
         self._cooldowns: OrderedDict[str, float] = OrderedDict()
         # discord_id (str) -> list[float] of request timestamps within quota window
@@ -107,17 +118,26 @@ class WebAPI:
         self._session_cache.pop(token, None)
         return web.json_response({"invalidated": existed})
 
-    # SRE-C7: health endpoint
+    # SRE-C7: health endpoint. Delegates to services.health for the rich
+    # subsystem snapshot (discord + oauth + mem0) and decorates with
+    # web-specific fields (active_connections).
     async def _handle_health(self, request: web.Request) -> web.Response:
-        discord_ok = self.bot.is_ready() if self.bot else False
-        uptime = time.time() - self._started_at if self._started_at else 0
-        status = "ok" if discord_ok else "degraded"
-        return web.json_response({
-            "status": status,
-            "discord_connected": discord_ok,
-            "uptime_s": int(uptime),
-            "active_connections": len(self._sid_to_user),
-        })
+        try:
+            from services.health import get_health_snapshot
+            snap = get_health_snapshot(bot=self.bot)
+        except Exception as exc:  # pragma: no cover — health must never fail hard
+            log.warning("get_health_snapshot failed, using minimal fallback: %s", exc)
+            discord_ok = self.bot.is_ready() if self.bot else False
+            uptime = int(time.time() - self._started_at) if self._started_at else 0
+            snap = {
+                "status": "ok" if discord_ok else "degraded",
+                "uptime_s": uptime,
+                "subsystems": {"discord": {"ok": discord_ok}},
+            }
+        # Decorate with web-specific stats
+        snap["active_connections"] = len(self._sid_to_user)
+        status_code = 200 if snap.get("status") == "ok" else 503
+        return web.json_response(snap, status=status_code)
 
     async def start(self, port: int = WEB_API_PORT, host: str = WEB_API_HOST) -> None:
         self._http = aiohttp.ClientSession()
@@ -175,12 +195,29 @@ class WebAPI:
         if hit is not None:
             return hit
 
-        # SRE-C6: bound _verify_locks to 1000 entries with LRU eviction
-        lock = self._verify_locks.setdefault(session_token, asyncio.Lock())
-        if len(self._verify_locks) > 1000:
-            overflow = list(self._verify_locks.keys())[:-1000]
-            for k in overflow:
-                self._verify_locks.pop(k, None)
+        # SRE-C6 / H-SEC-2: bound _verify_locks to 1000 entries with
+        # insert-only FIFO eviction. Never evict the lock we are about to
+        # acquire, and never evict a lock that another coroutine is already
+        # awaiting (acquired) — only evict the OLDEST unlocked entries.
+        existed = session_token in self._verify_locks
+        if existed:
+            lock = self._verify_locks[session_token]
+            self._verify_locks.move_to_end(session_token)
+        else:
+            # Evict before insert so the new lock is the most recently
+            # touched and is never selected for eviction in this pass.
+            while len(self._verify_locks) >= 1000:
+                oldest_key, oldest_lock = next(iter(self._verify_locks.items()))
+                if oldest_lock.locked():
+                    # Skip locked entries — they have a coroutine awaiting them
+                    self._verify_locks.move_to_end(oldest_key)
+                    # If every entry is locked we just live with >1000 momentarily
+                    if all(v.locked() for v in self._verify_locks.values()):
+                        break
+                    continue
+                self._verify_locks.popitem(last=False)
+            lock = asyncio.Lock()
+            self._verify_locks[session_token] = lock
 
         async with lock:
             # Check cache again — another coroutine may have populated it while we waited
@@ -446,6 +483,9 @@ class WebAPI:
         @sio.event
         async def send_message(sid, data):
             """Process a user message through Claude and stream status back."""
+            # M-1: set per-request correlation ID so downstream logs from
+            # call_with_tools, mem0, etc. all carry rid=XXXX.
+            new_request_id()
             user_info = self._sid_to_user.get(sid)
             if not user_info:
                 await sio.emit("error", {"message": "not authenticated"}, to=sid)

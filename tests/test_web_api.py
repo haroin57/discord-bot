@@ -971,18 +971,27 @@ async def test_health_endpoint_returns_ok_when_bot_ready():
 
     api = make_web_api()
     api.bot.is_ready = MagicMock(return_value=True)
+    # latency must be a real float for services.health._check_discord
+    api.bot.latency = 0.05
     api._started_at = time.time() - 10
 
     # Register route directly on the app (bypassing start())
     api.app.router.add_get("/health", api._handle_health)
 
-    async with TestClient(TestServer(api.app)) as client:
-        resp = await client.get("/health")
-        assert resp.status == 200
-        body = await resp.json()
-        assert body["status"] == "ok"
-        assert body["discord_connected"] is True
-        assert body["uptime_s"] >= 10
+    # Patch oauth + mem0 subsystem checks to return ok so overall status="ok"
+    with patch("services.health._check_oauth", return_value={"ok": True}), \
+         patch("services.health._check_mem0", return_value={"ok": True}):
+        async with TestClient(TestServer(api.app)) as client:
+            resp = await client.get("/health")
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["status"] == "ok"
+            # New schema (M-4): subsystems.discord.ok replaces discord_connected
+            assert body["subsystems"]["discord"]["ok"] is True
+            # uptime_s now comes from services.health module-level _started_at
+            # (set at import time), so we just assert it's non-negative.
+            assert body["uptime_s"] >= 0
+            assert body["active_connections"] == 0
 
 
 # ---------------------------------------------------------------------------
