@@ -226,6 +226,60 @@ class TestSaveCredentials:
         # Content must be unchanged (write refused)
         assert creds_file.read_text() == original_content
 
+    def test_refuses_insecure_dir(self, tmp_path, monkeypatch):
+        """Lines 157-158: refuse when the credentials dir itself is not private."""
+        import services.oauth_manager as om
+
+        insecure_dir = tmp_path / ".claude"
+        insecure_dir.mkdir()
+        os.chmod(insecure_dir, 0o755)  # group/other readable — must be refused
+        creds_file = insecure_dir / ".credentials.json"
+        monkeypatch.setattr(om, "CREDENTIALS_PATH", str(creds_file))
+
+        # File does not exist yet; the dir check must fire first and return early.
+        om._save_credentials("a", "r", 9999)
+        assert not creds_file.exists()
+
+    def test_atomic_write_cleans_up_tmp_on_error(self, tmp_path, monkeypatch):
+        """Lines 187-192: BaseException during os.replace cleans up the tempfile."""
+        import services.oauth_manager as om
+
+        creds_dir = _make_creds_dir(tmp_path)
+        creds_file = creds_dir / ".credentials.json"
+        monkeypatch.setattr(om, "CREDENTIALS_PATH", str(creds_file))
+
+        def bad_replace(src, dst):
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr(os, "replace", bad_replace)
+
+        # Should not raise — the outer except catches it.
+        om._save_credentials("a", "r", 9999)
+
+        # The tempfile must have been cleaned up.
+        remaining_tmps = list(creds_dir.glob("*.tmp"))
+        assert remaining_tmps == [], f"Leftover tempfiles: {remaining_tmps}"
+
+    def test_atomic_write_unlink_oserror_is_swallowed(self, tmp_path, monkeypatch):
+        """Lines 190-191: OSError from os.unlink inside cleanup is silently ignored."""
+        import services.oauth_manager as om
+
+        creds_dir = _make_creds_dir(tmp_path)
+        creds_file = creds_dir / ".credentials.json"
+        monkeypatch.setattr(om, "CREDENTIALS_PATH", str(creds_file))
+
+        def bad_replace(src, dst):
+            raise OSError("replace failed")
+
+        def bad_unlink(path):
+            raise OSError("unlink also failed")
+
+        monkeypatch.setattr(os, "replace", bad_replace)
+        monkeypatch.setattr(os, "unlink", bad_unlink)
+
+        # Both os.replace and os.unlink fail — outer except must still swallow it.
+        om._save_credentials("a", "r", 9999)  # must not raise
+
 
 # ---------------------------------------------------------------------------
 # refresh_token

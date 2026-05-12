@@ -3,6 +3,7 @@
 import asyncio
 import io
 import json
+import logging
 import os
 import time
 from collections import OrderedDict
@@ -211,6 +212,9 @@ class TestOnMessage:
         monkeypatch.setattr("bot.BOT_KEYWORDS", ["かなえ"])
         monkeypatch.setattr("bot.BOT_ROLE_IDS", set())
         monkeypatch.setattr("bot.MAX_COOLDOWN_ENTRIES", 1000)
+        # Always use local fallback in unit tests so the shared rate_limit
+        # module state doesn't bleed between tests.
+        monkeypatch.setattr("bot._USE_SHARED_RATE_LIMIT", False)
 
         # Mock bot.user — it's a property on discord.Client, so we patch at class level
         self._mock_bot_user = MagicMock()
@@ -932,18 +936,22 @@ class TestMain:
 class TestSessionAdditional:
     """Additional tests for services/session.py to improve coverage."""
 
+    # Use valid Discord-range channel IDs (10^14 <= id <= 10^19)
+    _CH1 = 100000000000000042  # 10^14 + 42
+    _CH2 = 100000000000000043  # 10^14 + 43
+
     def test_load_history_skips_blank_lines(self, tmp_state_dir):
         """Line 72: blank lines in JSONL are skipped."""
         from services.session import load_history_channel, _history_file
 
-        path = _history_file(42)
+        path = _history_file(self._CH1)
         with open(path, "w", encoding="utf-8") as f:
             f.write('{"role":"user","content":"hello"}\n')
             f.write("\n")  # blank line
             f.write("   \n")  # whitespace-only line
             f.write('{"role":"assistant","content":"hi"}\n')
 
-        msgs = load_history_channel(42)
+        msgs = load_history_channel(self._CH1)
         assert len(msgs) == 2
         assert msgs[0]["content"] == "hello"
         assert msgs[1]["content"] == "hi"
@@ -952,14 +960,14 @@ class TestSessionAdditional:
         """Line 77-78: JSONDecodeError lines are skipped."""
         from services.session import load_history_channel, _history_file
 
-        path = _history_file(43)
+        path = _history_file(self._CH2)
         with open(path, "w", encoding="utf-8") as f:
             f.write('{"role":"user","content":"good"}\n')
             f.write("this is not json\n")
             f.write("{broken json\n")
             f.write('{"role":"assistant","content":"also good"}\n')
 
-        msgs = load_history_channel(43)
+        msgs = load_history_channel(self._CH2)
         assert len(msgs) == 2
 
     # `load_all_history` / `LazyHistory` were removed in Phase D (perf overhaul).
@@ -1004,21 +1012,24 @@ class TestSessionAdditional:
         # After removing dangling user at end, then removing leading assistant
         assert h == []
 
+    _CH_MISSING = 100000000000099999  # guaranteed non-existent in tmp dir
+    _CH_APPEND = 100000000000000050
+
     def test_load_history_empty_channel_returns_empty(self, tmp_state_dir):
         """load_history_channel for nonexistent file returns []."""
         from services.session import load_history_channel
-        assert load_history_channel(99999) == []
+        assert load_history_channel(self._CH_MISSING) == []
 
     def test_append_jsonl_adds_timestamp(self, tmp_state_dir):
         """append_jsonl adds timestamp and channel_id fields."""
         from services.session import append_jsonl, _history_file
 
-        append_jsonl(50, {"role": "user", "content": "test"})
-        path = _history_file(50)
+        append_jsonl(self._CH_APPEND, {"role": "user", "content": "test"})
+        path = _history_file(self._CH_APPEND)
         with open(path) as f:
             entry = json.loads(f.readline())
         assert "timestamp" in entry
-        assert entry["channel_id"] == 50
+        assert entry["channel_id"] == self._CH_APPEND
 
 
 # ---------------------------------------------------------------------------
@@ -1150,16 +1161,19 @@ async def test_tree_sync_only_runs_once():
     import bot
 
     bot._tree_synced = False
+    bot._cleanup_scheduled = True  # skip cleanup branch
 
     mock_tree_sync = AsyncMock(return_value=[MagicMock(), MagicMock()])
-    mock_guilds = []
+    mock_tree = MagicMock()
+    mock_tree.sync = mock_tree_sync
 
-    with patch.object(bot.bot, "guilds", mock_guilds), \
-         patch.object(bot.bot, "tree") as mock_tree, \
-         patch("bot.build_mention_regex"), \
-         patch("bot._cleanup_scheduled", True):  # skip cleanup branch
-        mock_tree.sync = mock_tree_sync
+    mock_bot_user = MagicMock()
+    mock_bot_user.id = 88888
 
+    with patch.object(type(bot.bot), "guilds", new_callable=PropertyMock, return_value=[]), \
+         patch.object(type(bot.bot), "user", new_callable=PropertyMock, return_value=mock_bot_user), \
+         patch.object(type(bot.bot), "tree", new_callable=PropertyMock, return_value=mock_tree), \
+         patch("bot.build_mention_regex"):
         await bot.on_ready()
         await bot.on_ready()
 
@@ -1169,6 +1183,7 @@ async def test_tree_sync_only_runs_once():
 
     # Reset for other tests
     bot._tree_synced = False
+    bot._cleanup_scheduled = False
 
 
 def test_attachments_capped_at_10():
@@ -1191,3 +1206,302 @@ def test_attachments_capped_at_10():
         reply_files = reply_files[:10]
 
     assert len(reply_files) == 10, f"Chunk-reply cap failed: got {len(reply_files)} files"
+
+
+# ---------------------------------------------------------------------------
+# Additional on_message coverage — admin paths and non-admin quota
+# ---------------------------------------------------------------------------
+class TestOnMessageAdminAndQuota:
+    """Cover admin file attachment, non-admin quota, and delete command paths."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_bot_state(self, monkeypatch):
+        import bot
+        bot.cooldowns.clear()
+        bot._channel_semas.clear()
+        bot._daily_quota.clear()
+        monkeypatch.setattr("bot.COOLDOWN_SECONDS", 5)
+        monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345})
+        monkeypatch.setattr("bot.BOT_KEYWORDS", ["かなえ"])
+        monkeypatch.setattr("bot.BOT_ROLE_IDS", set())
+        monkeypatch.setattr("bot.MAX_COOLDOWN_ENTRIES", 1000)
+        monkeypatch.setattr("bot._USE_SHARED_RATE_LIMIT", False)
+
+        self._mock_bot_user = MagicMock()
+        self._mock_bot_user.id = 99900
+        self._user_patcher = patch.object(
+            type(bot.bot), "user", new_callable=PropertyMock, return_value=self._mock_bot_user
+        )
+        self._user_patcher.start()
+        yield
+        self._user_patcher.stop()
+
+    async def _dispatch(self, message):
+        import bot
+        await bot.bot.on_message(message)
+
+    @pytest.mark.asyncio
+    async def test_non_admin_gets_quota_denied(self, monkeypatch):
+        """Non-admin user hitting daily quota gets rejection message."""
+        import bot
+        monkeypatch.setattr("bot.ADMIN_USER_IDS", set())
+        monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 1)
+
+        # Exhaust quota for user 55555
+        bot._daily_quota[55555] = [time.time()]
+
+        msg = _make_message(content="かなえ hi", author_id=55555)
+        await self._dispatch(msg)
+
+        calls = msg.reply.call_args_list
+        assert any("上限" in str(c) or "quota" in str(c).lower() for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_delete_command_non_admin_rejected(self, monkeypatch):
+        """Non-admin sending delete command gets access denied."""
+        import bot
+        monkeypatch.setattr("bot.ADMIN_USER_IDS", {99999})  # 12345 is NOT admin
+
+        ref = MagicMock()
+        ref.message_id = 100
+        ref.cached_message = None
+        msg = _make_message(content="削除", author_id=12345, is_dm=True, reference=ref)
+        msg.channel = MagicMock(spec=discord.DMChannel)
+        msg.channel.id = 77777
+
+        await self._dispatch(msg)
+
+        calls = msg.reply.call_args_list
+        assert any("admin" in str(c).lower() or "❌" in str(c) for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_delete_command_admin_success(self, monkeypatch):
+        """Admin delete command deletes the referenced message."""
+        import bot
+        monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345})
+
+        ref_msg = AsyncMock()
+        ref_msg.id = 200
+        ref_msg.delete = AsyncMock()
+
+        ref = MagicMock()
+        ref.message_id = 200
+        ref.cached_message = ref_msg
+
+        msg = _make_message(content="削除", author_id=12345, is_dm=True, reference=ref)
+        msg.channel = MagicMock(spec=discord.DMChannel)
+        msg.channel.id = 77777
+        msg.delete = AsyncMock()
+
+        await self._dispatch(msg)
+
+        ref_msg.delete.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_non_admin_cooldown_uses_restricted_seconds(self, monkeypatch):
+        """Non-admin uses RESTRICTED_COOLDOWN_SECONDS, not COOLDOWN_SECONDS."""
+        import bot
+        monkeypatch.setattr("bot.ADMIN_USER_IDS", set())
+        monkeypatch.setattr("bot.RESTRICTED_COOLDOWN_SECONDS", 120)
+
+        # Place a fresh cooldown for non-admin user
+        bot.cooldowns[55555] = time.time()
+
+        msg = _make_message(content="かなえ hi", author_id=55555)
+        await self._dispatch(msg)
+
+        calls = msg.reply.call_args_list
+        assert any("⏳" in str(c) for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_admin_file_attached_in_response(self, monkeypatch):
+        """Admin response with file path attaches the file."""
+        import bot
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp.write(b"fake-png-data")
+            tmp_path = tmp.name
+
+        try:
+            msg = _make_message(content="かなえ hello", author_id=12345)
+
+            with patch("bot.strip_mention", return_value="hello"), \
+                 patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("see " + tmp_path, None)), \
+                 patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+                 patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+                 patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
+                 patch("bot.extract_image_paths", return_value=[tmp_path]), \
+                 patch("bot.extract_file_paths", return_value=[]), \
+                 patch("bot.normalize_image_filenames", side_effect=lambda x: x), \
+                 patch("bot.is_attach_ignored", return_value=False), \
+                 patch("bot.split_message", return_value=["see " + tmp_path]), \
+                 patch("bot.cleanup_attachments"), \
+                 patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+                 patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+                await self._dispatch(msg)
+
+                calls = msg.reply.call_args_list
+                assert any(c.kwargs.get("files") for c in calls)
+        finally:
+            os.unlink(tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_text_attachment_included_in_prompt(self, monkeypatch):
+        """Text attachments are included in the prompt."""
+        import bot
+
+        msg = _make_message(content="かなえ hello", author_id=12345)
+        captured_prompt = None
+
+        async def capture_call(prompt, *args, **kwargs):
+            nonlocal captured_prompt
+            captured_prompt = prompt
+            return ("ok", None)
+
+        with patch("bot.strip_mention", return_value="hello"), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.download_text_attachments", new_callable=AsyncMock, return_value=[("notes.txt", "secret content")]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+
+        assert captured_prompt is not None
+        assert "notes.txt" in captured_prompt
+        assert "secret content" in captured_prompt
+
+    @pytest.mark.asyncio
+    async def test_cooldown_eviction_bounded(self, monkeypatch):
+        """MAX_COOLDOWN_ENTRIES is respected by removing oldest entries."""
+        import bot
+        monkeypatch.setattr("bot.MAX_COOLDOWN_ENTRIES", 3)
+
+        for uid in [100, 200, 300]:
+            bot.cooldowns[uid] = time.time() - 1
+
+        msg = _make_message(content="かなえ hello", author_id=400)
+
+        with patch("bot.strip_mention", return_value="hello"), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+
+        assert len(bot.cooldowns) <= 3
+        assert 400 in bot.cooldowns
+
+
+# ---------------------------------------------------------------------------
+# _check_daily_quota unit tests
+# ---------------------------------------------------------------------------
+class TestCheckDailyQuota:
+    def test_allows_when_quota_disabled(self, monkeypatch):
+        import bot
+        monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 0)
+        allowed, remaining = bot._check_daily_quota(99999)
+        assert allowed is True
+        assert remaining == -1
+
+    def test_denies_when_quota_exhausted(self, monkeypatch):
+        import bot
+        monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 2)
+        bot._daily_quota.clear()
+        bot._daily_quota[77777] = [time.time(), time.time()]
+        allowed, remaining = bot._check_daily_quota(77777)
+        assert allowed is False
+        assert remaining == 0
+        bot._daily_quota.clear()
+
+    def test_counts_down_remaining(self, monkeypatch):
+        import bot
+        monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 3)
+        bot._daily_quota.clear()
+        allowed, remaining = bot._check_daily_quota(88888)
+        assert allowed is True
+        assert remaining == 2  # used 1 of 3
+        bot._daily_quota.clear()
+
+    def test_evicts_expired_entries(self, monkeypatch):
+        import bot
+        monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 5)
+        bot._daily_quota.clear()
+        # Old entry outside the 24h window
+        bot._daily_quota[11111] = [time.time() - 90000]
+        allowed, remaining = bot._check_daily_quota(11111)
+        assert allowed is True
+        assert remaining == 4  # the expired entry was evicted
+        bot._daily_quota.clear()
+
+
+# ---------------------------------------------------------------------------
+# _cap_text unit tests
+# ---------------------------------------------------------------------------
+class TestCapText:
+    def test_no_truncation_when_under_limit(self):
+        from bot import _cap_text
+        assert _cap_text("hello", 10) == "hello"
+
+    def test_truncation_when_over_limit(self):
+        from bot import _cap_text
+        result = _cap_text("hello world", 5)
+        assert result.startswith("hello")
+        assert "truncated" in result
+
+    def test_exact_limit_not_truncated(self):
+        from bot import _cap_text
+        assert _cap_text("hello", 5) == "hello"
+
+
+# ---------------------------------------------------------------------------
+# _wrap_untrusted unit tests
+# ---------------------------------------------------------------------------
+class TestWrapUntrusted:
+    def test_wraps_in_xml_tag(self):
+        from bot import _wrap_untrusted
+        result = _wrap_untrusted("some text")
+        assert "<untrusted_user_input>" in result
+        assert "some text" in result
+        assert "</untrusted_user_input>" in result
+
+
+# ---------------------------------------------------------------------------
+# _get_channel_sema LRU eviction
+# ---------------------------------------------------------------------------
+class TestGetChannelSema:
+    def test_creates_semaphore_for_new_channel(self):
+        import bot
+        bot._channel_semas.clear()
+        sema = bot._get_channel_sema(12345)
+        assert sema is not None
+        assert 12345 in bot._channel_semas
+        bot._channel_semas.clear()
+
+    def test_reuses_existing_semaphore(self):
+        import bot
+        bot._channel_semas.clear()
+        s1 = bot._get_channel_sema(111)
+        s2 = bot._get_channel_sema(111)
+        assert s1 is s2
+        bot._channel_semas.clear()
+
+    def test_lru_eviction_when_over_limit(self, monkeypatch):
+        import bot
+        monkeypatch.setattr("bot.MAX_CHANNEL_SEMAS", 2)
+        bot._channel_semas.clear()
+        bot._get_channel_sema(1)
+        bot._get_channel_sema(2)
+        bot._get_channel_sema(3)  # should evict channel 1 (oldest, not locked)
+        assert 1 not in bot._channel_semas
+        bot._channel_semas.clear()

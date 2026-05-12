@@ -2,17 +2,25 @@
 
 import asyncio
 import os
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from utils.attachments import (
     _basename_is_secret,
+    _has_image_magic,
+    _host_is_allowed,
     cleanup_attachments,
+    cleanup_attachments_async,
     cleanup_stale_attachments,
     download_attachments,
+    download_text_attachments,
     extract_file_paths,
     extract_image_paths,
+    is_attach_ignored,
+    normalize_image_filenames,
+    strip_attached_paths,
     IMAGE_CONTENT_TYPES,
 )
 
@@ -228,6 +236,431 @@ class TestDownloadAttachments:
             att = self._make_attachment(content_type=ct)
             # Just verify it's recognized as an image
             assert ct in IMAGE_CONTENT_TYPES
+
+
+class TestHostIsAllowed:
+    def test_discord_cdn_allowed(self):
+        assert _host_is_allowed("https://cdn.discordapp.com/attachments/1/2/test.png")
+
+    def test_media_discord_allowed(self):
+        assert _host_is_allowed("https://media.discordapp.net/attachments/1/2/test.png")
+
+    def test_http_rejected(self):
+        assert not _host_is_allowed("http://cdn.discordapp.com/attachments/1/2/test.png")
+
+    def test_non_discord_host_rejected(self):
+        assert not _host_is_allowed("https://evil.example.com/malware.png")
+
+    def test_empty_string(self):
+        assert not _host_is_allowed("")
+
+    def test_localhost_rejected(self):
+        assert not _host_is_allowed("https://localhost/secret")
+
+
+class TestHasImageMagic:
+    def test_valid_png(self, tmp_path):
+        f = tmp_path / "a.png"
+        f.write_bytes(_MAGIC["png"])
+        assert _has_image_magic(str(f))
+
+    def test_valid_jpeg(self, tmp_path):
+        f = tmp_path / "a.jpg"
+        f.write_bytes(_MAGIC["jpg"])
+        assert _has_image_magic(str(f))
+
+    def test_invalid_content(self, tmp_path):
+        f = tmp_path / "fake.png"
+        f.write_bytes(b"NOT AN IMAGE AT ALL")
+        assert not _has_image_magic(str(f))
+
+    def test_missing_file(self):
+        assert not _has_image_magic("/tmp/does_not_exist_xyz.png")
+
+
+class TestLoadAttachignore:
+    def test_returns_empty_when_file_missing(self, monkeypatch):
+        monkeypatch.setattr("utils.attachments._ATTACHIGNORE_PATH", "/nonexistent/.attachignore")
+        import utils.attachments as ua
+        ua._attachignore_cache = None
+        ua._attachignore_mtime = -1.0
+        from utils.attachments import _load_attachignore
+        result = _load_attachignore()
+        assert result == []
+
+    def test_loads_patterns(self, tmp_path, monkeypatch):
+        afile = tmp_path / ".attachignore"
+        afile.write_text("*.secret\n# comment\n\n*.db\n")
+        monkeypatch.setattr("utils.attachments._ATTACHIGNORE_PATH", str(afile))
+        import utils.attachments as ua
+        ua._attachignore_cache = None
+        ua._attachignore_mtime = -1.0
+        from utils.attachments import _load_attachignore
+        patterns = _load_attachignore()
+        assert "*.secret" in patterns
+        assert "*.db" in patterns
+        assert "# comment" not in patterns
+
+    def test_cache_hit(self, tmp_path, monkeypatch):
+        afile = tmp_path / ".attachignore"
+        afile.write_text("*.key\n")
+        monkeypatch.setattr("utils.attachments._ATTACHIGNORE_PATH", str(afile))
+        import utils.attachments as ua
+        ua._attachignore_cache = None
+        ua._attachignore_mtime = -1.0
+        from utils.attachments import _load_attachignore
+        r1 = _load_attachignore()
+        r2 = _load_attachignore()
+        assert r1 is r2  # same object returned from cache
+
+
+class TestIsAttachIgnored:
+    def test_matches_glob_pattern(self, tmp_path, monkeypatch):
+        afile = tmp_path / ".attachignore"
+        afile.write_text("*.secret\n")
+        monkeypatch.setattr("utils.attachments._ATTACHIGNORE_PATH", str(afile))
+        import utils.attachments as ua
+        ua._attachignore_cache = None
+        ua._attachignore_mtime = -1.0
+        target = tmp_path / "mytoken.secret"
+        target.write_text("x")
+        assert is_attach_ignored(str(target))
+
+    def test_no_match(self, tmp_path, monkeypatch):
+        afile = tmp_path / ".attachignore"
+        afile.write_text("*.secret\n")
+        monkeypatch.setattr("utils.attachments._ATTACHIGNORE_PATH", str(afile))
+        import utils.attachments as ua
+        ua._attachignore_cache = None
+        ua._attachignore_mtime = -1.0
+        target = tmp_path / "report.csv"
+        target.write_text("a,b")
+        assert not is_attach_ignored(str(target))
+
+    def test_empty_patterns(self, monkeypatch):
+        monkeypatch.setattr("utils.attachments._ATTACHIGNORE_PATH", "/nonexistent/.attachignore")
+        import utils.attachments as ua
+        ua._attachignore_cache = None
+        ua._attachignore_mtime = -1.0
+        assert not is_attach_ignored("/home/ubuntu/file.txt")
+
+
+class TestNormalizeImageFilenames:
+    def test_bare_filename_resolved(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments._IMAGE_SEARCH_DIRS", (str(tmp_path),))
+        img = tmp_path / "chart.png"
+        img.write_bytes(_MAGIC["png"])
+        result = normalize_image_filenames("こちらが chart.png です")
+        assert str(img) in result
+
+    def test_already_absolute_untouched(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments._IMAGE_SEARCH_DIRS", (str(tmp_path),))
+        img = tmp_path / "chart.png"
+        img.write_bytes(_MAGIC["png"])
+        full = str(img)
+        result = normalize_image_filenames(f"see {full}")
+        # absolute path must not be double-replaced
+        assert result.count(full) == 1
+
+    def test_ambiguous_not_replaced(self, tmp_path, monkeypatch):
+        dir1 = tmp_path / "d1"
+        dir2 = tmp_path / "d2"
+        dir1.mkdir(); dir2.mkdir()
+        monkeypatch.setattr("utils.attachments._IMAGE_SEARCH_DIRS", (str(dir1), str(dir2)))
+        (dir1 / "pic.png").write_bytes(_MAGIC["png"])
+        (dir2 / "pic.png").write_bytes(_MAGIC["png"])
+        result = normalize_image_filenames("show pic.png")
+        assert "pic.png" in result  # bare name stays — ambiguous
+
+    def test_missing_file_not_replaced(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments._IMAGE_SEARCH_DIRS", (str(tmp_path),))
+        result = normalize_image_filenames("show missing.png")
+        assert "missing.png" in result
+        assert str(tmp_path) not in result
+
+
+class TestExtractImagePathsAdmin:
+    def test_admin_allows_home_ubuntu(self, tmp_path, monkeypatch):
+        """Admin mode must accept paths under ADMIN_IMAGE_DIRS (mocked to tmp_path)."""
+        monkeypatch.setattr("utils.attachments.ADMIN_IMAGE_DIRS", (str(tmp_path),))
+        img = tmp_path / "chart.png"
+        img.write_bytes(_MAGIC["png"])
+        paths = extract_image_paths(f"see {img}", admin=True)
+        assert str(img) in paths
+
+    def test_non_admin_rejects_admin_only_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments.ALLOWED_IMAGE_DIRS", ("/nonexistent",))
+        monkeypatch.setattr("utils.attachments.ADMIN_IMAGE_DIRS", (str(tmp_path),))
+        img = tmp_path / "chart.png"
+        img.write_bytes(_MAGIC["png"])
+        paths = extract_image_paths(f"see {img}", admin=False)
+        assert paths == []
+
+    def test_symlink_escape_rejected(self, tmp_path, monkeypatch):
+        allowed = tmp_path / "allowed"
+        outside = tmp_path / "outside"
+        allowed.mkdir(); outside.mkdir()
+        monkeypatch.setattr("utils.attachments.ALLOWED_IMAGE_DIRS", (str(allowed),))
+        real_img = outside / "secret.png"
+        real_img.write_bytes(_MAGIC["png"])
+        link = allowed / "link.png"
+        link.symlink_to(real_img)
+        # realpath of link points to outside/, which is not under allowed/
+        paths = extract_image_paths(f"see {link}")
+        assert paths == []
+
+
+class TestStripAttachedPaths:
+    def test_removes_bare_path_on_own_line(self):
+        text = "See below:\n/tmp/foo.png\nDone."
+        result = strip_attached_paths(text, ["/tmp/foo.png"])
+        assert "/tmp/foo.png" not in result
+
+    def test_removes_attach_notation(self):
+        text = "result [attach:/tmp/foo.png] done"
+        result = strip_attached_paths(text, ["/tmp/foo.png"])
+        assert "[attach:/tmp/foo.png]" not in result
+
+    def test_removes_attachment_notation(self):
+        text = "see [Attachment: foo.png] here"
+        result = strip_attached_paths(text, ["/tmp/foo.png"])
+        assert "[Attachment: foo.png]" not in result
+
+    def test_collapses_extra_newlines(self):
+        text = "line1\n\n\n\nline2"
+        result = strip_attached_paths(text, [])
+        assert "\n\n\n" not in result
+
+    def test_empty_paths(self):
+        text = "hello world"
+        assert strip_attached_paths(text, []) == "hello world"
+
+
+class TestExtractFilePathsExtra:
+    def test_image_ext_skipped(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        img = tmp_path / "photo.png"
+        img.write_bytes(_MAGIC["png"])
+        result = extract_file_paths(f"see {img}")
+        assert result == []
+
+    def test_outside_admin_dirs_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", ("/nonexistent",))
+        f = tmp_path / "data.csv"
+        f.write_text("a,b\n")
+        result = extract_file_paths(f"output: {f}")
+        assert result == []
+
+    def test_empty_file_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        f = tmp_path / "empty.csv"
+        f.write_text("")
+        result = extract_file_paths(f"output: {f}")
+        assert result == []
+
+    def test_too_large_file_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        f = tmp_path / "big.csv"
+        f.write_bytes(b"x" * 100)
+        monkeypatch.setattr("utils.attachments.MAX_FILE_ATTACH_BYTES", 50)
+        result = extract_file_paths(f"output: {f}")
+        assert result == []
+
+    def test_caps_at_max(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        monkeypatch.setattr("utils.attachments.MAX_FILE_ATTACHMENTS", 2)
+        files = []
+        for i in range(5):
+            f = tmp_path / f"data{i}.csv"
+            f.write_text("a,b\n1,2\n")
+            files.append(str(f))
+        text = " ".join(files)
+        result = extract_file_paths(text)
+        assert len(result) == 2
+
+    def test_deduplicates(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        f = tmp_path / "report.csv"
+        f.write_text("a,b\n1,2\n")
+        text = f"see {f} and also {f}"
+        result = extract_file_paths(text)
+        assert len(result) == 1
+
+
+class TestCleanupAttachmentsAsync:
+    @pytest.mark.asyncio
+    async def test_removes_files_async(self, tmp_path):
+        f = tmp_path / "x.png"
+        f.write_bytes(b"data")
+        await cleanup_attachments_async([str(f)])
+        assert not f.exists()
+
+    @pytest.mark.asyncio
+    async def test_empty_list_noop(self):
+        await cleanup_attachments_async([])  # must not raise
+
+
+class TestDownloadAttachmentsExtra:
+    def _make_att(self, content_type="image/png", size=1000, filename="test.png", att_id=1,
+                  url="https://cdn.discordapp.com/attachments/1/2/test.png"):
+        att = MagicMock()
+        att.content_type = content_type
+        att.size = size
+        att.filename = filename
+        att.id = att_id
+        att.url = url
+        return att
+
+    @pytest.mark.asyncio
+    async def test_rejects_non_discord_url(self, tmp_attachment_dir):
+        att = self._make_att(url="https://evil.example.com/malware.png")
+        session = MagicMock()
+        result = await download_attachments(session, [att])
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_caps_at_max_image_attachments(self, monkeypatch):
+        monkeypatch.setattr("utils.attachments.MAX_IMAGE_ATTACHMENTS", 2)
+        atts = [self._make_att(att_id=i) for i in range(5)]
+        session = MagicMock()
+        # Patch _download_one to avoid real HTTP
+        with patch("utils.attachments._download_one", new=AsyncMock(return_value=None)):
+            result = await download_attachments(session, atts)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_successful_download(self, tmp_attachment_dir):
+        att = self._make_att(
+            att_id=9999,
+            url="https://cdn.discordapp.com/attachments/1/9999/test.png",
+        )
+        chunk = _MAGIC["png"]
+
+        async def fake_iter_chunked(size):
+            yield chunk
+
+        resp = MagicMock()
+        resp.status = 200
+        resp.content.iter_chunked = fake_iter_chunked
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+
+        session_ctx = MagicMock()
+        session_ctx.__aenter__ = AsyncMock(return_value=resp)
+        session_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        session = MagicMock()
+        session.get = MagicMock(return_value=session_ctx)
+
+        result = await download_attachments(session, [att])
+        assert len(result) == 1
+        assert result[0].endswith(".png")
+
+    @pytest.mark.asyncio
+    async def test_non_200_returns_none(self, tmp_attachment_dir):
+        att = self._make_att(
+            att_id=8888,
+            url="https://cdn.discordapp.com/attachments/1/8888/test.png",
+        )
+        resp = MagicMock()
+        resp.status = 404
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=resp)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+
+        session = MagicMock()
+        session.get = MagicMock(return_value=ctx)
+        result = await download_attachments(session, [att])
+        assert result == []
+
+
+class TestDownloadTextAttachments:
+    def _make_text_att(self, content_type="text/plain", size=100, filename="msg.txt",
+                       url="https://cdn.discordapp.com/attachments/1/1/msg.txt"):
+        att = MagicMock()
+        att.content_type = content_type
+        att.size = size
+        att.filename = filename
+        att.url = url
+        return att
+
+    @pytest.mark.asyncio
+    async def test_filters_non_text(self):
+        att = self._make_text_att(content_type="image/png")
+        session = MagicMock()
+        result = await download_text_attachments(session, [att])
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_skips_oversized(self):
+        att = self._make_text_att(size=200 * 1024)
+        session = MagicMock()
+        result = await download_text_attachments(session, [att])
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_rejects_non_discord_url(self):
+        att = self._make_text_att(url="https://evil.com/secret.txt")
+        session = MagicMock()
+        result = await download_text_attachments(session, [att])
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_successful_text_download(self):
+        att = self._make_text_att()
+        resp = MagicMock()
+        resp.status = 200
+        resp.read = AsyncMock(return_value=b"hello world")
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=resp)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+
+        session = MagicMock()
+        session.get = MagicMock(return_value=ctx)
+        result = await download_text_attachments(session, [att])
+        assert len(result) == 1
+        assert result[0] == ("msg.txt", "hello world")
+
+    @pytest.mark.asyncio
+    async def test_caps_at_max_text_attachments(self, monkeypatch):
+        monkeypatch.setattr("utils.attachments.MAX_TEXT_ATTACHMENTS", 2)
+        atts = [self._make_text_att(filename=f"f{i}.txt") for i in range(5)]
+        with patch("utils.attachments._download_text_one", new=AsyncMock(return_value=None)):
+            result = await download_text_attachments(MagicMock(), atts)
+        assert result == []
+
+
+class TestCleanupStaleAttachmentsMultiDir:
+    def test_cleans_multiple_dirs(self, tmp_path, monkeypatch):
+        d1 = tmp_path / "mermaid"
+        d2 = tmp_path / "table"
+        d1.mkdir(); d2.mkdir()
+        monkeypatch.setattr("config.ATTACHMENT_DIR", str(tmp_path / "att"))
+        (tmp_path / "att").mkdir()
+        monkeypatch.setattr("config.MERMAID_OUTPUT_DIR", str(d1))
+        monkeypatch.setattr("config.TABLE_RENDERS_DIR", str(d2))
+        monkeypatch.setattr("config.MATH_RENDERS_DIR", str(tmp_path / "math"))
+        (tmp_path / "math").mkdir()
+        old1 = d1 / "old.png"
+        old2 = d2 / "old.png"
+        old1.write_bytes(b"x"); old2.write_bytes(b"x")
+        os.utime(old1, (0, 0)); os.utime(old2, (0, 0))
+        cleanup_stale_attachments()
+        assert not old1.exists()
+        assert not old2.exists()
+
+    def test_skips_nonexistent_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("config.ATTACHMENT_DIR", str(tmp_path / "nonexistent"))
+        monkeypatch.setattr("config.MERMAID_OUTPUT_DIR", "")
+        monkeypatch.setattr("config.TABLE_RENDERS_DIR", "")
+        monkeypatch.setattr("config.MATH_RENDERS_DIR", "")
+        cleanup_stale_attachments()  # must not raise
 
 
 class TestReDoSGuards:

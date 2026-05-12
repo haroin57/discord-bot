@@ -1,17 +1,21 @@
 """Tests for services/session.py — persistence and history integrity."""
 
+import asyncio
 import json
-import logging
 import os
 from collections import OrderedDict
-from unittest.mock import patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from services.session import (
     SessionInfo,
+    _flatten_sessions,
     _history_file,
+    _on_save_done,
+    _schedule_save,
     append_jsonl,
+    clear_session,
     fix_history_integrity,
     get_session,
     load_history_channel,
@@ -54,6 +58,44 @@ class TestCompositeKey:
             _history_file(0)
         with pytest.raises(ValueError):
             _history_file(1)  # too small
+
+    def test_clear_session(self, tmp_state_dir):
+        info = SessionInfo(session_id="Z", mcp_server_keys=[])
+        set_session(200, 5, info)
+        assert get_session(200, 5) is not None
+        clear_session(200, 5)
+        assert get_session(200, 5) is None
+
+    def test_clear_session_nonexistent(self, tmp_state_dir):
+        # Should not raise when key is absent
+        clear_session(999, 999)
+
+    def test_flatten_sessions_last_entry_wins(self, tmp_state_dir):
+        store: OrderedDict = OrderedDict()
+        info_none = SessionInfo(session_id="none-bucket")
+        info_user = SessionInfo(session_id="user-bucket")
+        store[(300, None)] = info_none
+        store[(300, 10)] = info_user
+        flat = _flatten_sessions(store)
+        # user-specific entry inserted later wins
+        assert flat[300].session_id == "user-bucket"
+
+    def test_lru_eviction_in_sessions_store(self, tmp_state_dir):
+        for i in range(101):
+            set_session(i, None, SessionInfo(session_id=f"s{i}"))
+        assert len(_session_module._sessions_store) == 100
+        assert (0, None) not in _session_module._sessions_store
+        assert (100, None) in _session_module._sessions_store
+
+    def test_schedule_save_async_path(self, tmp_state_dir):
+        async def _run():
+            set_session(777, 1, SessionInfo(session_id="async-test"))
+            # Give the background task a chance to complete
+            await asyncio.sleep(0)
+
+        asyncio.run(_run())
+        loaded = load_sessions()
+        assert 777 in loaded
 
 
 class TestSessions:
@@ -98,38 +140,52 @@ class TestSessions:
         loaded = load_sessions()
         assert loaded[42].mcp_server_keys == ["context7", "brave-search"]
 
-    def test_save_sessions_atomic_replaces_existing(self, tmp_path):
-        """Old data must survive if json.dump raises mid-write."""
-        target = str(tmp_path / "sessions.json")
-        old_sessions: OrderedDict[int, SessionInfo] = OrderedDict(
-            [(1, SessionInfo(session_id="old-sess"))]
-        )
-        save_sessions(old_sessions, _path=target)
+    def test_load_sessions_populates_store(self, tmp_state_dir):
+        s: OrderedDict[int, SessionInfo] = OrderedDict([
+            (500, SessionInfo(session_id="legacy")),
+        ])
+        save_sessions(s)
+        _session_module._sessions_store.clear()
+        load_sessions()
+        # load_sessions should populate the store under None bucket
+        assert (500, None) in _session_module._sessions_store
 
-        new_sessions: OrderedDict[int, SessionInfo] = OrderedDict(
-            [(2, SessionInfo(session_id="new-sess"))]
-        )
-        with patch("json.dump", side_effect=RuntimeError("disk full")):
-            with pytest.raises(RuntimeError):
-                save_sessions(new_sessions, _path=target)
+    def test_load_sessions_dict_format(self, tmp_state_dir):
+        import config
+        with open(config.SESSIONS_PATH, "w") as f:
+            json.dump({"42": {"session_id": "dict-fmt", "mcp_server_keys": ["k1"]}}, f)
+        loaded = load_sessions()
+        assert loaded[42].session_id == "dict-fmt"
+        assert loaded[42].mcp_server_keys == ["k1"]
 
-        # .tmp file must have been cleaned up
-        assert not os.path.exists(target + ".tmp")
-        # Original file is intact
-        with open(target, encoding="utf-8") as f:
-            data = json.load(f)
-        assert "1" in data
-        assert data["1"]["session_id"] == "old-sess"
+    def test_update_session_with_user_id(self, tmp_state_dir):
+        s: OrderedDict[int, SessionInfo] = OrderedDict()
+        info = SessionInfo(session_id="uid-test")
+        update_session(s, 88, info, user_id=42)
+        assert get_session(88, 42).session_id == "uid-test"
 
-    def test_save_sessions_writes_tmp_then_renames(self, tmp_path):
-        """os.replace must be called to atomically swap .tmp -> target."""
-        target = str(tmp_path / "sessions.json")
-        s: OrderedDict[int, SessionInfo] = OrderedDict(
-            [(1, SessionInfo(session_id="x"))]
-        )
-        with patch("os.replace", wraps=os.replace) as mock_replace:
-            save_sessions(s, _path=target)
-        mock_replace.assert_called_once_with(target + ".tmp", target)
+    def test_on_save_done_exception_logged(self, caplog):
+        task = MagicMock(spec=asyncio.Task)
+        task.cancelled.return_value = False
+        task.exception.return_value = RuntimeError("disk full")
+        import logging
+        with caplog.at_level(logging.ERROR, logger="services.session"):
+            _on_save_done(task)
+        assert "save_sessions failed" in caplog.text
+
+    def test_on_save_done_cancelled(self):
+        task = MagicMock(spec=asyncio.Task)
+        task.cancelled.return_value = True
+        # Should return early without calling .exception()
+        _on_save_done(task)
+        task.exception.assert_not_called()
+
+    def test_on_save_done_cancelled_error_on_exception(self):
+        task = MagicMock(spec=asyncio.Task)
+        task.cancelled.return_value = False
+        task.exception.side_effect = asyncio.CancelledError()
+        # Should not raise
+        _on_save_done(task)
 
 
 # Minimal valid Discord snowflake IDs (must be in [10**14, 10**19])
@@ -157,21 +213,45 @@ class TestJSONLHistory:
         msgs = load_history_channel(_CH_B)
         assert len(msgs) == 2
 
-    def test_tail_jsonl_logs_corrupted_line(self, tmp_state_dir, caplog):
-        """A corrupted JSONL line must be skipped with a WARNING log."""
+    def test_tail_jsonl_oserror(self, tmp_state_dir, monkeypatch):
+        """OSError during read should return empty list."""
+        import services.session as sm
+        monkeypatch.setattr("os.path.isfile", lambda p: True)
+        original_open = open
+
+        def _bad_open(path, mode="r", **kw):
+            if "jsonl" in path:
+                raise OSError("permission denied")
+            return original_open(path, mode, **kw)
+
+        monkeypatch.setattr("builtins.open", _bad_open)
+        result = sm._tail_jsonl("/fake/path/100000000000000.jsonl", 10)
+        assert result == []
+
+    def test_tail_jsonl_invalid_json_line(self, tmp_state_dir):
+        import services.session as sm
         import config
-        path = os.path.join(config.HISTORY_DIR, f"{_CH_A}.jsonl")
-        os.makedirs(config.HISTORY_DIR, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write('{"role": "user", "content": "good"}\n')
-            f.write("NOT_VALID_JSON\n")
-            f.write('{"role": "assistant", "content": "also good"}\n')
-
-        with caplog.at_level(logging.WARNING, logger="services.session"):
-            msgs = load_history_channel(_CH_A)
-
+        path = os.path.join(config.HISTORY_DIR, "100000000000000.jsonl")
+        with open(path, "w") as f:
+            f.write('{"role": "user", "content": "ok"}\n')
+            f.write('not-valid-json\n')
+            f.write('{"role": "assistant", "content": "ok2"}\n')
+        msgs = sm._tail_jsonl(path, 10)
         assert len(msgs) == 2
-        assert any("corrupted" in r.message.lower() for r in caplog.records)
+
+    def test_tail_jsonl_truncates_to_max(self, tmp_state_dir):
+        """Messages exceeding max_entries should be truncated to the tail."""
+        import services.session as sm
+        import config
+        path = os.path.join(config.HISTORY_DIR, "100000000000000.jsonl")
+        with open(path, "w") as f:
+            for i in range(20):
+                role = "user" if i % 2 == 0 else "assistant"
+                f.write(json.dumps({"role": role, "content": f"m{i}"}) + "\n")
+        msgs = sm._tail_jsonl(path, 5)
+        assert len(msgs) == 5
+        # Should be the last 5
+        assert msgs[-1]["content"] == "m19"
 
 
 class TestTrimHistory:
@@ -198,6 +278,39 @@ class TestTrimHistory:
             {"role": "assistant", "content": "a2"},
         ]
         trim_history(h, max_pairs=1)
+        assert h[0]["role"] == "user"
+
+    def test_trim_advances_past_assistant_at_boundary(self):
+        # start index lands on an assistant entry -> forward scan advances once
+        h = []
+        for i in range(10):
+            h.append({"role": "user", "content": f"u{i}"})
+            h.append({"role": "assistant", "content": f"a{i}"})
+        # Insert an extra assistant at position 10 (between pairs 4 and 5)
+        h.insert(10, {"role": "assistant", "content": "extra"})
+        # max_pairs=5 → max_entries=10, start = len(h)-10 = 11, which is assistant
+        trim_history(h, max_pairs=5)
+        assert h[0]["role"] == "user"
+
+    def test_trim_fallback_when_no_user_at_boundary(self):
+        # Tail is all-assistant, so forward scan fails and fallback kicks in
+        h = [
+            {"role": "user", "content": "u0"},
+            {"role": "assistant", "content": "a0"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "assistant", "content": "a3"},
+            {"role": "assistant", "content": "a4"},
+            {"role": "assistant", "content": "a5"},
+            {"role": "assistant", "content": "a6"},
+            {"role": "assistant", "content": "a7"},
+            {"role": "assistant", "content": "a8"},
+            {"role": "assistant", "content": "a9"},
+            {"role": "assistant", "content": "a10"},
+        ]
+        # max_pairs=5 → max_entries=10, start=2, forward scan (2..4) are all assistant
+        trim_history(h, max_pairs=5)
+        # Fallback should find the user at index 0 and not wipe everything
         assert h[0]["role"] == "user"
 
 

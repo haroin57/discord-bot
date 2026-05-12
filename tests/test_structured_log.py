@@ -75,6 +75,40 @@ class TestJsonFormatter:
         assert isinstance(data["obj"], str)
 
 
+    def test_correlation_import_error_fallback(self):
+        """Line 50-51: ImportError -> rid defaults to '-'."""
+        with mock.patch.dict(sys.modules, {"services.correlation": None}):
+            from services.structured_log import JsonFormatter
+            fmt = JsonFormatter()
+            record = _make_record("no correlation")
+            output = fmt.format(record)
+        data = json.loads(output)
+        assert data.get("rid") == "-"
+
+    def test_exc_info_included(self):
+        """Line 62: exc_info -> 'exc' key in output."""
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            import sys as _sys
+            exc_info = _sys.exc_info()
+
+        logger = logging.getLogger("test.structured")
+        record = logger.makeRecord(
+            name="test.structured",
+            level=logging.ERROR,
+            fn="test_file.py",
+            lno=1,
+            msg="error occurred",
+            args=(),
+            exc_info=exc_info,
+        )
+        output = self.fmt.format(record)
+        data = json.loads(output)
+        assert "exc" in data
+        assert "ValueError" in data["exc"]
+
+
 class TestInstallStructuredLogging:
     def teardown_method(self):
         # Restore root logger to a clean state after each test

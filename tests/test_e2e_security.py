@@ -188,6 +188,18 @@ def _isolate_bot_state(monkeypatch):
     monkeypatch.setattr("bot.RESTRICTED_COOLDOWN_SECONDS", 0)
     monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 1000)
 
+    # H6: shared rate_limit module — reset its ledger and mirror the same
+    # defaults so tests that only patch bot.* also affect the shared path.
+    try:
+        from services import rate_limit as _rl
+        _rl.reset_for_tests()
+        monkeypatch.setattr(_rl, "COOLDOWN_SECONDS", 0)
+        monkeypatch.setattr(_rl, "RESTRICTED_COOLDOWN_SECONDS", 0)
+        monkeypatch.setattr(_rl, "RESTRICTED_DAILY_QUOTA", 1000)
+        monkeypatch.setattr(_rl, "MAX_COOLDOWN_ENTRIES", 1000)
+    except ImportError:
+        pass
+
     mock_bot_user = MagicMock()
     mock_bot_user.id = BOT_USER_ID
     patcher = patch.object(
@@ -354,7 +366,9 @@ class TestRestrictedSdkOptions:
         assert opts.system_prompt != SYSTEM_PROMPT
 
     @pytest.mark.asyncio
-    async def test_restricted_with_image_allows_read_only(self, monkeypatch):
+    async def test_restricted_with_image_has_no_tools(self, monkeypatch):
+        """H3: Read tool is no longer allowed even with image attachments in
+        restricted mode, because the CLI Read tool does not enforce cwd."""
         from services import claude_sdk
 
         captured = {}
@@ -383,7 +397,7 @@ class TestRestrictedSdkOptions:
             has_image_attachment=True,
         )
         opts = captured["options"]
-        assert opts.allowed_tools == ["Read"]
+        assert opts.allowed_tools == [], "H3: no tools allowed in restricted mode, even with images"
 
     @pytest.mark.asyncio
     async def test_admin_options_allow_full_access(self, monkeypatch):
@@ -733,6 +747,12 @@ class TestRateLimiting:
     async def test_nonadmin_cooldown_is_stricter(self, capture, monkeypatch):
         monkeypatch.setattr("bot.COOLDOWN_SECONDS", 1)
         monkeypatch.setattr("bot.RESTRICTED_COOLDOWN_SECONDS", 9999)
+        try:
+            from services import rate_limit as _rl
+            monkeypatch.setattr(_rl, "COOLDOWN_SECONDS", 1)
+            monkeypatch.setattr(_rl, "RESTRICTED_COOLDOWN_SECONDS", 9999)
+        except ImportError:
+            pass
 
         msg1 = _make_message(author_id=NONADMIN_ID, content="かなえ one")
         msg2 = _make_message(author_id=NONADMIN_ID, content="かなえ two")
@@ -747,6 +767,12 @@ class TestRateLimiting:
     async def test_admin_has_lax_cooldown(self, capture, monkeypatch):
         monkeypatch.setattr("bot.COOLDOWN_SECONDS", 0)
         monkeypatch.setattr("bot.RESTRICTED_COOLDOWN_SECONDS", 9999)
+        try:
+            from services import rate_limit as _rl
+            monkeypatch.setattr(_rl, "COOLDOWN_SECONDS", 0)
+            monkeypatch.setattr(_rl, "RESTRICTED_COOLDOWN_SECONDS", 9999)
+        except ImportError:
+            pass
         m1 = _make_message(author_id=ADMIN_ID, content="かなえ a")
         m2 = _make_message(author_id=ADMIN_ID, content="かなえ b")
         await _dispatch(m1)
@@ -757,6 +783,12 @@ class TestRateLimiting:
     async def test_nonadmin_daily_quota_enforced(self, capture, monkeypatch):
         monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 2)
         monkeypatch.setattr("bot.RESTRICTED_COOLDOWN_SECONDS", 0)
+        try:
+            from services import rate_limit as _rl
+            monkeypatch.setattr(_rl, "RESTRICTED_DAILY_QUOTA", 2)
+            monkeypatch.setattr(_rl, "RESTRICTED_COOLDOWN_SECONDS", 0)
+        except ImportError:
+            pass
         for _ in range(3):
             await _dispatch(_make_message(author_id=NONADMIN_ID, content="かなえ x"))
         assert len(capture.calls) == 2
@@ -765,6 +797,12 @@ class TestRateLimiting:
     async def test_admin_not_quota_capped(self, capture, monkeypatch):
         monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 2)
         monkeypatch.setattr("bot.COOLDOWN_SECONDS", 0)
+        try:
+            from services import rate_limit as _rl
+            monkeypatch.setattr(_rl, "RESTRICTED_DAILY_QUOTA", 2)
+            monkeypatch.setattr(_rl, "COOLDOWN_SECONDS", 0)
+        except ImportError:
+            pass
         for _ in range(5):
             await _dispatch(_make_message(author_id=ADMIN_ID, content="かなえ x"))
         assert len(capture.calls) == 5

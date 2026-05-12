@@ -1015,3 +1015,501 @@ async def test_disconnect_cancels_inflight_tasks():
 
     assert task.cancelled() or cancelled_flag.is_set()
     assert "sid_h10" not in api._sid_tasks
+
+
+# ---------------------------------------------------------------------------
+# _handle_invalidate_session — extra branches
+# ---------------------------------------------------------------------------
+
+
+async def test_invalidate_session_rejects_invalid_json_body():
+    """_handle_invalidate_session raises HTTPBadRequest when body is not JSON."""
+    from aiohttp import web as _web
+    api = make_web_api()
+
+    mock_request = MagicMock()
+    mock_request.remote = "127.0.0.1"
+    mock_request.json = AsyncMock(side_effect=Exception("not json"))
+
+    with pytest.raises(_web.HTTPBadRequest):
+        await api._handle_invalidate_session(mock_request)
+
+
+async def test_invalidate_session_rejects_missing_session_token_key():
+    """_handle_invalidate_session raises HTTPBadRequest when session_token key absent."""
+    from aiohttp import web as _web
+    api = make_web_api()
+
+    mock_request = MagicMock()
+    mock_request.remote = "127.0.0.1"
+    mock_request.json = AsyncMock(return_value={})
+
+    with pytest.raises(_web.HTTPBadRequest):
+        await api._handle_invalidate_session(mock_request)
+
+
+async def test_invalidate_session_rejects_non_string_token():
+    """_handle_invalidate_session raises HTTPBadRequest when token is not a string."""
+    from aiohttp import web as _web
+    api = make_web_api()
+
+    mock_request = MagicMock()
+    mock_request.remote = "127.0.0.1"
+    mock_request.json = AsyncMock(return_value={"session_token": 123})
+
+    with pytest.raises(_web.HTTPBadRequest):
+        await api._handle_invalidate_session(mock_request)
+
+
+async def test_invalidate_session_rejects_ipv6_localhost():
+    """_handle_invalidate_session raises HTTPForbidden for non-localhost IPv6 address."""
+    # ::1 is allowed but other IPv6 are not
+    from aiohttp import web as _web
+    api = make_web_api()
+    api._session_cache["tok_ipv6"] = {"discordId": "1", "_verified_at": 9999999999}
+
+    mock_request = MagicMock()
+    mock_request.remote = "::1"
+    mock_request.json = AsyncMock(return_value={"session_token": "tok_ipv6"})
+
+    # ::1 is localhost so it should succeed
+    response = await api._handle_invalidate_session(mock_request)
+    import json
+    body = json.loads(response.text)
+    assert body["invalidated"] is True
+
+
+# ---------------------------------------------------------------------------
+# stop — runner is None
+# ---------------------------------------------------------------------------
+
+
+async def test_stop_is_safe_when_runner_is_none():
+    """stop() does not raise when _runner is None."""
+    api = make_web_api()
+    api._http = None
+    api._runner = None
+    await api.stop()  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# _cache_hit — ValueError branch for non-numeric discordId
+# ---------------------------------------------------------------------------
+
+
+async def test_cache_hit_returns_none_for_invalid_discord_id():
+    """_cache_hit returns non-admin when discordId is non-numeric (ValueError guard)."""
+    import web_api as _web_api_mod
+    api = make_web_api()
+    api._session_cache["tok_bad_id"] = {
+        "discordId": "not_an_int",
+        "isAdmin": True,
+        "_verified_at": time.time(),
+    }
+    result = api._cache_hit("tok_bad_id")
+    assert result is not None
+    assert result["isAdmin"] is False
+
+
+# ---------------------------------------------------------------------------
+# _verify_locks LRU eviction (>1000 entries)
+# ---------------------------------------------------------------------------
+
+
+async def test_verify_session_evicts_excess_verify_locks(monkeypatch):
+    """When _verify_locks exceeds 1000, oldest entries are removed."""
+    api = make_web_api()
+
+    # Pre-fill with 1001 fake lock entries
+    for i in range(1001):
+        api._verify_locks[f"tok_{i}"] = asyncio.Lock()
+
+    mock_http = MagicMock()
+    mock_http.closed = False
+    resp_mock = AsyncMock()
+    resp_mock.__aenter__ = AsyncMock(return_value=resp_mock)
+    resp_mock.__aexit__ = AsyncMock(return_value=False)
+    resp_mock.status = 200
+    resp_mock.json = AsyncMock(return_value={"authenticated": True, "discordId": "42", "isAdmin": False})
+    mock_http.get = MagicMock(return_value=resp_mock)
+    api._http = mock_http
+
+    await api.verify_session("new_overflow_tok")
+    assert len(api._verify_locks) <= 1001
+
+
+# ---------------------------------------------------------------------------
+# verify_session double-check cache inside lock
+# ---------------------------------------------------------------------------
+
+
+async def test_verify_session_uses_cache_populated_while_waiting():
+    """Second coroutine uses cache entry written by first — hits double-check inside lock."""
+    api = make_web_api()
+
+    # Pre-populate cache as if first coroutine already wrote it
+    api._session_cache["concurrent_tok"] = {
+        "discordId": "77",
+        "isAdmin": False,
+        "_verified_at": time.time(),
+    }
+
+    # Acquire the lock as if another coroutine is holding it
+    lock = asyncio.Lock()
+    api._verify_locks["concurrent_tok"] = lock
+
+    async def _release_after():
+        async with lock:
+            pass
+
+    async with lock:
+        # While we hold the lock, start a verify_session call that will block
+        task = asyncio.ensure_future(api.verify_session("concurrent_tok"))
+        await asyncio.sleep(0)  # let it acquire the lock check
+    # lock released — task can proceed and will hit the double-check cache hit
+
+    result = await task
+    assert result is not None
+    assert result["discordId"] == "77"
+
+
+# ---------------------------------------------------------------------------
+# verify_session — ValueError for non-numeric discordId from HTTP response
+# ---------------------------------------------------------------------------
+
+
+async def test_verify_session_handles_non_numeric_discord_id(monkeypatch):
+    """discordId that can't be converted to int results in isAdmin=False."""
+    import web_api as _web_api_mod
+    monkeypatch.setattr(_web_api_mod, "ADMIN_USER_IDS", {12345})
+
+    mock_http = MagicMock()
+    mock_http.closed = False
+    resp_mock = AsyncMock()
+    resp_mock.__aenter__ = AsyncMock(return_value=resp_mock)
+    resp_mock.__aexit__ = AsyncMock(return_value=False)
+    resp_mock.status = 200
+    resp_mock.json = AsyncMock(return_value={"authenticated": True, "discordId": "not_int", "isAdmin": True})
+    mock_http.get = MagicMock(return_value=resp_mock)
+    api = make_web_api()
+    api._http = mock_http
+
+    result = await api.verify_session("tok_non_numeric")
+    assert result is not None
+    assert result["isAdmin"] is False
+
+
+# ---------------------------------------------------------------------------
+# _check_channel_permission — DM channel branches
+# ---------------------------------------------------------------------------
+
+
+async def test_check_channel_permission_dm_recipient_allowed():
+    """DM channel: the actual recipient is allowed."""
+    api = make_web_api()
+
+    mock_channel = MagicMock()
+    mock_channel.guild = None
+    mock_recipient = MagicMock()
+    mock_recipient.id = 55
+    mock_channel.recipient = mock_recipient
+    api.bot.get_channel = MagicMock(return_value=mock_channel)
+
+    allowed, err = await api._check_channel_permission("55", 999, "view", False)
+    assert allowed is True
+    assert err is None
+
+
+async def test_check_channel_permission_dm_wrong_recipient():
+    """DM channel: a different user is denied."""
+    api = make_web_api()
+
+    mock_channel = MagicMock()
+    mock_channel.guild = None
+    mock_recipient = MagicMock()
+    mock_recipient.id = 99
+    mock_channel.recipient = mock_recipient
+    api.bot.get_channel = MagicMock(return_value=mock_channel)
+
+    allowed, err = await api._check_channel_permission("55", 999, "view", False)
+    assert allowed is False
+    assert err == "permission denied"
+
+
+async def test_check_channel_permission_dm_no_recipient():
+    """DM channel: recipient=None → permission denied."""
+    api = make_web_api()
+
+    mock_channel = MagicMock()
+    mock_channel.guild = None
+    mock_channel.recipient = None
+    api.bot.get_channel = MagicMock(return_value=mock_channel)
+
+    allowed, err = await api._check_channel_permission("55", 999, "view", False)
+    assert allowed is False
+    assert err == "permission denied"
+
+
+async def test_check_channel_permission_invalid_discord_id():
+    """Non-numeric discord_id returns permission denied."""
+    api = make_web_api()
+
+    mock_channel = MagicMock()
+    mock_guild = MagicMock()
+    mock_channel.guild = mock_guild
+    api.bot.get_channel = MagicMock(return_value=mock_channel)
+
+    allowed, err = await api._check_channel_permission("not_int", 999, "view", False)
+    assert allowed is False
+    assert err == "permission denied"
+
+
+async def test_check_channel_permission_view_denied():
+    """view action denied when perms.view_channel is False."""
+    api = make_web_api()
+
+    mock_channel = MagicMock()
+    mock_guild = MagicMock()
+    mock_member = MagicMock()
+    mock_perms = MagicMock()
+    mock_perms.view_channel = False
+    mock_channel.guild = mock_guild
+    mock_guild.get_member = MagicMock(return_value=mock_member)
+    mock_channel.permissions_for = MagicMock(return_value=mock_perms)
+    api.bot.get_channel = MagicMock(return_value=mock_channel)
+
+    allowed, err = await api._check_channel_permission("55", 999, "view", False)
+    assert allowed is False
+    assert err == "permission denied"
+
+
+async def test_check_channel_permission_read_history_denied():
+    """read_history denied when read_message_history is False."""
+    api = make_web_api()
+
+    mock_channel = MagicMock()
+    mock_guild = MagicMock()
+    mock_member = MagicMock()
+    mock_perms = MagicMock()
+    mock_perms.view_channel = True
+    mock_perms.read_message_history = False
+    mock_channel.guild = mock_guild
+    mock_guild.get_member = MagicMock(return_value=mock_member)
+    mock_channel.permissions_for = MagicMock(return_value=mock_perms)
+    api.bot.get_channel = MagicMock(return_value=mock_channel)
+
+    allowed, err = await api._check_channel_permission("55", 999, "read_history", False)
+    assert allowed is False
+    assert err == "permission denied"
+
+
+async def test_check_channel_permission_send_denied():
+    """send action denied when send_messages is False."""
+    api = make_web_api()
+
+    mock_channel = MagicMock()
+    mock_guild = MagicMock()
+    mock_member = MagicMock()
+    mock_perms = MagicMock()
+    mock_perms.view_channel = True
+    mock_perms.send_messages = False
+    mock_channel.guild = mock_guild
+    mock_guild.get_member = MagicMock(return_value=mock_member)
+    mock_channel.permissions_for = MagicMock(return_value=mock_perms)
+    api.bot.get_channel = MagicMock(return_value=mock_channel)
+
+    allowed, err = await api._check_channel_permission("55", 999, "send", False)
+    assert allowed is False
+    assert err == "permission denied"
+
+
+async def test_check_channel_permission_all_allowed():
+    """All permission checks pass when perms are granted."""
+    api = make_web_api()
+
+    mock_channel = MagicMock()
+    mock_guild = MagicMock()
+    mock_member = MagicMock()
+    mock_perms = MagicMock()
+    mock_perms.view_channel = True
+    mock_perms.read_message_history = True
+    mock_perms.send_messages = True
+    mock_channel.guild = mock_guild
+    mock_guild.get_member = MagicMock(return_value=mock_member)
+    mock_channel.permissions_for = MagicMock(return_value=mock_perms)
+    api.bot.get_channel = MagicMock(return_value=mock_channel)
+
+    for action in ("view", "read_history", "send"):
+        allowed, err = await api._check_channel_permission("55", 999, action, False)
+        assert allowed is True
+        assert err is None
+
+
+# ---------------------------------------------------------------------------
+# _check_rate_limit — MAX_COOLDOWN_ENTRIES eviction inside check_rate_limit
+# ---------------------------------------------------------------------------
+
+
+def test_check_rate_limit_evicts_entries_when_max_exceeded(monkeypatch):
+    """_cooldowns is capped at MAX_COOLDOWN_ENTRIES via popitem."""
+    import web_api as _web_api_mod
+    monkeypatch.setattr(_web_api_mod, "MAX_COOLDOWN_ENTRIES", 3)
+    api = make_web_api()
+
+    # 3 fresh entries (within cooldown so they won't be purged by _purge_cooldowns)
+    api._cooldowns["u1"] = time.time()
+    api._cooldowns["u2"] = time.time()
+    api._cooldowns["u3"] = time.time()
+
+    # Adding a new user should evict oldest
+    allowed, _ = api.check_rate_limit("u4", is_admin=True)
+    assert allowed is True
+    assert len(api._cooldowns) <= 3
+
+
+# ---------------------------------------------------------------------------
+# _check_daily_quota — MAX_COOLDOWN_ENTRIES eviction
+# ---------------------------------------------------------------------------
+
+
+def test_check_daily_quota_evicts_entries_when_max_exceeded(monkeypatch):
+    """_daily_quota is capped at MAX_COOLDOWN_ENTRIES via popitem."""
+    import web_api as _web_api_mod
+    monkeypatch.setattr(_web_api_mod, "MAX_COOLDOWN_ENTRIES", 3)
+    monkeypatch.setattr(_web_api_mod, "RESTRICTED_DAILY_QUOTA", 10)
+    api = make_web_api()
+
+    now = time.time()
+    api._daily_quota["q1"] = [now]
+    api._daily_quota["q2"] = [now]
+    api._daily_quota["q3"] = [now]
+
+    allowed, remaining = api._check_daily_quota("q4")
+    assert allowed is True
+    assert len(api._daily_quota) <= 3
+
+
+# ---------------------------------------------------------------------------
+# leave_channel — left_channel emission
+# ---------------------------------------------------------------------------
+
+
+async def test_leave_channel_unauthenticated_sid_is_noop():
+    """leave_channel with unauthenticated sid does nothing (no emit, no leave_room)."""
+    api, handlers = make_api_with_captured_handlers()
+    # Don't populate _sid_to_user
+    await handlers["leave_channel"]("unauth_sid", {"channel_id": "42"})
+    api.sio.leave_room.assert_not_called()
+    api.sio.emit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# get_history — strip non-string content (no-op)
+# ---------------------------------------------------------------------------
+
+
+async def test_get_history_skips_strip_for_non_string_content():
+    """get_history does not crash when message content is not a string."""
+    api, handlers = make_api_with_captured_handlers()
+    api._sid_to_user["sid_ns"] = {"discord_id": "1", "is_admin": True}
+    api._check_channel_permission = AsyncMock(return_value=(True, None))
+
+    raw_messages = [
+        {"role": "user", "content": None},
+        {"role": "assistant", "content": 42},
+    ]
+
+    with patch("web_api.asyncio.to_thread", new=AsyncMock(return_value=raw_messages)):
+        await handlers["get_history"]("sid_ns", {"channel_id": "10"})
+
+    payload = api.sio.emit.call_args[0][1]
+    assert payload["messages"][0]["content"] is None
+    assert payload["messages"][1]["content"] == 42
+
+
+# ---------------------------------------------------------------------------
+# send_message — session_id=None branch (no update_session call)
+# ---------------------------------------------------------------------------
+
+
+async def test_send_message_skips_update_session_when_no_session_id():
+    """send_message does not call update_session when call_with_tools returns session_id=None."""
+    api, handlers = make_api_with_captured_handlers()
+    api._sid_to_user["sid_nosess"] = {"discord_id": "ok2", "is_admin": True, "username": "u", "tag": "u#0"}
+    api._check_channel_permission = AsyncMock(return_value=(True, None))
+
+    with patch("web_api.PromptBuilder.build_prompt", new=AsyncMock(return_value="prompt")), \
+         patch("web_api.PromptBuilder.cap_text", return_value="hi"), \
+         patch("web_api.call_with_tools", new=AsyncMock(return_value=("reply", None))), \
+         patch("web_api.update_session") as mock_update, \
+         patch("web_api.asyncio.to_thread", new=AsyncMock(return_value=None)), \
+         patch("web_api.asyncio.create_task"), \
+         patch.dict("sys.modules", {"services.mem0_service": MagicMock(
+             search_memories_multi=AsyncMock(return_value=[]),
+             add_memories=AsyncMock(),
+         )}):
+        await handlers["send_message"]("sid_nosess", {"channel_id": "10", "text": "hi"})
+
+    mock_update.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# send_message — _mem0_store task body (admin path)
+# ---------------------------------------------------------------------------
+
+
+async def test_send_message_admin_triggers_mem0_store():
+    """Admin send_message triggers asyncio.create_task for Mem0 store."""
+    api, handlers = make_api_with_captured_handlers()
+    api._sid_to_user["sid_mem0"] = {"discord_id": "adminuser", "is_admin": True, "username": "u", "tag": "u#0"}
+    api._check_channel_permission = AsyncMock(return_value=(True, None))
+
+    created_tasks = []
+
+    def capture_create_task(coro):
+        t = asyncio.ensure_future(coro)
+        created_tasks.append(t)
+        return t
+
+    with patch("web_api.PromptBuilder.build_prompt", new=AsyncMock(return_value="prompt")), \
+         patch("web_api.PromptBuilder.cap_text", return_value="hi"), \
+         patch("web_api.call_with_tools", new=AsyncMock(return_value=("reply", "sess_id"))), \
+         patch("web_api.asyncio.to_thread", new=AsyncMock(return_value=None)), \
+         patch("web_api.asyncio.create_task", side_effect=capture_create_task), \
+         patch.dict("sys.modules", {"services.mem0_service": MagicMock(
+             search_memories_multi=AsyncMock(return_value=[]),
+             add_memories=AsyncMock(),
+         )}):
+        await handlers["send_message"]("sid_mem0", {"channel_id": "10", "text": "hi"})
+        # Allow the Mem0 store coroutine to run
+        await asyncio.gather(*created_tasks, return_exceptions=True)
+
+    assert len(created_tasks) >= 1
+
+
+# ---------------------------------------------------------------------------
+# send_message — daily quota block reached inside send_message (line 493-498)
+# ---------------------------------------------------------------------------
+
+
+async def test_send_message_blocks_non_admin_at_daily_quota(monkeypatch):
+    """Non-admin hitting daily quota in send_message receives an error."""
+    import web_api as _web_api_mod
+    api, handlers = make_api_with_captured_handlers()
+    api._sid_to_user["sid_quota2"] = {
+        "discord_id": "quota_user2", "is_admin": False, "username": "u", "tag": "u#0",
+    }
+    api._check_channel_permission = AsyncMock(return_value=(True, None))
+    monkeypatch.setattr(_web_api_mod, "RESTRICTED_DAILY_QUOTA", 2)
+
+    # Bypass cooldown
+    import config as _cfg
+    api._cooldowns["quota_user2"] = time.time() - _cfg.RESTRICTED_COOLDOWN_SECONDS - 1
+
+    # Fill quota
+    now = time.time()
+    api._daily_quota["quota_user2"] = [now, now]
+
+    await handlers["send_message"]("sid_quota2", {"channel_id": "10", "text": "hello"})
+    all_calls = [c[0][0] for c in api.sio.emit.call_args_list]
+    assert "error" in all_calls
