@@ -81,14 +81,14 @@ def _host_is_allowed(url: str) -> bool:
     return host in ALLOWED_ATTACHMENT_HOSTS
 
 IMAGE_PATH_RE = re.compile(
-    r"(?:^|\s|`|\()(\/[\w./_-]+\.(?:png|jpg|jpeg|gif|webp|svg))(?:\s|$|`|[)}\]]|[。、,.])",
+    r"(?:^|\s|`|\()(\/[\w./_-]{1,512}\.(?:png|jpg|jpeg|gif|webp|svg))(?:\s|$|`|[)}\]]|[。、,.])",
     re.MULTILINE,
 )
 
 # Matches any absolute file path in response text (for admin file attachment).
 # Looks for paths like /home/ubuntu/foo.txt or /tmp/bar.csv
 FILE_PATH_RE = re.compile(
-    r"(?:^|\s|`|\()(\/[\w./_-]+\.[\w]+)(?:\s|$|`|[)}\]]|[。、,.])",
+    r"(?:^|\s|`|\()(\/[\w./_-]{1,512}\.[\w]{1,16})(?:\s|$|`|[)}\]]|[。、,.])",
     re.MULTILINE,
 )
 
@@ -97,6 +97,49 @@ ADMIN_FILE_DIRS = ("/home/ubuntu", "/tmp")
 # Max file size for Discord attachment (25MB Discord limit, we cap at 24MB)
 MAX_FILE_ATTACH_BYTES = 24 * 1024 * 1024
 MAX_FILE_ATTACHMENTS = 5
+
+# Hardcoded basename denylist applied regardless of allowed dir. Defence in
+# depth on top of .attachignore: a prompt-injection attempt that makes the
+# model emit a credential path should not be auto-attachable even if
+# .attachignore is missing or its globs don't cover hidden-file variants
+# (e.g. `.credentials.json` vs the existing `credentials.json` pattern).
+_SECRET_BASENAME_EXACT = frozenset({
+    ".env",
+    ".credentials.json",
+    "credentials.json",
+    "hosts.yml",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "authorized_keys",
+    "known_hosts",
+    ".netrc",
+    ".pgpass",
+})
+_SECRET_BASENAME_GLOBS = (
+    ".env.*",
+    "*.env",
+    "*.pem",
+    "*.key",
+    "*.token",
+    "*.secret",
+    "*.sqlite",
+    "*.sqlite3",
+    "*.db",
+)
+
+
+def _basename_is_secret(path: str) -> bool:
+    """True if the file's basename matches a known credential/secret pattern.
+
+    Applied as a denylist on top of the allowed-dir check so that even a
+    permissive ADMIN_FILE_DIRS can't leak hidden credential files.
+    """
+    base = os.path.basename(path)
+    if base in _SECRET_BASENAME_EXACT:
+        return True
+    return any(fnmatch.fnmatch(base, pat) for pat in _SECRET_BASENAME_GLOBS)
 
 # Path to .attachignore file (glob patterns, one per line, # comments)
 _ATTACHIGNORE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".attachignore")
@@ -209,6 +252,7 @@ def extract_image_paths(text: str, *, admin: bool = False) -> list[str]:
     When *admin* is True, the broader ADMIN_IMAGE_DIRS allow-list is used,
     which includes /home/ubuntu. Magic-byte checks are still enforced.
     """
+    text = text[:100_000]
     dirs = ADMIN_IMAGE_DIRS if admin else ALLOWED_IMAGE_DIRS
     allowed_real = tuple(os.path.realpath(d) for d in dirs)
     paths: list[str] = []
@@ -277,6 +321,7 @@ def extract_file_paths(text: str) -> list[str]:
     Only files under ADMIN_FILE_DIRS, resolved via realpath to prevent symlink escape.
     Skips image files (those are handled by extract_image_paths).
     """
+    text = text[:100_000]
     image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
     allowed_real = tuple(os.path.realpath(d) for d in ADMIN_FILE_DIRS)
     paths: list[str] = []
@@ -297,6 +342,11 @@ def extract_file_paths(text: str) -> list[str]:
             continue
         if not any(real == d or real.startswith(d + os.sep) for d in allowed_real):
             log.warning("Rejecting file path outside admin allow-list: %s", raw)
+            continue
+        if _basename_is_secret(real):
+            log.warning("Rejecting secret-basename file: %s", raw)
+            continue
+        if is_attach_ignored(real):
             continue
         if not os.path.isfile(real):
             continue

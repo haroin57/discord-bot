@@ -59,6 +59,16 @@ from utils.table_renderer import render_table_image
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Shared rate-limit module (H6) — defensive import with legacy fallback
+# ---------------------------------------------------------------------------
+try:
+    from services.rate_limit import check_cooldown as _rl_check_cooldown, check_daily_quota as _rl_check_daily_quota
+    _USE_SHARED_RATE_LIMIT = True
+except ImportError:
+    _USE_SHARED_RATE_LIMIT = False
+    log.warning("services.rate_limit not available; using local cooldown/quota fallback")
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 sessions = load_sessions()
@@ -264,12 +274,6 @@ async def on_ready():
                 if not role.is_default():
                     BOT_ROLE_IDS.add(role.id)
     build_mention_regex(bot.user.id)
-    # Load DGM cog
-    try:
-        await bot.load_extension("dgm")
-        log.info("DGM cog loaded successfully")
-    except Exception as e:
-        log.warning("Failed to load DGM cog: %s", e)
     # Sync slash commands with Discord
     try:
         synced = await bot.tree.sync()
@@ -393,7 +397,7 @@ async def on_message(message: discord.Message):
     log.debug("[%s] %s: %s", message.channel, message.author, message.content[:200])
 
     # In DMs, only admins can interact. In guilds, require mention or keyword.
-    is_dm = isinstance(message.channel, discord.DMChannel)
+    is_dm = isinstance(message.channel, (discord.DMChannel, discord.GroupChannel))
     if is_dm and not is_admin(message.author):
         return
     if not is_dm:
@@ -441,22 +445,31 @@ async def on_message(message: discord.Message):
     # Tiered rate limiting: non-admins get a much stricter cooldown so they
     # can't flood the shared Claude quota or memory budget.
     _purge_cooldowns()
-    now = time.time()
-    last = cooldowns.get(message.author.id, 0)
-    effective_cooldown = COOLDOWN_SECONDS if caller_is_admin else RESTRICTED_COOLDOWN_SECONDS
-    if now - last < effective_cooldown:
-        remaining = int(effective_cooldown - (now - last))
-        await message.reply(f"⏳ Please wait {remaining}s before sending another request.")
-        return
-    cooldowns[message.author.id] = now
-    cooldowns.move_to_end(message.author.id)
-    while len(cooldowns) > MAX_COOLDOWN_ENTRIES:
-        cooldowns.popitem(last=False)
+    if _USE_SHARED_RATE_LIMIT:
+        _cd_allowed, _cd_wait = _rl_check_cooldown(str(message.author.id), caller_is_admin)
+        if not _cd_allowed:
+            await message.reply(f"⏳ Please wait {_cd_wait}s before sending another request.")
+            return
+    else:
+        now = time.time()
+        last = cooldowns.get(message.author.id, 0)
+        effective_cooldown = COOLDOWN_SECONDS if caller_is_admin else RESTRICTED_COOLDOWN_SECONDS
+        if now - last < effective_cooldown:
+            remaining = int(effective_cooldown - (now - last))
+            await message.reply(f"⏳ Please wait {remaining}s before sending another request.")
+            return
+        cooldowns[message.author.id] = now
+        cooldowns.move_to_end(message.author.id)
+        while len(cooldowns) > MAX_COOLDOWN_ENTRIES:
+            cooldowns.popitem(last=False)
 
     # Daily quota (non-admin only).
     if not caller_is_admin:
-        allowed, remaining_quota = _check_daily_quota(message.author.id)
-        if not allowed:
+        if _USE_SHARED_RATE_LIMIT:
+            _q_allowed, _q_remaining = _rl_check_daily_quota(str(message.author.id), caller_is_admin)
+        else:
+            _q_allowed, _q_remaining = _check_daily_quota(message.author.id)
+        if not _q_allowed:
             await message.reply("⏳ 今日の利用上限に達しました。また明日来てください。")
             return
 
@@ -614,6 +627,13 @@ async def on_message(message: discord.Message):
             # full conversation history in its context window from the
             # initial turn. Only send what's new: user text, reply
             # context, and attachments.
+            #
+            # The new payload is still untrusted (Discord text, replied-to
+            # message body, text attachments) so it is wrapped in the same
+            # <untrusted_user_input> block as the initial-turn path. Without
+            # this wrapper, prompt-injection content in a reply chain or
+            # forwarded attachment can reach an admin Claude session
+            # operating with bypassPermissions.
             parts: list[str] = []
             if reply_context:
                 # reply_context is pre-sanitized at construction (lines ~521-524).
@@ -634,7 +654,7 @@ async def on_message(message: discord.Message):
                     parts.append(
                         f"<attached_file name=\"{safe_fname}\">\n{safe_content}\n</attached_file>"
                     )
-            prompt = "\n\n".join(parts)
+            prompt = _wrap_untrusted("\n\n".join(parts))
         else:
             # ── Full initial prompt ─────────────────────────────────
             # First message in a session or non-admin: include all

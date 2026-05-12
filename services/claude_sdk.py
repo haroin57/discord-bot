@@ -7,6 +7,7 @@ and error classification (free-code/services/api/withRetry.ts).
 import asyncio
 import logging
 import os
+import re
 import tempfile
 import time
 
@@ -98,6 +99,14 @@ _session_timestamps: dict[int, float] = {}
 # ---------------------------------------------------------------------------
 # Retry — exponential backoff (free-code: withRetry)
 # ---------------------------------------------------------------------------
+
+# M5: per-channel retry budget — at most 3 transient retries per 60 s window.
+# Bounded to 500 entries; oldest entry evicted when the limit is reached.
+_retry_budget: dict[int, list[float]] = {}
+_RETRY_BUDGET_MAX_CHANNELS = 500
+_RETRY_BUDGET_WINDOW_S = 60
+_RETRY_BUDGET_PER_WINDOW = 3
+
 BASE_BACKOFF_S = 3
 MAX_BACKOFF_S = CLAUDE_MAX_BACKOFF_S
 DEFAULT_MAX_ATTEMPTS = CLAUDE_MAX_ATTEMPTS
@@ -192,6 +201,15 @@ def _read_stderr_file(path: str | None) -> str:
         return content[-10000:] if len(content) > 10000 else content
     except Exception:
         return ""
+
+
+def _redact_secrets(text: str) -> str:
+    """Remove API keys / auth tokens from text before writing to disk or logs."""
+    # ANTHROPIC_API_KEY=xxx or ANTHROPIC_AUTH_TOKEN=xxx
+    text = re.sub(r"(ANTHROPIC_(?:API|AUTH)_(?:KEY|TOKEN))=\S+", r"\1=***", text)
+    # Raw sk-ant-... bearer tokens
+    text = re.sub(r"sk-ant-[A-Za-z0-9_-]+", "sk-ant-***", text)
+    return text
 
 
 def _cleanup_stderr(fileobj, path: str | None = None, *, keep: bool = False) -> None:
@@ -348,19 +366,29 @@ async def call_with_tools(
             #     subprocess inherits that key via env — so non-admin calls
             #     burn a dedicated, separately-billed quota rather than the
             #     owner's OAuth subscription.
-            has_images = has_image_attachment
             restricted_env: dict[str, str] = {}
             if RESTRICTED_ANTHROPIC_API_KEY:
                 restricted_env["ANTHROPIC_API_KEY"] = RESTRICTED_ANTHROPIC_API_KEY
                 # Unset OAuth so the CLI doesn't prefer it over the API key.
                 restricted_env["ANTHROPIC_AUTH_TOKEN"] = ""
+            # H3: allow_tools=[] unconditionally. The CLI Read tool does not
+            # enforce cwd, so a non-admin user could read absolute paths outside
+            # the attachment dir. Image content is passed to the model via the
+            # prompt (<attached_images> block in PromptBuilder) so Read is not
+            # needed. Future work: base64-embed image bytes in the prompt directly.
+            if has_image_attachment:
+                log.warning(
+                    "ch=%d restricted call has image attachment; images won't be "
+                    "processed by Read tool in restricted mode (H3)",
+                    channel_id,
+                )
             options = ClaudeCodeOptions(
                 system_prompt=RESTRICTED_SYSTEM_PROMPT,
                 permission_mode="default",
                 cwd=RESTRICTED_CWD,
                 max_turns=RESTRICTED_MAX_TURNS,
                 model=MODEL,
-                allowed_tools=(["Read"] if has_images else []),
+                allowed_tools=[],
                 disallowed_tools=_RESTRICTED_DENY_LIST,
                 mcp_servers={},
                 settings=None,  # don't inherit admin-level settings
@@ -370,8 +398,11 @@ async def call_with_tools(
             # Admin mode: model decides what tools to use, but we hand the
             # SDK only the MCP servers this request is likely to need so we
             # don't pay the chromium / scholarly / web-mcp startup cost on
-            # every reply. raw_user_text falls back to prompt if missing.
-            chosen_mcp = pick_mcp_servers(raw_user_text or prompt)
+            # every reply.
+            # M3: only use raw_user_text (never fall back to the full assembled
+            # prompt). The prompt may contain forwarded message content or Mem0
+            # memories that include MCP keywords, allowing injection attacks.
+            chosen_mcp = pick_mcp_servers(raw_user_text or "")
             options = ClaudeCodeOptions(
                 system_prompt=SYSTEM_PROMPT,
                 permission_mode="bypassPermissions",
@@ -428,6 +459,28 @@ async def call_with_tools(
         for attempt in range(TRANSIENT_MAX_ATTEMPTS):
             if attempt >= max_attempts:
                 break
+
+            # M5: per-channel retry budget — cap transient retries to
+            # _RETRY_BUDGET_PER_WINDOW within a rolling 60 s window so a
+            # flapping upstream cannot drive unbounded retries per channel.
+            if attempt > 0:
+                now = time.monotonic()
+                recent = [
+                    t for t in _retry_budget.get(channel_id, [])
+                    if now - t < _RETRY_BUDGET_WINDOW_S
+                ]
+                if len(recent) >= _RETRY_BUDGET_PER_WINDOW:
+                    log.warning(
+                        "Retry budget exhausted for ch=%d, giving up", channel_id
+                    )
+                    _cleanup_stderr(stderr_fileobj)
+                    return _error_message("unknown"), None
+                recent.append(now)
+                _retry_budget[channel_id] = recent
+                # LRU eviction: drop oldest entries if dict too large
+                if len(_retry_budget) > _RETRY_BUDGET_MAX_CHANNELS:
+                    oldest_key = next(iter(_retry_budget))
+                    del _retry_budget[oldest_key]
 
             stderr_path: str | None = None
             try:
@@ -560,14 +613,27 @@ async def call_with_tools(
 
                 # Save stderr for debugging — only on the first few attempts to
                 # avoid flooding .state/ with hundreds of files under retry storms.
+                # H2: redact secrets and write with mode 0o600 to prevent
+                # ANTHROPIC_API_KEY / sk-ant-* from leaking to world-readable files.
                 if stderr_tail and attempt < 3:
                     debug_path = os.path.join(STATE_DIR, f"stderr_ch{channel_id}.log")
+                    fd = None
                     try:
-                        with open(debug_path, "w", encoding="utf-8") as fh:
-                            fh.write(stderr_tail)
+                        fd = os.open(
+                            debug_path,
+                            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                            0o600,
+                        )
+                        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                            fh.write(_redact_secrets(stderr_tail))
+                        fd = None  # os.fdopen took ownership
                         log.info("Saved stderr to %s", debug_path)
                     except Exception:
-                        pass
+                        if fd is not None:
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
 
                 if stderr_tail:
                     log.error("SDK error (attempt %d, type=%s): %s\nstderr tail:\n%s",

@@ -105,36 +105,6 @@ def get_client() -> anthropic.Anthropic:
 
 
 # ---------------------------------------------------------------------------
-# DGM-specific client (no SDK retries — DGM handles its own retry logic)
-# ---------------------------------------------------------------------------
-_cached_dgm_client: anthropic.Anthropic | None = None
-_cached_dgm_token: str | None = None
-
-
-def get_dgm_client() -> anthropic.Anthropic:
-    """Get Anthropic client for DGM with max_retries=0 to avoid retry amplification."""
-    global _cached_dgm_client, _cached_dgm_token
-
-    oauth_init()
-
-    current_token = get_access_token()
-    if _cached_dgm_client is not None and current_token == _cached_dgm_token:
-        return _cached_dgm_client
-
-    _cached_dgm_client = anthropic.Anthropic(
-        default_headers={
-            "x-app": "cli",
-            "User-Agent": "claude-code/1.0",
-        },
-        timeout=600.0,
-        max_retries=0,
-    )
-    _cached_dgm_token = current_token
-    log.info("DGM Anthropic client created (max_retries=0, via oauth_manager)")
-    return _cached_dgm_client
-
-
-# ---------------------------------------------------------------------------
 # Message normalization (free-code: normalizeMessagesForAPI)
 # ---------------------------------------------------------------------------
 def normalize_messages(history: list[dict]) -> list[dict]:

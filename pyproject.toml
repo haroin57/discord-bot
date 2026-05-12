@@ -14,7 +14,7 @@ markers = [
 ]
 
 # Default to excluding `integration`-marked tests. The bot's test suite is
-# otherwise mock-heavy and runs in ~1-2 s; the dgm sandbox subprocess tests
+# otherwise mock-heavy and runs in ~1-2 s; integration-marked tests
 # add ~10-25 s when included.
 addopts = "-m 'not integration'"
 

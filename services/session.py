@@ -37,6 +37,62 @@ class SessionInfo:
 # ---------------------------------------------------------------------------
 # SDK session IDs (channel_id -> SessionInfo for --resume)
 # ---------------------------------------------------------------------------
+
+# Internal composite-key store: (channel_id, user_id | None) -> SessionInfo
+# user_id=None is the legacy fallback bucket for callers that don't supply it.
+_sessions_store: OrderedDict[tuple[int, int | None], SessionInfo] = OrderedDict()
+
+
+def get_session(channel_id: int, user_id: int | None) -> "SessionInfo | None":
+    """Return the SessionInfo for (channel_id, user_id), or None if absent."""
+    return _sessions_store.get((channel_id, user_id))
+
+
+def set_session(channel_id: int, user_id: int | None, info: "SessionInfo") -> None:
+    """Store info under composite key and schedule a non-blocking disk save."""
+    key = (channel_id, user_id)
+    _sessions_store[key] = info
+    _sessions_store.move_to_end(key)
+    while len(_sessions_store) > MAX_SESSIONS:
+        _sessions_store.popitem(last=False)
+    _schedule_save()
+
+
+def clear_session(channel_id: int, user_id: int | None) -> None:
+    """Remove the session for (channel_id, user_id) if present."""
+    _sessions_store.pop((channel_id, user_id), None)
+    _schedule_save()
+
+
+def _schedule_save() -> None:
+    """Flush _sessions_store to disk, async if a loop is running."""
+    flat = _flatten_sessions(_sessions_store)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        save_sessions(flat)
+        return
+    snapshot = OrderedDict(flat)
+    task = loop.create_task(asyncio.to_thread(save_sessions, snapshot))
+    _save_tasks.add(task)
+    task.add_done_callback(_on_save_done)
+
+
+def _flatten_sessions(
+    store: "OrderedDict[tuple[int, int | None], SessionInfo]",
+) -> "OrderedDict[int, SessionInfo]":
+    """Convert composite-key store to the channel_id-keyed format for disk.
+
+    For each channel_id the last seen entry wins (user_id=None legacy bucket
+    is included unless a user-specific entry for the same channel exists later
+    in insertion order).
+    """
+    flat: OrderedDict[int, SessionInfo] = OrderedDict()
+    for (ch, _uid), info in store.items():
+        flat[ch] = info
+    return flat
+
+
 def load_sessions() -> OrderedDict[int, SessionInfo]:
     try:
         with open(SESSIONS_PATH, encoding="utf-8") as f:
@@ -51,6 +107,9 @@ def load_sessions() -> OrderedDict[int, SessionInfo]:
                     session_id=v["session_id"],
                     mcp_server_keys=v.get("mcp_server_keys", []),
                 )
+        # Populate internal store from disk (legacy bucket, user_id=None)
+        for ch_id, info in result.items():
+            _sessions_store[(ch_id, None)] = info
         return result
     except (FileNotFoundError, json.JSONDecodeError):
         return OrderedDict()
@@ -80,6 +139,7 @@ def update_session(
     sessions: OrderedDict[int, SessionInfo],
     channel_id: int,
     info: SessionInfo,
+    user_id: int | None = None,
 ) -> None:
     """Mutate the session dict in-place and schedule a non-blocking save.
 
@@ -88,25 +148,17 @@ def update_session(
     so the event loop does not stall on every Discord message that produces
     a new SDK session ID. Falls back to a synchronous save when called
     outside an event loop (tests / CLI scripts).
+
+    `user_id` is forwarded to `set_session` so the internal composite-key
+    store is also updated. Pass None for backward-compatible behavior.
     """
     sessions[channel_id] = info
     sessions.move_to_end(channel_id)
     while len(sessions) > MAX_SESSIONS:
         sessions.popitem(last=False)
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # No running loop — direct sync save (tests / one-shot CLI usage).
-        save_sessions(sessions)
-        return
-    # Snapshot the dict on the event-loop thread (single bytecode op under
-    # the GIL) so the worker thread's `.items()` iteration in save_sessions
-    # cannot race with a concurrent update_session() mutation, which would
-    # otherwise raise "dictionary changed size during iteration".
-    snapshot = OrderedDict(sessions)
-    task = loop.create_task(asyncio.to_thread(save_sessions, snapshot))
-    _save_tasks.add(task)
-    task.add_done_callback(_on_save_done)
+    # Mirror into composite-key store.
+    set_session(channel_id, user_id, info)
+    # set_session already schedules the save; no need to do it again.
 
 
 def _on_save_done(task: asyncio.Task) -> None:
@@ -130,12 +182,23 @@ def _on_save_done(task: asyncio.Task) -> None:
 # ---------------------------------------------------------------------------
 # JSONL conversation history (free-code: {sessionId}.jsonl)
 # ---------------------------------------------------------------------------
+_CHANNEL_ID_MIN = 10**14
+_CHANNEL_ID_MAX = 10**19
+
+
+def _validate_channel_id(channel_id: int) -> None:
+    if not isinstance(channel_id, int) or not (_CHANNEL_ID_MIN <= channel_id <= _CHANNEL_ID_MAX):
+        raise ValueError(f"invalid channel_id range: {channel_id!r}")
+
+
 def _history_file(channel_id: int) -> str:
+    _validate_channel_id(channel_id)
     return os.path.join(HISTORY_DIR, f"{channel_id}.jsonl")
 
 
 def append_jsonl(channel_id: int, entry: dict) -> None:
     """Append a single entry to the channel's JSONL transcript (fire-and-forget safe)."""
+    _validate_channel_id(channel_id)
     entry["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     entry["channel_id"] = channel_id
     # Open with 0o600 so conversation transcripts are not world-readable on a
@@ -205,6 +268,7 @@ def _tail_jsonl(path: str, max_entries: int) -> list[dict]:
 
 def load_history_channel(channel_id: int) -> list[dict]:
     """Load recent conversation messages for a channel (tail only)."""
+    _validate_channel_id(channel_id)
     return _tail_jsonl(_history_file(channel_id), MAX_MESSAGES_PER_CHANNEL * 2)
 
 

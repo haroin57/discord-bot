@@ -11,6 +11,7 @@ import discord
 
 from config import (
     ADMIN_USER_IDS,
+    ALLOWED_ATTACHMENT_HOSTS,
     BOT_KEYWORDS,
     BOT_ROLE_IDS,
     CROSS_THREAD_CONTEXT_MESSAGES,
@@ -419,20 +420,59 @@ async def _resolve_one_link(
         for attachment in msg.attachments:
             content_type = (attachment.content_type or "").split(";")[0].strip().lower()
             if content_type in _INLINE_TEXT_TYPES and (attachment.size or 0) <= _MAX_LINK_TEXT_BYTES:
+                # SSRF guard mirrored from utils/attachments._host_is_allowed.
+                # Discord occasionally serves attachments from unexpected
+                # hosts (or a crafted message-link target could be spoofed
+                # via CDN redirect quirks); refuse anything that isn't a
+                # Discord CDN https URL before issuing the request.
+                attachment_url = attachment.url or ""
+                allowed = False
                 try:
-                    async with aiohttp.ClientSession() as sess:
-                        async with sess.get(attachment.url, allow_redirects=False) as resp:
-                            if resp.status == 200:
-                                data = await resp.read()
-                                if len(data) <= _MAX_LINK_TEXT_BYTES:
-                                    try:
-                                        text = data.decode("utf-8")
-                                    except UnicodeDecodeError:
-                                        text = data.decode("latin-1")
-                                    parts.append(f"[Attachment: {attachment.filename}]\n{text}")
-                                    continue
-                except Exception as e:
-                    log.warning("Failed to download linked attachment %s: %s", attachment.filename, e)
+                    parsed = urlparse(attachment_url)
+                    if parsed.scheme == "https" and (parsed.hostname or "").lower() in ALLOWED_ATTACHMENT_HOSTS:
+                        allowed = True
+                except ValueError:
+                    allowed = False
+                if not allowed:
+                    log.warning(
+                        "Rejecting linked attachment from non-allowlisted host: %s",
+                        attachment_url,
+                    )
+                else:
+                    try:
+                        async with aiohttp.ClientSession() as sess:
+                            async with sess.get(
+                                attachment_url, allow_redirects=False
+                            ) as resp:
+                                if resp.status == 200:
+                                    # Cap by Content-Length up front so we don't
+                                    # buffer the entire response just to discard.
+                                    cl = resp.headers.get("Content-Length")
+                                    if cl is not None:
+                                        try:
+                                            if int(cl) > _MAX_LINK_TEXT_BYTES:
+                                                parts.append(f"[Attachment: {attachment.filename}]")
+                                                continue
+                                        except ValueError:
+                                            pass
+                                    data = b""
+                                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                                        data += chunk
+                                        if len(data) > _MAX_LINK_TEXT_BYTES:
+                                            data = b""
+                                            break
+                                    if 0 < len(data) <= _MAX_LINK_TEXT_BYTES:
+                                        try:
+                                            text = data.decode("utf-8")
+                                        except UnicodeDecodeError:
+                                            text = data.decode("latin-1")
+                                        parts.append(f"[Attachment: {attachment.filename}]\n{text}")
+                                        continue
+                    except Exception as e:
+                        log.warning(
+                            "Failed to download linked attachment %s: %s",
+                            attachment.filename, e,
+                        )
             parts.append(f"[Attachment: {attachment.filename}]")
 
         # If the resolved message is in a thread, fetch surrounding context
@@ -447,7 +487,7 @@ async def _resolve_one_link(
                     oldest_first=False,
                 ):
                     if requester is not None and not _requester_can_read(channel, requester):
-                        break
+                        continue
                     body = _format_msg_body(m)
                     if body:
                         before_msgs.append((m.author.display_name, body))
@@ -459,6 +499,8 @@ async def _resolve_one_link(
                     after=msg,
                     oldest_first=True,
                 ):
+                    if requester is not None and not _requester_can_read(channel, requester):
+                        continue
                     body = _format_msg_body(m)
                     if body:
                         after_msgs.append((m.author.display_name, body))

@@ -1,6 +1,8 @@
 """Tests for services/claude_sdk.py — call_with_tools with mocked SDK."""
 
 import asyncio
+import os
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -300,3 +302,155 @@ class TestSessionResume:
             assert info is not None
             assert info.session_id == "new-sess"
             assert "context7" in info.mcp_server_keys  # BASE always included
+
+
+class TestSecurityFixes:
+    """Tests for H2, H3, M3, M5 security fixes."""
+
+    def test_stderr_redacts_api_key_and_token(self, tmp_path):
+        """H2: stderr written to disk must not contain plaintext API keys."""
+        from services.claude_sdk import _redact_secrets
+
+        dirty = (
+            "some log line\n"
+            "ANTHROPIC_API_KEY=sk-ant-real-secret-value\n"
+            "ANTHROPIC_AUTH_TOKEN=mytoken123\n"
+            "Bearer sk-ant-api03-abcDEF_xyz-rest\n"
+            "normal line\n"
+        )
+        clean = _redact_secrets(dirty)
+
+        assert "sk-ant-real-secret-value" not in clean
+        assert "mytoken123" not in clean
+        assert "sk-ant-api03-abcDEF_xyz-rest" not in clean
+        # Env var names should still be present (only values redacted)
+        assert "ANTHROPIC_API_KEY=***" in clean
+        assert "ANTHROPIC_AUTH_TOKEN=***" in clean
+        assert "sk-ant-***" in clean
+
+    def test_stderr_file_written_with_secure_permissions(self, tmp_path, monkeypatch):
+        """H2: stderr debug file must be created with mode 0o600."""
+        import services.claude_sdk as sdk
+
+        monkeypatch.setattr(sdk, "STATE_DIR", str(tmp_path))
+
+        debug_path = tmp_path / "stderr_ch999.log"
+        stderr_tail = "ANTHROPIC_API_KEY=secret\nsome error"
+
+        fd = os.open(
+            str(debug_path),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o600,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(sdk._redact_secrets(stderr_tail))
+
+        stat = os.stat(str(debug_path))
+        # Permissions must be exactly 0o600 (owner rw only)
+        assert (stat.st_mode & 0o777) == 0o600
+        content = debug_path.read_text()
+        assert "secret" not in content
+
+    @pytest.mark.asyncio
+    async def test_restricted_allowed_tools_is_empty(self):
+        """H3: restricted mode must use allowed_tools=[] even when has_image_attachment=True."""
+        captured_options = {}
+
+        async def spy_query(*args, **kwargs):
+            captured_options["opts"] = kwargs.get("options") or args[1]
+            from claude_code_sdk import ResultMessage
+            msg = MagicMock(spec=ResultMessage)
+            msg.result = "ok"
+            msg.session_id = None
+            msg.total_cost_usd = 0.0
+            msg.usage = {"input_tokens": 10, "output_tokens": 5}
+            msg.num_turns = 1
+            msg.duration_api_ms = 100
+            msg.is_error = False
+            yield msg
+
+        with patch("services.claude_sdk.query", side_effect=spy_query):
+            from services.claude_sdk import call_with_tools
+            await call_with_tools(
+                "hello", 42, {},
+                restricted=True,
+                has_image_attachment=True,
+            )
+
+        opts = captured_options.get("opts")
+        assert opts is not None
+        assert opts.allowed_tools == []
+
+    @pytest.mark.asyncio
+    async def test_pick_mcp_servers_does_not_fall_back_to_prompt(self):
+        """M3: pick_mcp_servers must only receive raw_user_text, never the full prompt."""
+        received_args = []
+
+        real_pick = None
+        import config as _cfg
+        real_pick = _cfg.pick_mcp_servers
+
+        def recording_pick(text):
+            received_args.append(text)
+            return real_pick(text)
+
+        async def fake_query(*args, **kwargs):
+            from claude_code_sdk import ResultMessage
+            msg = MagicMock(spec=ResultMessage)
+            msg.result = "ok"
+            msg.session_id = "s1"
+            msg.total_cost_usd = 0.0
+            msg.usage = {"input_tokens": 10, "output_tokens": 5}
+            msg.num_turns = 1
+            msg.duration_api_ms = 100
+            msg.is_error = False
+            yield msg
+
+        with patch("services.claude_sdk.pick_mcp_servers", side_effect=recording_pick):
+            with patch("services.claude_sdk.query", side_effect=fake_query):
+                from services.claude_sdk import call_with_tools
+                # prompt is positional; raw_user_text="" so the fallback to prompt
+                # must NOT happen (M3 fix)
+                await call_with_tools(
+                    "please use playwright to browse the web",
+                    99,
+                    {},
+                    restricted=False,
+                    raw_user_text="",
+                )
+
+        # pick_mcp_servers must receive "" (empty string), NOT the full prompt
+        assert len(received_args) >= 1
+        assert received_args[0] == ""
+
+    @pytest.mark.asyncio
+    async def test_retry_budget_bounded_per_channel(self):
+        """M5: after 3 transient retries within 60 s, the 4th attempt is blocked."""
+        import services.claude_sdk as sdk
+
+        channel_id = 77777
+        # Pre-fill budget with 3 recent timestamps to simulate 3 retries already used
+        now = time.monotonic()
+        sdk._retry_budget[channel_id] = [now - 5, now - 3, now - 1]
+
+        call_count = 0
+
+        async def transient_query(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("overloaded server 529")
+            yield  # make it a generator
+
+        from services.claude_sdk import call_with_tools
+        with patch("services.claude_sdk.query", side_effect=transient_query):
+            with patch("services.claude_sdk.asyncio.sleep", new_callable=AsyncMock):
+                text, info = await call_with_tools(
+                    "hello", channel_id, {},
+                    restricted=False,
+                    raw_user_text="hello",
+                )
+
+        # Budget was exhausted before the 2nd attempt could even be retried
+        assert info is None
+        # The query was called once (attempt 0), then budget check blocked attempt 1
+        assert call_count == 1

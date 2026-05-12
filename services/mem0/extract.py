@@ -52,7 +52,10 @@ async def _classify_for_metadata(messages: list[dict]) -> dict:
             if not isinstance(content, str):
                 content = str(content)
             if content:
-                conv_parts.append(f"{role}: {content[:400]}")
+                # M17: strip XML breakout tags and escape braces before format()
+                safe_content = _strip_extract_breakout_tags(content[:400])
+                safe_content = safe_content.replace("{", "{{").replace("}", "}}")
+                conv_parts.append(f"{role}: {safe_content}")
         if not conv_parts:
             return {}
         conv = "\n".join(conv_parts)

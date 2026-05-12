@@ -3,16 +3,54 @@
 import json
 from collections import OrderedDict
 
+import pytest
+
 from services.session import (
     SessionInfo,
+    _history_file,
     append_jsonl,
     fix_history_integrity,
+    get_session,
     load_history_channel,
     load_sessions,
     save_sessions,
+    set_session,
     trim_history,
     update_session,
 )
+import services.session as _session_module
+
+
+@pytest.fixture(autouse=True)
+def _clear_sessions_store():
+    """Isolate the module-level _sessions_store between tests."""
+    _session_module._sessions_store.clear()
+    yield
+    _session_module._sessions_store.clear()
+
+
+class TestCompositeKey:
+    def test_composite_key_isolates_users(self, tmp_state_dir):
+        info_a = SessionInfo(session_id="A", mcp_server_keys=[])
+        info_b = SessionInfo(session_id="B", mcp_server_keys=[])
+        set_session(100, 1, info_a)
+        set_session(100, 2, info_b)
+        assert get_session(100, 1).session_id == "A"
+        assert get_session(100, 2).session_id == "B"
+
+    def test_legacy_no_user_id_bucket(self, tmp_state_dir):
+        info = SessionInfo(session_id="X", mcp_server_keys=[])
+        set_session(100, None, info)
+        assert get_session(100, None).session_id == "X"
+        assert get_session(100, 999) is None  # not visible to other users
+
+    def test_history_file_rejects_traversal(self):
+        with pytest.raises(ValueError):
+            _history_file(-1)
+        with pytest.raises(ValueError):
+            _history_file(0)
+        with pytest.raises(ValueError):
+            _history_file(1)  # too small
 
 
 class TestSessions:
@@ -58,23 +96,29 @@ class TestSessions:
         assert loaded[42].mcp_server_keys == ["context7", "brave-search"]
 
 
+# Minimal valid Discord snowflake IDs (must be in [10**14, 10**19])
+_CH_A = 100000000000000   # 10**14
+_CH_B = 100000000000001
+_CH_MISSING = 999999999999999
+
+
 class TestJSONLHistory:
     def test_append_and_load(self, tmp_state_dir):
-        append_jsonl(42, {"role": "user", "content": "hello"})
-        append_jsonl(42, {"role": "assistant", "content": "hi"})
-        msgs = load_history_channel(42)
+        append_jsonl(_CH_A, {"role": "user", "content": "hello"})
+        append_jsonl(_CH_A, {"role": "assistant", "content": "hi"})
+        msgs = load_history_channel(_CH_A)
         assert len(msgs) == 2
         assert msgs[0] == {"role": "user", "content": "hello"}
         assert msgs[1] == {"role": "assistant", "content": "hi"}
 
     def test_load_missing_channel(self, tmp_state_dir):
-        assert load_history_channel(999) == []
+        assert load_history_channel(_CH_MISSING) == []
 
     def test_ignores_non_message_entries(self, tmp_state_dir):
-        append_jsonl(10, {"role": "user", "content": "msg1"})
-        append_jsonl(10, {"type": "system", "data": "noise"})  # not user/assistant
-        append_jsonl(10, {"role": "assistant", "content": "msg2"})
-        msgs = load_history_channel(10)
+        append_jsonl(_CH_B, {"role": "user", "content": "msg1"})
+        append_jsonl(_CH_B, {"type": "system", "data": "noise"})  # not user/assistant
+        append_jsonl(_CH_B, {"role": "assistant", "content": "msg2"})
+        msgs = load_history_channel(_CH_B)
         assert len(msgs) == 2
 
 

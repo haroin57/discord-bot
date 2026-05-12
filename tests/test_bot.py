@@ -994,3 +994,82 @@ class TestSessionAdditional:
             entry = json.loads(f.readline())
         assert "timestamp" in entry
         assert entry["channel_id"] == 50
+
+
+# ---------------------------------------------------------------------------
+# H8: GroupChannel DM gate
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_group_dm_treated_as_dm_for_admin_gate(monkeypatch):
+    """Non-admin messages in a GroupChannel must be silently rejected."""
+    import bot
+
+    monkeypatch.setattr("bot.ADMIN_USER_IDS", {99999})  # author 12345 is NOT admin
+
+    mock_bot_user = MagicMock()
+    mock_bot_user.id = 88888
+    with patch.object(type(bot.bot), "user", new_callable=PropertyMock, return_value=mock_bot_user):
+        msg = MagicMock(spec=discord.Message)
+        msg.author = MagicMock(spec=discord.Member)
+        msg.author.id = 12345
+        msg.author.bot = False
+        msg.author.__eq__ = lambda self, other: False  # not the bot user
+
+        # Use a real GroupChannel spec so isinstance check passes
+        msg.channel = MagicMock(spec=discord.GroupChannel)
+        msg.channel.id = 11111
+        msg.reply = AsyncMock()
+
+        await bot.on_message(msg)
+
+    # Should have returned early — reply never called (no rate-limit msg, no response)
+    msg.reply.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# H6: shared rate_limit module consulted
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rate_limit_uses_shared_module(monkeypatch):
+    """When services.rate_limit is available, check_cooldown must be called."""
+    import bot
+
+    called_with = []
+
+    def fake_check_cooldown(discord_id: str, is_admin: bool):
+        called_with.append((discord_id, is_admin))
+        return (False, 30)  # deny immediately so handler exits early
+
+    monkeypatch.setattr("bot._USE_SHARED_RATE_LIMIT", True)
+    monkeypatch.setattr("bot._rl_check_cooldown", fake_check_cooldown)
+    monkeypatch.setattr("bot.ADMIN_USER_IDS", {99999})
+    monkeypatch.setattr("bot.BOT_KEYWORDS", ["かなえ"])
+    monkeypatch.setattr("bot.BOT_ROLE_IDS", set())
+
+    mock_bot_user = MagicMock()
+    mock_bot_user.id = 88888
+
+    with patch.object(type(bot.bot), "user", new_callable=PropertyMock, return_value=mock_bot_user):
+        msg = MagicMock(spec=discord.Message)
+        msg.author = MagicMock(spec=discord.Member)
+        msg.author.id = 12345
+        msg.author.bot = False
+        msg.author.__eq__ = lambda self, other: False
+
+        msg.channel = MagicMock()
+        msg.channel.__class__ = type("TextChannel", (), {})
+        msg.channel.id = 22222
+        msg.content = "かなえ hello"
+        msg.mentions = []
+        msg.role_mentions = []
+        msg.attachments = []
+        msg.reference = None
+        msg.reply = AsyncMock()
+
+        await bot.on_message(msg)
+
+    # Shared module's check_cooldown was invoked
+    assert len(called_with) >= 1
+    assert called_with[0][0] == "12345"
