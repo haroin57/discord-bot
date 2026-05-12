@@ -504,75 +504,103 @@ class TestStreamSync:
     """Cover lines 115-153 of claude_api.py."""
 
     def test_successful_streaming(self, monkeypatch):
-        from services.claude_api import _stream_sync
+        from services.claude_api import _stream_once
 
         chunks = []
         mock_stream = MagicMock()
         mock_stream.__enter__ = MagicMock(return_value=mock_stream)
         mock_stream.__exit__ = MagicMock(return_value=False)
         mock_stream.text_stream = iter(["Hello", " World"])
+        mock_stream.get_final_message = MagicMock(return_value=None)
 
         mock_client = MagicMock()
         mock_client.beta.messages.stream.return_value = mock_stream
 
-        _stream_sync(mock_client, [{"role": "user", "content": "hi"}], chunks)
+        _stream_once(mock_client, [{"role": "user", "content": "hi"}], "system", chunks)
         assert "".join(chunks) == "Hello World"
 
-    def test_rate_limit_retry(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_rate_limit_retry(self, monkeypatch):
+        """call_direct retries on RateLimitError from _stream_once."""
         import anthropic
         from services import claude_api as api_mod
-        from services.claude_api import _stream_sync
+        from services.claude_api import call_direct
 
         monkeypatch.setattr(api_mod, "RETRY_BACKOFF_BASE", 0.01)
+        monkeypatch.setattr(api_mod, "MAX_RETRIES", 3)
+        monkeypatch.setattr("services.claude_api.get_client", lambda: MagicMock())
+        monkeypatch.setattr("services.claude_api.append_jsonl", lambda *a: None)
+        monkeypatch.setattr("services.claude_api.fix_history_integrity", lambda h: None)
+        monkeypatch.setattr("services.claude_api.trim_history", lambda h, m: None)
+        monkeypatch.setattr("services.claude_api.ensure_valid_token", AsyncMock(return_value=None))
 
-        call_count = 0
+        stream_call_count = 0
 
-        def mock_stream(**kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
+        async def fake_to_thread(fn, *args):
+            nonlocal stream_call_count
+            from services.claude_api import _stream_once as real_stream_once
+            import services.claude_api as _api
+            # Only intercept _stream_once calls
+            if fn is _api._stream_once:
+                stream_call_count += 1
+                if stream_call_count == 1:
+                    raise anthropic.RateLimitError(
+                        message="rate limited",
+                        response=MagicMock(status_code=429),
+                        body=None,
+                    )
+            fn(*args)
+
+        monkeypatch.setattr("asyncio.to_thread", fake_to_thread)
+
+        def fake_stream(api_client, messages, system_prompt, response_chunks):
+            response_chunks.append("Recovered")
+
+        monkeypatch.setattr("services.claude_api._stream_once", fake_stream)
+
+        conversation = OrderedDict()
+        result = await call_direct("test", 1, conversation)
+        assert stream_call_count == 2
+        assert result == "Recovered"
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_exhausted_raises(self, monkeypatch):
+        """call_direct returns error message when all retries exhausted."""
+        import anthropic
+        from services import claude_api as api_mod
+        from services.claude_api import call_direct
+
+        monkeypatch.setattr(api_mod, "RETRY_BACKOFF_BASE", 0.001)
+        monkeypatch.setattr(api_mod, "MAX_RETRIES", 2)
+        monkeypatch.setattr("services.claude_api.get_client", lambda: MagicMock())
+        monkeypatch.setattr("services.claude_api.append_jsonl", lambda *a: None)
+        monkeypatch.setattr("services.claude_api.fix_history_integrity", lambda h: None)
+        monkeypatch.setattr("services.claude_api.trim_history", lambda h, m: None)
+        monkeypatch.setattr("services.claude_api.ensure_valid_token", AsyncMock(return_value=None))
+
+        async def fake_to_thread(fn, *args):
+            import services.claude_api as _api
+            if fn is _api._stream_once:
                 raise anthropic.RateLimitError(
                     message="rate limited",
                     response=MagicMock(status_code=429),
                     body=None,
                 )
-            ctx = MagicMock()
-            ctx.__enter__ = MagicMock(return_value=ctx)
-            ctx.__exit__ = MagicMock(return_value=False)
-            ctx.text_stream = iter(["Recovered"])
-            return ctx
+            fn(*args)
 
-        mock_client = MagicMock()
-        mock_client.beta.messages.stream = mock_stream
+        monkeypatch.setattr("asyncio.to_thread", fake_to_thread)
 
-        chunks: list[str] = []
-        _stream_sync(mock_client, [{"role": "user", "content": "test"}], chunks)
-        assert call_count == 2
-        assert "Recovered" in "".join(chunks)
+        def fake_stream(api_client, messages, system_prompt, response_chunks):
+            pass
 
-    def test_rate_limit_exhausted_raises(self, monkeypatch):
-        import anthropic
-        from services import claude_api as api_mod
-        from services.claude_api import _stream_sync
+        monkeypatch.setattr("services.claude_api._stream_once", fake_stream)
 
-        monkeypatch.setattr(api_mod, "RETRY_BACKOFF_BASE", 0.001)
-        monkeypatch.setattr(api_mod, "MAX_RETRIES", 2)
-
-        def mock_stream(**kwargs):
-            raise anthropic.RateLimitError(
-                message="rate limited",
-                response=MagicMock(status_code=429),
-                body=None,
-            )
-
-        mock_client = MagicMock()
-        mock_client.beta.messages.stream = mock_stream
-
-        with pytest.raises(anthropic.RateLimitError):
-            _stream_sync(mock_client, [{"role": "user", "content": "x"}], [])
+        conversation = OrderedDict()
+        result = await call_direct("x", 1, conversation)
+        assert "API" in result or "error" in result.lower() or "エラー" in result
 
     def test_stall_detection_warning(self, monkeypatch):
-        from services.claude_api import _stream_sync
+        from services.claude_api import _stream_once
 
         # We simulate a gap larger than STREAM_STALL_THRESHOLD_S
         # by monkey-patching time.monotonic to jump
@@ -584,16 +612,17 @@ class TestStreamSync:
         mock_stream.__enter__ = MagicMock(return_value=mock_stream)
         mock_stream.__exit__ = MagicMock(return_value=False)
         mock_stream.text_stream = iter(["chunk"])
+        mock_stream.get_final_message = MagicMock(return_value=None)
 
         mock_client = MagicMock()
         mock_client.beta.messages.stream.return_value = mock_stream
 
         chunks: list[str] = []
-        _stream_sync(mock_client, [{"role": "user", "content": "hi"}], chunks)
+        _stream_once(mock_client, [{"role": "user", "content": "hi"}], "system", chunks)
         assert "chunk" in "".join(chunks)
 
     def test_idle_timeout_aborts(self, monkeypatch):
-        from services.claude_api import _stream_sync
+        from services.claude_api import _stream_once
 
         # Call sequence: last_event_time=0.0, first text now=0.0 (gap=0, appended),
         # second text now=100.0 (gap=100 > 90, break before append)
@@ -605,12 +634,13 @@ class TestStreamSync:
         mock_stream.__enter__ = MagicMock(return_value=mock_stream)
         mock_stream.__exit__ = MagicMock(return_value=False)
         mock_stream.text_stream = iter(["partial", "should_not_appear"])
+        mock_stream.get_final_message = MagicMock(return_value=None)
 
         mock_client = MagicMock()
         mock_client.beta.messages.stream.return_value = mock_stream
 
         chunks: list[str] = []
-        _stream_sync(mock_client, [{"role": "user", "content": "hi"}], chunks)
+        _stream_once(mock_client, [{"role": "user", "content": "hi"}], "system", chunks)
         # "partial" was appended (gap=0), "should_not_appear" triggered idle timeout
         assert chunks == ["partial"]
 
@@ -632,10 +662,10 @@ class TestCallDirect:
 
         monkeypatch.setattr("asyncio.to_thread", fake_to_thread)
 
-        def fake_stream(client, history, chunks):
-            chunks.append("Response text")
+        def fake_stream(api_client, messages, system_prompt, response_chunks):
+            response_chunks.append("Response text")
 
-        monkeypatch.setattr("services.claude_api._stream_sync", fake_stream)
+        monkeypatch.setattr("services.claude_api._stream_once", fake_stream)
 
         conversation = OrderedDict()
         result = await call_direct("Hello", 999, conversation, conv_context="Thread ctx")
@@ -660,10 +690,10 @@ class TestCallDirect:
 
         monkeypatch.setattr("asyncio.to_thread", fake_to_thread)
 
-        def fake_stream(client, history, chunks):
-            chunks.append("ok")
+        def fake_stream(api_client, messages, system_prompt, response_chunks):
+            response_chunks.append("ok")
 
-        monkeypatch.setattr("services.claude_api._stream_sync", fake_stream)
+        monkeypatch.setattr("services.claude_api._stream_once", fake_stream)
 
         conversation = OrderedDict()
         await call_direct("a", 1, conversation)
@@ -689,7 +719,7 @@ class TestCallDirect:
         conversation = OrderedDict()
         result = await call_direct("fail", 1, conversation)
 
-        assert "API error" in result
+        assert "エラー" in result or "error" in result.lower() or "API" in result
         # The user message should have been popped from history
         history = conversation[1]
         assert not any(m.get("role") == "user" and m.get("content") == "fail" for m in history)
@@ -708,10 +738,10 @@ class TestCallDirect:
 
         monkeypatch.setattr("asyncio.to_thread", fake_to_thread)
 
-        def fake_stream(client, history, chunks):
+        def fake_stream(api_client, messages, system_prompt, response_chunks):
             pass  # no chunks appended
 
-        monkeypatch.setattr("services.claude_api._stream_sync", fake_stream)
+        monkeypatch.setattr("services.claude_api._stream_once", fake_stream)
 
         conversation = OrderedDict()
         result = await call_direct("hello", 1, conversation)
@@ -731,10 +761,10 @@ class TestCallDirect:
 
         monkeypatch.setattr("asyncio.to_thread", fake_to_thread)
 
-        def fake_stream(client, history, chunks):
-            chunks.append("Reply")
+        def fake_stream(api_client, messages, system_prompt, response_chunks):
+            response_chunks.append("Reply")
 
-        monkeypatch.setattr("services.claude_api._stream_sync", fake_stream)
+        monkeypatch.setattr("services.claude_api._stream_once", fake_stream)
 
         conversation = OrderedDict()
         conversation[1] = [

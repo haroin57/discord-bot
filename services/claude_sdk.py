@@ -33,6 +33,7 @@ from claude_code_sdk.types import (
 from config import (
     ADMIN_MAX_TURNS as _CONFIG_ADMIN_MAX_TURNS,
     ATTACHMENT_DIR,
+    CLAUDE_CLI_ENV,
     CLAUDE_MAX_ATTEMPTS,
     CLAUDE_MAX_BACKOFF_S,
     CLAUDE_MAX_PARALLEL,
@@ -349,7 +350,10 @@ async def call_with_tools(
             #     burn a dedicated, separately-billed quota rather than the
             #     owner's OAuth subscription.
             has_images = has_image_attachment
-            restricted_env: dict[str, str] = {}
+            # Always inject CLAUDE_CLI_ENV (ToolSearch off) so the CLI's
+            # deferred-tool exit path can't strand us with result="". See
+            # docs/2026-05-13-tool-deferred-incident.md for the root cause.
+            restricted_env: dict[str, str] = {**CLAUDE_CLI_ENV}
             if RESTRICTED_ANTHROPIC_API_KEY:
                 restricted_env["ANTHROPIC_API_KEY"] = RESTRICTED_ANTHROPIC_API_KEY
                 # Unset OAuth so the CLI doesn't prefer it over the API key.
@@ -380,6 +384,7 @@ async def call_with_tools(
                 model=MODEL,
                 mcp_servers=chosen_mcp,
                 settings=SETTINGS_PATH,
+                env={**CLAUDE_CLI_ENV},
             )
 
         # Session resume — enabled for threads only. MCP server config is
@@ -409,6 +414,10 @@ async def call_with_tools(
             options.resume = None
 
         response_text: str | None = None
+        # Defence-in-depth: if ResultMessage.result comes back empty (e.g. the
+        # CLI's deferred-tool exit path), fall back to the last TextBlock we
+        # observed in the stream so we don't ship "(No response from Claude)".
+        stream_text: str = ""
         session_id: str | None = None
         # Track the MCP keys used for this invocation (for SessionInfo)
         active_mcp_keys: list[str] = list(options.mcp_servers.keys()) if options.mcp_servers else []
@@ -484,6 +493,7 @@ async def call_with_tools(
                                         )
 
                                 elif isinstance(block, TextBlock) and block.text:
+                                    stream_text = block.text
                                     preview = block.text[:150].replace("\n", " ")
                                     # F1: per-block log → DEBUG (was INFO).
                                     log.debug("[ch=%d] 📝 text: %s%s",
@@ -511,7 +521,17 @@ async def call_with_tools(
 
                         # --- ResultMessage (final) ---
                         elif isinstance(msg, ResultMessage):
-                            response_text = msg.result if hasattr(msg, "result") else str(msg)
+                            result_text = getattr(msg, "result", None)
+                            if not result_text and stream_text:
+                                log.warning(
+                                    "[ch=%d] ResultMessage.result empty (subtype=%s); "
+                                    "falling back to stream TextBlock (%d chars)",
+                                    channel_id,
+                                    getattr(msg, "subtype", "?"),
+                                    len(stream_text),
+                                )
+                                result_text = stream_text
+                            response_text = result_text or ""
                             session_id = msg.session_id if hasattr(msg, "session_id") else None
                             elapsed = time.monotonic() - t_start
                             cost_str = f"${msg.total_cost_usd:.4f}" if msg.total_cost_usd else "n/a"

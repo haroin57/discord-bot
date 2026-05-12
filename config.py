@@ -100,6 +100,15 @@ RESTRICTED_CLAUDE_MAX_PARALLEL = int(os.environ.get("RESTRICTED_CLAUDE_MAX_PARAL
 # cannot burn through the owner's subscription quota.
 RESTRICTED_ANTHROPIC_API_KEY = os.environ.get("BOT_RESTRICTED_ANTHROPIC_API_KEY", "")
 
+# Claude Code CLI v2.1.92+ の "ToolSearch / Deferred Tools" 最適化を無効化する。
+# Deferred tool が agent loop の最終アクションになると CLI が result="" で即終了し
+# ResultMessage.result が空になるバグ（2026-05-13 観測）を回避する。
+# トレードオフ：MCP ツールスキーマが upfront でプロンプトに載るため、cold-start
+# の cache_creation_tokens が ~+40% 増える。warm（キャッシュヒット時）は同等。
+CLAUDE_CLI_ENV: dict[str, str] = {
+    "ENABLE_TOOL_SEARCH": "false",
+}
+
 # Retry policy — reasonable bounds (was 999/999 which blocked for hours)
 CLAUDE_MAX_ATTEMPTS = int(os.environ.get("CLAUDE_MAX_ATTEMPTS", "5"))
 CLAUDE_TRANSIENT_MAX_ATTEMPTS = int(os.environ.get("CLAUDE_TRANSIENT_MAX_ATTEMPTS", "4"))

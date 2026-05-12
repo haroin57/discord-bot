@@ -1,11 +1,33 @@
 """Tests for services/claude_sdk.py — call_with_tools with mocked SDK."""
 
 import asyncio
+import tempfile
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from config import needs_tools
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_result_msg(result="ok", session_id="sess-1", cost=0.01,
+                     usage=None, num_turns=1, duration_ms=500, is_error=False):
+    """Build a ResultMessage-like MagicMock with all required fields."""
+    from claude_code_sdk import ResultMessage
+    msg = MagicMock(spec=ResultMessage)
+    msg.result = result
+    msg.session_id = session_id
+    msg.total_cost_usd = cost
+    msg.usage = usage or {"input_tokens": 10, "output_tokens": 5}
+    msg.num_turns = num_turns
+    msg.duration_api_ms = duration_ms
+    msg.is_error = is_error
+    msg.subtype = "end_turn"
+    return msg
 
 
 class TestNeedsToolsRouting:
@@ -64,12 +86,14 @@ class TestCallWithTools:
             yield
 
         with patch("services.claude_sdk.query", side_effect=error_query):
-            from services.claude_sdk import call_with_tools
-            text, info = await call_with_tools(
-                "hello", 1, {}, raw_user_text="hello"
-            )
-            assert "❌" in text
-            assert info is None
+            with patch("services.claude_sdk.TRANSIENT_MAX_ATTEMPTS", 1):
+                with patch("services.claude_sdk.DEFAULT_MAX_ATTEMPTS", 1):
+                    from services.claude_sdk import call_with_tools
+                    text, info = await call_with_tools(
+                        "hello", 999991, {}, raw_user_text="hello"
+                    )
+                    assert "❌" in text
+                    assert info is None
 
     @pytest.mark.asyncio
     async def test_no_response_returns_fallback(self):
@@ -277,26 +301,626 @@ class TestSessionResume:
 
     @pytest.mark.asyncio
     async def test_returns_session_info_with_mcp_keys(self):
-        """Successful call returns SessionInfo with MCP keys."""
+        """Successful call returns SessionInfo with MCP keys reflecting chosen MCP."""
         async def fake_query(*args, **kwargs):
-            from claude_code_sdk import ResultMessage
-            msg = MagicMock(spec=ResultMessage)
-            msg.result = "done"
-            msg.session_id = "new-sess"
-            msg.total_cost_usd = 0.01
-            msg.usage = {"input_tokens": 100, "output_tokens": 50}
-            msg.num_turns = 1
-            msg.duration_api_ms = 1000
-            msg.is_error = False
-            yield msg
+            yield _make_result_msg(result="done", session_id="new-sess")
 
         with patch("services.claude_sdk.query", side_effect=fake_query):
             from services.claude_sdk import call_with_tools
+            # "docs" triggers context7 MCP
             text, info = await call_with_tools(
-                "hello", 1, {},
-                raw_user_text="hello",
+                "docs について教えて", 55501, {},
+                raw_user_text="docs について教えて",
                 is_thread=True,
             )
             assert info is not None
             assert info.session_id == "new-sess"
-            assert "context7" in info.mcp_server_keys  # BASE always included
+            # When docs keyword is present, context7 should be picked
+            assert "context7" in info.mcp_server_keys
+
+
+# ---------------------------------------------------------------------------
+# Error classification
+# ---------------------------------------------------------------------------
+
+class TestClassifyError:
+    def test_rate_limit(self):
+        from services.claude_sdk import _classify_error
+        assert _classify_error("rate_limit exceeded", "") == "rate_limit"
+        assert _classify_error("429 too many requests", "") == "rate_limit"
+
+    def test_overloaded(self):
+        from services.claude_sdk import _classify_error
+        assert _classify_error("server is overloaded", "") == "overloaded"
+        assert _classify_error("529 server_overload", "") == "overloaded"
+
+    def test_auth_error(self):
+        from services.claude_sdk import _classify_error
+        assert _classify_error("authentication failed", "") == "auth"
+        assert _classify_error("401 unauthorized", "") == "auth"
+        assert _classify_error("invalid api key", "") == "auth"
+
+    def test_context_overflow(self):
+        from services.claude_sdk import _classify_error
+        assert _classify_error("token limit exceeded too long", "") == "context_overflow"
+
+    def test_max_turns(self):
+        from services.claude_sdk import _classify_error
+        assert _classify_error("max_turns reached", "") == "max_turns"
+
+    def test_cli_exit(self):
+        from services.claude_sdk import _classify_error
+        assert _classify_error("exit code 1", "") == "cli_exit"
+
+    def test_unknown(self):
+        from services.claude_sdk import _classify_error
+        assert _classify_error("something weird happened", "") == "unknown"
+
+    def test_stderr_combined(self):
+        from services.claude_sdk import _classify_error
+        # error in stderr_tail should be detected
+        assert _classify_error("", "ratelimiterror in details") == "rate_limit"
+
+    def test_is_transient(self):
+        from services.claude_sdk import _is_transient
+        assert _is_transient("rate_limit") is True
+        assert _is_transient("overloaded") is True
+        assert _is_transient("auth") is False
+        assert _is_transient("unknown") is False
+
+    def test_error_message_known(self):
+        from services.claude_sdk import _error_message
+        assert "⏳" in _error_message("rate_limit")
+        assert "🔑" in _error_message("auth")
+        assert "📝" in _error_message("context_overflow")
+
+    def test_error_message_unknown(self):
+        from services.claude_sdk import _error_message
+        msg = _error_message("some_unknown_type")
+        assert "❌" in msg
+
+
+# ---------------------------------------------------------------------------
+# Session helpers
+# ---------------------------------------------------------------------------
+
+class TestSessionHelpers:
+    def test_is_session_fresh_absent(self):
+        from services.claude_sdk import _is_session_fresh, _session_timestamps
+        _session_timestamps.pop(9999, None)
+        assert _is_session_fresh(9999) is False
+
+    def test_record_and_check_fresh(self):
+        from services.claude_sdk import _is_session_fresh, _record_session_time, _clear_session_time
+        _record_session_time(8888)
+        assert _is_session_fresh(8888) is True
+        _clear_session_time(8888)
+        assert _is_session_fresh(8888) is False
+
+    def test_session_expired(self):
+        from services.claude_sdk import _is_session_fresh, _session_timestamps, SESSION_TTL_S
+        _session_timestamps[7777] = time.monotonic() - SESSION_TTL_S - 1
+        assert _is_session_fresh(7777) is False
+        _session_timestamps.pop(7777, None)
+
+
+# ---------------------------------------------------------------------------
+# Stderr helpers
+# ---------------------------------------------------------------------------
+
+class TestStderrHelpers:
+    def test_read_stderr_buffer_bytes(self):
+        from services.claude_sdk import _read_stderr_buffer
+        buf = tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
+        buf.write(b"hello stderr")
+        result = _read_stderr_buffer(buf)
+        assert "hello stderr" in result
+        buf.close()
+
+    def test_read_stderr_buffer_none(self):
+        from services.claude_sdk import _read_stderr_buffer
+        assert _read_stderr_buffer(None) == ""
+
+    def test_read_stderr_buffer_truncates_large(self):
+        from services.claude_sdk import _read_stderr_buffer
+        buf = tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
+        buf.write(b"x" * 60000)
+        result = _read_stderr_buffer(buf)
+        assert len(result) == 50000
+        buf.close()
+
+    def test_read_stderr_file_missing(self):
+        from services.claude_sdk import _read_stderr_file
+        assert _read_stderr_file("/nonexistent/path.log") == ""
+
+    def test_read_stderr_file_empty_path(self):
+        from services.claude_sdk import _read_stderr_file
+        assert _read_stderr_file(None) == ""
+        assert _read_stderr_file("") == ""
+
+    def test_read_stderr_file_content(self, tmp_path):
+        from services.claude_sdk import _read_stderr_file
+        p = tmp_path / "stderr.log"
+        p.write_text("some error output")
+        result = _read_stderr_file(str(p))
+        assert "some error output" in result
+
+    def test_read_stderr_file_truncates_large(self, tmp_path):
+        from services.claude_sdk import _read_stderr_file
+        p = tmp_path / "big_stderr.log"
+        p.write_text("y" * 15000)
+        result = _read_stderr_file(str(p))
+        assert len(result) == 10000
+
+    def test_cleanup_stderr_closes_fileobj(self):
+        from services.claude_sdk import _cleanup_stderr
+        buf = tempfile.SpooledTemporaryFile(max_size=1024, mode="w+b")
+        buf.write(b"data")
+        _cleanup_stderr(buf)
+        assert buf.closed
+
+    def test_cleanup_stderr_none_fileobj(self):
+        from services.claude_sdk import _cleanup_stderr
+        # Should not raise
+        _cleanup_stderr(None)
+
+    def test_cleanup_stderr_removes_file(self, tmp_path):
+        from services.claude_sdk import _cleanup_stderr
+        p = tmp_path / "to_delete.log"
+        p.write_text("delete me")
+        buf = tempfile.SpooledTemporaryFile(max_size=1024, mode="w+b")
+        _cleanup_stderr(buf, str(p), keep=False)
+        assert not p.exists()
+
+    def test_cleanup_stderr_keep_file(self, tmp_path):
+        from services.claude_sdk import _cleanup_stderr
+        p = tmp_path / "keep.log"
+        p.write_text("keep me")
+        buf = tempfile.SpooledTemporaryFile(max_size=1024, mode="w+b")
+        _cleanup_stderr(buf, str(p), keep=True)
+        assert p.exists()
+
+
+# ---------------------------------------------------------------------------
+# _tool_input_hint
+# ---------------------------------------------------------------------------
+
+class TestToolInputHint:
+    def test_bash(self):
+        from services.claude_sdk import _tool_input_hint
+        assert _tool_input_hint("Bash", {"command": "ls -la"}) == "ls -la"
+
+    def test_read(self):
+        from services.claude_sdk import _tool_input_hint
+        assert _tool_input_hint("Read", {"file_path": "/etc/hosts"}) == "/etc/hosts"
+
+    def test_write(self):
+        from services.claude_sdk import _tool_input_hint
+        assert _tool_input_hint("Write", {"file_path": "/tmp/out.txt"}) == "/tmp/out.txt"
+
+    def test_glob(self):
+        from services.claude_sdk import _tool_input_hint
+        assert _tool_input_hint("Glob", {"pattern": "*.py"}) == "*.py"
+
+    def test_grep(self):
+        from services.claude_sdk import _tool_input_hint
+        assert _tool_input_hint("Grep", {"pattern": "TODO"}) == "TODO"
+
+    def test_web_fetch(self):
+        from services.claude_sdk import _tool_input_hint
+        assert _tool_input_hint("WebFetch", {"url": "https://example.com"}) == "https://example.com"
+
+    def test_web_search(self):
+        from services.claude_sdk import _tool_input_hint
+        assert _tool_input_hint("WebSearch", {"query": "python async"}) == "python async"
+
+    def test_search_x(self):
+        from services.claude_sdk import _tool_input_hint
+        assert _tool_input_hint("search_x", {"query": "AI news"}) == "AI news"
+
+    def test_agent(self):
+        from services.claude_sdk import _tool_input_hint
+        assert _tool_input_hint("Agent", {"description": "research task"}) == "research task"
+
+    def test_mcp_prefixed(self):
+        from services.claude_sdk import _tool_input_hint
+        # mcp__brave__brave_web_search strips prefix
+        result = _tool_input_hint("mcp__brave__brave_web_search", {"query": "news"})
+        assert result == "news"
+
+    def test_empty_input(self):
+        from services.claude_sdk import _tool_input_hint
+        assert _tool_input_hint("Bash", None) == ""
+        assert _tool_input_hint("Bash", {}) == ""
+
+    def test_generic_first_string_value(self):
+        from services.claude_sdk import _tool_input_hint
+        assert _tool_input_hint("UnknownTool", {"something": "value1"}) == "value1"
+
+    def test_no_string_values(self):
+        from services.claude_sdk import _tool_input_hint
+        assert _tool_input_hint("UnknownTool", {"num": 42}) == ""
+
+
+# ---------------------------------------------------------------------------
+# Restricted (non-admin) options
+# ---------------------------------------------------------------------------
+
+class TestRestrictedOptions:
+    @pytest.mark.asyncio
+    async def test_restricted_no_mcp_servers(self):
+        """Restricted callers get empty mcp_servers."""
+        async def fake_query(*args, **kwargs):
+            yield _make_result_msg(result="restricted ok", session_id=None)
+
+        with patch("services.claude_sdk.query", side_effect=fake_query) as mock_q:
+            from services.claude_sdk import call_with_tools
+            await call_with_tools("hello", 60001, {}, restricted=True, raw_user_text="hello")
+            options = mock_q.call_args.kwargs.get("options") or mock_q.call_args[1]["options"]
+            assert options.mcp_servers == {}
+
+    @pytest.mark.asyncio
+    async def test_restricted_permission_mode_default(self):
+        """Restricted callers use permission_mode='default' not bypassPermissions."""
+        async def fake_query(*args, **kwargs):
+            yield _make_result_msg(result="ok", session_id=None)
+
+        with patch("services.claude_sdk.query", side_effect=fake_query) as mock_q:
+            from services.claude_sdk import call_with_tools
+            await call_with_tools("hello", 60002, {}, restricted=True, raw_user_text="hello")
+            options = mock_q.call_args.kwargs.get("options") or mock_q.call_args[1]["options"]
+            assert options.permission_mode == "default"
+
+    @pytest.mark.asyncio
+    async def test_restricted_no_read_tool_without_image(self):
+        """Restricted callers without image attachment get empty allowed_tools."""
+        async def fake_query(*args, **kwargs):
+            yield _make_result_msg(result="ok", session_id=None)
+
+        with patch("services.claude_sdk.query", side_effect=fake_query) as mock_q:
+            from services.claude_sdk import call_with_tools
+            await call_with_tools("hello", 60003, {}, restricted=True,
+                                  has_image_attachment=False, raw_user_text="hello")
+            options = mock_q.call_args.kwargs.get("options") or mock_q.call_args[1]["options"]
+            assert options.allowed_tools == []
+
+    @pytest.mark.asyncio
+    async def test_restricted_read_tool_with_image(self):
+        """Restricted callers with image attachment get Read in allowed_tools."""
+        async def fake_query(*args, **kwargs):
+            yield _make_result_msg(result="ok", session_id=None)
+
+        with patch("services.claude_sdk.query", side_effect=fake_query) as mock_q:
+            from services.claude_sdk import call_with_tools
+            await call_with_tools("画像を確認", 60004, {}, restricted=True,
+                                  has_image_attachment=True, raw_user_text="画像を確認")
+            options = mock_q.call_args.kwargs.get("options") or mock_q.call_args[1]["options"]
+            assert "Read" in options.allowed_tools
+
+    @pytest.mark.asyncio
+    async def test_restricted_max_turns(self):
+        """Restricted callers get RESTRICTED_MAX_TURNS."""
+        async def fake_query(*args, **kwargs):
+            yield _make_result_msg(result="ok", session_id=None)
+
+        with patch("services.claude_sdk.query", side_effect=fake_query) as mock_q:
+            from services.claude_sdk import call_with_tools, RESTRICTED_MAX_TURNS
+            await call_with_tools("hello", 60005, {}, restricted=True, raw_user_text="hello")
+            options = mock_q.call_args.kwargs.get("options") or mock_q.call_args[1]["options"]
+            assert options.max_turns == RESTRICTED_MAX_TURNS
+
+    @pytest.mark.asyncio
+    async def test_restricted_settings_none(self):
+        """Restricted callers get settings=None (no admin settings)."""
+        async def fake_query(*args, **kwargs):
+            yield _make_result_msg(result="ok", session_id=None)
+
+        with patch("services.claude_sdk.query", side_effect=fake_query) as mock_q:
+            from services.claude_sdk import call_with_tools
+            await call_with_tools("hello", 60006, {}, restricted=True, raw_user_text="hello")
+            options = mock_q.call_args.kwargs.get("options") or mock_q.call_args[1]["options"]
+            assert options.settings is None
+
+    @pytest.mark.asyncio
+    async def test_restricted_api_key_injected(self):
+        """When RESTRICTED_ANTHROPIC_API_KEY is set, it's passed in env."""
+        async def fake_query(*args, **kwargs):
+            yield _make_result_msg(result="ok", session_id=None)
+
+        with patch("services.claude_sdk.query", side_effect=fake_query) as mock_q:
+            with patch("services.claude_sdk.RESTRICTED_ANTHROPIC_API_KEY", "test-key-xyz"):
+                from services.claude_sdk import call_with_tools
+                await call_with_tools("hello", 60007, {}, restricted=True, raw_user_text="hello")
+                options = mock_q.call_args.kwargs.get("options") or mock_q.call_args[1]["options"]
+                assert options.env.get("ANTHROPIC_API_KEY") == "test-key-xyz"
+                assert options.env.get("ANTHROPIC_AUTH_TOKEN") == ""
+
+
+# ---------------------------------------------------------------------------
+# Admin options
+# ---------------------------------------------------------------------------
+
+class TestAdminOptions:
+    @pytest.mark.asyncio
+    async def test_admin_bypass_permissions(self):
+        """Admin callers use bypassPermissions."""
+        async def fake_query(*args, **kwargs):
+            yield _make_result_msg()
+
+        with patch("services.claude_sdk.query", side_effect=fake_query) as mock_q:
+            from services.claude_sdk import call_with_tools
+            await call_with_tools("hello", 70001, {}, restricted=False, raw_user_text="hello")
+            options = mock_q.call_args.kwargs.get("options") or mock_q.call_args[1]["options"]
+            assert options.permission_mode == "bypassPermissions"
+
+    @pytest.mark.asyncio
+    async def test_admin_max_turns(self):
+        """Admin callers get ADMIN_MAX_TURNS."""
+        async def fake_query(*args, **kwargs):
+            yield _make_result_msg()
+
+        with patch("services.claude_sdk.query", side_effect=fake_query) as mock_q:
+            from services.claude_sdk import call_with_tools, ADMIN_MAX_TURNS
+            await call_with_tools("hello", 70002, {}, restricted=False, raw_user_text="hello")
+            options = mock_q.call_args.kwargs.get("options") or mock_q.call_args[1]["options"]
+            assert options.max_turns == ADMIN_MAX_TURNS
+
+    @pytest.mark.asyncio
+    async def test_stream_text_fallback(self):
+        """When ResultMessage.result is empty, fall back to last TextBlock stream_text."""
+        from claude_code_sdk import AssistantMessage
+        from claude_code_sdk.types import TextBlock
+
+        async def fake_query(*args, **kwargs):
+            # First yield an AssistantMessage with TextBlock
+            am = MagicMock(spec=AssistantMessage)
+            tb = MagicMock(spec=TextBlock)
+            tb.text = "stream fallback text"
+            am.content = [tb]
+            yield am
+
+            # Then ResultMessage with empty result
+            msg = _make_result_msg(result="", session_id="s-fallback")
+            msg.subtype = "end_turn"
+            yield msg
+
+        with patch("services.claude_sdk.query", side_effect=fake_query):
+            from services.claude_sdk import call_with_tools
+            text, info = await call_with_tools("hello", 70003, {}, raw_user_text="hello")
+            assert text == "stream fallback text"
+
+
+# ---------------------------------------------------------------------------
+# Retry behavior
+# ---------------------------------------------------------------------------
+
+class TestRetryBehavior:
+    @pytest.mark.asyncio
+    async def test_transient_rate_limit_retries(self):
+        """Rate limit error triggers retry and eventually succeeds."""
+        call_count = {"n": 0}
+
+        async def flaky_query(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] < 2:
+                raise RuntimeError("429 rate_limit exceeded")
+            yield _make_result_msg(result="success after retry")
+
+        with patch("services.claude_sdk.query", side_effect=flaky_query):
+            with patch("services.claude_sdk.BASE_BACKOFF_S", 0):
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    from services.claude_sdk import call_with_tools
+                    text, info = await call_with_tools(
+                        "hello", 80001, {}, raw_user_text="hello"
+                    )
+                    assert text == "success after retry"
+                    assert call_count["n"] >= 2
+
+    @pytest.mark.asyncio
+    async def test_auth_error_no_retry(self):
+        """Auth errors are non-retryable — return immediately."""
+        call_count = {"n": 0}
+
+        async def auth_fail(*args, **kwargs):
+            call_count["n"] += 1
+            raise RuntimeError("authentication failed 401 unauthorized")
+            yield
+
+        with patch("services.claude_sdk.query", side_effect=auth_fail):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                from services.claude_sdk import call_with_tools
+                text, info = await call_with_tools(
+                    "hello", 80002, {}, raw_user_text="hello"
+                )
+                assert "🔑" in text
+                assert call_count["n"] == 1  # no retry for auth
+
+    @pytest.mark.asyncio
+    async def test_context_overflow_no_retry(self):
+        """Context overflow is non-retryable."""
+        async def ctx_fail(*args, **kwargs):
+            raise RuntimeError("token limit exceeded too long")
+            yield
+
+        with patch("services.claude_sdk.query", side_effect=ctx_fail):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                from services.claude_sdk import call_with_tools
+                text, info = await call_with_tools(
+                    "hello", 80003, {}, raw_user_text="hello"
+                )
+                assert "📝" in text
+                assert info is None
+
+    @pytest.mark.asyncio
+    async def test_timeout_clears_resume(self):
+        """TimeoutError on a resumed session clears the session and retries fresh."""
+        from services.session import SessionInfo
+        from services.claude_sdk import _record_session_time
+
+        sessions = {90001: SessionInfo(session_id="old-sess", mcp_server_keys=[])}
+        _record_session_time(90001)
+
+        call_count = {"n": 0}
+
+        async def timeout_then_ok(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise TimeoutError()
+            yield _make_result_msg(result="fresh ok", session_id="new-sess")
+
+        with patch("services.claude_sdk.query", side_effect=timeout_then_ok):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with patch("services.claude_sdk.kill_orphan_claude_cli", return_value=0):
+                    from services.claude_sdk import call_with_tools
+                    text, info = await call_with_tools(
+                        "hello", 90001, sessions, raw_user_text="hello"
+                    )
+                    assert text == "fresh ok"
+                    assert call_count["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_timeout_no_resume_returns_message(self):
+        """TimeoutError with no resume returns timeout message directly."""
+        async def always_timeout(*args, **kwargs):
+            raise TimeoutError()
+            yield
+
+        with patch("services.claude_sdk.query", side_effect=always_timeout):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with patch("services.claude_sdk.kill_orphan_claude_cli", return_value=0):
+                    with patch("services.claude_sdk.TRANSIENT_MAX_ATTEMPTS", 1):
+                        from services.claude_sdk import call_with_tools
+                        text, info = await call_with_tools(
+                            "hello", 90002, {}, raw_user_text="hello"
+                        )
+                        assert "⏰" in text
+                        assert info is None
+
+    @pytest.mark.asyncio
+    async def test_cli_exit_with_partial_response(self):
+        """cli_exit with a partial response returns what we got."""
+        call_count = {"n": 0}
+
+        async def partial_then_exit(*args, **kwargs):
+            call_count["n"] += 1
+            # Yield a result message so response_text is set, then raise cli_exit
+            msg = _make_result_msg(result="partial answer here", session_id="p-sess")
+            yield msg
+            # Simulate a second call that raises
+            raise RuntimeError("exit code 1 cli")
+
+        # We need to simulate getting the ResultMessage first then the exit code error.
+        # Instead, test the case where response_text is set before the error path:
+        # Use separate invocations
+        results = {"first": True}
+
+        async def cli_exit_error(*args, **kwargs):
+            if results["first"]:
+                results["first"] = False
+                raise RuntimeError("exit code 1 failed")
+            yield _make_result_msg(result="ok")
+
+        with patch("services.claude_sdk.query", side_effect=cli_exit_error):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                with patch("services.claude_sdk.TRANSIENT_MAX_ATTEMPTS", 1):
+                    with patch("services.claude_sdk.DEFAULT_MAX_ATTEMPTS", 1):
+                        from services.claude_sdk import call_with_tools
+                        text, info = await call_with_tools(
+                            "hello", 90003, {}, raw_user_text="hello"
+                        )
+                        assert "⚠️" in text
+
+
+# ---------------------------------------------------------------------------
+# Message stream processing
+# ---------------------------------------------------------------------------
+
+class TestStreamProcessing:
+    @pytest.mark.asyncio
+    async def test_thinking_block_status_callback(self):
+        """ThinkingBlock triggers status_callback."""
+        from claude_code_sdk import AssistantMessage
+        from claude_code_sdk.types import ThinkingBlock
+
+        callback = AsyncMock()
+
+        async def thinking_query(*args, **kwargs):
+            am = MagicMock(spec=AssistantMessage)
+            tb = MagicMock(spec=ThinkingBlock)
+            tb.thinking = "I am thinking about this problem"
+            am.content = [tb]
+            yield am
+            yield _make_result_msg()
+
+        with patch("services.claude_sdk.query", side_effect=thinking_query):
+            from services.claude_sdk import call_with_tools
+            await call_with_tools("hello", 100001, {}, status_callback=callback,
+                                  raw_user_text="hello")
+            # callback should have been called with thinking summary
+            calls = [str(c) for c in callback.call_args_list]
+            assert any("💭" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_tool_result_error_status(self):
+        """ToolResultBlock with is_error=True triggers error status callback."""
+        from claude_code_sdk import AssistantMessage
+        from claude_code_sdk.types import ToolResultBlock
+        from claude_code_sdk.types import UserMessage as SDKUserMessage
+
+        callback = AsyncMock()
+
+        async def tool_result_query(*args, **kwargs):
+            um = MagicMock(spec=SDKUserMessage)
+            trb = MagicMock(spec=ToolResultBlock)
+            trb.is_error = True
+            trb.content = "tool failed"
+            um.content = [trb]
+            yield um
+            yield _make_result_msg()
+
+        with patch("services.claude_sdk.query", side_effect=tool_result_query):
+            from services.claude_sdk import call_with_tools
+            await call_with_tools("hello", 100002, {}, status_callback=callback,
+                                  raw_user_text="hello")
+            calls = [str(c) for c in callback.call_args_list]
+            assert any("❌" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_system_message_logged(self):
+        """SystemMessage is processed without error."""
+        from claude_code_sdk.types import SystemMessage as SDKSystemMessage
+
+        async def sys_msg_query(*args, **kwargs):
+            sm = MagicMock(spec=SDKSystemMessage)
+            sm.subtype = "init"
+            yield sm
+            yield _make_result_msg()
+
+        with patch("services.claude_sdk.query", side_effect=sys_msg_query):
+            from services.claude_sdk import call_with_tools
+            text, info = await call_with_tools("hello", 100003, {}, raw_user_text="hello")
+            assert text == "ok"
+
+    @pytest.mark.asyncio
+    async def test_tool_result_ok_status(self):
+        """ToolResultBlock without error triggers ok status callback."""
+        from claude_code_sdk.types import ToolResultBlock
+        from claude_code_sdk.types import UserMessage as SDKUserMessage
+
+        callback = AsyncMock()
+
+        async def ok_result_query(*args, **kwargs):
+            um = MagicMock(spec=SDKUserMessage)
+            trb = MagicMock(spec=ToolResultBlock)
+            trb.is_error = False
+            trb.content = "tool succeeded"
+            um.content = [trb]
+            yield um
+            yield _make_result_msg()
+
+        with patch("services.claude_sdk.query", side_effect=ok_result_query):
+            from services.claude_sdk import call_with_tools
+            await call_with_tools("hello", 100004, {}, status_callback=callback,
+                                  raw_user_text="hello")
+            calls = [str(c) for c in callback.call_args_list]
+            assert any("📨" in c for c in calls)

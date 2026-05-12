@@ -21,12 +21,50 @@ we could hit — the `on_message` coroutine is the single real entry point.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import os
+import sys
 import types
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
 import pytest
+
+
+# ---------------------------------------------------------------------------
+# Module-level state restoration helpers
+# ---------------------------------------------------------------------------
+
+def _restore_real_mem0_service() -> None:
+    """Ensure sys.modules['services.mem0_service'] is the real module.
+
+    test_mcp_mem0_server replaces the module with a stub at import time.
+    If that stub is present, we reload the real module so that subsequent
+    `import bot` (which does `from services.mem0_service import …`) succeeds.
+    """
+    mod = sys.modules.get("services.mem0_service")
+    if mod is None or not hasattr(mod, "format_memories_for_prompt"):
+        # Remove the stub so importlib fetches the real file.
+        sys.modules.pop("services.mem0_service", None)
+        try:
+            real = importlib.import_module("services.mem0_service")
+            sys.modules["services.mem0_service"] = real
+        except Exception:
+            pass  # best-effort; individual test will fail with a clear error
+
+
+def _ensure_bot_module() -> types.ModuleType:
+    """Return the bot module, reloading it if its mem0_service import broke."""
+    _restore_real_mem0_service()
+    bot_mod = sys.modules.get("bot")
+    if bot_mod is None:
+        bot_mod = importlib.import_module("bot")
+    else:
+        # Check that the module's own reference to format_memories_for_prompt
+        # still resolves — if not, reload.
+        if not hasattr(bot_mod, "_sanitize_untrusted_text"):
+            bot_mod = importlib.reload(bot_mod)
+    return bot_mod
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +152,8 @@ class CallCapture:
         self.calls: list[dict] = []
 
     def __call__(self, prompt, channel_id, sessions,
-                 status_callback=None, restricted=False, raw_user_text=""):
+                 status_callback=None, restricted=False, raw_user_text="",
+                 is_thread=False, has_image_attachment=False):
         async def _coro():
             self.calls.append({
                 "prompt": prompt,
@@ -122,14 +161,22 @@ class CallCapture:
                 "restricted": restricted,
                 "raw_user_text": raw_user_text,
             })
-            return ("OK response", "session-xyz")
+            from services.session import SessionInfo
+            return ("OK response", SessionInfo(session_id="session-xyz"))
         return _coro()
 
 
 @pytest.fixture(autouse=True)
 def _isolate_bot_state(monkeypatch):
-    """Per-test hygiene: clear cooldowns/quota and pin admin set."""
-    import bot
+    """Per-test hygiene: clear cooldowns/quota and pin admin set.
+
+    Also repairs sys.modules contamination from test_mcp_mem0_server, which
+    replaces services.mem0_service with a stub that lacks format_memories_for_prompt.
+    """
+    # Repair any stub contamination before touching `bot`.
+    _restore_real_mem0_service()
+    bot = _ensure_bot_module()
+
     bot.cooldowns.clear()
     bot._channel_semas.clear()
     bot._daily_quota.clear()
@@ -155,7 +202,7 @@ def _isolate_bot_state(monkeypatch):
 @pytest.fixture
 def capture(monkeypatch):
     """Patch call_with_tools and return the capture object."""
-    import bot
+    bot = _ensure_bot_module()  # noqa: F841 — just ensure it's loaded
     cap = CallCapture()
     monkeypatch.setattr("bot.call_with_tools", cap)
     # Silence mem0
@@ -167,7 +214,7 @@ def capture(monkeypatch):
 
 
 async def _dispatch(msg):
-    import bot
+    bot = _ensure_bot_module()
     await bot.bot.on_message(msg)
 
 
@@ -318,6 +365,12 @@ class TestRestrictedSdkOptions:
             m = MagicMock(spec=ResultMessage)
             m.result = "ok"
             m.session_id = "s1"
+            m.total_cost_usd = 0.0
+            m.num_turns = 1
+            m.duration_api_ms = 0
+            m.is_error = False
+            m.usage = {"input_tokens": 0, "output_tokens": 0}
+            m.subtype = None
             yield m
 
         monkeypatch.setattr(claude_sdk, "query", fake_query)
@@ -327,6 +380,7 @@ class TestRestrictedSdkOptions:
             channel_id=123,
             sessions={},
             restricted=True,
+            has_image_attachment=True,
         )
         opts = captured["options"]
         assert opts.allowed_tools == ["Read"]
@@ -343,15 +397,22 @@ class TestRestrictedSdkOptions:
             m = MagicMock(spec=ResultMessage)
             m.result = "ok"
             m.session_id = "s1"
+            m.total_cost_usd = 0.0
+            m.num_turns = 1
+            m.duration_api_ms = 0
+            m.is_error = False
+            m.usage = {"input_tokens": 0, "output_tokens": 0}
+            m.subtype = None
             yield m
 
         monkeypatch.setattr(claude_sdk, "query", fake_query)
 
         await claude_sdk.call_with_tools(
-            prompt="do a thing",
+            prompt="ニュースを検索して教えて",
             channel_id=123,
             sessions={},
             restricted=False,
+            raw_user_text="ニュースを検索して教えて",
         )
         opts = captured["options"]
         assert opts.permission_mode == "bypassPermissions"
@@ -646,7 +707,8 @@ class TestResponseImageSuppression:
 
         # Custom capture that returns the crafted response text.
         async def fake_call(prompt, channel_id, sessions, status_callback=None,
-                            restricted=False, raw_user_text=""):
+                            restricted=False, raw_user_text="",
+                            is_thread=False, has_image_attachment=False):
             return (f"here is the file: {img}", None)
         monkeypatch.setattr("bot.call_with_tools", fake_call)
 
@@ -884,6 +946,8 @@ class TestRestrictedConcurrencyPool:
         )
         assert captured["env"]["ANTHROPIC_API_KEY"] == "sk-fake-restricted-key"
         assert captured["env"]["ANTHROPIC_AUTH_TOKEN"] == ""
+        # CLAUDE_CLI_ENV (ToolSearch disable) は常時注入される
+        assert captured["env"]["ENABLE_TOOL_SEARCH"] == "false"
 
     @pytest.mark.asyncio
     async def test_restricted_env_empty_without_config(self, monkeypatch):
@@ -905,8 +969,11 @@ class TestRestrictedConcurrencyPool:
         await claude_sdk.call_with_tools(
             prompt="plain", channel_id=1, sessions={}, restricted=True,
         )
-        # No env vars injected — inherit parent env (OAuth still used).
-        assert captured["env"] == {}
+        # RESTRICTED_ANTHROPIC_API_KEY 未設定でも、ToolSearch 無効化 env は
+        # CLI の deferred-tool 終了パスを塞ぐために常時注入される。OAuth は
+        # 引き続き親プロセスから継承される。
+        assert "ANTHROPIC_API_KEY" not in captured["env"]
+        assert captured["env"].get("ENABLE_TOOL_SEARCH") == "false"
 
 
 # ===========================================================================
@@ -951,6 +1018,8 @@ class TestCallDirectAttribution:
             @property
             def text_stream(self):
                 return iter([])
+            def get_final_message(self):
+                return None
 
         def fake_stream(**kwargs):
             captured.update(kwargs)
@@ -964,9 +1033,17 @@ class TestCallDirectAttribution:
         claude_api._stream_once(mock_client, messages, "CLEAN_SYSTEM_PROMPT", chunks)
 
         # System prompt must NOT carry any attribution/billing text.
-        assert captured["system"] == "CLEAN_SYSTEM_PROMPT"
-        assert "billing" not in captured["system"]
-        assert "cc_version" not in captured["system"]
+        # _build_cached_system wraps the prompt in a list of dicts for prompt caching.
+        system_val = captured["system"]
+        if isinstance(system_val, list):
+            system_text = " ".join(
+                block.get("text", "") for block in system_val if isinstance(block, dict)
+            )
+        else:
+            system_text = str(system_val)
+        assert "CLEAN_SYSTEM_PROMPT" in system_text
+        assert "billing" not in system_text
+        assert "cc_version" not in system_text
         # extra_headers must carry the billing header.
         headers = captured.get("extra_headers", {})
         assert "x-anthropic-billing-header" in headers
@@ -982,7 +1059,8 @@ class TestErrorMasking:
     @pytest.mark.asyncio
     async def test_internal_error_replies_generic(self, capture, monkeypatch):
         async def boom(prompt, channel_id, sessions, status_callback=None,
-                       restricted=False, raw_user_text=""):
+                       restricted=False, raw_user_text="",
+                       is_thread=False, has_image_attachment=False):
             raise RuntimeError("internal path /home/ubuntu/discord-bot/.env leaked")
         monkeypatch.setattr("bot.call_with_tools", boom)
 
