@@ -142,9 +142,32 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </body></html>"""
 
 
+# Tags / attributes permitted in the sanitized table HTML. Anything outside
+# this allowlist (e.g. <script>, <img onerror=...>, on* attributes) is stripped
+# by bleach before the HTML is handed to headless Chromium.
+_TABLE_HTML_ALLOWED_TAGS = (
+    "table", "thead", "tbody", "tfoot", "tr", "th", "td",
+    "strong", "em", "b", "i", "code", "br", "span",
+)
+_TABLE_HTML_ALLOWED_ATTRS = {"th": ["align"], "td": ["align"]}
+
+
 def _md_table_to_html(md_table: str) -> str:
-    """Convert a Markdown table string to an HTML <table>."""
-    return markdown.markdown(md_table, extensions=["tables"])
+    """Convert a Markdown table string to an HTML <table>, then sanitize.
+
+    `markdown.markdown(..., extensions=["tables"])` pass-throughs raw HTML in
+    cells by default, so a malicious cell value can inject <script>, <img
+    onerror=...>, etc. into the Puppeteer-rendered page (which runs with
+    --no-sandbox). Bleach removes anything outside the table-only allowlist.
+    """
+    import bleach
+    raw_html = markdown.markdown(md_table, extensions=["tables"])
+    return bleach.clean(
+        raw_html,
+        tags=_TABLE_HTML_ALLOWED_TAGS,
+        attributes=_TABLE_HTML_ALLOWED_ATTRS,
+        strip=True,
+    )
 
 
 async def render_table_image(
@@ -164,8 +187,12 @@ async def render_table_image(
         return out_path
 
     # Build HTML
+    import html as _html
     table_html = _md_table_to_html(md_table)
-    caption_html = f'<div class="caption">{caption}</div>' if caption else ""
+    # Caption comes from an LLM-rendered markdown heading and can include
+    # arbitrary user-controlled text; HTML-escape so it cannot inject <script>
+    # or event-handler attributes into the rendered page.
+    caption_html = f'<div class="caption">{_html.escape(caption)}</div>' if caption else ""
     full_html = HTML_TEMPLATE.format(
         css=TABLE_CSS,
         caption_html=caption_html,

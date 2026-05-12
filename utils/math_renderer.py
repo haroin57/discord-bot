@@ -215,7 +215,10 @@ try {{
   katex.render({latex_json}, document.getElementById('math-target'), {{
     displayMode: {display_mode},
     throwOnError: false,
-    trust: true,
+    // trust: false (KaTeX default) prevents \\href, \\url, \\includegraphics
+    // and \\htmlClass from receiving attacker-controlled values that could
+    // execute javascript: URLs inside the Puppeteer page.
+    trust: false,
     strict: false,
   }});
 }} catch(e) {{
