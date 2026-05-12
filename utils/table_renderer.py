@@ -5,94 +5,19 @@ Renders HTML tables with a Discord-style dark theme and captures
 a tight screenshot around the table element.
 """
 
-import asyncio
 import hashlib
 import logging
 import os
 
 import markdown
 
-from utils.render_semaphore import render_sema as _render_sema  # shared with math_renderer
+from utils.browser_pool import render_with_browser_daemon
 
 __all__ = ["render_table_image"]
 
 log = logging.getLogger(__name__)
 
 TABLE_OUTPUT_DIR = "/tmp/table_renders"
-PUPPETEER_CONFIG = "/home/ubuntu/puppeteer-config.json"
-PUPPETEER_MODULE = (
-    "/usr/local/lib/node_modules/@mermaid-js/mermaid-cli"
-    "/node_modules/puppeteer/lib/cjs/puppeteer/puppeteer.js"
-)
-
-# NOTE: _render_sema is imported from utils.render_semaphore so it is shared
-# globally with math_renderer (and any future renderer). A local Semaphore(1)
-# here would not actually prevent concurrent Chromium spawns from a different
-# module — see utils/render_semaphore.py for rationale.
-
-# ---------------------------------------------------------------------------
-# Node.js render script (written once to disk)
-# ---------------------------------------------------------------------------
-_RENDER_SCRIPT = r"""
-const fs = require('fs');
-
-// Use setTimeout to avoid circular dependency issue with puppeteer CJS build
-setTimeout(async () => {
-  try {
-    let puppeteer = require(process.argv[2]);
-    // Handle both CJS default export and named export patterns
-    if (typeof puppeteer.launch !== 'function' && puppeteer.default) {
-      puppeteer = puppeteer.default;
-    }
-    const configPath = process.argv[3];
-    const htmlPath = process.argv[4];
-    const outPath = process.argv[5];
-
-    let config = {};
-    try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {}
-
-    const browser = await puppeteer.launch({
-      headless: 'new',
-      args: [...(config.args || []), '--no-sandbox', '--disable-setuid-sandbox',
-             '--disable-gpu', '--disable-dev-shm-usage'],
-    });
-
-    try {
-      const page = await browser.newPage();
-      await page.setViewport({ width: 1400, height: 900 });
-
-      const html = fs.readFileSync(htmlPath, 'utf8');
-      // Phase B1: 'domcontentloaded' is sufficient because the HTML has no
-      // external <link rel="stylesheet"> / <script src=...> references — all
-      // styles are inline. 'networkidle0' previously waited 1-3 s (or up to
-      // 15 s on CDN outage) for a network quiescence that never fires.
-      await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 5000 });
-
-      const el = await page.$('.table-container');
-      if (!el) { process.exit(1); }
-      const box = await el.boundingBox();
-      const pad = 20;
-
-      await page.screenshot({
-        path: outPath,
-        clip: {
-          x: Math.max(0, box.x - pad),
-          y: Math.max(0, box.y - pad),
-          width: box.width + pad * 2,
-          height: box.height + pad * 2,
-        },
-        type: 'png',
-      });
-    } finally {
-      await browser.close();
-    }
-  } catch (err) {
-    console.error(err);
-    process.exit(1);
-  }
-}, 0);
-"""
-
 # ---------------------------------------------------------------------------
 # CSS (Discord dark theme)
 # ---------------------------------------------------------------------------
@@ -225,39 +150,18 @@ async def render_table_image(
     with open(html_path, "w") as f:
         f.write(full_html)
 
-    # Ensure render script exists
-    script_path = os.path.join(output_dir, "_render.js")
-    if not os.path.isfile(script_path):
-        with open(script_path, "w") as f:
-            f.write(_RENDER_SCRIPT)
-
-    async with _render_sema:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "node",
-                script_path,
-                PUPPETEER_MODULE,
-                PUPPETEER_CONFIG,
-                html_path,
-                out_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-
-            if proc.returncode != 0:
-                log.error("Table render failed (rc=%d): %s", proc.returncode, stderr.decode()[:500])
-                return None
-
-            return out_path if os.path.isfile(out_path) else None
-
-        except asyncio.TimeoutError:
-            log.error("Table render timed out")
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            return None
-        except Exception as e:
-            log.error("Table render error: %s", e)
-            return None
+    try:
+        await render_with_browser_daemon(
+            html_path=html_path,
+            output_path=out_path,
+            selector=".table-container",
+            pad=20,
+            viewport={"width": 1400, "height": 900},
+        )
+        return out_path if os.path.isfile(out_path) else None
+    except TimeoutError:
+        log.error("Table render timed out")
+        return None
+    except Exception as e:
+        log.error("Table render failed: %s", e)
+        return None

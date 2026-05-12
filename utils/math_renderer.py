@@ -5,114 +5,17 @@ Renders KaTeX HTML with a Discord-style dark theme and captures
 a tight screenshot around the math element.
 """
 
-import asyncio
 import hashlib
 import logging
 import os
 
-from utils.render_semaphore import render_sema as _render_sema  # shared with table_renderer
+from utils.browser_pool import render_with_browser_daemon
 
 __all__ = ["render_math_image"]
 
 log = logging.getLogger(__name__)
 
 MATH_OUTPUT_DIR = "/tmp/math_renders"
-PUPPETEER_CONFIG = "/home/ubuntu/puppeteer-config.json"
-PUPPETEER_MODULE = (
-    "/usr/local/lib/node_modules/@mermaid-js/mermaid-cli"
-    "/node_modules/puppeteer/lib/cjs/puppeteer/puppeteer.js"
-)
-
-
-def _find_chrome_executable() -> str | None:
-    """Find Chrome executable in puppeteer cache."""
-    import glob as _glob
-    patterns = [
-        "/home/ubuntu/.cache/puppeteer/chrome/*/chrome-linux64/chrome",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
-        "/usr/bin/google-chrome",
-    ]
-    for pattern in patterns:
-        matches = _glob.glob(pattern)
-        if matches:
-            return sorted(matches)[-1]  # Latest version
-    return None
-
-
-CHROME_EXECUTABLE = _find_chrome_executable()
-
-# NOTE: _render_sema is imported from utils.render_semaphore at module-top so
-# it is the SAME object instance as the one used by table_renderer. The prior
-# `asyncio.Semaphore(1)` literal here created a separate object that did not
-# actually block a concurrent table render.
-
-# ---------------------------------------------------------------------------
-# Node.js render script
-# ---------------------------------------------------------------------------
-_RENDER_SCRIPT = r"""
-const fs = require('fs');
-
-setTimeout(async () => {
-  try {
-    let puppeteer = require(process.argv[2]);
-    if (typeof puppeteer.launch !== 'function' && puppeteer.default) {
-      puppeteer = puppeteer.default;
-    }
-    const configPath = process.argv[3];
-    const htmlPath = process.argv[4];
-    const outPath = process.argv[5];
-    const chromePath = process.argv[6] || undefined;
-    const screenshotPad = parseInt(process.argv[7] || '12', 10);
-
-    let config = {};
-    try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch {}
-
-    const launchOpts = {
-      headless: 'new',
-      args: [...(config.args || []), '--no-sandbox', '--disable-setuid-sandbox',
-             '--disable-gpu', '--disable-dev-shm-usage'],
-    };
-    if (chromePath) { launchOpts.executablePath = chromePath; }
-    const browser = await puppeteer.launch(launchOpts);
-
-    try {
-      const page = await browser.newPage();
-      await page.setViewport({ width: 800, height: 600, deviceScaleFactor: 2 });
-
-      // Phase B1: navigate to the html file via `file://` instead of
-      // `setContent`. The HTML template references katex.min.{css,js} via
-      // absolute `file://` URLs; from a `setContent`-loaded page the origin
-      // is `about:blank` and Chromium blocks cross-origin sub-resources,
-      // which would silently skip the KaTeX load and produce blank math.
-      // Navigating to a real `file://` URL gives the page a same-origin
-      // base so KaTeX loads correctly.
-      await page.goto('file://' + htmlPath, { waitUntil: 'domcontentloaded', timeout: 5000 });
-
-      const el = await page.$('.math-container');
-      if (!el) { process.exit(1); }
-      const box = await el.boundingBox();
-      const pad = screenshotPad;
-
-      await page.screenshot({
-        path: outPath,
-        clip: {
-          x: Math.max(0, box.x - pad),
-          y: Math.max(0, box.y - pad),
-          width: box.width + pad * 2,
-          height: box.height + pad * 2,
-        },
-        type: 'png',
-      });
-    } finally {
-      await browser.close();
-    }
-  } catch (err) {
-    console.error(err);
-    process.exit(1);
-  }
-}, 0);
-"""
 
 # ---------------------------------------------------------------------------
 # CSS (Discord dark theme for math)
@@ -295,46 +198,18 @@ async def render_math_image(
     with open(html_path, "w") as f:
         f.write(full_html)
 
-    # Ensure render script exists (always overwrite to pick up changes)
-    script_path = os.path.join(output_dir, "_math_render.js")
-    with open(script_path, "w") as f:
-        f.write(_RENDER_SCRIPT)
-
-    async with _render_sema:
-        try:
-            cmd = [
-                "node",
-                script_path,
-                PUPPETEER_MODULE,
-                PUPPETEER_CONFIG,
-                html_path,
-                out_path,
-            ]
-            if CHROME_EXECUTABLE:
-                cmd.append(CHROME_EXECUTABLE)
-            else:
-                cmd.append("")  # placeholder for chromePath
-            cmd.append(str(scale_params["screenshot_pad"]))  # adaptive screenshot padding
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-
-            if proc.returncode != 0:
-                log.error("Math render failed (rc=%d): %s", proc.returncode, stderr.decode()[:500])
-                return None
-
-            return out_path if os.path.isfile(out_path) else None
-
-        except asyncio.TimeoutError:
-            log.error("Math render timed out")
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            return None
-        except Exception as e:
-            log.error("Math render error: %s", e)
-            return None
+    try:
+        await render_with_browser_daemon(
+            html_path=html_path,
+            output_path=out_path,
+            selector=".math-container",
+            pad=scale_params["screenshot_pad"],
+            viewport={"width": 800, "height": 600, "deviceScaleFactor": 2},
+        )
+        return out_path if os.path.isfile(out_path) else None
+    except TimeoutError:
+        log.error("Math render timed out")
+        return None
+    except Exception as e:
+        log.error("Math render error: %s", e)
+        return None
