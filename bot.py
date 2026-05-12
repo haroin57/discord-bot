@@ -623,7 +623,11 @@ async def on_message(message: discord.Message):
             # context, and attachments.
             parts: list[str] = []
             if reply_context:
-                parts.append(reply_context)
+                # Sanitize at this layer too for consistency with the other
+                # context variables — the inner pieces are already sanitized
+                # at construction, but applying once more is idempotent and
+                # survives future refactoring.
+                parts.append(_sanitize_untrusted_text(reply_context))
             parts.append(safe_user_text)
             if image_paths:
                 image_instructions = "\n".join(
@@ -677,7 +681,9 @@ async def on_message(message: discord.Message):
                     f"</forwarded_messages>"
                 )
             if reply_context:
-                parts.append(reply_context)
+                # Idempotent outer sanitize for parity with conv_context /
+                # cross_thread_context / forwarded_context just above.
+                parts.append(_sanitize_untrusted_text(reply_context))
             parts.append(safe_user_text)
             if image_paths:
                 image_instructions = "\n".join(
