@@ -84,6 +84,21 @@ async def add_memories(
                     continue
                 candidates.append(f)
 
+            # Intra-batch dedup: two facts with identical text in the same
+            # call would both pass the parallel dedup-check (neither is in
+            # the store yet) and both get inserted. Drop within-batch
+            # duplicates by `text` before firing any ChromaDB queries.
+            seen_texts: set[str] = set()
+            deduped: list[dict] = []
+            for f in candidates:
+                t = f.get("text", "")
+                if t in seen_texts:
+                    skip_dup += 1
+                    continue
+                seen_texts.add(t)
+                deduped.append(f)
+            candidates = deduped
+
             # Parallel near-dup check: previously each candidate awaited its
             # own search serially. asyncio.gather lets ChromaDB embed+query
             # all candidates concurrently and cuts per-ingest latency from

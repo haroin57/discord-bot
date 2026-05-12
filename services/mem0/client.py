@@ -20,6 +20,11 @@ _last_token: str | None = None
 # (services/mem0/extract.py, services/mem0/search.py).
 _async_anthropic_client = None
 _async_anthropic_token: str | None = None
+# Serializes (rare) singleton (re)construction so two concurrent callers from
+# asyncio.gather cannot both race past the None check and each build a fresh
+# AsyncAnthropic. Once initialized the lock is only contended on token
+# rotation, which happens at most every ~hour — negligible overhead.
+_async_anthropic_lock = asyncio.Lock()
 
 
 async def get_anthropic_client():
@@ -34,11 +39,18 @@ async def get_anthropic_client():
     token = get_access_token()
     if not token:
         return None
-    if _async_anthropic_client is None or token != _async_anthropic_token:
-        # First call or token rotated since last cache; rebuild.
-        from anthropic import AsyncAnthropic
-        _async_anthropic_client = AsyncAnthropic(auth_token=token)
-        _async_anthropic_token = token
+    # Fast path: no rebuild needed.
+    if _async_anthropic_client is not None and token == _async_anthropic_token:
+        return _async_anthropic_client
+    # Slow path: build (or rebuild after token rotation) under a lock so two
+    # concurrent callers cannot both construct a fresh client.
+    async with _async_anthropic_lock:
+        # Re-check after acquiring the lock — another coroutine may have
+        # already built the right client while we were waiting.
+        if _async_anthropic_client is None or token != _async_anthropic_token:
+            from anthropic import AsyncAnthropic
+            _async_anthropic_client = AsyncAnthropic(auth_token=token)
+            _async_anthropic_token = token
     return _async_anthropic_client
 
 
