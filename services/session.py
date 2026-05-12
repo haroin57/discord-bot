@@ -65,6 +65,9 @@ def save_sessions(s: OrderedDict[int, SessionInfo]) -> None:
     # symlink at SESSIONS_PATH so a local attacker cannot redirect the write.
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
     fd = os.open(SESSIONS_PATH, flags, 0o600)
+    # fchmod enforces 0o600 even when the file pre-existed with looser
+    # permissions (os.open's mode argument is only applied on create).
+    os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f)
 
@@ -97,6 +100,9 @@ def append_jsonl(channel_id: int, entry: dict) -> None:
     # to follow a symlink at the history-file path.
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
     fd = os.open(_history_file(channel_id), flags, 0o600)
+    # fchmod enforces 0o600 even when the file pre-existed with looser
+    # permissions (the mode argument is only applied on create).
+    os.fchmod(fd, 0o600)
     # Explicit buffering avoids tiny unbuffered writes on spinning disks.
     with os.fdopen(fd, "a", encoding="utf-8", buffering=8192) as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")

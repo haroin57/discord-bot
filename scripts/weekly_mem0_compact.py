@@ -57,6 +57,12 @@ async def main() -> None:
     state_dir = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
     state_dir = os.path.join(state_dir, "discord-bot")
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    # makedirs mode only applies on create; chmod enforces 0o700 even when the
+    # directory pre-existed with looser permissions (e.g. 0o755 from a prior run).
+    try:
+        os.chmod(state_dir, 0o700)
+    except OSError:
+        pass
     default_out = os.path.join(state_dir, f"mem0_compact_{datetime.now().strftime('%Y%m%d')}.md")
 
     p = argparse.ArgumentParser()

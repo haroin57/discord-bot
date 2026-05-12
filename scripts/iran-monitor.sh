@@ -30,6 +30,8 @@ LOCK="$STATE_DIR/iran-monitor.lock"
 
 # Prevent overlapping runs via flock (atomic; symlink-attack proof).
 # fd 200 stays open for the lifetime of the script; the lock releases on exit.
+# Pre-create the lockfile with mode 0o600 for consistency with other state files.
+[[ -e "$LOCK" ]] || install -m 600 /dev/null "$LOCK"
 exec 200>"$LOCK"
 if ! flock -n 200; then
     echo "$(date): Already running, skipping" >> "$LOG"
