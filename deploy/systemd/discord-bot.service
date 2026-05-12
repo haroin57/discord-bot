@@ -18,7 +18,12 @@ SyslogIdentifier=discord-bot
 
 # Security hardening (audit 2026-05-13: H11)
 NoNewPrivileges=yes
-PrivateTmp=yes
+# PrivateTmp=no — bot writes /tmp/discord_bot_attachments etc. that need to be
+# visible to the host (cleanup scripts, debugging, Discord attachment upload).
+# Combined with ReadWritePaths on the same /tmp paths, PrivateTmp=yes triggers
+# a status=226/NAMESPACE failure because the private /tmp doesn't contain
+# those subdirectories at unit-spawn time.
+PrivateTmp=no
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/ubuntu/discord-bot /home/ubuntu/.local/state/discord-bot /tmp/discord_bot_attachments /tmp/mermaid_output /tmp/table_renders /tmp/math_renders
