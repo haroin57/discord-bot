@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 __all__ = [
     "TextSegment", "TableSegment", "MathSegment", "Segment",
-    "parse_segments", "has_tables", "has_math",
+    "parse_segments", "has_tables", "has_math", "mask_code_blocks",
 ]
 
 
@@ -71,23 +71,39 @@ _ALL_MATH_RE = re.compile(
 )
 
 
-def _mask_code_blocks(text: str) -> str:
-    """Replace code blocks with placeholder of same length to preserve offsets."""
+def mask_code_blocks(text: str) -> str:
+    """Replace code blocks with placeholder of same length to preserve offsets.
+
+    Public so callers can compute the masked form once and pass it to multiple
+    detectors instead of re-scanning the same text via has_tables/has_math/
+    parse_segments separately.
+    """
     def _replacer(m: re.Match) -> str:
         # Replace with spaces/newlines to keep line structure
         return re.sub(r"[^\n]", " ", m.group(0))
     return _CODE_BLOCK_RE.sub(_replacer, text)
 
 
-def has_tables(text: str) -> bool:
-    """Lightweight check: does the text contain at least one Markdown table?"""
-    masked = _mask_code_blocks(text)
+# Backwards-compat alias (some internal callers still use the underscore name).
+_mask_code_blocks = mask_code_blocks
+
+
+def has_tables(text: str, *, _masked: str | None = None) -> bool:
+    """Lightweight check: does the text contain at least one Markdown table?
+
+    If the caller has already computed the masked form via mask_code_blocks(),
+    pass it via the keyword-only `_masked` arg to skip a redundant scan.
+    """
+    masked = _masked if _masked is not None else mask_code_blocks(text)
     return bool(TABLE_RE.search(masked))
 
 
-def has_math(text: str) -> bool:
-    """Lightweight check: does the text contain LaTeX math expressions?"""
-    masked = _mask_code_blocks(text)
+def has_math(text: str, *, _masked: str | None = None) -> bool:
+    """Lightweight check: does the text contain LaTeX math expressions?
+
+    See has_tables() for the optional `_masked` arg.
+    """
+    masked = _masked if _masked is not None else mask_code_blocks(text)
     return bool(_ALL_MATH_RE.search(masked))
 
 

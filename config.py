@@ -239,10 +239,14 @@ MCP_SERVERS_BASE: dict = {
     },
 }
 
-# Scholarly MCP (Google Scholar検索) — light, but only useful for paper queries
-MCP_SERVERS_BASE["scholarly"] = {
-    "command": "/home/ubuntu/scholarly-mcp/.venv/bin/python",
-    "args": ["/home/ubuntu/scholarly-mcp/server.py"],
+# Scholarly MCP (Google Scholar検索) — only spawn its Python subprocess when
+# the user's text actually mentions a paper-related keyword. Previously this
+# was in BASE and started on every admin request, adding 100-300ms unconditionally.
+MCP_SERVERS_PAPER: dict = {
+    "scholarly": {
+        "command": "/home/ubuntu/scholarly-mcp/.venv/bin/python",
+        "args": ["/home/ubuntu/scholarly-mcp/server.py"],
+    },
 }
 
 MCP_SERVERS_WEB: dict = {
@@ -294,27 +298,34 @@ MCP_SERVERS: dict = {
     **MCP_SERVERS_WEB,
     **MCP_SERVERS_HEAVY,
     **MCP_SERVERS_MEMORY,
+    **MCP_SERVERS_PAPER,
 }
 
 
 # Keyword sets used by pick_mcp_servers(). Cheap substring scans on the
 # user's raw text — model is still free to refuse / pick differently, this
 # only decides which subprocesses we spin up for the request.
-_WEB_TRIGGERS = (
+# Tuples are pre-lowercased at module load so pick_mcp_servers() can compare
+# without a per-call .lower() on each keyword.
+_WEB_TRIGGERS = tuple(kw.lower() for kw in (
     "検索", "調べて", "ググって", "ニュース",
     "twitter", "x.com", "ツイート", "tweet", "trend", "トレンド",
     "search", "ググ", "Brave", "x ", "X(", "X検索",
-)
-_HEAVY_TRIGGERS = (
+))
+_HEAVY_TRIGGERS = tuple(kw.lower() for kw in (
     "ブラウズ", "browse", "スクリーンショット", "screenshot",
     "playwright", "puppeteer", "render", "webページを開",
     "サイトを開", "アクセスして",
-)
-_MEMORY_TRIGGERS = (
+))
+_MEMORY_TRIGGERS = tuple(kw.lower() for kw in (
     "記憶", "覚えて", "覚えとい", "覚えてる", "思い出", "忘れた", "忘れない",
     "mem0", "memory", "remember", "recall", "過去の",
     "前に話した", "前に言った", "以前", "昔話した",
-)
+))
+_PAPER_TRIGGERS = tuple(kw.lower() for kw in (
+    "論文", "paper", "scholar", "arxiv", "学術", "引用文献",
+    "citation", "google scholar",
+))
 
 
 def get_mcp_servers_by_keys(keys: list[str]) -> dict:
@@ -332,12 +343,14 @@ def pick_mcp_servers(raw_user_text: str) -> dict:
     """
     text = (raw_user_text or "").lower()
     servers = dict(MCP_SERVERS_BASE)
-    if any(kw.lower() in text for kw in _WEB_TRIGGERS):
+    if any(kw in text for kw in _WEB_TRIGGERS):
         servers.update(MCP_SERVERS_WEB)
-    if any(kw.lower() in text for kw in _HEAVY_TRIGGERS):
+    if any(kw in text for kw in _HEAVY_TRIGGERS):
         servers.update(MCP_SERVERS_HEAVY)
-    if any(kw.lower() in text for kw in _MEMORY_TRIGGERS):
+    if any(kw in text for kw in _MEMORY_TRIGGERS):
         servers.update(MCP_SERVERS_MEMORY)
+    if any(kw in text for kw in _PAPER_TRIGGERS):
+        servers.update(MCP_SERVERS_PAPER)
     return servers
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,8 @@ import os
 
 import markdown
 
+from utils.render_semaphore import render_sema as _render_sema  # shared with math_renderer
+
 __all__ = ["render_table_image"]
 
 log = logging.getLogger(__name__)
@@ -23,8 +25,10 @@ PUPPETEER_MODULE = (
     "/node_modules/puppeteer/lib/cjs/puppeteer/puppeteer.js"
 )
 
-# Semaphore: limit to 1 concurrent Puppeteer process (2 GB RAM constraint)
-_render_sema = asyncio.Semaphore(1)
+# NOTE: _render_sema is imported from utils.render_semaphore so it is shared
+# globally with math_renderer (and any future renderer). A local Semaphore(1)
+# here would not actually prevent concurrent Chromium spawns from a different
+# module — see utils/render_semaphore.py for rationale.
 
 # ---------------------------------------------------------------------------
 # Node.js render script (written once to disk)
