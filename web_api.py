@@ -36,6 +36,14 @@ from config import (
 from services.claude_sdk import call_with_tools
 from services.prompt_builder import PromptBuilder
 from services.session import load_history_channel, load_sessions, update_session
+try:
+    from services.correlation import new_request_id, get_request_id
+except ImportError:  # pragma: no cover — defensive fallback
+    def new_request_id() -> str:
+        return ""
+
+    def get_request_id() -> str:
+        return ""
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +72,11 @@ class WebAPI:
 
         # session_token -> {discord_id, username, ...}
         self._session_cache: dict[str, dict] = {}
+        # session_token -> asyncio.Lock (SRE-C6: dedup concurrent misses).
+        # OrderedDict so eviction is FIFO insert-order, not arbitrary; we
+        # only evict on insert so an in-progress lock holder can never have
+        # its lock dropped mid-await (review H-SEC-2).
+        self._verify_locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
         # discord_id (str) -> last request epoch seconds
         self._cooldowns: OrderedDict[str, float] = OrderedDict()
         # discord_id (str) -> list[float] of request timestamps within quota window
@@ -75,8 +88,14 @@ class WebAPI:
         # sid -> discord_id mapping (populated on connect)
         self._sid_to_user: dict[str, dict] = {}
 
+        # sid -> set of in-flight asyncio.Task (SRE-H10)
+        self._sid_tasks: dict[str, set[asyncio.Task]] = {}
+
         self._runner: web.AppRunner | None = None
         self._http: aiohttp.ClientSession | None = None
+
+        # SRE-C7: record start time for /health uptime
+        self._started_at: float = time.time()
 
         self._register_events()
 
@@ -99,10 +118,33 @@ class WebAPI:
         self._session_cache.pop(token, None)
         return web.json_response({"invalidated": existed})
 
+    # SRE-C7: health endpoint. Delegates to services.health for the rich
+    # subsystem snapshot (discord + oauth + mem0) and decorates with
+    # web-specific fields (active_connections).
+    async def _handle_health(self, request: web.Request) -> web.Response:
+        try:
+            from services.health import get_health_snapshot
+            snap = get_health_snapshot(bot=self.bot)
+        except Exception as exc:  # pragma: no cover — health must never fail hard
+            log.warning("get_health_snapshot failed, using minimal fallback: %s", exc)
+            discord_ok = self.bot.is_ready() if self.bot else False
+            uptime = int(time.time() - self._started_at) if self._started_at else 0
+            snap = {
+                "status": "ok" if discord_ok else "degraded",
+                "uptime_s": uptime,
+                "subsystems": {"discord": {"ok": discord_ok}},
+            }
+        # Decorate with web-specific stats
+        snap["active_connections"] = len(self._sid_to_user)
+        status_code = 200 if snap.get("status") == "ok" else 503
+        return web.json_response(snap, status=status_code)
+
     async def start(self, port: int = WEB_API_PORT, host: str = WEB_API_HOST) -> None:
         self._http = aiohttp.ClientSession()
         # H5: register invalidation route before site is created
         self.app.router.add_post("/internal/invalidate_session", self._handle_invalidate_session)
+        # SRE-C7: health route
+        self.app.router.add_get("/health", self._handle_health)
         self._runner = web.AppRunner(self.app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, host, port)
@@ -128,57 +170,95 @@ class WebAPI:
     # -----------------------------------------------------------------------
     # Session verification
     # -----------------------------------------------------------------------
+    def _cache_hit(self, session_token: str) -> dict | None:
+        """Return cached session if still fresh (<300 s), else None."""
+        cached = self._session_cache.get(session_token)
+        if cached and time.time() - cached.get("_verified_at", 0) < 300:
+            # M9: Re-derive is_admin on every cache hit so ADMIN_USER_IDS changes apply immediately
+            try:
+                is_admin_live = int(cached["discordId"]) in ADMIN_USER_IDS
+            except (KeyError, ValueError):
+                is_admin_live = False
+            return {**cached, "isAdmin": is_admin_live}
+        return None
+
     async def verify_session(self, session_token: str) -> dict | None:
         """Verify a session token against the Next.js /api/session/verify.
 
         The Next.js endpoint reads the session cookie and returns:
             {authenticated: true, discordId: str, isAdmin: bool}
         Caches valid results for 300s to avoid hammering the auth endpoint.
+        SRE-C6: concurrent misses for the same token are deduplicated via a
+        per-token Lock so the HTTP round-trip happens only once.
         """
-        cached = self._session_cache.get(session_token)
-        if cached:
-            if time.time() - cached.get("_verified_at", 0) < 300:
-                # M9: Re-derive is_admin on every cache hit so ADMIN_USER_IDS changes apply immediately
-                try:
-                    is_admin_live = int(cached["discordId"]) in ADMIN_USER_IDS
-                except (KeyError, ValueError):
-                    is_admin_live = False
-                return {**cached, "isAdmin": is_admin_live}
+        hit = self._cache_hit(session_token)
+        if hit is not None:
+            return hit
 
-        if self._http is None or self._http.closed:
-            self._http = aiohttp.ClientSession()
+        # SRE-C6 / H-SEC-2: bound _verify_locks to 1000 entries with
+        # insert-only FIFO eviction. Never evict the lock we are about to
+        # acquire, and never evict a lock that another coroutine is already
+        # awaiting (acquired) — only evict the OLDEST unlocked entries.
+        existed = session_token in self._verify_locks
+        if existed:
+            lock = self._verify_locks[session_token]
+            self._verify_locks.move_to_end(session_token)
+        else:
+            # Evict before insert so the new lock is the most recently
+            # touched and is never selected for eviction in this pass.
+            while len(self._verify_locks) >= 1000:
+                oldest_key, oldest_lock = next(iter(self._verify_locks.items()))
+                if oldest_lock.locked():
+                    # Skip locked entries — they have a coroutine awaiting them
+                    self._verify_locks.move_to_end(oldest_key)
+                    # If every entry is locked we just live with >1000 momentarily
+                    if all(v.locked() for v in self._verify_locks.values()):
+                        break
+                    continue
+                self._verify_locks.popitem(last=False)
+            lock = asyncio.Lock()
+            self._verify_locks[session_token] = lock
 
-        try:
-            async with self._http.get(
-                "http://localhost:3001/api/session/verify",
-                cookies={"next-auth.session-token": session_token},
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-                if not data.get("authenticated"):
-                    return None
-                # Re-derive admin status from the bot's own ADMIN_USER_IDS
-                # instead of trusting the Next.js verifier. The verifier is a
-                # separate process whose config could drift or be tampered
-                # with; admin power inside the bot must be governed by the
-                # bot's own allowlist.
-                discord_id = str(data["discordId"])
-                try:
-                    is_admin = int(discord_id) in ADMIN_USER_IDS
-                except ValueError:
-                    is_admin = False
-                user = {
-                    "discordId": discord_id,
-                    "isAdmin": is_admin,
-                    "_verified_at": time.time(),
-                }
-                self._session_cache[session_token] = user
-                return user
-        except Exception as e:
-            log.warning("Session verify failed: %s", e)
-            return None
+        async with lock:
+            # Check cache again — another coroutine may have populated it while we waited
+            hit = self._cache_hit(session_token)
+            if hit is not None:
+                return hit
+
+            if self._http is None or self._http.closed:
+                self._http = aiohttp.ClientSession()
+
+            try:
+                async with self._http.get(
+                    "http://localhost:3001/api/session/verify",
+                    cookies={"next-auth.session-token": session_token},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    if not data.get("authenticated"):
+                        return None
+                    # Re-derive admin status from the bot's own ADMIN_USER_IDS
+                    # instead of trusting the Next.js verifier. The verifier is a
+                    # separate process whose config could drift or be tampered
+                    # with; admin power inside the bot must be governed by the
+                    # bot's own allowlist.
+                    discord_id = str(data["discordId"])
+                    try:
+                        is_admin = int(discord_id) in ADMIN_USER_IDS
+                    except ValueError:
+                        is_admin = False
+                    user = {
+                        "discordId": discord_id,
+                        "isAdmin": is_admin,
+                        "_verified_at": time.time(),
+                    }
+                    self._session_cache[session_token] = user
+                    return user
+            except Exception as e:
+                log.warning("Session verify failed: %s", e)
+                return None
 
     # -----------------------------------------------------------------------
     # Discord channel permission checks
@@ -324,6 +404,9 @@ class WebAPI:
         @sio.event
         async def disconnect(sid):
             self._sid_to_user.pop(sid, None)
+            # SRE-H10: cancel in-flight tasks for this sid
+            for t in self._sid_tasks.pop(sid, set()):
+                t.cancel()
             log.info("WS disconnected: sid=%s", sid)
 
         @sio.event
@@ -400,6 +483,9 @@ class WebAPI:
         @sio.event
         async def send_message(sid, data):
             """Process a user message through Claude and stream status back."""
+            # M-1: set per-request correlation ID so downstream logs from
+            # call_with_tools, mem0, etc. all carry rid=XXXX.
+            new_request_id()
             user_info = self._sid_to_user.get(sid)
             if not user_info:
                 await sio.emit("error", {"message": "not authenticated"}, to=sid)
@@ -483,12 +569,19 @@ class WebAPI:
                     discord_id, channel_id, is_admin, len(prompt),
                 )
 
-                response_text, session_id = await call_with_tools(
+                # SRE-H10: track task so disconnect can cancel it
+                _loop = asyncio.get_event_loop()
+                task = _loop.create_task(call_with_tools(
                     prompt, channel_id, self._sessions,
                     status_callback=status_callback,
                     restricted=not is_admin,
                     raw_user_text=raw_text,
-                )
+                ))
+                self._sid_tasks.setdefault(sid, set()).add(task)
+                try:
+                    response_text, session_id = await task
+                finally:
+                    self._sid_tasks.get(sid, set()).discard(task)
 
                 if session_id:
                     await asyncio.to_thread(

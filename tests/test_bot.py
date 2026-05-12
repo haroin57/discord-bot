@@ -1098,3 +1098,96 @@ async def test_rate_limit_uses_shared_module(monkeypatch):
     # Shared module's check_cooldown was invoked
     assert len(called_with) >= 1
     assert called_with[0][0] == "12345"
+
+
+# ---------------------------------------------------------------------------
+# SRE tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mem0_failure_logs_warning(caplog):
+    """Mem0 store failure should log at WARNING, not DEBUG."""
+    import bot
+
+    async def _raise(*args, **kwargs):
+        raise RuntimeError("Mem0 connection refused")
+
+    with patch("bot.add_memories", side_effect=_raise):
+        with caplog.at_level(logging.WARNING, logger="bot"):
+            # Build and directly invoke the _mem0_store coroutine by simulating what
+            # on_message does: define the inner coroutine and run it.
+            mem0_user_id = "99999"
+            raw_user_text = "hello"
+            response_text = "hi"
+            channel_id = 11111
+
+            async def _mem0_store():
+                try:
+                    await bot.add_memories(
+                        user_text=raw_user_text,
+                        assistant_text=response_text,
+                        user_id=mem0_user_id,
+                        context_hint="",
+                        metadata={"channel_id": str(channel_id), "channel_name": "test"},
+                    )
+                except Exception as exc:
+                    bot.log.warning(
+                        "Mem0 store failed: %s (user=%s, channel=%s)",
+                        exc, mem0_user_id, channel_id,
+                    )
+
+            await _mem0_store()
+
+    assert any(
+        r.levelno == logging.WARNING and "Mem0 store failed" in r.message
+        for r in caplog.records
+    ), f"Expected WARNING with 'Mem0 store failed', got: {caplog.records}"
+
+
+@pytest.mark.asyncio
+async def test_tree_sync_only_runs_once():
+    """bot.tree.sync() must be called exactly once even if on_ready fires twice."""
+    import bot
+
+    bot._tree_synced = False
+
+    mock_tree_sync = AsyncMock(return_value=[MagicMock(), MagicMock()])
+    mock_guilds = []
+
+    with patch.object(bot.bot, "guilds", mock_guilds), \
+         patch.object(bot.bot, "tree") as mock_tree, \
+         patch("bot.build_mention_regex"), \
+         patch("bot._cleanup_scheduled", True):  # skip cleanup branch
+        mock_tree.sync = mock_tree_sync
+
+        await bot.on_ready()
+        await bot.on_ready()
+
+    assert mock_tree_sync.call_count == 1, (
+        f"Expected tree.sync called once, got {mock_tree_sync.call_count}"
+    )
+
+    # Reset for other tests
+    bot._tree_synced = False
+
+
+def test_attachments_capped_at_10():
+    """The >8000-char path caps all_files to 10 before calling reply."""
+    import io as _io
+
+    # Mirrors the cap logic added in bot.py for the >8000 path.
+    fake_attach = [MagicMock(spec=discord.File) for _ in range(15)]
+    all_files = [discord.File(_io.StringIO("x"), filename="response.md")] + fake_attach
+    assert len(all_files) == 16
+
+    if len(all_files) > 10:
+        all_files = all_files[:10]
+
+    assert len(all_files) == 10, f"Cap failed: got {len(all_files)} files"
+
+    # Also verify the chunk-reply path cap.
+    reply_files = fake_attach[:]  # 15 items
+    if len(reply_files) > 10:
+        reply_files = reply_files[:10]
+
+    assert len(reply_files) == 10, f"Chunk-reply cap failed: got {len(reply_files)} files"

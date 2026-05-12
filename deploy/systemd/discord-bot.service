@@ -2,6 +2,11 @@
 Description=Kanae Discord Bot
 After=network-online.target
 Wants=network-online.target
+# SRE-C2: cap crash-loop retries to 3 per 60s; surface failure instead of
+# infinite restart hammer.
+StartLimitBurst=3
+StartLimitIntervalSec=60
+StartLimitAction=none
 
 [Service]
 Type=simple
@@ -21,7 +26,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/ubuntu/discord-bot /home/ubuntu/.local/state/discord-bot /tmp/discord_bot_attachments /tmp/mermaid_output /tmp/table_renders /tmp/math_renders
+ReadWritePaths=/home/ubuntu/discord-bot /home/ubuntu/.local/state/discord-bot /tmp/discord_bot_attachments /tmp/mermaid_output /tmp/table_renders /tmp/math_renders /home/ubuntu/.npm /home/ubuntu/.cache /home/ubuntu/.claude
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -33,6 +38,12 @@ MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
 SystemCallArchitectures=native
 CapabilityBoundingSet=
+
+# SRE-H8: cap memory at 1700MB on 2GB host; trigger cgroup reclaim at 1500MB
+# before OOM kill, giving the bot a chance to shed Puppeteer/MCP children.
+MemoryMax=1700M
+MemoryHigh=1500M
+LimitNOFILE=4096
 
 [Install]
 WantedBy=multi-user.target

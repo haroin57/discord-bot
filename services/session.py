@@ -115,7 +115,9 @@ def load_sessions() -> OrderedDict[int, SessionInfo]:
         return OrderedDict()
 
 
-def save_sessions(s: OrderedDict[int, SessionInfo]) -> None:
+def save_sessions(s: OrderedDict[int, SessionInfo], *, _path: str | None = None) -> None:
+    target = _path or SESSIONS_PATH
+    tmp = target + ".tmp"
     data = {
         str(k): {
             "session_id": v.session_id,
@@ -123,16 +125,19 @@ def save_sessions(s: OrderedDict[int, SessionInfo]) -> None:
         }
         for k, v in s.items()
     }
-    # Open with 0o600 so SDK session_ids (potentially session-resumable secrets)
-    # are not world-readable on a shared host. O_NOFOLLOW refuses to follow a
-    # symlink at SESSIONS_PATH so a local attacker cannot redirect the write.
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
-    fd = os.open(SESSIONS_PATH, flags, 0o600)
-    # fchmod enforces 0o600 even when the file pre-existed with looser
-    # permissions (os.open's mode argument is only applied on create).
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def update_session(
@@ -212,6 +217,8 @@ def append_jsonl(channel_id: int, entry: dict) -> None:
     # Explicit buffering avoids tiny unbuffered writes on spinning disks.
     with os.fdopen(fd, "a", encoding="utf-8", buffering=8192) as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def _tail_jsonl(path: str, max_entries: int) -> list[dict]:
@@ -257,7 +264,8 @@ def _tail_jsonl(path: str, max_entries: int) -> list[dict]:
             continue
         try:
             entry = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            log.warning("Skipping corrupted JSONL line in %s: %s", path, e)
             continue
         if entry.get("role") in ("user", "assistant"):
             messages.append({"role": entry["role"], "content": entry["content"]})

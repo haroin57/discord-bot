@@ -19,6 +19,11 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 
+
+class OAuthRefreshFailed(RuntimeError):
+    """Raised when OAuth token is expired and refresh has failed repeatedly."""
+
+
 # ---------------------------------------------------------------------------
 # H-2: permission verification helpers
 # ---------------------------------------------------------------------------
@@ -73,6 +78,40 @@ REFRESH_SCOPES = [
 ]
 # Refresh 5 minutes before expiry (same buffer as free-code)
 EXPIRY_BUFFER_MS = 5 * 60 * 1000
+
+# ---------------------------------------------------------------------------
+# Refresh failure tracking (SRE-C9)
+# ---------------------------------------------------------------------------
+_refresh_failure_count = 0
+_REFRESH_FAILURE_ALERT_THRESHOLD = 3
+
+
+def _record_refresh_failure(err):
+    global _refresh_failure_count
+    _refresh_failure_count += 1
+    if _refresh_failure_count >= _REFRESH_FAILURE_ALERT_THRESHOLD:
+        log.error(
+            "OAuth refresh failed %d consecutive times: %s. "
+            "Bot will start returning 401 from Anthropic API soon.",
+            _refresh_failure_count, err,
+        )
+    else:
+        log.warning("OAuth refresh failed (%d/%d): %s",
+                    _refresh_failure_count, _REFRESH_FAILURE_ALERT_THRESHOLD, err)
+
+
+def _record_refresh_success():
+    global _refresh_failure_count
+    if _refresh_failure_count > 0:
+        log.info("OAuth refresh recovered after %d failures", _refresh_failure_count)
+    _refresh_failure_count = 0
+
+
+def is_oauth_healthy() -> bool:
+    """Public helper for health endpoint — True if last refresh succeeded
+    or no failures recorded yet."""
+    return _refresh_failure_count < _REFRESH_FAILURE_ALERT_THRESHOLD
+
 
 # ---------------------------------------------------------------------------
 # State
@@ -166,7 +205,7 @@ async def refresh_token() -> bool:
     global _access_token, _refresh_token, _expires_at
 
     if not _refresh_token:
-        log.error("No refresh token available")
+        _record_refresh_failure("no refresh token available")
         return False
 
     body = {
@@ -186,7 +225,7 @@ async def refresh_token() -> bool:
         ) as resp:
             if resp.status != 200:
                 text = await resp.text()
-                log.error("OAuth token refresh failed (%d): %s", resp.status, text)
+                _record_refresh_failure(f"HTTP {resp.status}: {text}")
                 return False
 
             data = await resp.json()
@@ -205,16 +244,21 @@ async def refresh_token() -> bool:
         # Persist to disk
         _save_credentials(_access_token, _refresh_token, _expires_at)
 
+        _record_refresh_success()
         log.info("OAuth token refreshed, expires in %ds", expires_in)
         return True
 
     except Exception as exc:
-        log.error("OAuth token refresh error: %s", exc)
+        _record_refresh_failure(exc)
         return False
 
 
 async def ensure_valid_token() -> str | None:
-    """Return a valid access token, refreshing if needed."""
+    """Return a valid access token, refreshing if needed.
+
+    Raises OAuthRefreshFailed when the token is expired AND refresh has
+    consecutively failed >= _REFRESH_FAILURE_ALERT_THRESHOLD times.
+    """
     global _access_token
 
     if _access_token and not _is_expired():
@@ -224,6 +268,12 @@ async def ensure_valid_token() -> str | None:
         log.info("OAuth token expired or expiring soon, refreshing")
         if await refresh_token():
             return _access_token
+
+    # Token is expired and refresh is not recovering — raise if at threshold.
+    if _is_expired() and _refresh_failure_count >= _REFRESH_FAILURE_ALERT_THRESHOLD:
+        raise OAuthRefreshFailed(
+            f"OAuth token expired and refresh has failed {_refresh_failure_count} consecutive times"
+        )
 
     return _access_token
 

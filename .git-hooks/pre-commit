@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Project pre-commit hook for discord-bot.
+# Install via: ./scripts/install-hooks.sh
+set -euo pipefail
+
+# 1. Block merge conflict markers
+if git diff --cached --name-only | xargs -r grep -lE "^<<<<<<<|^>>>>>>>" 2>/dev/null; then
+    echo "ERROR: merge conflict markers in staged files"
+    exit 1
+fi
+
+# 2. Block staged .bak files (SRE-C1 follow-up: tokens leaked via .bak files)
+if git diff --cached --name-only | grep -E '\.(bak|backup|bak\.[0-9]+)$' >/dev/null; then
+    echo "ERROR: backup file staged — possible secret leak"
+    echo "Use git reset HEAD <file> and add to .gitignore"
+    exit 1
+fi
+
+# 3. Block known token patterns
+TOKEN_RE='ANTHROPIC_(API|AUTH)_(KEY|TOKEN)=[A-Za-z0-9_-]+|sk-ant-[A-Za-z0-9_-]+|MT[A-Za-z0-9]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'
+if git diff --cached -U0 | grep -E "^\+" | grep -qE "${TOKEN_RE}"; then
+    echo "ERROR: token-like string in staged diff"
+    exit 1
+fi
+
+# 4. Python syntax check on staged .py files
+STAGED_PY="$(git diff --cached --name-only --diff-filter=AM | grep '\.py$' || true)"
+if [[ -n "${STAGED_PY}" ]]; then
+    for f in ${STAGED_PY}; do
+        if [[ -f "${f}" ]]; then
+            python -m py_compile "${f}" || exit 1
+        fi
+    done
+fi
+
+echo "[pre-commit] OK"

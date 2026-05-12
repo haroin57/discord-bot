@@ -932,3 +932,95 @@ async def test_verify_session_admin_status_granted_on_cache_hit(monkeypatch):
 
     result = await api.verify_session("tok_z")
     assert result["isAdmin"] is True
+
+
+# ---------------------------------------------------------------------------
+# SRE-C6 — verify_session concurrent miss dedup
+# ---------------------------------------------------------------------------
+
+
+async def test_verify_session_dedupes_concurrent_misses():
+    """5 concurrent verify_session calls for the same token must result in only
+    one HTTP request (lock dedup)."""
+    api = make_web_api()
+
+    mock_http = MagicMock()
+    mock_http.closed = False
+    resp_mock = AsyncMock()
+    resp_mock.__aenter__ = AsyncMock(return_value=resp_mock)
+    resp_mock.__aexit__ = AsyncMock(return_value=False)
+    resp_mock.status = 200
+    resp_mock.json = AsyncMock(return_value={"authenticated": True, "discordId": "42", "isAdmin": False})
+    mock_http.get = MagicMock(return_value=resp_mock)
+    api._http = mock_http
+
+    results = await asyncio.gather(*[api.verify_session("dedup_tok") for _ in range(5)])
+
+    assert all(r is not None for r in results)
+    assert mock_http.get.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# SRE-C7 — /health endpoint
+# ---------------------------------------------------------------------------
+
+
+async def test_health_endpoint_returns_ok_when_bot_ready():
+    """GET /health returns status='ok' and discord_connected=True when bot is ready."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    api = make_web_api()
+    api.bot.is_ready = MagicMock(return_value=True)
+    # latency must be a real float for services.health._check_discord
+    api.bot.latency = 0.05
+    api._started_at = time.time() - 10
+
+    # Register route directly on the app (bypassing start())
+    api.app.router.add_get("/health", api._handle_health)
+
+    # Patch oauth + mem0 subsystem checks to return ok so overall status="ok"
+    with patch("services.health._check_oauth", return_value={"ok": True}), \
+         patch("services.health._check_mem0", return_value={"ok": True}):
+        async with TestClient(TestServer(api.app)) as client:
+            resp = await client.get("/health")
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["status"] == "ok"
+            # New schema (M-4): subsystems.discord.ok replaces discord_connected
+            assert body["subsystems"]["discord"]["ok"] is True
+            # uptime_s now comes from services.health module-level _started_at
+            # (set at import time), so we just assert it's non-negative.
+            assert body["uptime_s"] >= 0
+            assert body["active_connections"] == 0
+
+
+# ---------------------------------------------------------------------------
+# SRE-H10 — disconnect cancels in-flight send_message tasks
+# ---------------------------------------------------------------------------
+
+
+async def test_disconnect_cancels_inflight_tasks():
+    """disconnect() cancels tasks registered in _sid_tasks for the given sid."""
+    api, handlers = make_api_with_captured_handlers()
+    api._sid_to_user["sid_h10"] = {"discord_id": "1", "is_admin": True, "username": "u", "tag": "u#0"}
+
+    # Create a task that blocks until cancelled
+    cancelled_flag = asyncio.Event()
+
+    async def _long_running():
+        try:
+            await asyncio.sleep(9999)
+        except asyncio.CancelledError:
+            cancelled_flag.set()
+            raise
+
+    task = asyncio.create_task(_long_running())
+    api._sid_tasks["sid_h10"] = {task}
+
+    await handlers["disconnect"]("sid_h10")
+
+    # Give the event loop a chance to deliver cancellation
+    await asyncio.sleep(0)
+
+    assert task.cancelled() or cancelled_flag.is_set()
+    assert "sid_h10" not in api._sid_tasks

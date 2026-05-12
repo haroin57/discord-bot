@@ -12,6 +12,7 @@ import logging
 import logging.handlers
 import os
 import queue
+import signal
 import sys
 
 from config import BOT_DIR, DISCORD_TOKEN, STATE_DIR, WEB_API_HOST, WEB_API_PORT, validate_discord_token
@@ -98,8 +99,15 @@ def _acquire_pidlock() -> None:
     atexit.register(_release)
 
 
+log = logging.getLogger(__name__)
+
+
 async def main() -> None:
-    _setup_logging()
+    try:
+        from services.structured_log import install_structured_logging
+        install_structured_logging()
+    except ImportError:
+        _setup_logging()
 
     try:
         validate_discord_token()
@@ -116,10 +124,49 @@ async def main() -> None:
 
     web_api = WebAPI(bot)
 
-    await asyncio.gather(
-        bot.start(DISCORD_TOKEN),
-        web_api.start(port=WEB_API_PORT, host=WEB_API_HOST),
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+
+    def _handle_signal(sig):
+        log.warning("Received signal %s; initiating graceful shutdown", sig.name)
+        shutdown_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handle_signal, sig)
+        except (NotImplementedError, RuntimeError):
+            pass  # Windows / non-main-thread
+
+    async def _run_services():
+        await asyncio.gather(
+            bot.start(DISCORD_TOKEN),
+            web_api.start(port=WEB_API_PORT, host=WEB_API_HOST),
+        )
+
+    main_task = asyncio.create_task(_run_services())
+
+    shutdown_task = asyncio.create_task(shutdown_event.wait())
+    done, pending = await asyncio.wait(
+        [main_task, shutdown_task],
+        return_when=asyncio.FIRST_COMPLETED,
     )
+
+    if shutdown_task in done:
+        log.info("Graceful shutdown: cancelling main_task and killing Claude subprocesses")
+        try:
+            from services.claude_sdk import kill_orphan_claude_cli
+            kill_orphan_claude_cli()
+        except Exception as e:
+            log.warning("kill_orphan_claude_cli failed: %s", e)
+        try:
+            await bot.close()
+        except Exception:
+            pass
+        main_task.cancel()
+        try:
+            await main_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 if __name__ == "__main__":
