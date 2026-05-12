@@ -15,7 +15,7 @@ import queue
 import sys
 
 from config import BOT_DIR, DISCORD_TOKEN, STATE_DIR, WEB_API_PORT, validate_discord_token
-from utils.attachments import cleanup_stale_attachments
+# cleanup_stale_attachments is now scheduled from bot.on_ready (Phase G/D5).
 
 _LOG_LEVEL = os.environ.get("BOT_LOG_LEVEL", "INFO").upper()
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
@@ -109,7 +109,7 @@ async def main() -> None:
         raise SystemExit(1) from e
 
     _acquire_pidlock()
-    cleanup_stale_attachments()
+    # cleanup_stale_attachments now scheduled from bot.on_ready (Phase G/D5).
 
     from bot import bot
     from web_api import WebAPI

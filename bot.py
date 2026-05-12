@@ -75,6 +75,10 @@ _http_session: aiohttp.ClientSession | None = None
 # silently swallowed.
 _background_tasks: set[asyncio.Task] = set()
 
+# Phase G/D5: one-shot guard so the on_ready cleanup doesn't fire again on
+# every Discord reconnect (which is otherwise harmless but wasteful).
+_cleanup_scheduled: bool = False
+
 
 def _track_task(coro, *, name: str | None = None) -> asyncio.Task:
     """Schedule a fire-and-forget coroutine and track it for GC + error logging."""
@@ -122,39 +126,15 @@ log.info("Loaded %d sessions from disk", len(sessions))
 # ---------------------------------------------------------------------------
 # Prompt-injection sanitization (C-2)
 # ---------------------------------------------------------------------------
-# Sentinel labels that the trusted prompt scaffold uses. If a user input
-# contains them verbatim, strip them so the attacker can't close a tag and
-# inject a new, fake authority header.
-_SENTINEL_RE = re.compile(
-    r"\[(?:Message from|End of|Mem0|Attached images|Current message|Thread:|"
-    r"Channel recent|Referenced message|Replied-to message|End of thread|"
-    r"End of channel|End of Mem0|Trusted context|untrusted_user_input)[^\]\n]*\]"
-    r"|</?retrieved_memories[^>]*>"
-    r"|</?untrusted_user_input[^>]*>",
-    re.IGNORECASE,
+# Regexes and the sanitize function live in services/sentinel.py as the
+# single source of truth — services/prompt_builder.py uses the same module.
+# Locally-named aliases preserve back-compat for call sites that still spell
+# them with the underscore prefix.
+from services.sentinel import (
+    SENTINEL_RE as _SENTINEL_RE,
+    POWER_PHRASE_RE as _POWER_PHRASE_RE,
+    sanitize_untrusted_text as _sanitize_untrusted_text,
 )
-_POWER_PHRASE_RE = re.compile(
-    r"(adminユーザー|bypassPermissions|bypass[_\- ]permissions|全機能利用可能|"
-    r"all[_\- ]permissions|system[_\- ]prompt|root[_\- ]access|ignore (?:the )?(?:previous|above)|"
-    r"disregard (?:the )?(?:previous|above)|</untrusted_user_input>)",
-    re.IGNORECASE,
-)
-
-
-def _sanitize_untrusted_text(text: str) -> str:
-    """Remove prompt-scaffold sentinel labels and obvious power-grab phrases.
-
-    Applied to EVERY piece of untrusted text (user input, reply content,
-    thread history, link-resolved messages) before it is concatenated into
-    the prompt. Does not need to be perfect — the real defences are the XML
-    wrapper + the restricted system prompt + allow-list tools. This is
-    defence-in-depth.
-    """
-    if not text:
-        return text
-    text = _SENTINEL_RE.sub("[redacted-marker]", text)
-    text = _POWER_PHRASE_RE.sub("[redacted]", text)
-    return text
 
 
 def _wrap_untrusted(text: str) -> str:
@@ -297,6 +277,19 @@ async def on_ready():
     except Exception as e:
         log.warning("Failed to sync slash commands: %s", e)
     log.info("Bot is ready: %s (id=%s), role_ids=%s", bot.user, bot.user.id, BOT_ROLE_IDS)
+    # D5: cleanup_stale_attachments was previously called synchronously from
+    # main.py before bot.run(). For a tmpdir with thousands of files the
+    # scan+stat loop blocked startup. Schedule it as a fire-and-forget
+    # background task here so the bot is reachable while it runs. on_ready
+    # fires on every reconnect; the _cleanup_scheduled guard ensures we
+    # only run cleanup once per process lifetime.
+    global _cleanup_scheduled
+    if not _cleanup_scheduled:
+        _cleanup_scheduled = True
+        _track_task(
+            asyncio.to_thread(cleanup_stale_attachments),
+            name="cleanup_stale_attachments",
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -232,7 +232,16 @@ BOT_ROLE_IDS: set[int] = set()  # populated at runtime by bot.py on_ready
 # `MCP_SERVERS` is the union (kept for backwards-compat / tests / settings.json
 # fallthrough).
 # ---------------------------------------------------------------------------
-MCP_SERVERS_BASE: dict = {
+# BASE is intentionally empty now. context7 was here previously, but `npx -y`
+# resolves the package on every fresh session (+300-800ms cold start), and
+# the docs MCP is only useful when the user explicitly asks about library /
+# framework documentation. context7 moved to MCP_SERVERS_DOCS below, gated
+# by _DOCS_TRIGGERS in pick_mcp_servers().
+MCP_SERVERS_BASE: dict = {}
+
+# Docs MCP (Upstash context7) — only spawn when the user message mentions
+# docs / library / API reference keywords.
+MCP_SERVERS_DOCS: dict = {
     "context7": {
         "command": "npx",
         "args": ["-y", "@upstash/context7-mcp"],
@@ -299,6 +308,7 @@ MCP_SERVERS: dict = {
     **MCP_SERVERS_HEAVY,
     **MCP_SERVERS_MEMORY,
     **MCP_SERVERS_PAPER,
+    **MCP_SERVERS_DOCS,
 }
 
 
@@ -328,6 +338,13 @@ _PAPER_TRIGGERS = tuple(kw.lower() for kw in (
     "論文", "paper", "arxiv", "学術", "引用文献", "citation",
     "google scholar", "semantic scholar", "scholar.google",
 ))
+_DOCS_TRIGGERS = tuple(kw.lower() for kw in (
+    # Library / framework docs lookup via context7 MCP. Includes English +
+    # Japanese cues; pre-lowercased so pick_mcp_servers skips .lower() per kw.
+    "context7", "docs", "ドキュメント", "公式ドキュメント", "api reference",
+    "リファレンス", "ライブラリ", "library", "使い方", "how to use",
+    "npm package", "pypi", "github.com/",
+))
 
 
 def get_mcp_servers_by_keys(keys: list[str]) -> dict:
@@ -353,6 +370,8 @@ def pick_mcp_servers(raw_user_text: str) -> dict:
         servers.update(MCP_SERVERS_MEMORY)
     if any(kw in text for kw in _PAPER_TRIGGERS):
         servers.update(MCP_SERVERS_PAPER)
+    if any(kw in text for kw in _DOCS_TRIGGERS):
+        servers.update(MCP_SERVERS_DOCS)
     return servers
 
 # ---------------------------------------------------------------------------

@@ -8,25 +8,13 @@ import re
 import logging
 from typing import Callable, Awaitable
 
-log = logging.getLogger(__name__)
+# Sanitize regexes + helper now live in services/sentinel.py — single source
+# of truth shared with bot.py. Local aliases preserve the existing names
+# used inside PromptBuilder.sanitize so the rest of this file is unchanged.
+from services.sentinel import SENTINEL_RE as _SENTINEL_RE
+from services.sentinel import POWER_PHRASE_RE as _POWER_PHRASE_RE
 
-# ---------------------------------------------------------------------------
-# Prompt-injection sanitization constants (mirrors bot.py)
-# ---------------------------------------------------------------------------
-_SENTINEL_RE = re.compile(
-    r"\[(?:Message from|End of|Mem0|Attached images|Current message|Thread:|"
-    r"Channel recent|Referenced message|Replied-to message|End of thread|"
-    r"End of channel|End of Mem0|Trusted context|untrusted_user_input)[^\]\n]*\]"
-    r"|</?retrieved_memories[^>]*>"
-    r"|</?untrusted_user_input[^>]*>",
-    re.IGNORECASE,
-)
-_POWER_PHRASE_RE = re.compile(
-    r"(adminユーザー|bypassPermissions|bypass[_\- ]permissions|全機能利用可能|"
-    r"all[_\- ]permissions|system[_\- ]prompt|root[_\- ]access|ignore (?:the )?(?:previous|above)|"
-    r"disregard (?:the )?(?:previous|above)|</untrusted_user_input>)",
-    re.IGNORECASE,
-)
+log = logging.getLogger(__name__)
 
 _JP_STOP_WORDS = frozenset(
     "の は が を に で と も か な へ や て だ です ます した して "
