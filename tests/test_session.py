@@ -1,7 +1,10 @@
 """Tests for services/session.py — persistence and history integrity."""
 
 import json
+import logging
+import os
 from collections import OrderedDict
+from unittest.mock import patch
 
 import pytest
 
@@ -95,6 +98,39 @@ class TestSessions:
         loaded = load_sessions()
         assert loaded[42].mcp_server_keys == ["context7", "brave-search"]
 
+    def test_save_sessions_atomic_replaces_existing(self, tmp_path):
+        """Old data must survive if json.dump raises mid-write."""
+        target = str(tmp_path / "sessions.json")
+        old_sessions: OrderedDict[int, SessionInfo] = OrderedDict(
+            [(1, SessionInfo(session_id="old-sess"))]
+        )
+        save_sessions(old_sessions, _path=target)
+
+        new_sessions: OrderedDict[int, SessionInfo] = OrderedDict(
+            [(2, SessionInfo(session_id="new-sess"))]
+        )
+        with patch("json.dump", side_effect=RuntimeError("disk full")):
+            with pytest.raises(RuntimeError):
+                save_sessions(new_sessions, _path=target)
+
+        # .tmp file must have been cleaned up
+        assert not os.path.exists(target + ".tmp")
+        # Original file is intact
+        with open(target, encoding="utf-8") as f:
+            data = json.load(f)
+        assert "1" in data
+        assert data["1"]["session_id"] == "old-sess"
+
+    def test_save_sessions_writes_tmp_then_renames(self, tmp_path):
+        """os.replace must be called to atomically swap .tmp -> target."""
+        target = str(tmp_path / "sessions.json")
+        s: OrderedDict[int, SessionInfo] = OrderedDict(
+            [(1, SessionInfo(session_id="x"))]
+        )
+        with patch("os.replace", wraps=os.replace) as mock_replace:
+            save_sessions(s, _path=target)
+        mock_replace.assert_called_once_with(target + ".tmp", target)
+
 
 # Minimal valid Discord snowflake IDs (must be in [10**14, 10**19])
 _CH_A = 100000000000000   # 10**14
@@ -120,6 +156,22 @@ class TestJSONLHistory:
         append_jsonl(_CH_B, {"role": "assistant", "content": "msg2"})
         msgs = load_history_channel(_CH_B)
         assert len(msgs) == 2
+
+    def test_tail_jsonl_logs_corrupted_line(self, tmp_state_dir, caplog):
+        """A corrupted JSONL line must be skipped with a WARNING log."""
+        import config
+        path = os.path.join(config.HISTORY_DIR, f"{_CH_A}.jsonl")
+        os.makedirs(config.HISTORY_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"role": "user", "content": "good"}\n')
+            f.write("NOT_VALID_JSON\n")
+            f.write('{"role": "assistant", "content": "also good"}\n')
+
+        with caplog.at_level(logging.WARNING, logger="services.session"):
+            msgs = load_history_channel(_CH_A)
+
+        assert len(msgs) == 2
+        assert any("corrupted" in r.message.lower() for r in caplog.records)
 
 
 class TestTrimHistory:

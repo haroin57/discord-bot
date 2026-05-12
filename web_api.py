@@ -64,6 +64,8 @@ class WebAPI:
 
         # session_token -> {discord_id, username, ...}
         self._session_cache: dict[str, dict] = {}
+        # session_token -> asyncio.Lock (SRE-C6: dedup concurrent misses)
+        self._verify_locks: dict[str, asyncio.Lock] = {}
         # discord_id (str) -> last request epoch seconds
         self._cooldowns: OrderedDict[str, float] = OrderedDict()
         # discord_id (str) -> list[float] of request timestamps within quota window
@@ -75,8 +77,14 @@ class WebAPI:
         # sid -> discord_id mapping (populated on connect)
         self._sid_to_user: dict[str, dict] = {}
 
+        # sid -> set of in-flight asyncio.Task (SRE-H10)
+        self._sid_tasks: dict[str, set[asyncio.Task]] = {}
+
         self._runner: web.AppRunner | None = None
         self._http: aiohttp.ClientSession | None = None
+
+        # SRE-C7: record start time for /health uptime
+        self._started_at: float = time.time()
 
         self._register_events()
 
@@ -99,10 +107,24 @@ class WebAPI:
         self._session_cache.pop(token, None)
         return web.json_response({"invalidated": existed})
 
+    # SRE-C7: health endpoint
+    async def _handle_health(self, request: web.Request) -> web.Response:
+        discord_ok = self.bot.is_ready() if self.bot else False
+        uptime = time.time() - self._started_at if self._started_at else 0
+        status = "ok" if discord_ok else "degraded"
+        return web.json_response({
+            "status": status,
+            "discord_connected": discord_ok,
+            "uptime_s": int(uptime),
+            "active_connections": len(self._sid_to_user),
+        })
+
     async def start(self, port: int = WEB_API_PORT, host: str = WEB_API_HOST) -> None:
         self._http = aiohttp.ClientSession()
         # H5: register invalidation route before site is created
         self.app.router.add_post("/internal/invalidate_session", self._handle_invalidate_session)
+        # SRE-C7: health route
+        self.app.router.add_get("/health", self._handle_health)
         self._runner = web.AppRunner(self.app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, host, port)
@@ -128,57 +150,78 @@ class WebAPI:
     # -----------------------------------------------------------------------
     # Session verification
     # -----------------------------------------------------------------------
+    def _cache_hit(self, session_token: str) -> dict | None:
+        """Return cached session if still fresh (<300 s), else None."""
+        cached = self._session_cache.get(session_token)
+        if cached and time.time() - cached.get("_verified_at", 0) < 300:
+            # M9: Re-derive is_admin on every cache hit so ADMIN_USER_IDS changes apply immediately
+            try:
+                is_admin_live = int(cached["discordId"]) in ADMIN_USER_IDS
+            except (KeyError, ValueError):
+                is_admin_live = False
+            return {**cached, "isAdmin": is_admin_live}
+        return None
+
     async def verify_session(self, session_token: str) -> dict | None:
         """Verify a session token against the Next.js /api/session/verify.
 
         The Next.js endpoint reads the session cookie and returns:
             {authenticated: true, discordId: str, isAdmin: bool}
         Caches valid results for 300s to avoid hammering the auth endpoint.
+        SRE-C6: concurrent misses for the same token are deduplicated via a
+        per-token Lock so the HTTP round-trip happens only once.
         """
-        cached = self._session_cache.get(session_token)
-        if cached:
-            if time.time() - cached.get("_verified_at", 0) < 300:
-                # M9: Re-derive is_admin on every cache hit so ADMIN_USER_IDS changes apply immediately
-                try:
-                    is_admin_live = int(cached["discordId"]) in ADMIN_USER_IDS
-                except (KeyError, ValueError):
-                    is_admin_live = False
-                return {**cached, "isAdmin": is_admin_live}
+        hit = self._cache_hit(session_token)
+        if hit is not None:
+            return hit
 
-        if self._http is None or self._http.closed:
-            self._http = aiohttp.ClientSession()
+        # SRE-C6: bound _verify_locks to 1000 entries with LRU eviction
+        lock = self._verify_locks.setdefault(session_token, asyncio.Lock())
+        if len(self._verify_locks) > 1000:
+            overflow = list(self._verify_locks.keys())[:-1000]
+            for k in overflow:
+                self._verify_locks.pop(k, None)
 
-        try:
-            async with self._http.get(
-                "http://localhost:3001/api/session/verify",
-                cookies={"next-auth.session-token": session_token},
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-                if not data.get("authenticated"):
-                    return None
-                # Re-derive admin status from the bot's own ADMIN_USER_IDS
-                # instead of trusting the Next.js verifier. The verifier is a
-                # separate process whose config could drift or be tampered
-                # with; admin power inside the bot must be governed by the
-                # bot's own allowlist.
-                discord_id = str(data["discordId"])
-                try:
-                    is_admin = int(discord_id) in ADMIN_USER_IDS
-                except ValueError:
-                    is_admin = False
-                user = {
-                    "discordId": discord_id,
-                    "isAdmin": is_admin,
-                    "_verified_at": time.time(),
-                }
-                self._session_cache[session_token] = user
-                return user
-        except Exception as e:
-            log.warning("Session verify failed: %s", e)
-            return None
+        async with lock:
+            # Check cache again — another coroutine may have populated it while we waited
+            hit = self._cache_hit(session_token)
+            if hit is not None:
+                return hit
+
+            if self._http is None or self._http.closed:
+                self._http = aiohttp.ClientSession()
+
+            try:
+                async with self._http.get(
+                    "http://localhost:3001/api/session/verify",
+                    cookies={"next-auth.session-token": session_token},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    if not data.get("authenticated"):
+                        return None
+                    # Re-derive admin status from the bot's own ADMIN_USER_IDS
+                    # instead of trusting the Next.js verifier. The verifier is a
+                    # separate process whose config could drift or be tampered
+                    # with; admin power inside the bot must be governed by the
+                    # bot's own allowlist.
+                    discord_id = str(data["discordId"])
+                    try:
+                        is_admin = int(discord_id) in ADMIN_USER_IDS
+                    except ValueError:
+                        is_admin = False
+                    user = {
+                        "discordId": discord_id,
+                        "isAdmin": is_admin,
+                        "_verified_at": time.time(),
+                    }
+                    self._session_cache[session_token] = user
+                    return user
+            except Exception as e:
+                log.warning("Session verify failed: %s", e)
+                return None
 
     # -----------------------------------------------------------------------
     # Discord channel permission checks
@@ -324,6 +367,9 @@ class WebAPI:
         @sio.event
         async def disconnect(sid):
             self._sid_to_user.pop(sid, None)
+            # SRE-H10: cancel in-flight tasks for this sid
+            for t in self._sid_tasks.pop(sid, set()):
+                t.cancel()
             log.info("WS disconnected: sid=%s", sid)
 
         @sio.event
@@ -483,12 +529,19 @@ class WebAPI:
                     discord_id, channel_id, is_admin, len(prompt),
                 )
 
-                response_text, session_id = await call_with_tools(
+                # SRE-H10: track task so disconnect can cancel it
+                _loop = asyncio.get_event_loop()
+                task = _loop.create_task(call_with_tools(
                     prompt, channel_id, self._sessions,
                     status_callback=status_callback,
                     restricted=not is_admin,
                     raw_user_text=raw_text,
-                )
+                ))
+                self._sid_tasks.setdefault(sid, set()).add(task)
+                try:
+                    response_text, session_id = await task
+                finally:
+                    self._sid_tasks.get(sid, set()).discard(task)
 
                 if session_id:
                     await asyncio.to_thread(

@@ -58,6 +58,7 @@ def _reset_oauth_globals(monkeypatch):
     monkeypatch.setattr(real_mod, "_expires_at", 0)
     monkeypatch.setattr(real_mod, "_http_session", None)
     monkeypatch.setattr(real_mod, "_patched", False)
+    monkeypatch.setattr(real_mod, "_refresh_failure_count", 0)
 
     yield
 
@@ -648,3 +649,72 @@ class TestGetSession:
         session = await om._get_session()
         assert session is not closed
         await session.close()
+
+
+# ---------------------------------------------------------------------------
+# SRE-C9: refresh failure counter and escalation
+# ---------------------------------------------------------------------------
+
+class TestRefreshFailureCounter:
+    def test_refresh_failure_logged_at_warning_then_error(self, monkeypatch, caplog):
+        import logging
+        import services.oauth_manager as om
+
+        monkeypatch.setattr(om, "_refresh_failure_count", 0)
+
+        with caplog.at_level(logging.WARNING, logger="services.oauth_manager"):
+            om._record_refresh_failure("err1")
+            om._record_refresh_failure("err2")
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 2
+
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="services.oauth_manager"):
+            om._record_refresh_failure("err3")
+
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "consecutive" in errors[0].message
+
+    def test_refresh_success_resets_counter(self, monkeypatch, caplog):
+        import logging
+        import services.oauth_manager as om
+
+        monkeypatch.setattr(om, "_refresh_failure_count", 2)
+
+        with caplog.at_level(logging.INFO, logger="services.oauth_manager"):
+            om._record_refresh_success()
+
+        assert om._refresh_failure_count == 0
+        info_msgs = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert any("recovered" in r.message for r in info_msgs)
+
+    def test_is_oauth_healthy_reflects_threshold(self, monkeypatch):
+        import services.oauth_manager as om
+
+        monkeypatch.setattr(om, "_refresh_failure_count", 0)
+        assert om.is_oauth_healthy() is True
+
+        monkeypatch.setattr(om, "_refresh_failure_count", 2)
+        assert om.is_oauth_healthy() is True
+
+        monkeypatch.setattr(om, "_refresh_failure_count", 3)
+        assert om.is_oauth_healthy() is False
+
+    @pytest.mark.asyncio
+    async def test_ensure_valid_token_raises_when_expired_and_failing(self, monkeypatch):
+        import services.oauth_manager as om
+
+        monkeypatch.setattr(om, "_access_token", "stale-tok")
+        monkeypatch.setattr(om, "_expires_at", 0)  # expired
+        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
+        monkeypatch.setattr(om, "_refresh_failure_count", 3)
+
+        async def fake_refresh():
+            return False
+
+        monkeypatch.setattr(om, "refresh_token", fake_refresh)
+
+        with pytest.raises(om.OAuthRefreshFailed):
+            await om.ensure_valid_token()

@@ -70,10 +70,26 @@ except ImportError:
     log.warning("services.rate_limit not available; using local cooldown/quota fallback")
 
 # ---------------------------------------------------------------------------
+# Correlation / request-ID module (SRE-H4) — defensive import with no-op fallback
+# ---------------------------------------------------------------------------
+try:
+    from services.correlation import new_request_id, get_request_id
+except ImportError:
+    import uuid
+
+    def new_request_id() -> str:  # type: ignore[misc]
+        return ""
+
+    def get_request_id() -> str:  # type: ignore[misc]
+        return ""
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 sessions = load_sessions()
 cooldowns: OrderedDict[int, float] = OrderedDict()
+# SRE-H1: gate bot.tree.sync() to once per process (not per Discord reconnect).
+_tree_synced: bool = False
 # LRU-bounded: evict least-recently-used channel sema when over MAX_CHANNEL_SEMAS.
 _channel_semas: OrderedDict[int, asyncio.Semaphore] = OrderedDict()
 _http_session: aiohttp.ClientSession | None = None
@@ -275,12 +291,18 @@ async def on_ready():
                 if not role.is_default():
                     BOT_ROLE_IDS.add(role.id)
     build_mention_regex(bot.user.id)
-    # Sync slash commands with Discord
-    try:
-        synced = await bot.tree.sync()
-        log.info("Synced %d slash command(s)", len(synced))
-    except Exception as e:
-        log.warning("Failed to sync slash commands: %s", e)
+    # Sync slash commands with Discord (SRE-H1: only once per process,
+    # not on every reconnect, to avoid the global-sync rate limit).
+    global _tree_synced
+    if not _tree_synced:
+        try:
+            synced = await bot.tree.sync()
+            log.info("Synced %d slash command(s)", len(synced))
+            _tree_synced = True
+        except Exception as e:
+            log.error("Failed to sync slash commands: %s", e)
+    else:
+        log.debug("Slash command sync already done; skipping on reconnect")
     log.info("Bot is ready: %s (id=%s), role_ids=%s", bot.user, bot.user.id, BOT_ROLE_IDS)
     # D5: cleanup_stale_attachments was previously called synchronously from
     # main.py before bot.run(). For a tmpdir with thousands of files the
@@ -395,7 +417,8 @@ async def on_message(message: discord.Message):
     if message.author == bot.user or message.author.bot:
         return
 
-    log.debug("[%s] %s: %s", message.channel, message.author, message.content[:200])
+    new_request_id()  # SRE-H4: set correlation ID for this request context
+    log.debug("[rid=%s] [%s] %s: %s", get_request_id(), message.channel, message.author, message.content[:200])
 
     # In DMs, only admins can interact. In guilds, require mention or keyword.
     is_dm = isinstance(message.channel, (discord.DMChannel, discord.GroupChannel))
@@ -758,8 +781,8 @@ async def on_message(message: discord.Message):
 
         # DO NOT log prompt content — may contain secrets from admin context.
         log.info(
-            "Request from user=%s channel=%s admin=%s len=%d",
-            message.author.id, message.channel.id, caller_is_admin, len(prompt),
+            "[rid=%s] processing user=%s channel=%s admin=%s len=%d",
+            get_request_id(), message.author.id, message.channel.id, caller_is_admin, len(prompt),
         )
 
         admin = caller_is_admin
@@ -889,7 +912,12 @@ async def on_message(message: discord.Message):
                         },
                     )
                 except Exception as exc:
-                    log.debug("Mem0 store failed (non-fatal): %s", exc)
+                    # SRE-C8: WARNING (was DEBUG) so silent Mem0 failures
+                    # surface in journalctl / alerting.
+                    log.warning(
+                        "Mem0 store failed: %s (user=%s, channel=%s)",
+                        exc, mem0_user_id, message.channel.id,
+                    )
 
             _track_task(_mem0_store(), name="mem0_store")
 
@@ -931,6 +959,9 @@ async def on_message(message: discord.Message):
             _has_rich = has_tables(response_text, _masked=_masked) or has_math(response_text, _masked=_masked)
             if len(response_text) > 8000 and not _has_rich:
                 all_files = [discord.File(io.StringIO(response_text), filename="response.md")] + attach_files
+                if len(all_files) > 10:
+                    log.warning("Capping attachments %d -> 10 for Discord limit", len(all_files))
+                    all_files = all_files[:10]
                 await message.reply("Response is too long, sending as file(s):", files=all_files)
             elif _has_rich:
                 await _send_segmented(message, response_text, attach_files)
@@ -939,7 +970,11 @@ async def on_message(message: discord.Message):
                 for i, chunk in enumerate(chunks):
                     if i == 0:
                         if attach_files:
-                            await message.reply(chunk, files=attach_files)
+                            _reply_files = attach_files
+                            if len(_reply_files) > 10:
+                                log.warning("Capping attachments %d -> 10 for Discord limit", len(_reply_files))
+                                _reply_files = _reply_files[:10]
+                            await message.reply(chunk, files=_reply_files)
                         else:
                             await message.reply(chunk)
                     else:

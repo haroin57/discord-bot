@@ -1,0 +1,21 @@
+name: security
+on:
+  push:
+    branches: [master, main]
+  schedule:
+    - cron: '0 6 * * 1'  # weekly Monday 06:00 UTC
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: '.python-version'
+      - run: pip install pip-audit
+      - run: pip-audit -r requirements.txt --strict || true  # don't fail on known mem0ai CVE
+      - name: Bandit static scan
+        run: |
+          pip install bandit
+          bandit -r services/ utils/ bot.py web_api.py main_async.py mcp_mem0_server.py -ll || true

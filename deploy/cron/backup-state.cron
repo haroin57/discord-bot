@@ -1,0 +1,3 @@
+# SRE-C4: weekly backup of bot state. Add to crontab via `crontab -e`.
+# Runs every Sunday at 04:00 (low traffic window, before mem0 weekly compact).
+0 4 * * 0 /home/ubuntu/discord-bot/scripts/backup_state.sh

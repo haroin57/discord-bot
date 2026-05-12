@@ -92,6 +92,12 @@ RESTRICTED_MAX_TURNS = 8
 ADMIN_MAX_TURNS = _CONFIG_ADMIN_MAX_TURNS
 
 # ---------------------------------------------------------------------------
+# Stream stall detection thresholds (SRE-H5)
+# ---------------------------------------------------------------------------
+STREAM_STALL_THRESHOLD_S = 30   # warn after 30 s without a message
+STREAM_IDLE_TIMEOUT_S = 120     # raise TimeoutError after 2 min of silence
+
+# ---------------------------------------------------------------------------
 # Session resume
 # ---------------------------------------------------------------------------
 SESSION_TTL_S = 30 * 60
@@ -333,6 +339,19 @@ def _tool_input_hint(name: str, inp: dict | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Safe status callback wrapper (SRE-C5)
+# ---------------------------------------------------------------------------
+async def _safe_status(cb, msg: str) -> None:
+    """Invoke status_callback without letting exceptions propagate."""
+    if cb is None:
+        return
+    try:
+        await cb(msg)
+    except Exception as e:
+        log.debug("status_callback failed (non-fatal): %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point — free-code pattern: no keyword routing
 # ---------------------------------------------------------------------------
 async def call_with_tools(
@@ -519,96 +538,147 @@ async def call_with_tools(
                 tool_count = 0
                 t_start = time.monotonic()
 
-                async with asyncio.timeout(timeout):
-                    async for msg in query(prompt=prompt, options=options):
-                        # --- SystemMessage ---
-                        if isinstance(msg, SystemMessage):
-                            log.info("[ch=%d] 📡 system: subtype=%s",
-                                     channel_id, msg.subtype)
+                # SRE-H5: shared mutable cell for watchdog
+                last_msg_time_cell: list[float] = [time.monotonic()]
+                _stall_warned: list[bool] = [False]
+                _stream_idle: list[bool] = [False]
+                _parent_task = asyncio.current_task()
 
-                        # --- AssistantMessage (thinking / tool_use / text) ---
-                        elif isinstance(msg, AssistantMessage):
-                            for block in msg.content:
-                                if isinstance(block, ThinkingBlock) and block.thinking:
-                                    summary = block.thinking[:200].replace("\n", " ")
-                                    # F1: demote per-block stream logs to DEBUG.
-                                    # A 30-turn task with 5 tools/turn produced
-                                    # 150+ log.info lines on the hot path; the
-                                    # default logger writes synchronously.
-                                    log.debug("[ch=%d] 💭 thinking: %s%s",
-                                              channel_id, summary,
-                                              "…" if len(block.thinking) > 200 else "")
-                                    if status_callback:
-                                        await status_callback(f"💭 {summary}")
-
-                                elif isinstance(block, ToolUseBlock):
-                                    tool_count += 1
-                                    # Summarize input (truncate large payloads)
-                                    inp = str(block.input) if block.input else ""
-                                    inp_summary = inp[:200] + ("…" if len(inp) > 200 else "")
-                                    # F1: per-block log → DEBUG (was INFO).
-                                    log.debug("[ch=%d] 🔧 tool_use #%d: %s(%s)",
-                                              channel_id, tool_count, block.name, inp_summary)
-                                    # Discord status: tool name + short input hint
-                                    if status_callback:
-                                        hint = _tool_input_hint(block.name, block.input)
-                                        await status_callback(
-                                            f"🔧 {block.name}" + (f"  `{hint}`" if hint else "")
-                                        )
-
-                                elif isinstance(block, TextBlock) and block.text:
-                                    stream_text = block.text
-                                    preview = block.text[:150].replace("\n", " ")
-                                    # F1: per-block log → DEBUG (was INFO).
-                                    log.debug("[ch=%d] 📝 text: %s%s",
-                                              channel_id, preview,
-                                              "…" if len(block.text) > 150 else "")
-                                    if status_callback:
-                                        await status_callback(f"📝 応答を生成中")
-
-                        # --- UserMessage (tool results flowing back) ---
-                        elif isinstance(msg, UserMessage):
-                            for block in (msg.content if isinstance(msg.content, list) else []):
-                                if isinstance(block, ToolResultBlock):
-                                    status = "❌ error" if block.is_error else "✅ ok"
-                                    content_str = str(block.content) if block.content else ""
-                                    preview = content_str[:200].replace("\n", " ")
-                                    # F1: per-block log → DEBUG (was INFO).
-                                    log.debug("[ch=%d] 📨 tool_result [%s]: %s%s",
-                                              channel_id, status, preview,
-                                              "…" if len(content_str) > 200 else "")
-                                    if status_callback:
-                                        if block.is_error:
-                                            await status_callback(f"❌ ツールエラー")
-                                        else:
-                                            await status_callback(f"📨 結果を受信")
-
-                        # --- ResultMessage (final) ---
-                        elif isinstance(msg, ResultMessage):
-                            result_text = getattr(msg, "result", None)
-                            if not result_text and stream_text:
-                                log.warning(
-                                    "[ch=%d] ResultMessage.result empty (subtype=%s); "
-                                    "falling back to stream TextBlock (%d chars)",
-                                    channel_id,
-                                    getattr(msg, "subtype", "?"),
-                                    len(stream_text),
-                                )
-                                result_text = stream_text
-                            response_text = result_text or ""
-                            session_id = msg.session_id if hasattr(msg, "session_id") else None
-                            elapsed = time.monotonic() - t_start
-                            cost_str = f"${msg.total_cost_usd:.4f}" if msg.total_cost_usd else "n/a"
-                            usage_in = msg.usage.get("input_tokens", 0) if msg.usage else 0
-                            usage_out = msg.usage.get("output_tokens", 0) if msg.usage else 0
-                            log.info(
-                                "[ch=%d] ✅ done: turns=%d tools=%d "
-                                "elapsed=%.1fs api=%.1fs cost=%s "
-                                "tokens_in=%d tokens_out=%d error=%s",
-                                channel_id, msg.num_turns, tool_count,
-                                elapsed, msg.duration_api_ms / 1000,
-                                cost_str, usage_in, usage_out, msg.is_error,
+                async def _stall_watchdog() -> None:
+                    """Poll last_msg_time every 10 s; cancel parent on idle timeout."""
+                    while True:
+                        await asyncio.sleep(10)
+                        idle = time.monotonic() - last_msg_time_cell[0]
+                        if idle > STREAM_IDLE_TIMEOUT_S:
+                            log.warning(
+                                "[ch=%d] stream idle for %.0fs, cancelling",
+                                channel_id, idle,
                             )
+                            _stream_idle[0] = True
+                            if _parent_task is not None:
+                                _parent_task.cancel("stream idle")
+                            return
+                        if idle > STREAM_STALL_THRESHOLD_S and not _stall_warned[0]:
+                            log.warning(
+                                "[ch=%d] stream stall: no message for %.0fs",
+                                channel_id, idle,
+                            )
+                            _stall_warned[0] = True
+
+                _watchdog_task: asyncio.Task | None = None
+                try:
+                    _watchdog_task = asyncio.create_task(_stall_watchdog())
+
+                    # SRE-C1: catch CancelledError to kill orphan subprocess
+                    try:
+                        async with asyncio.timeout(timeout):
+                            async for msg in query(prompt=prompt, options=options):
+                                last_msg_time_cell[0] = time.monotonic()
+                                _stall_warned[0] = False
+
+                                # --- SystemMessage ---
+                                if isinstance(msg, SystemMessage):
+                                    log.info("[ch=%d] 📡 system: subtype=%s",
+                                             channel_id, msg.subtype)
+
+                                # --- AssistantMessage (thinking / tool_use / text) ---
+                                elif isinstance(msg, AssistantMessage):
+                                    for block in msg.content:
+                                        if isinstance(block, ThinkingBlock) and block.thinking:
+                                            summary = block.thinking[:200].replace("\n", " ")
+                                            # F1: demote per-block stream logs to DEBUG.
+                                            # A 30-turn task with 5 tools/turn produced
+                                            # 150+ log.info lines on the hot path; the
+                                            # default logger writes synchronously.
+                                            log.debug("[ch=%d] 💭 thinking: %s%s",
+                                                      channel_id, summary,
+                                                      "…" if len(block.thinking) > 200 else "")
+                                            await _safe_status(status_callback, f"💭 {summary}")
+
+                                        elif isinstance(block, ToolUseBlock):
+                                            tool_count += 1
+                                            # Summarize input (truncate large payloads)
+                                            inp = str(block.input) if block.input else ""
+                                            inp_summary = inp[:200] + ("…" if len(inp) > 200 else "")
+                                            # F1: per-block log → DEBUG (was INFO).
+                                            log.debug("[ch=%d] 🔧 tool_use #%d: %s(%s)",
+                                                      channel_id, tool_count, block.name, inp_summary)
+                                            # Discord status: tool name + short input hint
+                                            hint = _tool_input_hint(block.name, block.input)
+                                            await _safe_status(
+                                                status_callback,
+                                                f"🔧 {block.name}" + (f"  `{hint}`" if hint else "")
+                                            )
+
+                                        elif isinstance(block, TextBlock) and block.text:
+                                            stream_text = block.text
+                                            preview = block.text[:150].replace("\n", " ")
+                                            # F1: per-block log → DEBUG (was INFO).
+                                            log.debug("[ch=%d] 📝 text: %s%s",
+                                                      channel_id, preview,
+                                                      "…" if len(block.text) > 150 else "")
+                                            await _safe_status(status_callback, f"📝 応答を生成中")
+
+                                # --- UserMessage (tool results flowing back) ---
+                                elif isinstance(msg, UserMessage):
+                                    for block in (msg.content if isinstance(msg.content, list) else []):
+                                        if isinstance(block, ToolResultBlock):
+                                            status = "❌ error" if block.is_error else "✅ ok"
+                                            content_str = str(block.content) if block.content else ""
+                                            preview = content_str[:200].replace("\n", " ")
+                                            # F1: per-block log → DEBUG (was INFO).
+                                            log.debug("[ch=%d] 📨 tool_result [%s]: %s%s",
+                                                      channel_id, status, preview,
+                                                      "…" if len(content_str) > 200 else "")
+                                            if block.is_error:
+                                                await _safe_status(status_callback, f"❌ ツールエラー")
+                                            else:
+                                                await _safe_status(status_callback, f"📨 結果を受信")
+
+                                # --- ResultMessage (final) ---
+                                elif isinstance(msg, ResultMessage):
+                                    result_text = getattr(msg, "result", None)
+                                    if not result_text and stream_text:
+                                        log.warning(
+                                            "[ch=%d] ResultMessage.result empty (subtype=%s); "
+                                            "falling back to stream TextBlock (%d chars)",
+                                            channel_id,
+                                            getattr(msg, "subtype", "?"),
+                                            len(stream_text),
+                                        )
+                                        result_text = stream_text
+                                    response_text = result_text or ""
+                                    session_id = msg.session_id if hasattr(msg, "session_id") else None
+                                    elapsed = time.monotonic() - t_start
+                                    cost_str = f"${msg.total_cost_usd:.4f}" if msg.total_cost_usd else "n/a"
+                                    usage_in = msg.usage.get("input_tokens", 0) if msg.usage else 0
+                                    usage_out = msg.usage.get("output_tokens", 0) if msg.usage else 0
+                                    log.info(
+                                        "[ch=%d] ✅ done: turns=%d tools=%d "
+                                        "elapsed=%.1fs api=%.1fs cost=%s "
+                                        "tokens_in=%d tokens_out=%d error=%s",
+                                        channel_id, msg.num_turns, tool_count,
+                                        elapsed, msg.duration_api_ms / 1000,
+                                        cost_str, usage_in, usage_out, msg.is_error,
+                                    )
+                    except asyncio.CancelledError:
+                        # SRE-C1: kill orphan subprocess before propagating cancellation
+                        killed = kill_orphan_claude_cli()
+                        if killed:
+                            log.warning(
+                                "Killed %d orphan claude CLI process(es) on CancelledError",
+                                killed,
+                            )
+                        raise
+                finally:
+                    # SRE-H5: always cancel watchdog when the stream block exits
+                    if _watchdog_task is not None and not _watchdog_task.done():
+                        _watchdog_task.cancel()
+                        try:
+                            await _watchdog_task
+                        except (asyncio.CancelledError, TimeoutError):
+                            pass
+
                 break  # success
 
             except TimeoutError:
@@ -710,8 +780,7 @@ async def call_with_tools(
 
                 backoff = min(BASE_BACKOFF_S * (2 ** attempt), MAX_BACKOFF_S)
                 log.info("Retrying in %ds (type=%s, attempt %d/%d)", backoff, error_type, attempt + 1, max_attempts)
-                if status_callback:
-                    await status_callback(f"🔄 リトライ中... ({attempt + 1}/{max_attempts})")
+                await _safe_status(status_callback, f"🔄 リトライ中... ({attempt + 1}/{max_attempts})")
                 await asyncio.sleep(backoff)
 
         # Phase F3: single cleanup after the retry loop exits normally.
