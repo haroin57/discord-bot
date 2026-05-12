@@ -32,12 +32,23 @@ COOLDOWN_SECONDS = int(os.environ.get("BOT_COOLDOWN", "5"))
 RESTRICTED_COOLDOWN_SECONDS = int(os.environ.get("BOT_RESTRICTED_COOLDOWN", "30"))
 # Per-user daily quota for non-admins (messages-per-24h). 0 disables.
 RESTRICTED_DAILY_QUOTA = int(os.environ.get("BOT_RESTRICTED_DAILY_QUOTA", "30"))
-BOT_KEYWORDS = [s.strip() for s in os.environ.get("BOT_KEYWORDS", "かなえ").split(",") if s.strip()]
+_raw_keywords = [s.strip() for s in os.environ.get("BOT_KEYWORDS", "かなえ").split(",") if s.strip()]
+BOT_KEYWORDS = [kw for kw in _raw_keywords if len(kw) >= 3]
+if len(BOT_KEYWORDS) < len(_raw_keywords):
+    import warnings
+    warnings.warn("BOT_KEYWORDS entries shorter than 3 chars were dropped", stacklevel=2)
 
 ADMIN_USER_IDS: set[int] = set()
 _raw_ids = os.environ.get("ADMIN_USER_IDS", "")
 if _raw_ids:
-    ADMIN_USER_IDS = {int(uid.strip()) for uid in _raw_ids.split(",") if uid.strip().isdigit()}
+    _parts = [uid.strip() for uid in _raw_ids.split(",") if uid.strip()]
+    _valid = {int(uid) for uid in _parts if uid.isdigit()}
+    if _parts and not _valid:
+        raise RuntimeError(
+            "ADMIN_USER_IDS was set but contained no valid integers; "
+            "refusing to start with zero admins"
+        )
+    ADMIN_USER_IDS = _valid
 
 # ---------------------------------------------------------------------------
 # Claude
@@ -63,9 +74,16 @@ SETTINGS_PATH = os.path.join(BOT_DIR, ".claude", "settings.json")
 CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 ATTACHMENT_DIR = os.path.join(tempfile.gettempdir(), "discord_bot_attachments")
 
-os.makedirs(STATE_DIR, exist_ok=True)
-os.makedirs(HISTORY_DIR, exist_ok=True)
-os.makedirs(ATTACHMENT_DIR, exist_ok=True)
+def _ensure_mode_700(path: str) -> None:
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+_ensure_mode_700(STATE_DIR)
+_ensure_mode_700(HISTORY_DIR)
+_ensure_mode_700(ATTACHMENT_DIR)
 
 # ---------------------------------------------------------------------------
 # Limits (free-code: constants/limits)
@@ -387,23 +405,11 @@ def pick_mcp_servers(raw_user_text: str) -> dict:
 # Web API
 # ---------------------------------------------------------------------------
 WEB_API_PORT = int(os.environ.get("WEB_API_PORT", "3002"))
+# Default to localhost so a fresh `main_async.py` start does not expose the
+# Web API to the public internet. Override with WEB_API_HOST=0.0.0.0 when
+# fronting it with an authenticated reverse proxy or tunnel.
+WEB_API_HOST = os.environ.get("WEB_API_HOST", "127.0.0.1")
 WEB_API_CORS_ORIGINS = os.environ.get("WEB_API_CORS_ORIGINS", "http://localhost:3001").split(",")
-
-# ---------------------------------------------------------------------------
-# DGM (Darwin Gödel Machine)
-# ---------------------------------------------------------------------------
-DGM_POPULATION_SIZE = int(os.environ.get("DGM_POPULATION_SIZE", "4"))
-DGM_MAX_GENERATIONS = int(os.environ.get("DGM_MAX_GENERATIONS", "3"))
-DGM_OFFSPRING_PER_GEN = int(os.environ.get("DGM_OFFSPRING_PER_GEN", "2"))
-DGM_TOURNAMENT_K = int(os.environ.get("DGM_TOURNAMENT_K", "2"))
-DGM_SANDBOX_MEMORY_MB = int(os.environ.get("DGM_SANDBOX_MEMORY_MB", "50"))
-DGM_SANDBOX_TIMEOUT_S = int(os.environ.get("DGM_SANDBOX_TIMEOUT_S", "5"))
-DGM_LLM_MODEL = os.environ.get("DGM_LLM_MODEL", "claude-sonnet-4-6")
-DGM_LLM_MODEL_CROSSOVER = os.environ.get("DGM_LLM_MODEL_CROSSOVER", "claude-sonnet-4-6")
-DGM_LLM_MODEL_MUTATION = os.environ.get("DGM_LLM_MODEL_MUTATION", "claude-haiku-4-5-20251001")
-DGM_LLM_MODEL_META = os.environ.get("DGM_LLM_MODEL_META", "claude-haiku-4-5-20251001")
-DGM_DB_PATH = os.path.join(STATE_DIR, "dgm.db")
-DGM_ARCHIVE_GRID = int(os.environ.get("DGM_ARCHIVE_GRID", "4"))  # NxN MAP-Elites grid
 
 # Mem0 quality-improvement flags (added 2026-05-12, see plans/partitioned-wibbling-sifakis.md)
 def _bool_env(name: str, default: bool) -> bool:

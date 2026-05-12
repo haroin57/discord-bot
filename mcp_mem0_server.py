@@ -210,12 +210,28 @@ async def list_all(user_id: str = DEFAULT_USER_ID, limit: int = 50) -> str:
 
 
 @mcp.tool()
-async def delete(memory_id: str) -> str:
+async def delete(memory_id: str, user_id: str = DEFAULT_USER_ID) -> str:
     """Delete a specific memory by its Mem0 ID.
+
+    Only the owner of the memory (matched by user_id) can delete it.
 
     Args:
         memory_id: The memory ID returned by `list_all` or `search`.
+        user_id: Discord snowflake of the requesting user. Must match the
+            user_id stored on the memory record.
     """
+    try:
+        user_id = _validated_user_id(user_id)
+    except ValueError as e:
+        return f"(rejected: {e})"
+
+    # Verify ownership before deletion by searching all memories for this user
+    # and confirming the target memory_id exists in their namespace.
+    user_memories = await get_all_memories(user_id=user_id)
+    owned_ids = {m.get("id") for m in user_memories if m.get("id")}
+    if memory_id not in owned_ids:
+        return "permission denied"
+
     ok = await delete_memory(memory_id)
     return f"deleted {memory_id}" if ok else f"delete failed for {memory_id}"
 

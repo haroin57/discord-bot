@@ -112,24 +112,34 @@ def _get_math_css(display_mode: bool, latex: str = "") -> str:
     )
     return base + KATEX_THEME_CSS
 
-# Local KaTeX bundle (Phase B1). Resolved at import; the field name stays
-# `KATEX_CDN` for the HTML_TEMPLATE.format(katex_cdn=...) substitution. Falls
-# back to the jsdelivr CDN if no local copy is present so renders remain
-# functional in environments that ship without the npm package.
-def _resolve_katex_root() -> str:
-    candidates = [
-        "/usr/lib/node_modules/katex/dist",
-        "/usr/local/lib/node_modules/katex/dist",
-        "/usr/local/lib/node_modules/@mermaid-js/mermaid-cli/node_modules/katex/dist",
-    ]
-    for p in candidates:
+# Local KaTeX bundle. Install with `npm install katex` in the bot directory,
+# or via `npm install -g katex`. CDN fallback is intentionally removed to
+# prevent network-dependent rendering and potential CDN supply-chain risk.
+_KATEX_CANDIDATES = [
+    "/usr/lib/node_modules/katex/dist",
+    "/usr/local/lib/node_modules/katex/dist",
+    "/usr/local/lib/node_modules/@mermaid-js/mermaid-cli/node_modules/katex/dist",
+]
+
+
+def _resolve_katex_root() -> str | None:
+    for p in _KATEX_CANDIDATES:
         if os.path.isfile(os.path.join(p, "katex.min.js")):
             return f"file://{p}"
-    log.warning("Local KaTeX not found; falling back to jsdelivr CDN (slower).")
-    return "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist"
+    return None
 
 
-KATEX_CDN = _resolve_katex_root()
+_katex_root = _resolve_katex_root()
+_KATEX_AVAILABLE: bool = _katex_root is not None
+if not _KATEX_AVAILABLE:
+    log.warning(
+        "Local KaTeX not found (checked %s). "
+        "Math rendering disabled. Install via `npm install katex` in the bot directory.",
+        ", ".join(_KATEX_CANDIDATES),
+    )
+
+# Field name stays `KATEX_CDN` for HTML_TEMPLATE.format(katex_cdn=...) substitution.
+KATEX_CDN: str = _katex_root or ""
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html><head>
@@ -169,7 +179,14 @@ async def render_math_image(
     display_mode: bool = True,
     output_dir: str = MATH_OUTPUT_DIR,
 ) -> str | None:
-    """Render a LaTeX expression as a PNG image. Returns the file path, or None on failure."""
+    """Render a LaTeX expression as a PNG image.
+
+    Returns the file path on success, or None if KaTeX is unavailable or
+    rendering fails. Requires a local KaTeX install (`npm install katex`).
+    """
+    if not _KATEX_AVAILABLE:
+        log.warning("render_math_image called but KaTeX is not installed locally; returning None")
+        return None
     os.makedirs(output_dir, exist_ok=True)
 
     # Cache key includes display mode and a template version so a change to

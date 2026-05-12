@@ -225,3 +225,69 @@ class TestBuildLayeredLines:
         # Layer 2 messages (first 10) should be summarized (shorter)
         # Layer 1 messages (last 15) should be full
         assert len(lines) >= LAYER1_COUNT  # at least layer1 lines present
+
+
+class TestAfterMsgsPermissionFilter:
+    """H9: after_msgs loop must apply _requester_can_read, same as before_msgs."""
+
+    @pytest.mark.asyncio
+    async def test_after_msgs_filters_unauthorized(self):
+        import discord
+        from unittest.mock import patch as _patch
+        from utils.discord_helpers import _resolve_one_link
+
+        # Build a fake requester
+        requester = MagicMock()
+        requester.id = 42
+
+        # Build a fake thread channel
+        channel = MagicMock(spec=discord.Thread)
+        channel.guild = MagicMock()
+        channel.guild.get_member = MagicMock(return_value=MagicMock())
+
+        # permissions_for returns deny for the requester
+        bad_perms = MagicMock()
+        bad_perms.read_message_history = False
+        channel.permissions_for = MagicMock(return_value=bad_perms)
+        channel.name = "test-thread"
+        channel.id = 222
+
+        # The referenced message
+        ref_msg = MagicMock()
+        ref_msg.author.display_name = "RefUser"
+        ref_msg.content = "ref content"
+        ref_msg.embeds = []
+        ref_msg.attachments = []
+        ref_msg.guild = channel.guild
+        ref_msg.channel = channel
+
+        # after_msg: a message that should be filtered out (no read permission)
+        after_msg = MagicMock()
+        after_msg.author.display_name = "SecretUser"
+        after_msg.content = "secret after content"
+        after_msg.embeds = []
+        after_msg.attachments = []
+
+        async def fake_history(**kwargs):
+            after = kwargs.get("after")
+            before = kwargs.get("before")
+            if after is not None:
+                # This is the after_msgs fetch
+                yield after_msg
+            # before_msgs fetch: yield nothing
+            return
+
+        channel.history = MagicMock(side_effect=lambda **kwargs: fake_history(**kwargs))
+        channel.fetch_message = AsyncMock(return_value=ref_msg)
+
+        match = MagicMock()
+        match.group = MagicMock(side_effect=lambda i: {0: "https://discord.com/channels/1/222/333", 1: "1", 2: "222", 3: "333"}[i])
+
+        client = MagicMock()
+        client.get_channel = MagicMock(return_value=channel)
+
+        _, result = await _resolve_one_link(client, match, requester=requester, caller_is_admin=False)
+
+        # The after_msg content must not appear in the resolved context
+        if result is not None:
+            assert "secret after content" not in result

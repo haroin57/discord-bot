@@ -16,6 +16,7 @@ __pycache__/
 *.old
 *.orig
 *.rej
+*~
 
 # Credential blobs (defense in depth; real path lives outside repo)
 .credentials.json

@@ -14,7 +14,7 @@ import os
 import queue
 import sys
 
-from config import BOT_DIR, DISCORD_TOKEN, STATE_DIR, WEB_API_PORT, validate_discord_token
+from config import BOT_DIR, DISCORD_TOKEN, STATE_DIR, WEB_API_HOST, WEB_API_PORT, validate_discord_token
 # cleanup_stale_attachments is now scheduled from bot.on_ready (Phase G/D5).
 
 _LOG_LEVEL = os.environ.get("BOT_LOG_LEVEL", "INFO").upper()
@@ -118,7 +118,7 @@ async def main() -> None:
 
     await asyncio.gather(
         bot.start(DISCORD_TOKEN),
-        web_api.start(port=WEB_API_PORT),
+        web_api.start(port=WEB_API_PORT, host=WEB_API_HOST),
     )
 
 

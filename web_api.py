@@ -7,12 +7,19 @@ http://localhost:3001/api/session/verify.
 
 import asyncio
 import logging
+import re as _re
 import time
 from collections import OrderedDict
 
 import aiohttp
 import socketio
 from aiohttp import web
+
+_MEM_BLOCK_RE = _re.compile(r"<retrieved_memories\b[^>]*>.*?</retrieved_memories>", _re.DOTALL)
+
+
+def _strip_mem_block(content: str) -> str:
+    return _MEM_BLOCK_RE.sub("", content)
 
 from config import (
     ADMIN_USER_IDS,
@@ -23,6 +30,7 @@ from config import (
     RESTRICTED_COOLDOWN_SECONDS,
     RESTRICTED_DAILY_QUOTA,
     WEB_API_CORS_ORIGINS,
+    WEB_API_HOST,
     WEB_API_PORT,
 )
 from services.claude_sdk import call_with_tools
@@ -36,6 +44,14 @@ _QUOTA_WINDOW_S = 24 * 60 * 60
 
 class WebAPI:
     def __init__(self, bot):
+        # M6: reject wildcard CORS before constructing the server
+        for origin in WEB_API_CORS_ORIGINS:
+            if origin == "*" or origin == "":
+                raise RuntimeError(
+                    "WEB_API_CORS_ORIGINS must not contain wildcards; "
+                    "this disables socket.io credential checks"
+                )
+
         self.bot = bot
         self.sio = socketio.AsyncServer(
             async_mode="aiohttp",
@@ -67,13 +83,31 @@ class WebAPI:
     # -----------------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------------
-    async def start(self, port: int = WEB_API_PORT) -> None:
+    # H5: internal session invalidation route
+    async def _handle_invalidate_session(self, request: web.Request) -> web.Response:
+        remote = request.remote
+        if remote not in ("127.0.0.1", "::1"):
+            raise web.HTTPForbidden()
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest()
+        token = body.get("session_token")
+        if not isinstance(token, str) or not token:
+            raise web.HTTPBadRequest()
+        existed = token in self._session_cache
+        self._session_cache.pop(token, None)
+        return web.json_response({"invalidated": existed})
+
+    async def start(self, port: int = WEB_API_PORT, host: str = WEB_API_HOST) -> None:
         self._http = aiohttp.ClientSession()
+        # H5: register invalidation route before site is created
+        self.app.router.add_post("/internal/invalidate_session", self._handle_invalidate_session)
         self._runner = web.AppRunner(self.app)
         await self._runner.setup()
-        site = web.TCPSite(self._runner, "0.0.0.0", port)
+        site = web.TCPSite(self._runner, host, port)
         await site.start()
-        log.info("WebAPI Socket.IO server listening on port %d", port)
+        log.info("WebAPI Socket.IO server listening on %s:%d", host, port)
         # Keep running until cancelled
         try:
             await asyncio.Event().wait()
@@ -104,7 +138,12 @@ class WebAPI:
         cached = self._session_cache.get(session_token)
         if cached:
             if time.time() - cached.get("_verified_at", 0) < 300:
-                return cached
+                # M9: Re-derive is_admin on every cache hit so ADMIN_USER_IDS changes apply immediately
+                try:
+                    is_admin_live = int(cached["discordId"]) in ADMIN_USER_IDS
+                except (KeyError, ValueError):
+                    is_admin_live = False
+                return {**cached, "isAdmin": is_admin_live}
 
         if self._http is None or self._http.closed:
             self._http = aiohttp.ClientSession()
@@ -120,9 +159,19 @@ class WebAPI:
                 data = await resp.json()
                 if not data.get("authenticated"):
                     return None
+                # Re-derive admin status from the bot's own ADMIN_USER_IDS
+                # instead of trusting the Next.js verifier. The verifier is a
+                # separate process whose config could drift or be tampered
+                # with; admin power inside the bot must be governed by the
+                # bot's own allowlist.
+                discord_id = str(data["discordId"])
+                try:
+                    is_admin = int(discord_id) in ADMIN_USER_IDS
+                except ValueError:
+                    is_admin = False
                 user = {
-                    "discordId": data["discordId"],
-                    "isAdmin": data.get("isAdmin", False),
+                    "discordId": discord_id,
+                    "isAdmin": is_admin,
                     "_verified_at": time.time(),
                 }
                 self._session_cache[session_token] = user
@@ -130,6 +179,72 @@ class WebAPI:
         except Exception as e:
             log.warning("Session verify failed: %s", e)
             return None
+
+    # -----------------------------------------------------------------------
+    # Discord channel permission checks
+    # -----------------------------------------------------------------------
+    async def _check_channel_permission(
+        self,
+        discord_id: str,
+        channel_id: int,
+        action: str,
+        is_admin: bool,
+    ) -> tuple[bool, str | None]:
+        """Verify *discord_id* may perform *action* on *channel_id*.
+
+        Action is one of: ``view``, ``read_history``, ``send``.
+
+        Admin (bot-side ADMIN_USER_IDS) bypasses the Discord-side check so
+        admin tooling keeps working even on channels where the admin isn't
+        an explicit guild member (e.g. DMs initiated via the Web UI).
+
+        Returns (allowed, error_message).
+        """
+        if is_admin:
+            return True, None
+
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except Exception as e:
+                log.warning("channel %s not resolvable for %s: %s",
+                            channel_id, discord_id, e)
+                return False, "permission denied"
+
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            # DM channels: only the recipient may operate on them.
+            recipient = getattr(channel, "recipient", None)
+            if recipient is None:
+                return False, "permission denied"
+            try:
+                return (str(recipient.id) == discord_id), (
+                    None if str(recipient.id) == discord_id else "permission denied"
+                )
+            except AttributeError:
+                return False, "permission denied"
+
+        try:
+            user_id_int = int(discord_id)
+        except ValueError:
+            return False, "permission denied"
+        member = guild.get_member(user_id_int)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id_int)
+            except Exception:
+                log.debug("user %s is not a member of guild for channel %s", discord_id, channel_id)
+                return False, "permission denied"
+
+        perms = channel.permissions_for(member)
+        if action == "view" and not perms.view_channel:
+            return False, "permission denied"
+        if action == "read_history" and not (perms.view_channel and perms.read_message_history):
+            return False, "permission denied"
+        if action == "send" and not (perms.view_channel and perms.send_messages):
+            return False, "permission denied"
+        return True, None
 
     # -----------------------------------------------------------------------
     # Rate limiting
@@ -214,15 +329,33 @@ class WebAPI:
         @sio.event
         async def join_channel(sid, data):
             """Join a channel room to receive channel-scoped events."""
-            channel_id = str(data.get("channel_id", ""))
-            if not channel_id:
+            user_info = self._sid_to_user.get(sid)
+            if not user_info:
+                await sio.emit("error", {"message": "not authenticated"}, to=sid)
                 return
+            channel_id_raw = data.get("channel_id", "")
+            try:
+                channel_id_int = int(channel_id_raw)
+            except (TypeError, ValueError):
+                await sio.emit("error", {"message": "invalid channel_id"}, to=sid)
+                return
+            allowed, err = await self._check_channel_permission(
+                user_info["discord_id"], channel_id_int, "view", user_info["is_admin"],
+            )
+            if not allowed:
+                await sio.emit("error", {"message": err or "permission denied"}, to=sid)
+                return
+            channel_id = str(channel_id_int)
             await sio.enter_room(sid, f"channel:{channel_id}")
             log.debug("sid=%s joined channel room %s", sid, channel_id)
             await sio.emit("joined_channel", {"channel_id": channel_id}, to=sid)
 
         @sio.event
         async def leave_channel(sid, data):
+            # H4: require authenticated sid
+            user_info = self._sid_to_user.get(sid)
+            if not user_info:
+                return
             channel_id = str(data.get("channel_id", ""))
             if not channel_id:
                 return
@@ -244,11 +377,23 @@ class WebAPI:
                 await sio.emit("error", {"message": "invalid channel_id"}, to=sid)
                 return
 
+            allowed, err = await self._check_channel_permission(
+                user_info["discord_id"], channel_id, "read_history", user_info["is_admin"],
+            )
+            if not allowed:
+                await sio.emit("error", {"message": err or "permission denied"}, to=sid)
+                return
+
             try:
                 messages = await asyncio.to_thread(load_history_channel, channel_id)
             except Exception as e:
                 log.warning("get_history failed for ch=%s: %s", channel_id, e)
                 messages = []
+
+            # M8: strip Mem0 memory blocks so cross-user memories are not leaked
+            for msg in messages:
+                if isinstance(msg.get("content"), str):
+                    msg["content"] = _strip_mem_block(msg["content"])
 
             await sio.emit("history", {"channel_id": channel_id, "messages": messages}, to=sid)
 
@@ -276,6 +421,13 @@ class WebAPI:
 
             if not raw_text:
                 await sio.emit("error", {"message": "empty message"}, to=sid)
+                return
+
+            allowed, err = await self._check_channel_permission(
+                discord_id, channel_id, "send", is_admin,
+            )
+            if not allowed:
+                await sio.emit("error", {"message": err or "permission denied"}, to=sid)
                 return
 
             # Rate limiting

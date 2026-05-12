@@ -56,7 +56,7 @@ PROMPT="以下の情報を調べて、簡潔な日本語レポート（Discord�
 - 最後に情報ソース（URL）を1-2個つける"
 
 # Run Claude CLI with tools (brave-search + x-scraper for comprehensive coverage)
-RESULT=$(cd /home/ubuntu && claude -p "$PROMPT" --max-turns 15 2>>"$LOG") || {
+RESULT=$(cd /home/ubuntu && claude -p "$PROMPT" --max-turns 15 --allowed-tools "WebFetch,WebSearch" 2>>"$LOG") || {
     echo "$(date): Claude CLI failed" >> "$LOG"
     RESULT="❌ Claude CLI実行エラー。手動で確認してください。"
 }

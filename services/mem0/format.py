@@ -2,6 +2,8 @@
 
 import re
 
+from services.sentinel import POWER_PHRASE_RE
+
 # Markers an attacker could have stored in a fact (via the ingestion path)
 # that would close the <retrieved_memories> fence or impersonate any trusted
 # prompt-scaffold block when echoed back into the prompt. Strip them
@@ -24,10 +26,15 @@ _FACT_TEXT_BLOCKLIST = re.compile(
 
 
 def _scrub_fact_text(text: str) -> str:
-    """Drop markers that could close the memories fence or impersonate trust headers."""
+    """Drop markers that could close the memories fence or impersonate trust headers.
+
+    Also applies POWER_PHRASE_RE to redact power-grab phrases (M15).
+    """
     if not text:
         return text
-    return _FACT_TEXT_BLOCKLIST.sub("[redacted-marker]", text)
+    text = _FACT_TEXT_BLOCKLIST.sub("[redacted-marker]", text)
+    text = POWER_PHRASE_RE.sub("[redacted]", text)
+    return text
 
 
 def format_memories_for_prompt(memories: list[dict]) -> str:

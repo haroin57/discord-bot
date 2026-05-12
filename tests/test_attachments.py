@@ -7,9 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from utils.attachments import (
+    _basename_is_secret,
     cleanup_attachments,
     cleanup_stale_attachments,
     download_attachments,
+    extract_file_paths,
     extract_image_paths,
     IMAGE_CONTENT_TYPES,
 )
@@ -134,6 +136,68 @@ class TestCleanupStaleAttachments:
         assert recent.exists()
 
 
+class TestSecretBasenameDenylist:
+    """The basename-level denylist must reject credential file patterns
+    even when the file lives under an allowed ADMIN_FILE_DIRS entry."""
+
+    def test_exact_hidden_credentials(self):
+        assert _basename_is_secret("/home/ubuntu/.claude/.credentials.json")
+        assert _basename_is_secret("/home/ubuntu/.config/gh/hosts.yml")
+        assert _basename_is_secret("/home/ubuntu/.ssh/id_rsa")
+        assert _basename_is_secret("/home/ubuntu/.ssh/id_ed25519")
+
+    def test_dotenv_variants(self):
+        assert _basename_is_secret("/home/ubuntu/project/.env")
+        assert _basename_is_secret("/home/ubuntu/project/.env.production")
+        assert _basename_is_secret("/home/ubuntu/project/prod.env")
+
+    def test_secret_globs(self):
+        assert _basename_is_secret("/home/ubuntu/keys/server.pem")
+        assert _basename_is_secret("/home/ubuntu/keys/api.key")
+        assert _basename_is_secret("/home/ubuntu/tokens/access.token")
+        assert _basename_is_secret("/home/ubuntu/data/app.sqlite")
+        assert _basename_is_secret("/home/ubuntu/data/app.db")
+
+    def test_innocuous_files_pass(self):
+        assert not _basename_is_secret("/home/ubuntu/notes.md")
+        assert not _basename_is_secret("/home/ubuntu/report.pdf")
+        assert not _basename_is_secret("/tmp/output.txt")
+
+
+class TestExtractFilePathsDenylist:
+    """Regression: a path under ADMIN_FILE_DIRS but with a credential
+    basename must not be returned for auto-attachment, even though the
+    file exists and the allowlist would otherwise let it through."""
+
+    def test_credential_under_admin_dir_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        secret = tmp_path / ".credentials.json"
+        secret.write_text('{"token": "secret"}')
+        text = f"check {secret}"
+        assert extract_file_paths(text) == []
+
+    def test_env_under_admin_dir_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        env = tmp_path / ".env"
+        env.write_text("API_KEY=xxx")
+        text = f"see {env}"
+        assert extract_file_paths(text) == []
+
+    def test_pem_under_admin_dir_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        pem = tmp_path / "server.pem"
+        pem.write_text("-----BEGIN PRIVATE KEY-----")
+        text = f"path: {pem}"
+        assert extract_file_paths(text) == []
+
+    def test_normal_file_still_allowed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        report = tmp_path / "report.csv"
+        report.write_text("a,b\n1,2\n")
+        text = f"output: {report}"
+        assert str(report) in extract_file_paths(text)
+
+
 class TestDownloadAttachments:
     def _make_attachment(self, content_type="image/png", size=1000, filename="test.png", att_id=1):
         att = MagicMock()
@@ -164,3 +228,31 @@ class TestDownloadAttachments:
             att = self._make_attachment(content_type=ct)
             # Just verify it's recognized as an image
             assert ct in IMAGE_CONTENT_TYPES
+
+
+class TestReDoSGuards:
+    def test_image_path_re_bounded(self):
+        """IMAGE_PATH_RE must not backtrack on adversarial input."""
+        import time
+        big = "/" + "a" * 10000 + ".png"
+        start = time.monotonic()
+        extract_image_paths(big)
+        assert time.monotonic() - start < 1.0
+
+    def test_file_path_re_bounded(self):
+        """FILE_PATH_RE must not backtrack on adversarial input."""
+        import time
+        big = "/" + "a" * 10000 + ".txt"
+        start = time.monotonic()
+        extract_file_paths(big)
+        assert time.monotonic() - start < 1.0
+
+    def test_input_capped_at_100k(self, allowed_tmp):
+        """Input text longer than 100k chars is silently capped before regex scan."""
+        img = allowed_tmp / "real.png"
+        img.write_bytes(_MAGIC["png"])
+        # Place the valid path after the 100k cap boundary; it must NOT be found
+        big_prefix = "x" * 100_001
+        text = big_prefix + f" {img} "
+        paths = extract_image_paths(text)
+        assert str(img) not in paths
