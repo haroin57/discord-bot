@@ -34,7 +34,13 @@ ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=yes
 LockPersonality=yes
-MemoryDenyWriteExecute=yes
+# MemoryDenyWriteExecute=no — claude_code_sdk spawns the Claude CLI as a
+# subprocess (`node`), and V8's baseline JIT compiler requires
+# write+execute mmap pages to generate code. With =yes set, Node dies
+# with `Check failed: 12 == errno (ENOMEM)` deep inside
+# v8::base::OS::SetPermissions, every claude_code_sdk.query() retry
+# fails, and the bot ends up "running" but unable to talk to Claude.
+MemoryDenyWriteExecute=no
 RestrictRealtime=yes
 SystemCallArchitectures=native
 CapabilityBoundingSet=
