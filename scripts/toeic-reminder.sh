@@ -20,7 +20,10 @@ if [[ -z "${BOT_TOKEN// /}" ]]; then
     exit 1
 fi
 USER_ID="573489206240870410"  # haroin（先輩）
-LOG="/tmp/toeic-reminder.log"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/discord-bot"
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR" 2>/dev/null || true
+LOG="$STATE_DIR/toeic-reminder.log"
 
 # --- 期限チェック: 5/16を過ぎたら自動削除 ---
 TODAY=$(TZ=Asia/Tokyo date +%Y-%m-%d)

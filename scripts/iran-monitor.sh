@@ -20,19 +20,21 @@ if [[ -z "${BOT_TOKEN// /}" ]]; then
     exit 1
 fi
 NOTIFY_USER="<@1037285234200297522>"  # b0nchichi (お父さん)
-LOG="/tmp/iran-monitor.log"
-LOCK="/tmp/iran-monitor.lock"
 
-# Prevent overlapping runs
-if [ -f "$LOCK" ]; then
-    pid=$(cat "$LOCK" 2>/dev/null)
-    if kill -0 "$pid" 2>/dev/null; then
-        echo "$(date): Already running (pid=$pid), skipping" >> "$LOG"
-        exit 0
-    fi
+# State directory (XDG-style) — owned by the running user, mode 700 on create
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/discord-bot"
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR" 2>/dev/null || true
+LOG="$STATE_DIR/iran-monitor.log"
+LOCK="$STATE_DIR/iran-monitor.lock"
+
+# Prevent overlapping runs via flock (atomic; symlink-attack proof).
+# fd 200 stays open for the lifetime of the script; the lock releases on exit.
+exec 200>"$LOCK"
+if ! flock -n 200; then
+    echo "$(date): Already running, skipping" >> "$LOG"
+    exit 0
 fi
-echo $$ > "$LOCK"
-trap 'rm -f "$LOCK"' EXIT
 
 echo "$(date): Starting Iran monitor run" >> "$LOG"
 

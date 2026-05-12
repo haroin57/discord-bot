@@ -60,7 +60,12 @@ def save_sessions(s: OrderedDict[int, SessionInfo]) -> None:
         }
         for k, v in s.items()
     }
-    with open(SESSIONS_PATH, "w", encoding="utf-8") as f:
+    # Open with 0o600 so SDK session_ids (potentially session-resumable secrets)
+    # are not world-readable on a shared host. O_NOFOLLOW refuses to follow a
+    # symlink at SESSIONS_PATH so a local attacker cannot redirect the write.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    fd = os.open(SESSIONS_PATH, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f)
 
 
@@ -87,8 +92,13 @@ def append_jsonl(channel_id: int, entry: dict) -> None:
     """Append a single entry to the channel's JSONL transcript (fire-and-forget safe)."""
     entry["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     entry["channel_id"] = channel_id
+    # Open with 0o600 so conversation transcripts are not world-readable on a
+    # shared host. O_APPEND keeps the append-only semantics; O_NOFOLLOW refuses
+    # to follow a symlink at the history-file path.
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
+    fd = os.open(_history_file(channel_id), flags, 0o600)
     # Explicit buffering avoids tiny unbuffered writes on spinning disks.
-    with open(_history_file(channel_id), "a", encoding="utf-8", buffering=8192) as f:
+    with os.fdopen(fd, "a", encoding="utf-8", buffering=8192) as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
