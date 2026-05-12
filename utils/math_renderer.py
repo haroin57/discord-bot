@@ -10,6 +10,8 @@ import hashlib
 import logging
 import os
 
+from utils.render_semaphore import render_sema as _render_sema  # shared with table_renderer
+
 __all__ = ["render_math_image"]
 
 log = logging.getLogger(__name__)
@@ -40,8 +42,10 @@ def _find_chrome_executable() -> str | None:
 
 CHROME_EXECUTABLE = _find_chrome_executable()
 
-# Share the semaphore with table_renderer (2GB RAM constraint)
-_render_sema = asyncio.Semaphore(1)
+# NOTE: _render_sema is imported from utils.render_semaphore at module-top so
+# it is the SAME object instance as the one used by table_renderer. The prior
+# `asyncio.Semaphore(1)` literal here created a separate object that did not
+# actually block a concurrent table render.
 
 # ---------------------------------------------------------------------------
 # Node.js render script
