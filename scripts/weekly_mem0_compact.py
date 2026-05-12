@@ -41,6 +41,21 @@ from services.oauth_manager import ensure_valid_token  # noqa: E402
 
 DEFAULT_USER_ID = "573489206240870410"
 
+# Pre-compiled at module load (was re-compiled inside main() on every run).
+# Detects other-speaker subjects in stored fact text — used by the P5
+# contamination regression check. False positives possible on quotation
+# contexts, so the alert threshold (>=2 hits) absorbs that noise.
+OTHER_SPEAKER_PATTERN = re.compile(
+    r"(お父さん|watabegg|b0nchichi|お母さん|お父様|父親)"
+    r".{0,15}(言って|思って|考えて|話して|発言|主張|意見|希望|要望)"
+)
+
+# Hard cap on the O(n²) intra-week near-dup pair check. At N=200 the loop
+# does ~20k SequenceMatcher comparisons (≈0.5 s); above that the cost grows
+# faster than weekly cadence permits. If new_in_week exceeds this, the loop
+# is skipped and the report logs the cap so we know to revisit.
+MAX_NEAR_DUP_N = 200
+
 
 def _parse_dt(value: str | None) -> datetime | None:
     if not value:
@@ -96,11 +111,6 @@ async def main() -> None:
     tier_counts: Counter = Counter()
     gate_version_counts: Counter = Counter()      # P5: v2/v1/missing
     other_speaker_hits: list[dict] = []           # P5: regression check
-
-    # P5: detect other-speaker subjects in memory text — false-positive可能(引用文脈)
-    OTHER_SPEAKER_PATTERN = re.compile(
-        r"(お父さん|watabegg|b0nchichi|お母さん|お父様|父親).{0,15}(言って|思って|考えて|話して|発言|主張|意見|希望|要望)"
-    )
 
     for m in memories:
         meta = m.get("metadata") or {}
@@ -172,17 +182,27 @@ async def main() -> None:
     if len(archive_candidates) > 30:
         lines.append(f"- ... +{len(archive_candidates)-30} more")
 
-    # P5: intra-week near-dup pairs (SequenceMatcher, 軽量で十分)
+    # P5: intra-week near-dup pairs (SequenceMatcher, O(n²))
+    # Cap N to keep the weekly batch under ~1 s even on growth weeks. When
+    # new_in_week exceeds MAX_NEAR_DUP_N, skip the check entirely and surface
+    # the cap in the report so we know to revisit with a MinHash / TF-IDF
+    # approach.
     near_dup_pairs: list[tuple[str, str, float]] = []
-    for i, a in enumerate(new_in_week):
-        for b in new_in_week[i+1:]:
-            ta = (a.get("memory") or "")[:200]
-            tb = (b.get("memory") or "")[:200]
-            if not ta or not tb:
-                continue
-            sim = SequenceMatcher(None, ta, tb).ratio()
-            if sim >= 0.85:
-                near_dup_pairs.append((a["id"][:8], b["id"][:8], sim))
+    near_dup_skipped_reason: str | None = None
+    if len(new_in_week) > MAX_NEAR_DUP_N:
+        near_dup_skipped_reason = (
+            f"skipped: new_in_week={len(new_in_week)} > MAX_NEAR_DUP_N={MAX_NEAR_DUP_N}"
+        )
+    else:
+        for i, a in enumerate(new_in_week):
+            for b in new_in_week[i+1:]:
+                ta = (a.get("memory") or "")[:200]
+                tb = (b.get("memory") or "")[:200]
+                if not ta or not tb:
+                    continue
+                sim = SequenceMatcher(None, ta, tb).ratio()
+                if sim >= 0.85:
+                    near_dup_pairs.append((a["id"][:8], b["id"][:8], sim))
 
     # P5: gate version distribution
     lines += ["", "## Gate version distribution (P5)", ""]
@@ -208,6 +228,8 @@ async def main() -> None:
         f"## Intra-week near-duplicate pairs (sim>=0.85, P5): {len(near_dup_pairs)}",
         "",
     ]
+    if near_dup_skipped_reason is not None:
+        lines.append(f"- ⚠️ {near_dup_skipped_reason}")
     for a, b, sim in near_dup_pairs[:20]:
         lines.append(f"- `{a}` <-> `{b}` (sim={sim:.2f})")
     if len(near_dup_pairs) > 20:

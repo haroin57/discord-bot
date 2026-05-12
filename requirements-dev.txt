@@ -1,0 +1,18 @@
+# Development & test dependencies. Install with
+#   pip install -r requirements.txt -r requirements-dev.txt
+# These are NOT shipped to the production runtime (the bot's venv only needs
+# `requirements.txt`).
+
+-r requirements.txt
+
+# Test infrastructure — explicit so CVE bumps are tracked here.
+pytest>=9.0.3,<10.0              # CVE-2025-71176
+pytest-asyncio>=1.0,<2.0
+pytest-cov>=7.0,<8.0
+# Parallel test runner. Default pytest invocation is serial; use `pytest -n auto`
+# to spawn one worker per CPU. The suite is mock-heavy and embarrassingly
+# parallel, so wall-clock typically drops ~40-60% on a 2+ core host.
+pytest-xdist>=3.5,<4.0
+
+# Audit tooling for ad-hoc CVE checks (also used by the security workflow).
+pip-audit>=2.7,<3.0

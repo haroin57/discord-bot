@@ -16,7 +16,5 @@ cryptography>=46.0.7,<47.0      # CVE-2026-39892
 urllib3>=2.7.0,<3.0              # CVE-2026-44431, CVE-2026-44432
 python-multipart>=0.0.27,<0.1    # CVE-2026-40347, CVE-2026-42561
 
-# Test infrastructure — explicit so CVE bumps are tracked here too.
-pytest>=9.0.3,<10.0              # CVE-2025-71176
-pytest-asyncio>=1.0,<2.0
-pytest-cov>=7.0,<8.0
+# Test packages live in requirements-dev.txt now so prod installs do not
+# pull pytest / pytest-asyncio / pytest-cov / pytest-xdist needlessly.
