@@ -62,7 +62,11 @@ setTimeout(async () => {
       await page.setViewport({ width: 1400, height: 900 });
 
       const html = fs.readFileSync(htmlPath, 'utf8');
-      await page.setContent(html, { waitUntil: 'networkidle0', timeout: 15000 });
+      // Phase B1: 'domcontentloaded' is sufficient because the HTML has no
+      // external <link rel="stylesheet"> / <script src=...> references — all
+      // styles are inline. 'networkidle0' previously waited 1-3 s (or up to
+      // 15 s on CDN outage) for a network quiescence that never fires.
+      await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 5000 });
 
       const el = await page.$('.table-container');
       if (!el) { process.exit(1); }
@@ -133,10 +137,14 @@ tr:nth-child(even) {
 strong, b { color: #f2f3f5; }
 """
 
+# NOTE: No Google Fonts <link rel="stylesheet"> here on purpose. Previously
+# every cache-miss render waited for an external CDN response under
+# `waitUntil:'networkidle0'`, adding 1-3 s per render and stalling for
+# 15 s on CDN outage. We now rely on the system-installed Noto Sans CJK
+# (TABLE_CSS uses local fallbacks) — no network request fires.
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
-<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;600;700&display=swap" rel="stylesheet">
 <style>{css}</style>
 </head><body>
 <div class="table-container">

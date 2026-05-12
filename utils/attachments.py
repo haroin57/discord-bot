@@ -101,11 +101,26 @@ MAX_FILE_ATTACHMENTS = 5
 # Path to .attachignore file (glob patterns, one per line, # comments)
 _ATTACHIGNORE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".attachignore")
 
+# Cached parsed patterns. The file is small and rarely edited; cache on first
+# read and invalidate via mtime so a manual edit picks up on the next call
+# without restarting the bot. Previously each call re-opened the file —
+# `is_attach_ignored` runs per candidate image path in every response so the
+# repeated open() showed up in profiles.
+_attachignore_cache: list[str] | None = None
+_attachignore_mtime: float = -1.0
+
 
 def _load_attachignore() -> list[str]:
-    """Load ignore patterns from .attachignore file."""
-    if not os.path.isfile(_ATTACHIGNORE_PATH):
-        return []
+    """Load ignore patterns from .attachignore, mtime-cached."""
+    global _attachignore_cache, _attachignore_mtime
+    try:
+        st = os.stat(_ATTACHIGNORE_PATH)
+    except OSError:
+        _attachignore_cache = []
+        _attachignore_mtime = -1.0
+        return _attachignore_cache
+    if _attachignore_cache is not None and st.st_mtime == _attachignore_mtime:
+        return _attachignore_cache
     patterns: list[str] = []
     try:
         with open(_ATTACHIGNORE_PATH) as f:
@@ -115,6 +130,8 @@ def _load_attachignore() -> list[str]:
                     patterns.append(line)
     except OSError:
         pass
+    _attachignore_cache = patterns
+    _attachignore_mtime = st.st_mtime
     return patterns
 
 
@@ -376,12 +393,34 @@ async def download_attachments(http_session: aiohttp.ClientSession, attachments:
     return [p for p in results if p]
 
 
-def cleanup_attachments(paths: list[str]) -> None:
+def _cleanup_attachments_sync(paths: list[str]) -> None:
+    """Synchronous helper for cleanup_attachments; runs in a worker thread."""
     for p in paths:
         try:
             os.remove(p)
         except OSError:
             pass
+
+
+def cleanup_attachments(paths: list[str]) -> None:
+    """Remove temp attachment files. Synchronous wrapper kept for back-compat.
+
+    Hot-path callers should prefer `cleanup_attachments_async` so the disk
+    unlinks run on a worker thread instead of blocking the event loop.
+    """
+    _cleanup_attachments_sync(paths)
+
+
+async def cleanup_attachments_async(paths: list[str]) -> None:
+    """Async cleanup — offloads N os.remove() calls to a worker thread.
+
+    Use from any `async def` finally-block (bot.py, web_api.py) so the
+    event loop doesn't pause on temp-file unlinks.
+    """
+    import asyncio as _asyncio
+    if not paths:
+        return
+    await _asyncio.to_thread(_cleanup_attachments_sync, paths)
 
 
 async def _download_text_one(session: aiohttp.ClientSession, att) -> tuple[str, str] | None:

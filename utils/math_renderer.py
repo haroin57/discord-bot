@@ -81,7 +81,11 @@ setTimeout(async () => {
       await page.setViewport({ width: 800, height: 600, deviceScaleFactor: 2 });
 
       const html = fs.readFileSync(htmlPath, 'utf8');
-      await page.setContent(html, { waitUntil: 'networkidle0', timeout: 15000 });
+      // Phase B1: 'domcontentloaded' instead of 'networkidle0'. With the
+      // local KaTeX bundle below replacing the CDN load, every cache-miss
+      // render no longer waits 1-3 s (or up to 15 s on CDN outage) for
+      // network quiescence.
+      await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 5000 });
 
       const el = await page.$('.math-container');
       if (!el) { process.exit(1); }
@@ -203,8 +207,24 @@ def _get_math_css(display_mode: bool, latex: str = "") -> str:
     )
     return base + KATEX_THEME_CSS
 
-# KaTeX CSS/JS from CDN
-KATEX_CDN = "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist"
+# Local KaTeX bundle (Phase B1). Resolved at import; the field name stays
+# `KATEX_CDN` for the HTML_TEMPLATE.format(katex_cdn=...) substitution. Falls
+# back to the jsdelivr CDN if no local copy is present so renders remain
+# functional in environments that ship without the npm package.
+def _resolve_katex_root() -> str:
+    candidates = [
+        "/usr/lib/node_modules/katex/dist",
+        "/usr/local/lib/node_modules/katex/dist",
+        "/usr/local/lib/node_modules/@mermaid-js/mermaid-cli/node_modules/katex/dist",
+    ]
+    for p in candidates:
+        if os.path.isfile(os.path.join(p, "katex.min.js")):
+            return f"file://{p}"
+    log.warning("Local KaTeX not found; falling back to jsdelivr CDN (slower).")
+    return "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist"
+
+
+KATEX_CDN = _resolve_katex_root()
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html><head>
