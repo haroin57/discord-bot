@@ -3,6 +3,7 @@
 JSONL append-only transcripts per channel, JSON for SDK session IDs.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -12,13 +13,16 @@ from dataclasses import dataclass, field
 
 from config import (
     HISTORY_DIR,
-    MAX_HISTORY,
     MAX_MESSAGES_PER_CHANNEL,
     MAX_SESSIONS,
     SESSIONS_PATH,
 )
 
 log = logging.getLogger(__name__)
+
+# Background save tasks for `update_session`. We keep a strong reference so
+# the task is not GC'd before completion; the done callback removes itself.
+_save_tasks: set[asyncio.Task] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -77,11 +81,27 @@ def update_session(
     channel_id: int,
     info: SessionInfo,
 ) -> None:
+    """Mutate the session dict in-place and schedule a non-blocking save.
+
+    The dict mutation is synchronous (cheap, single hash lookup + LRU pop)
+    but the disk write is offloaded to a worker thread via `asyncio.to_thread`
+    so the event loop does not stall on every Discord message that produces
+    a new SDK session ID. Falls back to a synchronous save when called
+    outside an event loop (tests / CLI scripts).
+    """
     sessions[channel_id] = info
     sessions.move_to_end(channel_id)
     while len(sessions) > MAX_SESSIONS:
         sessions.popitem(last=False)
-    save_sessions(sessions)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop — direct sync save (tests / one-shot CLI usage).
+        save_sessions(sessions)
+        return
+    task = loop.create_task(asyncio.to_thread(save_sessions, sessions))
+    _save_tasks.add(task)
+    task.add_done_callback(_save_tasks.discard)
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +132,10 @@ def _tail_jsonl(path: str, max_entries: int) -> list[dict]:
     """Read the last `max_entries` valid role='user'/'assistant' rows from a JSONL file.
 
     Reads from the end of the file in chunks to avoid loading huge transcripts
-    into memory on hot-path access.
+    into memory on hot-path access. Accumulates chunks in a list and joins
+    once at the end so the buffer concatenation is O(n) instead of the
+    previous `data = read() + data` pattern which was O(n²) in memory churn
+    (1 MB file → ~64 MB intermediate allocation under the old pattern).
     """
     if not os.path.isfile(path):
         return []
@@ -121,7 +144,7 @@ def _tail_jsonl(path: str, max_entries: int) -> list[dict]:
             f.seek(0, os.SEEK_END)
             size = f.tell()
             chunk = 8192
-            data = b""
+            chunks: list[bytes] = []
             lines_found = 0
             pos = size
             # Read chunks from the tail until we have enough newlines or hit BOF.
@@ -129,9 +152,11 @@ def _tail_jsonl(path: str, max_entries: int) -> list[dict]:
                 read_size = min(chunk, pos)
                 pos -= read_size
                 f.seek(pos)
-                data = f.read(read_size) + data
-                lines_found = data.count(b"\n")
-            text = data.decode("utf-8", errors="replace")
+                buf = f.read(read_size)
+                chunks.insert(0, buf)
+                # Count newlines in the new chunk only — total grows monotonically.
+                lines_found += buf.count(b"\n")
+            text = b"".join(chunks).decode("utf-8", errors="replace")
     except OSError:
         return []
 
@@ -156,43 +181,11 @@ def load_history_channel(channel_id: int) -> list[dict]:
     return _tail_jsonl(_history_file(channel_id), MAX_MESSAGES_PER_CHANNEL * 2)
 
 
-class LazyHistory(OrderedDict):
-    """LRU-bounded OrderedDict that lazy-loads channel tails from JSONL on first access."""
-
-    def __missing__(self, channel_id: int):
-        path = os.path.join(HISTORY_DIR, f"{channel_id}.jsonl")
-        msgs = _tail_jsonl(path, MAX_MESSAGES_PER_CHANNEL * 2)
-        self[channel_id] = msgs
-        # LRU bound: drop oldest channels beyond MAX_HISTORY.
-        while len(self) > MAX_HISTORY:
-            self.popitem(last=False)
-        return msgs
-
-
-def load_all_history() -> LazyHistory:
-    """Eagerly scan HISTORY_DIR on startup (tail-loading each channel).
-
-    Returns a LazyHistory so subsequent lookups for unseen channels still
-    work via LazyHistory.__missing__.
-    """
-    result = LazyHistory()
-    try:
-        for fname in sorted(os.listdir(HISTORY_DIR)):
-            if not fname.endswith(".jsonl"):
-                continue
-            try:
-                channel_id = int(fname.replace(".jsonl", ""))
-            except ValueError:
-                continue
-            msgs = _tail_jsonl(os.path.join(HISTORY_DIR, fname), MAX_MESSAGES_PER_CHANNEL * 2)
-            if msgs:
-                result[channel_id] = msgs
-    except FileNotFoundError:
-        pass
-    # Drop oldest channels over the LRU limit.
-    while len(result) > MAX_HISTORY:
-        result.popitem(last=False)
-    return result
+# `LazyHistory` and `load_all_history` were removed in Phase D — they were
+# referenced only by tests, never by production code (bot.py calls
+# load_history_channel directly via asyncio.to_thread). Eager startup-time
+# scanning of every JSONL file blocked the event loop and the LazyHistory
+# dict was never consulted on the hot path.
 
 
 # ---------------------------------------------------------------------------

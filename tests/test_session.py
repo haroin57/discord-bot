@@ -7,7 +7,6 @@ from services.session import (
     SessionInfo,
     append_jsonl,
     fix_history_integrity,
-    load_all_history,
     load_history_channel,
     load_sessions,
     save_sessions,
@@ -70,16 +69,6 @@ class TestJSONLHistory:
 
     def test_load_missing_channel(self, tmp_state_dir):
         assert load_history_channel(999) == []
-
-    def test_load_all_history(self, tmp_state_dir):
-        append_jsonl(1, {"role": "user", "content": "a"})
-        append_jsonl(1, {"role": "assistant", "content": "b"})
-        append_jsonl(2, {"role": "user", "content": "c"})
-        append_jsonl(2, {"role": "assistant", "content": "d"})
-        result = load_all_history()
-        assert len(result) == 2
-        assert 1 in result
-        assert 2 in result
 
     def test_ignores_non_message_entries(self, tmp_state_dir):
         append_jsonl(10, {"role": "user", "content": "msg1"})
