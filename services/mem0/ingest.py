@@ -98,8 +98,8 @@ async def add_memories(
                 except Exception as e:
                     log.warning("Mem0 raw insert failed: %s", e)
             log.info(
-                "Mem0 gate: facts=%d kept=%d skip(low=%d,other=%d,dup=%d) user=%s",
-                len(facts), len(kept), skip_low, skip_other, skip_dup, user_id,
+                "Mem0 gate: facts=%d kept=%d skip(low=%d,other=%d,dup=%d) user=...%s",
+                len(facts), len(kept), skip_low, skip_other, skip_dup, str(user_id)[-4:],
             )
             return {"results": results, "kept": len(kept), "skipped": {
                 "low_importance": skip_low, "other_speaker": skip_other, "near_dup": skip_dup,
@@ -122,11 +122,13 @@ async def add_memories(
         )
         count = len(result.get("results", [])) if isinstance(result, dict) else 0
         if count:
-            previews = " | ".join(
-                str(r.get("memory", r.get("text", "")))[:60]
-                for r in (result.get("results") or [])[:5]
-            )
-            log.info("Mem0(legacy): extracted %d user=%s | %s", count, user_id, previews)
+            log.info("Mem0(legacy): extracted %d user=...%s", count, str(user_id)[-4:])
+            if log.isEnabledFor(logging.DEBUG):
+                previews = " | ".join(
+                    str(r.get("memory", r.get("text", "")))[:60]
+                    for r in (result.get("results") or [])[:5]
+                )
+                log.debug("Mem0(legacy) previews: %s", previews)
         return result
     except Exception as exc:
         log.warning("Mem0 add error: %s", exc)

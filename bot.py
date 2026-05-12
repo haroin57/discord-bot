@@ -430,8 +430,8 @@ async def on_message(message: discord.Message):
         except discord.errors.Forbidden:
             await message.reply("⚠️ そのメッセージを削除する権限がありません。")
         except Exception as e:
-            log.warning("Failed to delete message: %s", e)
-            await message.reply(f"❌ 削除に失敗しました: {e}")
+            log.warning("Failed to delete message: %s", e, exc_info=True)
+            await message.reply("❌ 削除に失敗しました。ログを確認してください。")
         return
 
     # Tiered rate limiting: non-admins get a much stricter cooldown so they
@@ -704,7 +704,7 @@ async def on_message(message: discord.Message):
                         f"{_sanitize_untrusted_text(mem0_block)}\n"
                         f"</retrieved_memories>\n\n{prompt}"
                     )
-                    log.info("Mem0: injected %d memories for user %s", len(mem_results), mem0_user_id)
+                    log.info("Mem0: injected %d memories for user ...%s", len(mem_results), str(mem0_user_id)[-4:])
             except Exception as e:
                 log.warning("Mem0 recall failed (non-fatal): %s", e)
 
@@ -894,7 +894,10 @@ async def on_message(message: discord.Message):
                 f.close()
 
     except Exception:
-        log.exception("Error processing message from %s in #%s", message.author, message.channel)
+        log.exception(
+            "Error processing message from user ...%s in #%s",
+            str(message.author.id)[-4:], message.channel,
+        )
         await message.reply("❌ エラーが発生しました。")
     finally:
         sema.release()
