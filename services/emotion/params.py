@@ -136,9 +136,13 @@ TELOS_THRESHOLDS: dict[str, float] = {
 # Suppression parameters.
 TSUNDERE_GATE = 0.5
 MAX_CONSECUTIVE_SELF_INITIATED = 2
-# Quiet-hour range as [start_hour, end_hour) in JST. 0-10 = midnight to 10am.
-QUIET_HOUR_RANGE: tuple[int, int] = (0, 10)
-LATE_NIGHT_HOUR_START = 22
+# Quiet-hour range as [start_hour, end_hour) in JST. The user opted out of
+# time-of-day suppression: with (0, 0) the half-open range matches no hour,
+# so QUIET_HOUR_RANGE[0] <= now.hour < QUIET_HOUR_RANGE[1] is always False.
+QUIET_HOUR_RANGE: tuple[int, int] = (0, 0)
+# Setting LATE_NIGHT_HOUR_START to 24 means `now.hour >= 24` is always
+# False, disabling the soft 60%-suppression block in telos.should_suppress.
+LATE_NIGHT_HOUR_START = 24
 
 # ±NOISE_AMPLITUDE random perturbation on event deltas to keep transitions
 # from being too mechanical. apply_event uses random.uniform(-x, +x).
