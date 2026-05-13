@@ -799,3 +799,51 @@ async def call_with_tools(
         log.info("Response via %s (restricted=%s) len=%d",
                  MODEL, restricted, len(response_text))
         return response_text.strip() or "(No response from Claude)", result_info
+
+
+# ---------------------------------------------------------------------------
+# PR7 backend dispatcher (refactor/claude-api-unify)
+# ---------------------------------------------------------------------------
+# When CLAUDE_BACKEND=api, call_with_tools / _is_session_fresh /
+# kill_orphan_claude_cli are routed to services.claude_api instead of the
+# CLI-driven implementation above. PR8 flips the default to "api". PR9
+# deletes claude_sdk.py outright.
+#
+# All three symbols must dispatch together (Codex v3 #8): if only
+# call_with_tools is rerouted, the API path's _session_timestamps and
+# MCP-child set are stranded from bot.py's _is_session_fresh and
+# main_async.py's shutdown cleanup.
+_legacy_call_with_tools = call_with_tools
+_legacy_is_session_fresh = _is_session_fresh
+_legacy_kill_orphan_claude_cli = kill_orphan_claude_cli
+
+
+def _backend() -> str:
+    return os.environ.get("CLAUDE_BACKEND", "sdk").lower()
+
+
+async def call_with_tools(*args, **kwargs):
+    if _backend() == "api":
+        from services.claude_api import call_with_tools as _impl
+        return await _impl(*args, **kwargs)
+    return await _legacy_call_with_tools(*args, **kwargs)
+
+
+def _is_session_fresh(channel_id: int) -> bool:
+    if _backend() == "api":
+        from services.claude_api import _is_session_fresh as _impl
+        return _impl(channel_id)
+    return _legacy_is_session_fresh(channel_id)
+
+
+def kill_orphan_claude_cli() -> int:
+    """Run BOTH cleanup paths during the migration window.
+
+    Even when CLAUDE_BACKEND=api, the SDK-side cmdline scan stays useful
+    because a previous SDK-mode run may have left CLI children behind.
+    """
+    n = _legacy_kill_orphan_claude_cli()
+    if _backend() == "api":
+        from services.claude_api import kill_orphan_claude_cli as _impl
+        n += _impl()
+    return n

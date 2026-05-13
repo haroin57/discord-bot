@@ -51,7 +51,16 @@ from services.claude_api.mcp_client import (
 )
 from services.claude_api.stall import StallWatchdog
 from services.claude_api.status import _safe_status, _tool_input_hint
-from services.claude_api.tool_loop import AgentLoopResult, run_agent_loop
+from services.claude_api.restricted import (
+    RESTRICTED_DENY_LIST,
+    RESTRICTED_MAX_TURNS,
+    make_can_use_tool,
+)
+from services.claude_api.tool_loop import (
+    AgentLoopResult,
+    kill_orphan_claude_cli,
+    run_agent_loop,
+)
 from services.claude_api.tools import (
     BUILTIN_TOOLS,
     ToolContext,
@@ -113,7 +122,15 @@ __all__ = [
     "execute_builtin_tool",
     # tool_loop (PR6)
     "AgentLoopResult",
+    "kill_orphan_claude_cli",
     "run_agent_loop",
+    # restricted + entry (PR7)
+    "RESTRICTED_DENY_LIST",
+    "RESTRICTED_MAX_TURNS",
+    "call_with_tools",
+    "claude_semaphore",
+    "make_can_use_tool",
+    "restricted_claude_semaphore",
 ]
 
 from config import (
@@ -137,20 +154,15 @@ from services.session import (
 )
 
 # ---------------------------------------------------------------------------
-# Constants (free-code: constants/betas.ts, constants/system.ts)
+# Constants (free-code: constants/betas.ts, constants/system.ts).
+# Moved to services/claude_api/client.py so submodules can import them
+# without a circular dependency through this __init__.
 # ---------------------------------------------------------------------------
-CC_VERSION = "2.1.92"
-CC_ENTRYPOINT = "sdk-py"
-
-# Betas for Opus (free-code: getAllModelBetas)
-MODEL_BETAS = [
-    "claude-code-20250219",       # non-haiku
-    "oauth-2025-04-20",           # OAuth subscriber
-    "interleaved-thinking-2025-05-14",  # ISP
-    "context-1m-2025-08-07",      # 1M context (Opus)
-    "context-management-2025-06-27",
-    "prompt-caching-scope-2026-01-05",  # 1P only
-]
+from services.claude_api.client import (
+    CC_ENTRYPOINT,
+    CC_VERSION,
+    MODEL_BETAS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -161,7 +173,9 @@ _cached_client: anthropic.Anthropic | None = None
 _cached_token: str | None = None
 
 
-_session_id = str(uuid.uuid4())
+# Re-export the single session id from client.py so callers patching this
+# namespace and submodules that need it see the same value.
+from services.claude_api.client import _session_id  # noqa: E402
 
 
 def _get_attribution_header(messages_str: str) -> str:
@@ -427,3 +441,14 @@ async def call_direct(
         if history and history[-1]["role"] == "user":
             history.pop()
         return "❌ APIエラーが発生しました。少し待って再試行してください。"
+
+
+# ---------------------------------------------------------------------------
+# Top-level entry — imported last because entry.py pulls in every submodule
+# above (circular if hoisted earlier).
+# ---------------------------------------------------------------------------
+from services.claude_api.entry import (  # noqa: E402
+    call_with_tools,
+    claude_semaphore,
+    restricted_claude_semaphore,
+)
