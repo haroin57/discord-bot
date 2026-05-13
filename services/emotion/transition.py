@@ -26,6 +26,8 @@ from services.emotion.params import (
     BOUNDS,
     DECAY_QUALITY_MODIFIER_MAX,
     DECAY_QUALITY_MODIFIER_MIN,
+    DECAY_QUALITY_WEIGHT,
+    DECAY_RESPONSIVENESS_WEIGHT,
     EVENT_DELTAS,
     INERTIA,
     LONELINESS_RATE_PER_HOUR,
@@ -50,14 +52,21 @@ def _clamp(value: float, key: str) -> float:
 def _quality_modifier(state: EmotionState) -> float:
     """Return the loneliness/anxiety growth multiplier driven by the last chat.
 
-    `quality * senpai_responsiveness` is interpolated between the MAX
-    (terse/bad chat → faster decay) and MIN (warm/responsive chat →
-    slower decay). A fresh state with no last_interaction yet uses 1.0.
+    Inputs ``quality`` and ``senpai_responsiveness`` are blended via a
+    **weighted average** (not a product) so that a warm-but-unresponsive
+    senpai and a terse-but-responsive one don't collapse to the same value.
+    The blended 0..1 score is then linearly interpolated between MAX
+    (bad chat → faster lonely growth) and MIN (good chat → slower growth).
+    A fresh state with no last_interaction yet uses 1.0.
     """
     li = state.last_interaction
     if li is None or not li.timestamp:
         return 1.0
-    raw = max(0.0, min(1.0, li.quality * li.senpai_responsiveness))
+    blended = (
+        DECAY_QUALITY_WEIGHT * li.quality
+        + DECAY_RESPONSIVENESS_WEIGHT * li.senpai_responsiveness
+    )
+    raw = max(0.0, min(1.0, blended))
     return DECAY_QUALITY_MODIFIER_MAX + raw * (
         DECAY_QUALITY_MODIFIER_MIN - DECAY_QUALITY_MODIFIER_MAX
     )
@@ -68,10 +77,14 @@ def apply_time_decay(state: EmotionState, elapsed_hours: float) -> EmotionState:
 
     Loneliness grows linearly (α * h * quality_modifier, capped at 1.0).
     Anxiety creeps up at a much slower rate (also modulated). Every other
-    component is pulled toward its baseline by repeated inertia blending —
-    one step per whole hour. Fractional hours under 1 still apply the
-    loneliness/anxiety linear growth so a tick after 10 minutes isn't a
-    no-op.
+    component is pulled toward its baseline via exponential mean reversion:
+
+        new = baseline + (cur - baseline) * gamma**elapsed_hours
+
+    The closed-form replaces the previous discrete `for _ in range(steps)`
+    loop: it gives identical math for whole hours, but is continuous in
+    fractional hours (0.5h applies sqrt(gamma) of one step, not nothing),
+    and is O(1) regardless of how long silence lasted.
     """
     if elapsed_hours <= 0:
         return state
@@ -87,16 +100,13 @@ def apply_time_decay(state: EmotionState, elapsed_hours: float) -> EmotionState:
         "anxiety",
     )
 
-    # Mean reversion for the remaining components. We discretize to whole
-    # hours so the result is identical whether the bot ran every minute or
-    # every hour for the same total elapsed time.
-    steps = max(1, int(elapsed_hours))
+    # Mean reversion in closed form: identical to repeated 1-hour blending
+    # for integer hours, but continuous and correct for fractional ones.
     for key in _MEAN_REVERSION_COMPONENTS:
         cur = getattr(new, key)
         baseline = BASELINE[key]
         gamma = INERTIA[key]
-        for _ in range(steps):
-            cur = gamma * cur + (1.0 - gamma) * baseline
+        cur = baseline + (cur - baseline) * (gamma ** elapsed_hours)
         setattr(new, key, _clamp(cur, key))
 
     return new

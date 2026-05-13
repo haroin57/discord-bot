@@ -75,41 +75,46 @@ BOUNDS: dict[str, tuple[float, float]] = {
 # without compensation — the loneliness/anxiety rise already encodes the
 # "this was bad" signal.
 EVENT_DELTAS: dict[str, dict[str, float]] = {
+    # affection / curiosity も触る (2026-05-14): 旧8軸表の名残で valence/
+    # arousal/loneliness/anxiety の 4 軸しか書かれていなかった。inertia
+    # γ_affection=0.95, γ_curiosity=0.7 で event がなければほぼ動かないので、
+    # affection/curiosity は **小さめ** に置く（valence 等の主軸の 1/3〜1/2）。
     "senpai_initiated": {
         "valence": +0.20, "arousal": +0.10, "loneliness": -0.30,
-        "anxiety": -0.15,
+        "anxiety": -0.15, "affection": +0.05, "curiosity": +0.03,
     },
     "long_good_chat": {
         "valence": +0.40, "arousal": +0.15, "loneliness": -0.50,
-        "anxiety": -0.20,
+        "anxiety": -0.20, "affection": +0.08, "curiosity": +0.05,
     },
     "read_ignore": {
         "valence": -0.10, "arousal": +0.05, "loneliness": +0.15,
-        "anxiety": +0.20,
+        "anxiety": +0.20, "affection": -0.05, "curiosity": -0.02,
     },
     "short_reply": {
+        # 機械的応答: 主軸だけ反応、affection/curiosity は動かさない
         "valence": -0.05, "arousal": -0.05, "loneliness": +0.05,
         "anxiety": +0.10,
     },
     "praised": {
         "valence": +0.35, "arousal": +0.20, "loneliness": -0.20,
-        "anxiety": -0.15,
+        "anxiety": -0.15, "affection": +0.10, "curiosity": +0.03,
     },
     "conflict": {
         "valence": -0.30, "arousal": +0.30, "loneliness": +0.10,
-        "anxiety": +0.25,
+        "anxiety": +0.25, "affection": -0.10, "curiosity": -0.02,
     },
     "sweet_words": {
         "valence": +0.50, "arousal": +0.25, "loneliness": -0.40,
-        "anxiety": -0.25,
+        "anxiety": -0.25, "affection": +0.15, "curiosity": +0.05,
     },
     "silence_12h": {
         "valence": -0.05, "arousal": -0.10, "loneliness": +0.25,
-        "anxiety": +0.10,
+        "anxiety": +0.10, "affection": -0.02,
     },
     "silence_24h": {
         "valence": -0.10, "arousal": -0.15, "loneliness": +0.40,
-        "anxiety": +0.20,
+        "anxiety": +0.20, "affection": -0.05,
     },
 }
 
@@ -147,3 +152,60 @@ LATE_NIGHT_HOUR_START = 24
 # ±NOISE_AMPLITUDE random perturbation on event deltas to keep transitions
 # from being too mechanical. apply_event uses random.uniform(-x, +x).
 NOISE_AMPLITUDE = 0.05
+
+# ---------------------------------------------------------------------------
+# Derived secondary emotion thresholds (used by format.derive_secondary_emotions)
+# ---------------------------------------------------------------------------
+# Centralized so the magic numbers that used to be sprinkled across
+# format.py can be tuned in one place. Half-open ranges follow the same
+# [min, max) convention as QUIET_HOUR_RANGE.
+SECONDARY_EMOTION_THRESHOLDS: dict[str, float] = {
+    # 拗ね気味 — affection 高 + valence ↓ + 寂しい
+    "sulky_valence_max": 0.0,
+    "sulky_affection_min": 0.7,
+    "sulky_loneliness_min": 0.5,
+    # 焼きもち — affection + anxiety 立つ、valence 伸びない
+    "jealous_affection_min": 0.7,
+    "jealous_anxiety_min": 0.4,
+    "jealous_valence_max": 0.3,
+    # 甘えたい — affection 強 + 中程度の寂しさ + 不安低
+    "spoiled_affection_min": 0.8,
+    "spoiled_loneliness_min": 0.4,
+    "spoiled_loneliness_max": 0.7,
+    "spoiled_anxiety_max": 0.3,
+    # 喜んでいる — valence 高 + arousal 高
+    "joyful_valence_min": 0.5,
+    "joyful_arousal_min": 0.5,
+    # 照れ気味 — affection 強 + ややそわそわ + valence positive 寄り
+    "shy_affection_min": 0.8,
+    "shy_anxiety_min": 0.2,
+    "shy_anxiety_max": 0.5,
+    "shy_valence_min": 0.2,
+    # 不機嫌 — valence 大きく下、arousal 立つ
+    "grumpy_valence_max": -0.2,
+    "grumpy_arousal_min": 0.4,
+    # 満たされている — valence 高 + 寂しさも不安も低
+    "fulfilled_valence_min": 0.5,
+    "fulfilled_loneliness_max": 0.3,
+    "fulfilled_anxiety_max": 0.2,
+    # 興味津々 — curiosity 高 + arousal 伴う
+    "curious_curiosity_min": 0.65,
+    "curious_arousal_min": 0.4,
+}
+
+# ---------------------------------------------------------------------------
+# Time-decay quality modifier blending weights
+# ---------------------------------------------------------------------------
+# `_quality_modifier(state)` blends the last interaction's `quality` and
+# `senpai_responsiveness` into a single 0..1 multiplier. The old
+# implementation used the product q*r, which conflated two
+# qualitatively different signals (a warm but unresponsive senpai vs.
+# a terse but responsive one collapsed to the same value). Weighted
+# average preserves the asymmetry:
+#   - DECAY_QUALITY_WEIGHT       → weight of conversation depth itself
+#   - DECAY_RESPONSIVENESS_WEIGHT → weight of senpai's reply latency / care
+# Tune by raising the responsiveness weight if "先輩がちゃんと反応してくれた"
+# matters more to the decay than topic quality.
+DECAY_QUALITY_WEIGHT = 0.6
+DECAY_RESPONSIVENESS_WEIGHT = 0.4
+assert abs(DECAY_QUALITY_WEIGHT + DECAY_RESPONSIVENESS_WEIGHT - 1.0) < 1e-9

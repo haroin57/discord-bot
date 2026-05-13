@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from services.emotion.params import SECONDARY_EMOTION_THRESHOLDS as _T
 from services.emotion.state import EmotionState
 
 # ---------------------------------------------------------------------------
@@ -82,29 +83,44 @@ def derive_secondary_emotions(state: EmotionState) -> list[str]:
     so the prompt block stays readable.
     """
     scored: list[tuple[str, float]] = []
+    # All numeric thresholds live in services.emotion.params:
+    # SECONDARY_EMOTION_THRESHOLDS — tune one place, propagates here.
     # 拗ね — affection が高いのに valence が落ちて寂しい
-    if state.valence < 0.0 and state.affection > 0.7 and state.loneliness > 0.5:
+    if (state.valence < _T["sulky_valence_max"]
+            and state.affection > _T["sulky_affection_min"]
+            and state.loneliness > _T["sulky_loneliness_min"]):
         scored.append(("拗ね気味", state.loneliness * state.affection))
     # 焼きもち — affection と anxiety の両方が立ち、valence は伸びない
-    if state.affection > 0.7 and state.anxiety > 0.4 and state.valence < 0.3:
+    if (state.affection > _T["jealous_affection_min"]
+            and state.anxiety > _T["jealous_anxiety_min"]
+            and state.valence < _T["jealous_valence_max"]):
         scored.append(("焼きもち", state.anxiety * state.affection))
     # 甘え — affection 高、寂しさは中程度、不安は低い
-    if state.affection > 0.8 and 0.4 <= state.loneliness <= 0.7 and state.anxiety < 0.3:
+    if (state.affection > _T["spoiled_affection_min"]
+            and _T["spoiled_loneliness_min"] <= state.loneliness <= _T["spoiled_loneliness_max"]
+            and state.anxiety < _T["spoiled_anxiety_max"]):
         scored.append(("甘えたい", state.affection))
     # 喜び — valence と arousal の両方が立つ
-    if state.valence > 0.5 and state.arousal > 0.5:
+    if (state.valence > _T["joyful_valence_min"]
+            and state.arousal > _T["joyful_arousal_min"]):
         scored.append(("喜んでいる", state.valence * state.arousal))
     # 照れ — affection 高、ややそわそわ、valence は positive 寄り
-    if state.affection > 0.8 and 0.2 <= state.anxiety <= 0.5 and state.valence > 0.2:
+    if (state.affection > _T["shy_affection_min"]
+            and _T["shy_anxiety_min"] <= state.anxiety <= _T["shy_anxiety_max"]
+            and state.valence > _T["shy_valence_min"]):
         scored.append(("照れ気味", state.affection - state.anxiety))
     # 不機嫌 — valence 大きく下、arousal が立つ
-    if state.valence < -0.2 and state.arousal > 0.4:
+    if (state.valence < _T["grumpy_valence_max"]
+            and state.arousal > _T["grumpy_arousal_min"]):
         scored.append(("不機嫌", -state.valence * state.arousal))
     # 満たされ — valence 高、寂しさも不安も低い
-    if state.valence > 0.5 and state.loneliness < 0.3 and state.anxiety < 0.2:
+    if (state.valence > _T["fulfilled_valence_min"]
+            and state.loneliness < _T["fulfilled_loneliness_max"]
+            and state.anxiety < _T["fulfilled_anxiety_max"]):
         scored.append(("満たされている", state.valence))
     # 興味津々 — curiosity が高く arousal も伴う
-    if state.curiosity > 0.65 and state.arousal > 0.4:
+    if (state.curiosity > _T["curious_curiosity_min"]
+            and state.arousal > _T["curious_arousal_min"]):
         scored.append(("興味津々", state.curiosity))
 
     scored.sort(key=lambda t: t[1], reverse=True)
