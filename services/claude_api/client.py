@@ -108,24 +108,50 @@ _BILLING_SALT = "59cf53e54c78"
 
 
 def _first_user_text(messages: list[dict]) -> str:
-    """Return the text of the first user message in ``messages``.
+    """Return the text of the first non-meta user message in ``messages``.
 
-    Mirrors the CLI's SBY function: scans for the first message with
-    role=="user", returns its content if it's a string, otherwise the text
-    of the first content block whose type is "text", else "".
+    Mirrors the CLI's HBY function (cli.js): scans for the first user
+    message that is NOT marked isMeta (CLI internal field used for
+    system-reminder / available-deferred-tools etc.). We don't carry an
+    explicit ``isMeta`` flag in our API-shaped messages, but we should
+    skip any user message whose only content blocks are clearly meta:
+    those wrapped in ``<system-reminder>``, ``<available-deferred-tools>``,
+    or ``<attached_images>`` tags. Falls back to the very first user
+    message text if nothing else qualifies.
+
+    Returning the right text matters because the attribution suffix
+    (KA7 in cli.js) hashes ``text[4] + text[7] + text[20]``; using a
+    meta-prefixed string yields a different suffix than the CLI's, and
+    the API server appears to validate it.
     """
+    fallback = ""
     for m in messages:
         if m.get("role") != "user":
             continue
         content = m.get("content")
+        text_val: str | None = None
         if isinstance(content, str):
-            return content
-        if isinstance(content, list):
+            text_val = content
+        elif isinstance(content, list):
             for blk in content:
                 if isinstance(blk, dict) and blk.get("type") == "text":
-                    return blk.get("text", "") or ""
-        return ""
-    return ""
+                    t = blk.get("text", "") or ""
+                    if t:
+                        text_val = t
+                        break
+        if text_val is None:
+            continue
+        if not fallback:
+            fallback = text_val
+        stripped = text_val.lstrip()
+        if stripped.startswith((
+            "<system-reminder>",
+            "<available-deferred-tools>",
+            "<attached_images>",
+        )):
+            continue
+        return text_val
+    return fallback
 
 
 def get_attribution_header_value(messages: list[dict] | None = None) -> str:

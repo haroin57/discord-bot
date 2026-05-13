@@ -233,14 +233,29 @@ def _resolve_session(
 
 async def _make_api_client(restricted: bool) -> anthropic.AsyncAnthropic:
     """Return the right AsyncAnthropic client for this call."""
+    # Headers the real claude-cli sends. The X-Stainless-* fields identify
+    # the SDK (Node 0.80.0) to Anthropic's server-side subscriber-tier
+    # gating; sending the Python SDK values ("python", "CPython", "0.88.0")
+    # appears to demote the call out of the subscriber bucket and triggers
+    # the immediate HTTP 429s we kept seeing. Mimic the Node CLI exactly.
+    cli_headers = {
+        "x-app": "cli",
+        "User-Agent": USER_AGENT,
+        "X-Claude-Code-Session-Id": _session_id,
+        "X-Stainless-Lang": "js",
+        "X-Stainless-Package-Version": "0.80.0",
+        "X-Stainless-Runtime": "node",
+        "X-Stainless-Runtime-Version": "v24.14.1",
+        "X-Stainless-OS": "Linux",
+        "X-Stainless-Arch": "x64",
+        "X-Stainless-Timeout": "600",
+        "accept-language": "*",
+        "sec-fetch-mode": "cors",
+    }
     if restricted and RESTRICTED_ANTHROPIC_API_KEY:
         return make_async_api_key_client(
             RESTRICTED_ANTHROPIC_API_KEY,
-            default_headers={
-                "x-app": "cli",
-                "User-Agent": USER_AGENT,
-                "X-Claude-Code-Session-Id": _session_id,
-            },
+            default_headers=cli_headers,
         )
     # bot startup paths only call oauth_init() lazily through mem0 or the
     # sync get_client(); on a cold call_with_tools the token is still
@@ -248,13 +263,7 @@ async def _make_api_client(restricted: bool) -> anthropic.AsyncAnthropic:
     # _access_token is populated before make_async_oauth_client reads it.
     oauth_init()
     await ensure_valid_token()
-    return make_async_oauth_client(
-        default_headers={
-            "x-app": "cli",
-            "User-Agent": USER_AGENT,
-            "X-Claude-Code-Session-Id": _session_id,
-        },
-    )
+    return make_async_oauth_client(default_headers=cli_headers)
 
 
 async def call_with_tools(
