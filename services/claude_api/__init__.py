@@ -4,6 +4,12 @@ OAuth via oauth_manager (single source of truth), streaming with stall detection
 message normalization, attribution header, metadata.
 
 Reference: free-code/src/services/api/claude.ts, client.ts, constants/betas.ts
+
+PR1 (refactor/claude-api-unify): file -> package migration. Body unchanged from
+the pre-refactor services/claude_api.py to keep test_claude_api.py 100% green
+under monkeypatch.setattr(api_mod, "_cached_client", ...). New submodules
+(errors.py, retry.py, ...) are added in subsequent PRs and import state from
+this __init__ namespace as needed.
 """
 
 import hashlib
@@ -14,6 +20,118 @@ import time
 import uuid
 
 import anthropic
+
+from services.claude_api.errors import (
+    _classify_error,
+    _error_message,
+    _is_transient,
+    _redact_secrets,
+    classify_anthropic_error,
+)
+from services.claude_api.retry import (
+    BASE_BACKOFF_S,
+    DEFAULT_MAX_ATTEMPTS,
+    MAX_BACKOFF_S,
+    TRANSIENT_MAX_ATTEMPTS,
+    check_and_record_retry_budget,
+    compute_backoff,
+)
+from services.claude_api.session_store import (
+    SESSION_TTL_S,
+    _clear_session_time,
+    _is_session_fresh,
+    _record_session_time,
+)
+from services.claude_api.mcp_client import (
+    McpServerHandle,
+    call_mcp_tool,
+    kill_orphan_mcp_processes,
+    mcp_tools_to_anthropic,
+    spawn_servers,
+)
+from services.claude_api.stall import StallWatchdog
+from services.claude_api.status import _safe_status, _tool_input_hint
+from services.claude_api.restricted import (
+    RESTRICTED_DENY_LIST,
+    RESTRICTED_MAX_TURNS,
+    make_can_use_tool,
+)
+from services.claude_api.tool_loop import (
+    AgentLoopResult,
+    kill_orphan_claude_cli,
+    run_agent_loop,
+)
+from services.claude_api.tools import (
+    BUILTIN_TOOLS,
+    ToolContext,
+    ToolDef,
+    builtin_tools_for_api,
+    execute_builtin_tool,
+)
+
+__all__ = [
+    # client / streaming (PR1)
+    "CC_VERSION",
+    "CC_ENTRYPOINT",
+    "MAX_RETRIES",
+    "MODEL_BETAS",
+    "RETRY_BACKOFF_BASE",
+    "_build_cached_system",
+    "_get_attribution_header",
+    "_get_metadata",
+    "_inject_cache_breakpoints",
+    "_retry_backoff_base",
+    "_session_id",
+    "_stream_once",
+    "call_direct",
+    "get_client",
+    "normalize_messages",
+    # errors (PR2)
+    "_classify_error",
+    "_error_message",
+    "_is_transient",
+    "_redact_secrets",
+    "classify_anthropic_error",
+    # retry (PR2)
+    "BASE_BACKOFF_S",
+    "DEFAULT_MAX_ATTEMPTS",
+    "MAX_BACKOFF_S",
+    "TRANSIENT_MAX_ATTEMPTS",
+    "check_and_record_retry_budget",
+    "compute_backoff",
+    # session_store (PR2)
+    "SESSION_TTL_S",
+    "_clear_session_time",
+    "_is_session_fresh",
+    "_record_session_time",
+    # stall + status (PR3)
+    "StallWatchdog",
+    "_safe_status",
+    "_tool_input_hint",
+    # mcp_client (PR4)
+    "McpServerHandle",
+    "call_mcp_tool",
+    "kill_orphan_mcp_processes",
+    "mcp_tools_to_anthropic",
+    "spawn_servers",
+    # tools (PR5)
+    "BUILTIN_TOOLS",
+    "ToolContext",
+    "ToolDef",
+    "builtin_tools_for_api",
+    "execute_builtin_tool",
+    # tool_loop (PR6)
+    "AgentLoopResult",
+    "kill_orphan_claude_cli",
+    "run_agent_loop",
+    # restricted + entry (PR7)
+    "RESTRICTED_DENY_LIST",
+    "RESTRICTED_MAX_TURNS",
+    "call_with_tools",
+    "claude_semaphore",
+    "make_can_use_tool",
+    "restricted_claude_semaphore",
+]
 
 from config import (
     CLAUDE_MAX_TOKENS,
@@ -36,20 +154,15 @@ from services.session import (
 )
 
 # ---------------------------------------------------------------------------
-# Constants (free-code: constants/betas.ts, constants/system.ts)
+# Constants (free-code: constants/betas.ts, constants/system.ts).
+# Moved to services/claude_api/client.py so submodules can import them
+# without a circular dependency through this __init__.
 # ---------------------------------------------------------------------------
-CC_VERSION = "2.1.92"
-CC_ENTRYPOINT = "sdk-py"
-
-# Betas for Opus (free-code: getAllModelBetas)
-MODEL_BETAS = [
-    "claude-code-20250219",       # non-haiku
-    "oauth-2025-04-20",           # OAuth subscriber
-    "interleaved-thinking-2025-05-14",  # ISP
-    "context-1m-2025-08-07",      # 1M context (Opus)
-    "context-management-2025-06-27",
-    "prompt-caching-scope-2026-01-05",  # 1P only
-]
+from services.claude_api.client import (
+    CC_ENTRYPOINT,
+    CC_VERSION,
+    MODEL_BETAS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -60,7 +173,9 @@ _cached_client: anthropic.Anthropic | None = None
 _cached_token: str | None = None
 
 
-_session_id = str(uuid.uuid4())
+# Re-export the single session id from client.py so callers patching this
+# namespace and submodules that need it see the same value.
+from services.claude_api.client import _session_id  # noqa: E402
 
 
 def _get_attribution_header(messages_str: str) -> str:
@@ -326,3 +441,14 @@ async def call_direct(
         if history and history[-1]["role"] == "user":
             history.pop()
         return "❌ APIエラーが発生しました。少し待って再試行してください。"
+
+
+# ---------------------------------------------------------------------------
+# Top-level entry — imported last because entry.py pulls in every submodule
+# above (circular if hoisted earlier).
+# ---------------------------------------------------------------------------
+from services.claude_api.entry import (  # noqa: E402
+    call_with_tools,
+    claude_semaphore,
+    restricted_claude_semaphore,
+)

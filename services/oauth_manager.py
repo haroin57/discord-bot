@@ -288,6 +288,12 @@ def get_access_token() -> str | None:
 # ---------------------------------------------------------------------------
 _patched = False
 
+# Captured before _patch_anthropic_sdk() reassigns __init__, so callers that
+# need the un-patched constructor (e.g. restricted-mode API-key clients in
+# services/claude_api/restricted.py) can bypass OAuth injection cleanly.
+_orig_anthropic_init = None
+_orig_async_anthropic_init = None
+
 
 def _patch_anthropic_sdk() -> None:
     """Monkey-patch anthropic.Anthropic so all instances use OAuth Bearer auth.
@@ -295,15 +301,27 @@ def _patch_anthropic_sdk() -> None:
     Mem0 internally does `anthropic.Anthropic(api_key=...)` which sets the
     x-api-key header. We intercept this to drop api_key and inject auth_token
     + the required beta header instead.
+
+    Only the sync ``Anthropic`` class is patched. ``AsyncAnthropic`` is NOT
+    touched — services/claude_api uses ``make_async_oauth_client()`` below
+    to direct-inject the token instead. Mem0 only uses the sync client.
     """
-    global _patched
+    global _patched, _orig_anthropic_init, _orig_async_anthropic_init
     if _patched:
         return
 
     try:
         import anthropic
 
-        _orig_init = anthropic.Anthropic.__init__
+        _orig_anthropic_init = anthropic.Anthropic.__init__
+        # Capture the async constructor too so make_async_*_client can build
+        # patch-free instances without re-import dance. Defensive getattr so
+        # the existing test harness that mocks `anthropic` with a stub still
+        # works.
+        _async_cls = getattr(anthropic, "AsyncAnthropic", None)
+        _orig_async_anthropic_init = (
+            _async_cls.__init__ if _async_cls is not None else None
+        )
 
         def _oauth_init(self, **kwargs):
             # Drop api_key — we use auth_token directly (NOT env var)
@@ -316,13 +334,67 @@ def _patch_anthropic_sdk() -> None:
                 beta = f"{existing_beta},{OAUTH_BETA_HEADER}".strip(",") if existing_beta else OAUTH_BETA_HEADER
                 headers["anthropic-beta"] = beta
             kwargs["default_headers"] = headers
-            _orig_init(self, **kwargs)
+            _orig_anthropic_init(self, **kwargs)
 
         anthropic.Anthropic.__init__ = _oauth_init
         _patched = True
         log.info("Anthropic SDK patched for OAuth Bearer auth")
     except ImportError:
         log.warning("anthropic package not installed, skipping SDK patch")
+
+
+def _merge_oauth_headers(headers: dict | None) -> dict:
+    out = dict(headers or {})
+    existing_beta = out.get("anthropic-beta", "")
+    if OAUTH_BETA_HEADER not in existing_beta:
+        out["anthropic-beta"] = (
+            f"{existing_beta},{OAUTH_BETA_HEADER}".strip(",")
+            if existing_beta else OAUTH_BETA_HEADER
+        )
+    return out
+
+
+def make_async_oauth_client(**kwargs):
+    """Build an AsyncAnthropic that authenticates via the OAuth Bearer token.
+
+    The sync-side monkey patch does not cover AsyncAnthropic, so this factory
+    direct-injects ``auth_token`` instead of relying on the patch.
+    """
+    import anthropic
+    if _access_token is None:
+        raise RuntimeError("OAuth not initialized; call init() first")
+    kwargs.pop("api_key", None)
+    kwargs["auth_token"] = _access_token
+    kwargs["default_headers"] = _merge_oauth_headers(kwargs.pop("default_headers", None))
+    return anthropic.AsyncAnthropic(**kwargs)
+
+
+def make_async_api_key_client(api_key: str, **kwargs):
+    """Build an AsyncAnthropic that bills against a separate API key.
+
+    Used by the restricted-mode path so non-admin calls do not consume the
+    OAuth subscription quota. Does NOT go through the sync-side OAuth patch.
+    """
+    import anthropic
+    kwargs.pop("auth_token", None)  # never mix
+    kwargs["api_key"] = api_key
+    # OAUTH_BETA_HEADER is OAuth-subscriber-only; for API-key billing we omit it.
+    return anthropic.AsyncAnthropic(**kwargs)
+
+
+def make_sync_api_key_client(api_key: str, **kwargs):
+    """Build a sync ``Anthropic`` client bypassing the OAuth patch.
+
+    Kept for legacy ``call_direct``-style callers that still use the sync
+    SDK and need a different billing account from OAuth.
+    """
+    import anthropic
+    if _orig_anthropic_init is None:
+        # Patch not installed yet — fall back to plain constructor.
+        return anthropic.Anthropic(api_key=api_key, **kwargs)
+    client = anthropic.Anthropic.__new__(anthropic.Anthropic)
+    _orig_anthropic_init(client, api_key=api_key, **kwargs)
+    return client
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,10 @@
-"""Tests for services/claude_sdk.py — call_with_tools with mocked SDK."""
+"""Tests for services/claude_sdk.py — call_with_tools with mocked SDK.
+
+PR8 (refactor/claude-api-unify) flipped the dispatcher default to "api".
+These tests target the SDK-backed legacy implementation, so we force the
+backend back to "sdk" for the duration of this file. The whole module is
+deleted in PR9 along with services/claude_sdk.py itself.
+"""
 
 import asyncio
 import os
@@ -9,6 +15,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from config import needs_tools
+
+
+@pytest.fixture(autouse=True)
+def _force_sdk_backend(monkeypatch):
+    monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
 
 
 # ---------------------------------------------------------------------------
