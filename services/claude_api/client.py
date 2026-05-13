@@ -189,24 +189,25 @@ def _first_user_text(messages: list[dict]) -> str:
 
 
 def get_attribution_header_value(messages: list[dict] | None = None) -> str:
-    """Build the ``x-anthropic-billing-header`` value (no name prefix).
+    """Build the full ``x-anthropic-billing-header: ...`` string.
 
-    Algorithm copied from claude-cli 2.1.92's KA7 function:
+    Algorithm copied from claude-cli 2.1.92's KA7 function (cli.js):
 
-        first_text = first user message's text content
-        picks = first_text[4] + first_text[7] + first_text[20] (each "0" if absent)
+        first_text = first user message's text content (HBY-filtered)
+        picks = first_text[4] + first_text[7] + first_text[20] ("0" if absent)
         suffix = sha256(SALT + picks + VERSION).hex[:3]
-        cc_version = f"{VERSION}.{suffix}"
-        return f"cc_version=...; cc_entrypoint=...; cch=00000;"
 
-    The CLI also embeds this string verbatim as ``system[0]`` — that
-    redundancy is part of the subscriber-tier protocol.
+    The CLI also embeds this string verbatim as ``system[0]`` INCLUDING
+    the ``x-anthropic-billing-header: `` prefix (mitmproxy capture
+    2026-05-13: system[0].text starts with that literal). Stripping the
+    prefix was leaving a 52-char block where the CLI sends 80, byte
+    diff against the expected subscriber-tier signature.
     """
     text = _first_user_text(messages or [])
     picks = "".join((text[i] if len(text) > i else "0") for i in (4, 7, 20))
     raw = f"{_BILLING_SALT}{picks}{CC_VERSION}"
     suffix = hashlib.sha256(raw.encode()).hexdigest()[:3]
     return (
-        f"cc_version={CC_VERSION}.{suffix}; "
+        f"x-anthropic-billing-header: cc_version={CC_VERSION}.{suffix}; "
         f"cc_entrypoint={CC_ENTRYPOINT}; cch=00000;"
     )
