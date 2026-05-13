@@ -28,6 +28,11 @@ import anthropic
 
 from config import CLAUDE_MAX_TOKENS
 
+from services.claude_api.client import (
+    CLI_IDENTITY_TEXT,
+    get_attribution_header_value,
+    get_metadata,
+)
 from services.claude_api.errors import classify_anthropic_error
 from services.claude_api.mcp_client import kill_orphan_mcp_processes
 from services.claude_api.stall import StallWatchdog
@@ -43,12 +48,25 @@ class AgentLoopResult:
     active_mcp_keys: list[str]
 
 
-def _build_cached_system(system_prompt: str) -> list[dict]:
-    """Mirrors the helper in __init__.py — duplicated locally to dodge
-    a circular import (services.claude_api.__init__ imports this module).
+def _build_cached_system(system_prompt: str, messages_str: str = "") -> list[dict]:
+    """Build the 3-block system prompt the OAuth-subscriber path expects.
+
+    Captured from the real claude-cli 2.1.92 (mitmproxy, 2026-05-13):
+
+        system[0] = "x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli; cch=00000;"
+        system[1] = "You are Claude Code, Anthropic's official CLI for Claude."
+        system[2] = <the actual user-supplied system prompt>  (cache_control ephemeral)
+
+    Stripping the first two blocks is what makes the API treat the call as
+    a generic (non-subscriber) OAuth request and return HTTP 429.
     """
-    return [{"type": "text", "text": system_prompt,
-             "cache_control": {"type": "ephemeral"}}]
+    attribution = get_attribution_header_value(messages_str)
+    return [
+        {"type": "text", "text": attribution},
+        {"type": "text", "text": CLI_IDENTITY_TEXT},
+        {"type": "text", "text": system_prompt,
+         "cache_control": {"type": "ephemeral"}},
+    ]
 
 
 def _inject_cache_breakpoints(messages: list[dict]) -> list[dict]:
@@ -140,9 +158,13 @@ async def run_agent_loop(
     last_text = ""
 
     for turn in range(max_turns):
-        cached_system = _build_cached_system(system_prompt)
         messages = _normalize_history_for_api(history)
         messages = _inject_cache_breakpoints(messages)
+        # Pass a stable fingerprint input so the attribution header value is
+        # consistent across retries of the same turn.
+        import json as _json
+        messages_fingerprint = _json.dumps(messages, ensure_ascii=False)[:2000]
+        cached_system = _build_cached_system(system_prompt, messages_fingerprint)
 
         stream_kwargs = dict(
             model=model,
@@ -150,6 +172,7 @@ async def run_agent_loop(
             system=cached_system,
             messages=messages,
             betas=extra_betas,
+            metadata=get_metadata(),
         )
         if tools_for_api:
             stream_kwargs["tools"] = tools_for_api
