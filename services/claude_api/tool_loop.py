@@ -60,21 +60,22 @@ class AgentLoopResult:
 def _build_cached_system(system_prompt: str, messages: list[dict]) -> list[dict]:
     """Build the 4-block system prompt the CLI sends on /v1/messages.
 
-    Captured from the real claude-cli 2.1.92 (mitmproxy, 2026-05-13):
+    Captured from real claude-cli 2.1.92 (mitmproxy, 2026-05-13):
 
         system[0] = attribution header value (no cache)
         system[1] = "You are Claude Code, Anthropic's official CLI for
                      Claude." (no cache)
-        system[2] = the CLI's default 11700-char system prompt
-                     (cache_control={"type":"ephemeral","scope":"global"})
-        system[3] = the caller-supplied system prompt (no cache)
+        system[2] = CLI's 11700-char default agent system prompt
+                    (cache_control={"type":"ephemeral","scope":"global"})
+        system[3] = caller-supplied prompt — for us this is the
+                    concatenation of ~/.claude/CLAUDE.md (global persona)
+                    + discord-bot/CLAUDE.md (Discord-specific override).
+                    No cache; this block changes per session.
 
-    Originally we collapsed system[2] and system[3] into a single block
-    containing only the caller's prompt. That made our system bytes look
-    different from any real CLI request and is the most likely reason
-    the API returned 429 with empty anthropic-ratelimit-unified-*
-    headers (i.e. "subscriber tier not recognized" rather than
-    "exhausted").
+    The CLI default prompt at system[2] is what subscriber-tier gating
+    appears to inspect; the caller's persona prompt at system[3] is the
+    behavior override that wins on conflicts (Anthropic prompts give
+    later system text more weight when they contradict).
     """
     attribution = get_attribution_header_value(messages)
     return [

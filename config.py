@@ -188,10 +188,34 @@ def needs_tools(text: str) -> bool:
 # System prompt
 # ---------------------------------------------------------------------------
 def load_system_prompt() -> str:
+    """Concatenate ~/.claude/CLAUDE.md (global) and discord-bot/CLAUDE.md.
+
+    The global file is the source of truth for the "佐藤かなえ" persona
+    + git safety rules + workflow conventions. The project file is the
+    Discord-specific override and comes last so it wins on conflicts.
+    """
+    parts: list[str] = []
+    global_md = os.path.expanduser("~/.claude/CLAUDE.md")
+    if os.path.isfile(global_md):
+        try:
+            with open(global_md, encoding="utf-8") as f:
+                parts.append(
+                    "# Contents of ~/.claude/CLAUDE.md "
+                    "(global instructions, the persona lives here)\n\n"
+                    + f.read()
+                )
+        except OSError:
+            pass
     claude_md = os.path.join(BOT_DIR, "CLAUDE.md")
     if os.path.isfile(claude_md):
         with open(claude_md, encoding="utf-8") as f:
-            return f.read()
+            parts.append(
+                "# Contents of CLAUDE.md "
+                "(project instructions; Discord-specific adjustments)\n\n"
+                + f.read()
+            )
+    if parts:
+        return "\n\n---\n\n".join(parts)
     return (
         "You are a helpful assistant running as a Discord bot. "
         "Answer concisely. You have full access to the local machine's filesystem and shell. "
