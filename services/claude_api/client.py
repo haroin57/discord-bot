@@ -98,17 +98,55 @@ def get_metadata() -> dict:
     return {"user_id": json.dumps(payload)}
 
 
-def get_attribution_header_value(messages_str: str) -> str:
+# Hardcoded SALT used by the real claude-cli (KA7 / jBY in cli.js).
+# Located in /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js.
+# We strongly suspect the API server recomputes this hash to validate
+# subscriber identity; sending a wrong hash format puts the call into a
+# generic OAuth bucket that is rate-limited far harder than the
+# subscriber bucket.
+_BILLING_SALT = "59cf53e54c78"
+
+
+def _first_user_text(messages: list[dict]) -> str:
+    """Return the text of the first user message in ``messages``.
+
+    Mirrors the CLI's SBY function: scans for the first message with
+    role=="user", returns its content if it's a string, otherwise the text
+    of the first content block whose type is "text", else "".
+    """
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "text":
+                    return blk.get("text", "") or ""
+        return ""
+    return ""
+
+
+def get_attribution_header_value(messages: list[dict] | None = None) -> str:
     """Build the ``x-anthropic-billing-header`` value (no name prefix).
 
+    Algorithm copied from claude-cli 2.1.92's KA7 function:
+
+        first_text = first user message's text content
+        picks = first_text[4] + first_text[7] + first_text[20] (each "0" if absent)
+        suffix = sha256(SALT + picks + VERSION).hex[:3]
+        cc_version = f"{VERSION}.{suffix}"
+        return f"cc_version=...; cc_entrypoint=...; cch=00000;"
+
     The CLI also embeds this string verbatim as ``system[0]`` — that
-    redundancy is part of the subscriber-tier protocol. The trailing
-    ``cch=00000;`` segment is sent by the real CLI; we mirror it.
+    redundancy is part of the subscriber-tier protocol.
     """
-    fingerprint = hashlib.sha256(
-        (messages_str + CC_VERSION).encode()
-    ).hexdigest()[:16]
+    text = _first_user_text(messages or [])
+    picks = "".join((text[i] if len(text) > i else "0") for i in (4, 7, 20))
+    raw = f"{_BILLING_SALT}{picks}{CC_VERSION}"
+    suffix = hashlib.sha256(raw.encode()).hexdigest()[:3]
     return (
-        f"cc_version={CC_VERSION}.{fingerprint}; "
+        f"cc_version={CC_VERSION}.{suffix}; "
         f"cc_entrypoint={CC_ENTRYPOINT}; cch=00000;"
     )

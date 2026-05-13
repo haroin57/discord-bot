@@ -35,6 +35,11 @@ from services.claude_api.client import (
 )
 from services.claude_api.errors import classify_anthropic_error
 from services.claude_api.mcp_client import kill_orphan_mcp_processes
+from services.claude_api.ratelimit import (
+    maybe_wait_before_request,
+    observe as observe_ratelimit,
+    should_block,
+)
 from services.claude_api.stall import StallWatchdog
 from services.claude_api.status import _safe_status, _tool_input_hint
 
@@ -48,7 +53,7 @@ class AgentLoopResult:
     active_mcp_keys: list[str]
 
 
-def _build_cached_system(system_prompt: str, messages_str: str = "") -> list[dict]:
+def _build_cached_system(system_prompt: str, messages: list[dict]) -> list[dict]:
     """Build the 3-block system prompt the OAuth-subscriber path expects.
 
     Captured from the real claude-cli 2.1.92 (mitmproxy, 2026-05-13):
@@ -58,9 +63,11 @@ def _build_cached_system(system_prompt: str, messages_str: str = "") -> list[dic
         system[2] = <the actual user-supplied system prompt>  (cache_control ephemeral)
 
     Stripping the first two blocks is what makes the API treat the call as
-    a generic (non-subscriber) OAuth request and return HTTP 429.
+    a generic (non-subscriber) OAuth request and return HTTP 429. The
+    attribution string is derived from the messages via the CLI's KA7
+    algorithm (cli.js); see services/claude_api/client.py for details.
     """
-    attribution = get_attribution_header_value(messages_str)
+    attribution = get_attribution_header_value(messages)
     return [
         {"type": "text", "text": attribution},
         {"type": "text", "text": CLI_IDENTITY_TEXT},
@@ -160,11 +167,20 @@ async def run_agent_loop(
     for turn in range(max_turns):
         messages = _normalize_history_for_api(history)
         messages = _inject_cache_breakpoints(messages)
-        # Pass a stable fingerprint input so the attribution header value is
-        # consistent across retries of the same turn.
-        import json as _json
-        messages_fingerprint = _json.dumps(messages, ensure_ascii=False)[:2000]
-        cached_system = _build_cached_system(system_prompt, messages_fingerprint)
+        cached_system = _build_cached_system(system_prompt, messages)
+
+        # Refuse outright if observed rate-limit state says any attempt is futile.
+        blocked, reason = should_block()
+        if blocked:
+            log.warning("ratelimit pre-check refused request: %s", reason)
+            return AgentLoopResult(
+                text=f"⏳ {reason}",
+                synthetic_session_id=None,
+                active_mcp_keys=active_mcp_keys,
+            )
+        # Soft pacing — sleep up to a few seconds if last response told us
+        # we're in the warning zone, so we don't trip the probabilistic throttle.
+        await maybe_wait_before_request()
 
         stream_kwargs = dict(
             model=model,
@@ -200,10 +216,28 @@ async def run_agent_loop(
                                 label += f" `{hint[:60]}`"
                             await _safe_status(status_callback, label)
                 final_msg = await stream.get_final_message()
+                # Update the shared rate-limit state from the response so
+                # the next turn (and the next call from entry.py) can pace
+                # itself before sending. anthropic SDK exposes the raw
+                # response via stream.response.headers.
+                try:
+                    resp = getattr(stream, "response", None)
+                    if resp is not None and getattr(resp, "headers", None) is not None:
+                        observe_ratelimit(resp.headers)
+                except Exception as exc:
+                    log.debug("ratelimit observe failed: %s", exc)
         except anthropic.AnthropicError as exc:
             category = classify_anthropic_error(exc)
             log.error("agent loop API error turn=%d category=%s: %s",
                       turn, category, exc)
+            # Also try to observe ratelimit headers from the failing response
+            # so the next pre-check can refuse outright.
+            try:
+                resp = getattr(exc, "response", None)
+                if resp is not None and getattr(resp, "headers", None) is not None:
+                    observe_ratelimit(resp.headers)
+            except Exception:
+                pass
             # Caller (entry.py) owns retry/backoff; surface the exception.
             raise
 

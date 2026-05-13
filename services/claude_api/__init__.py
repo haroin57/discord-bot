@@ -49,6 +49,13 @@ from services.claude_api.mcp_client import (
     mcp_tools_to_anthropic,
     spawn_servers,
 )
+from services.claude_api.ratelimit import (
+    RateLimitState,
+    get_state as get_ratelimit_state,
+    maybe_wait_before_request,
+    observe as observe_ratelimit,
+    should_block as ratelimit_should_block,
+)
 from services.claude_api.stall import StallWatchdog
 from services.claude_api.status import _safe_status, _tool_input_hint
 from services.claude_api.restricted import (
