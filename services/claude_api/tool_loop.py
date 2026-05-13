@@ -118,18 +118,44 @@ def _block_to_dict(block) -> dict:
     if btype == "text":
         return {"type": "text", "text": getattr(block, "text", "")}
     if btype == "tool_use":
-        return {
+        out = {
             "type": "tool_use",
             "id": getattr(block, "id", ""),
             "name": getattr(block, "name", ""),
             "input": getattr(block, "input", None) or {},
         }
+        # CLI capture (mitmproxy 2026-05-13) showed tool_use blocks
+        # round-tripping with a "caller" field present. Preserve it if
+        # the SDK exposed it so 2nd-turn requests are byte-shape-equal
+        # to what the CLI emits.
+        caller = getattr(block, "caller", None)
+        if caller is not None:
+            # caller may be a Pydantic model with .model_dump
+            if hasattr(caller, "model_dump"):
+                out["caller"] = caller.model_dump()
+            else:
+                out["caller"] = caller
+        return out
     if btype == "thinking":
-        # Anthropic round-trips thinking content; keep it as-is for the next turn.
-        return {
+        # Anthropic round-trips thinking content; the API REQUIRES the
+        # signature field on the way back, or it returns HTTP 400
+        # "thinking.signature: Field required" on the next turn.
+        out = {
             "type": "thinking",
             "thinking": getattr(block, "thinking", ""),
         }
+        sig = getattr(block, "signature", None)
+        if sig is not None:
+            out["signature"] = sig
+        return out
+    if btype == "redacted_thinking":
+        # Same story for redacted_thinking blocks — keep the data field
+        # so we can echo it back next turn.
+        out = {"type": "redacted_thinking"}
+        data = getattr(block, "data", None)
+        if data is not None:
+            out["data"] = data
+        return out
     # Unknown / future block type — best effort.
     if hasattr(block, "model_dump"):
         return block.model_dump()
