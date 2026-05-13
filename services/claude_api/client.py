@@ -86,19 +86,26 @@ _user_account_cache: dict | None = None
 
 
 def get_metadata() -> dict:
-    """Build the full ``metadata`` object the API expects from OAuth subscribers.
+    """Build the ``metadata`` object the API expects from OAuth subscribers.
 
-    The CLI sends a JSON-encoded ``user_id`` containing device_id +
-    account_uuid + session_id. Anything less and the API does not recognize
-    the call as subscriber-tier (observed: HTTP 429 instead of 200).
+    Byte-exact mimic of the CLI: the ``user_id`` JSON string is built with
+    keys in the order ``device_id, account_uuid, session_id`` and with
+    ``json.dumps(..., separators=(',', ':'))`` so there are no spaces. We
+    suspect the server hashes / compares this string verbatim for
+    subscriber identification — Python's default ``json.dumps`` reorders
+    by insertion and inserts spaces, both of which differ from JS's
+    ``JSON.stringify`` output.
     """
     account = _read_claude_user_account()
-    payload = {"session_id": _session_id}
+    # The order matters: CLI sends device_id first, then account_uuid, then
+    # session_id. We construct an OrderedDict-equivalent via insertion order.
+    payload: dict[str, str] = {}
     if account.get("device_id"):
         payload["device_id"] = account["device_id"]
     if account.get("account_uuid"):
         payload["account_uuid"] = account["account_uuid"]
-    return {"user_id": json.dumps(payload)}
+    payload["session_id"] = _session_id
+    return {"user_id": json.dumps(payload, separators=(",", ":"))}
 
 
 # Hardcoded SALT used by the real claude-cli (KA7 / jBY in cli.js).

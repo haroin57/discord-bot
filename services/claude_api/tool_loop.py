@@ -61,21 +61,22 @@ def _build_cached_system(system_prompt: str, messages: list[dict]) -> list[dict]
 
     Captured from the real claude-cli 2.1.92 (mitmproxy, 2026-05-13):
 
-        system[0] = "x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli; cch=00000;"
-        system[1] = "You are Claude Code, Anthropic's official CLI for Claude."
-        system[2] = <the actual user-supplied system prompt>  (cache_control ephemeral)
+        system[0] = attribution header value (no cache)
+        system[1] = "You are Claude Code, Anthropic's official CLI for Claude." (no cache)
+        system[2] = the user-supplied system prompt with
+                    cache_control={"type":"ephemeral","scope":"global"}
 
-    Stripping the first two blocks is what makes the API treat the call as
-    a generic (non-subscriber) OAuth request and return HTTP 429. The
-    attribution string is derived from the messages via the CLI's KA7
-    algorithm (cli.js); see services/claude_api/client.py for details.
+    The ``scope: "global"`` field is from the ``prompt-caching-scope-
+    2026-01-05`` beta. CLI sends it; omitting it makes our request a
+    byte-mismatched copy of CLI's, which appears to demote subscriber
+    identification.
     """
     attribution = get_attribution_header_value(messages)
     return [
         {"type": "text", "text": attribution},
         {"type": "text", "text": CLI_IDENTITY_TEXT},
         {"type": "text", "text": system_prompt,
-         "cache_control": {"type": "ephemeral"}},
+         "cache_control": {"type": "ephemeral", "scope": "global"}},
     ]
 
 
