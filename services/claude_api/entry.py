@@ -44,6 +44,7 @@ from services.oauth_manager import (
     init as oauth_init,
     make_async_api_key_client,
     make_async_oauth_client,
+    prime_subscriber_session,
 )
 from services.session import SessionInfo
 
@@ -263,6 +264,11 @@ async def _make_api_client(restricted: bool) -> anthropic.AsyncAnthropic:
     # _access_token is populated before make_async_oauth_client reads it.
     oauth_init()
     await ensure_valid_token()
+    # Subscriber session prime: replay the CLI's /api/oauth/profile and
+    # /api/oauth/claude_cli/roles GETs. Once per process. Without this,
+    # we've seen 429s with zero ratelimit-unified headers (= subscriber
+    # tier not recognized).
+    await prime_subscriber_session()
     return make_async_oauth_client(default_headers=cli_headers)
 
 

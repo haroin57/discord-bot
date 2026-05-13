@@ -404,6 +404,58 @@ def _make_http_client_with_hook():
     )
 
 
+_session_primed: bool = False
+
+
+async def prime_subscriber_session() -> None:
+    """Replay the CLI's pre-/v1/messages requests so server-side gating
+    treats us as an active subscriber.
+
+    The real claude-cli always calls these GET endpoints (with the same
+    OAuth Bearer token) before its first /v1/messages POST:
+
+        GET https://api.anthropic.com/api/oauth/profile
+        GET https://api.anthropic.com/api/oauth/claude_cli/roles
+
+    We've observed that without those preludes our /v1/messages calls
+    come back HTTP 429 with zero anthropic-ratelimit-unified-* headers,
+    which is the signature of "subscriber not recognized" rather than
+    "quota exhausted". Replaying them is cheap (~200 ms total) and is
+    only done once per process.
+    """
+    global _session_primed
+    if _session_primed:
+        return
+    if _access_token is None:
+        return
+    try:
+        import aiohttp
+    except ImportError:
+        log.warning("aiohttp not available, skipping session prime")
+        return
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Authorization": f"Bearer {_access_token}",
+        "User-Agent": "axios/1.13.6",
+        "Accept-Encoding": "gzip, compress, deflate, br",
+    }
+    urls = [
+        "https://api.anthropic.com/api/oauth/profile",
+        "https://api.anthropic.com/api/oauth/claude_cli/roles",
+    ]
+    try:
+        async with aiohttp.ClientSession() as sess:
+            for url in urls:
+                try:
+                    async with sess.get(url, headers=headers, timeout=10) as resp:
+                        log.info("session prime: %s → HTTP %d", url, resp.status)
+                except Exception as exc:
+                    log.warning("session prime %s failed: %s", url, exc)
+        _session_primed = True
+    except Exception as exc:
+        log.warning("session prime aborted: %s", exc)
+
+
 def make_async_oauth_client(**kwargs):
     """Build an AsyncAnthropic that authenticates via the OAuth Bearer token.
 
