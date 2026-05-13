@@ -344,6 +344,15 @@ def _patch_anthropic_sdk() -> None:
 
 
 def _merge_oauth_headers(headers: dict | None) -> dict:
+    """Merge OAuth-required headers into the caller-supplied dict.
+
+    Adds:
+    - ``anthropic-beta: oauth-2025-04-20`` (subscriber-tier flag).
+    - ``anthropic-dangerous-direct-browser-access: true`` — the real CLI
+      sends this on every OAuth-authenticated request (mitmproxy capture
+      2026-05-13). Absence appears to be what triggered HTTP 429 on
+      first-call from our refactor smoke.
+    """
     out = dict(headers or {})
     existing_beta = out.get("anthropic-beta", "")
     if OAUTH_BETA_HEADER not in existing_beta:
@@ -351,6 +360,7 @@ def _merge_oauth_headers(headers: dict | None) -> dict:
             f"{existing_beta},{OAUTH_BETA_HEADER}".strip(",")
             if existing_beta else OAUTH_BETA_HEADER
         )
+    out.setdefault("anthropic-dangerous-direct-browser-access", "true")
     return out
 
 
@@ -373,12 +383,12 @@ def make_async_api_key_client(api_key: str, **kwargs):
     """Build an AsyncAnthropic that bills against a separate API key.
 
     Used by the restricted-mode path so non-admin calls do not consume the
-    OAuth subscription quota. Does NOT go through the sync-side OAuth patch.
+    OAuth subscription quota. Does NOT go through the sync-side OAuth patch
+    and does NOT add OAUTH_BETA_HEADER (subscriber-tier only).
     """
     import anthropic
     kwargs.pop("auth_token", None)  # never mix
     kwargs["api_key"] = api_key
-    # OAUTH_BETA_HEADER is OAuth-subscriber-only; for API-key billing we omit it.
     return anthropic.AsyncAnthropic(**kwargs)
 
 

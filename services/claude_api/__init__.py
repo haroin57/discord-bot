@@ -205,10 +205,14 @@ def get_client() -> anthropic.Anthropic:
     if _cached_client is not None and current_token == _cached_token:
         return _cached_client
 
+    # Match the real claude-cli 2.1.92 headers captured via mitmproxy
+    # (2026-05-13). The dangerous-direct-browser-access flag + the
+    # OAUTH_BETA_HEADER are added inside oauth_manager._merge_oauth_headers.
+    from services.claude_api.client import USER_AGENT
     _cached_client = anthropic.Anthropic(
         default_headers={
             "x-app": "cli",
-            "User-Agent": f"claude-cli/{CC_VERSION} (external, {CC_ENTRYPOINT})",
+            "User-Agent": USER_AGENT,
             "X-Claude-Code-Session-Id": _session_id,
         },
         timeout=600.0,

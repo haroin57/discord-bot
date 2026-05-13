@@ -49,6 +49,7 @@ from services.session import SessionInfo
 from services.claude_api.client import (
     CC_VERSION,
     MODEL_BETAS,
+    USER_AGENT,
     _session_id,
 )
 from services.claude_api.errors import (
@@ -232,12 +233,19 @@ def _resolve_session(
 async def _make_api_client(restricted: bool) -> anthropic.AsyncAnthropic:
     """Return the right AsyncAnthropic client for this call."""
     if restricted and RESTRICTED_ANTHROPIC_API_KEY:
-        return make_async_api_key_client(RESTRICTED_ANTHROPIC_API_KEY)
+        return make_async_api_key_client(
+            RESTRICTED_ANTHROPIC_API_KEY,
+            default_headers={
+                "x-app": "cli",
+                "User-Agent": USER_AGENT,
+                "X-Claude-Code-Session-Id": _session_id,
+            },
+        )
     await ensure_valid_token()
     return make_async_oauth_client(
         default_headers={
             "x-app": "cli",
-            "User-Agent": f"claude-cli/{CC_VERSION} (external, sdk-py)",
+            "User-Agent": USER_AGENT,
             "X-Claude-Code-Session-Id": _session_id,
         },
     )
