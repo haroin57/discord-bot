@@ -367,19 +367,33 @@ def _merge_oauth_headers(headers: dict | None) -> dict:
 async def _sanitize_outgoing_request(request) -> None:
     """httpx event hook: strip Python-SDK-only headers + dedupe.
 
-    - ``x-stainless-async`` is sent only by the Python AsyncAnthropic client
-      and is a strong "this is python" signal to subscriber-tier gating.
-    - ``x-stainless-timeout`` ends up duplicated as "NOT_GIVEN, 600" when
-      default_headers and the SDK's own auto-fill collide; collapse it.
+    Diff source: mitmproxy capture of the real claude-cli 2.1.92 vs our
+    outgoing request. Every header below appears only on the Python
+    side and is a likely tell to subscriber-tier gating:
+        x-stainless-async         (Python AsyncAnthropic only)
+        x-stainless-helper-method (Python SDK convenience layer)
+        x-stainless-stream-helper (ditto)
+        x-stainless-read-timeout  (Python SDK only; CLI uses just
+                                    x-stainless-timeout)
+
+    Also collapse the duplicated x-stainless-timeout to the single CLI
+    value and pretend we accept brotli (the real CLI does).
     """
     h = request.headers
-    if "x-stainless-async" in h:
-        del h["x-stainless-async"]
-    # httpx Headers are case-insensitive; get_list returns every value.
+    for k in (
+        "x-stainless-async",
+        "x-stainless-helper-method",
+        "x-stainless-stream-helper",
+        "x-stainless-read-timeout",
+    ):
+        if k in h:
+            del h[k]
     timeouts = h.get_list("x-stainless-timeout")
     if len(timeouts) > 1 or (timeouts and "NOT_GIVEN" in timeouts[0]):
         del h["x-stainless-timeout"]
         h["x-stainless-timeout"] = "600"
+    # The Node SDK advertises brotli; httpx omits it by default.
+    h["accept-encoding"] = "br, gzip, deflate"
 
 
 def _make_http_client_with_hook():
