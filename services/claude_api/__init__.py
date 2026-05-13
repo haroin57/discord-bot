@@ -51,6 +51,13 @@ from services.claude_api.mcp_client import (
 )
 from services.claude_api.stall import StallWatchdog
 from services.claude_api.status import _safe_status, _tool_input_hint
+from services.claude_api.tools import (
+    BUILTIN_TOOLS,
+    ToolContext,
+    ToolDef,
+    builtin_tools_for_api,
+    execute_builtin_tool,
+)
 
 __all__ = [
     # client / streaming (PR1)
@@ -97,6 +104,12 @@ __all__ = [
     "kill_orphan_mcp_processes",
     "mcp_tools_to_anthropic",
     "spawn_servers",
+    # tools (PR5)
+    "BUILTIN_TOOLS",
+    "ToolContext",
+    "ToolDef",
+    "builtin_tools_for_api",
+    "execute_builtin_tool",
 ]
 
 from config import (
