@@ -51,6 +51,7 @@ from services.claude_api.mcp_client import (
 )
 from services.claude_api.stall import StallWatchdog
 from services.claude_api.status import _safe_status, _tool_input_hint
+from services.claude_api.tool_loop import AgentLoopResult, run_agent_loop
 from services.claude_api.tools import (
     BUILTIN_TOOLS,
     ToolContext,
@@ -110,6 +111,9 @@ __all__ = [
     "ToolDef",
     "builtin_tools_for_api",
     "execute_builtin_tool",
+    # tool_loop (PR6)
+    "AgentLoopResult",
+    "run_agent_loop",
 ]
 
 from config import (
