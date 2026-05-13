@@ -51,6 +51,30 @@ _session_id = str(uuid.uuid4())
 CLI_IDENTITY_TEXT = "You are Claude Code, Anthropic's official CLI for Claude."
 
 
+def _load_cli_default_system_prompt() -> str:
+    """The CLI's default agent system prompt (system[2] in mitm capture).
+
+    Pinned verbatim from the real claude-cli 2.1.92 against /v1/messages
+    on model=claude-opus-4-6. Sending this block at system[2] (with
+    ``cache_control={"type":"ephemeral","scope":"global"}``) appears to
+    be required for subscriber-tier identification — without it the
+    server returns 429 with zero ratelimit-unified headers.
+    """
+    import os as _os
+    path = _os.path.join(_os.path.dirname(__file__),
+                         "cli_default_system_prompt.txt")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as exc:
+        log.warning("could not load CLI default system prompt at %s: %s",
+                    path, exc)
+        return ""
+
+
+CLI_DEFAULT_SYSTEM_PROMPT = _load_cli_default_system_prompt()
+
+
 def _read_claude_user_account() -> dict:
     """Return ``{"device_id": str, "account_uuid": str}`` for metadata.user_id.
 

@@ -30,6 +30,7 @@ from config import CLAUDE_MAX_TOKENS
 
 from services.claude_api.client import (
     CLAUDE_MAX_TOKENS_OPUS,
+    CLI_DEFAULT_SYSTEM_PROMPT,
     CLI_IDENTITY_TEXT,
     OUTPUT_CONFIG,
     THINKING_CONFIG,
@@ -57,26 +58,31 @@ class AgentLoopResult:
 
 
 def _build_cached_system(system_prompt: str, messages: list[dict]) -> list[dict]:
-    """Build the 3-block system prompt the OAuth-subscriber path expects.
+    """Build the 4-block system prompt the CLI sends on /v1/messages.
 
     Captured from the real claude-cli 2.1.92 (mitmproxy, 2026-05-13):
 
         system[0] = attribution header value (no cache)
-        system[1] = "You are Claude Code, Anthropic's official CLI for Claude." (no cache)
-        system[2] = the user-supplied system prompt with
-                    cache_control={"type":"ephemeral","scope":"global"}
+        system[1] = "You are Claude Code, Anthropic's official CLI for
+                     Claude." (no cache)
+        system[2] = the CLI's default 11700-char system prompt
+                     (cache_control={"type":"ephemeral","scope":"global"})
+        system[3] = the caller-supplied system prompt (no cache)
 
-    The ``scope: "global"`` field is from the ``prompt-caching-scope-
-    2026-01-05`` beta. CLI sends it; omitting it makes our request a
-    byte-mismatched copy of CLI's, which appears to demote subscriber
-    identification.
+    Originally we collapsed system[2] and system[3] into a single block
+    containing only the caller's prompt. That made our system bytes look
+    different from any real CLI request and is the most likely reason
+    the API returned 429 with empty anthropic-ratelimit-unified-*
+    headers (i.e. "subscriber tier not recognized" rather than
+    "exhausted").
     """
     attribution = get_attribution_header_value(messages)
     return [
         {"type": "text", "text": attribution},
         {"type": "text", "text": CLI_IDENTITY_TEXT},
-        {"type": "text", "text": system_prompt,
+        {"type": "text", "text": CLI_DEFAULT_SYSTEM_PROMPT,
          "cache_control": {"type": "ephemeral", "scope": "global"}},
+        {"type": "text", "text": system_prompt},
     ]
 
 
