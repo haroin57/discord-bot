@@ -42,6 +42,8 @@ from services.claude_api.session_store import (
     _is_session_fresh,
     _record_session_time,
 )
+from services.claude_api.stall import StallWatchdog
+from services.claude_api.status import _safe_status, _tool_input_hint
 
 __all__ = [
     # client / streaming (PR1)
@@ -78,6 +80,10 @@ __all__ = [
     "_clear_session_time",
     "_is_session_fresh",
     "_record_session_time",
+    # stall + status (PR3)
+    "StallWatchdog",
+    "_safe_status",
+    "_tool_input_hint",
 ]
 
 from config import (
