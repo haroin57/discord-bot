@@ -173,8 +173,14 @@ class TestResolveSession:
 # Dispatcher (claude_sdk.py wrapper)
 # ---------------------------------------------------------------------------
 class TestDispatcher:
-    def test_default_backend_is_sdk(self, monkeypatch):
+    def test_default_backend_is_api(self, monkeypatch):
+        # PR8: default flipped from "sdk" to "api". Rollback path is env var.
         monkeypatch.delenv("CLAUDE_BACKEND", raising=False)
+        from services import claude_sdk
+        assert claude_sdk._backend() == "api"
+
+    def test_explicit_sdk_backend_works(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
         from services import claude_sdk
         assert claude_sdk._backend() == "sdk"
 

@@ -819,7 +819,9 @@ _legacy_kill_orphan_claude_cli = kill_orphan_claude_cli
 
 
 def _backend() -> str:
-    return os.environ.get("CLAUDE_BACKEND", "sdk").lower()
+    # PR8 (refactor/claude-api-unify): flipped default from "sdk" to "api".
+    # Rollback: set CLAUDE_BACKEND=sdk in the environment.
+    return os.environ.get("CLAUDE_BACKEND", "api").lower()
 
 
 async def call_with_tools(*args, **kwargs):
