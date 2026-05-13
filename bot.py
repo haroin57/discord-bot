@@ -28,6 +28,7 @@ from config import (
     MEM0_MIN_QUERY_LENGTH,
     RESTRICTED_COOLDOWN_SECONDS,
     RESTRICTED_DAILY_QUOTA,
+    STATE_DIR,
 )
 from services.claude_sdk import _is_session_fresh, call_with_tools, kill_orphan_claude_cli
 from services.mem0_service import add_memories, format_memories_for_prompt, search_memories, search_memories_smart
