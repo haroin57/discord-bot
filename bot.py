@@ -608,6 +608,23 @@ async def on_message(message: discord.Message):
         else:
             mem0_task = None
 
+        # Emotion state — read-only here, admin only. Off the hot path via
+        # to_thread because load_state does sync file I/O. Non-admin returns
+        # None so neither the file is read nor the block injected.
+        async def _load_emotion():
+            if not caller_is_admin:
+                return None
+            try:
+                from pathlib import Path as _Path
+                from services.emotion.state import load_state as _load_state
+                return await asyncio.to_thread(
+                    _load_state, _Path(STATE_DIR) / "kanae_emotion.json",
+                )
+            except Exception as exc:
+                log.warning("emotion load failed (non-fatal): %s", exc)
+                return None
+        emotion_task: asyncio.Task | None = asyncio.create_task(_load_emotion())
+
         reply_context, ref_attachments = await reply_task
         all_attachments = list(message.attachments) + ref_attachments
         http_session = await get_http_session()
@@ -776,6 +793,23 @@ async def on_message(message: discord.Message):
             except Exception as e:
                 log.warning("Mem0 recall failed (non-fatal): %s", e)
 
+        # Emotion state — admin only, prepended *before* mem0/header so the
+        # model reads its own internal state first. emotion_task was started
+        # alongside the Mem0 task above; non-admins always get None.
+        emotion_state = None
+        try:
+            emotion_state = await emotion_task
+        except Exception as exc:
+            log.warning("emotion task failed (non-fatal): %s", exc)
+        if emotion_state is not None:
+            try:
+                from services.emotion.format import format_emotion_for_prompt
+                kanae_block = format_emotion_for_prompt(emotion_state)
+                if kanae_block:
+                    prompt = f"{kanae_block}\n\n{prompt}"
+            except Exception as exc:
+                log.warning("emotion block render failed (non-fatal): %s", exc)
+
         # Final global size cap to bound cost and context.
         prompt = _cap_text(prompt, MAX_PROMPT_CHARS)
 
@@ -920,6 +954,22 @@ async def on_message(message: discord.Message):
                     )
 
             _track_task(_mem0_store(), name="mem0_store")
+
+            # Emotion feedback — analyze this turn + persist new state.
+            # Same admin gate as Mem0 (non-admin neither reads nor writes
+            # emotion state). Fire-and-forget; never blocks the response.
+            async def _emotion_feedback():
+                try:
+                    from services.emotion.feedback import schedule_feedback
+                    await schedule_feedback(
+                        user_text=raw_user_text,
+                        assistant_text=response_text,
+                        state_dir=STATE_DIR,
+                    )
+                except Exception as exc:
+                    log.warning("emotion feedback failed (non-fatal): %s", exc)
+
+            _track_task(_emotion_feedback(), name="emotion_feedback")
 
         # Extract file paths from response. For non-admin sessions the
         # model has no file-system tools, so any path it "outputs" can only
