@@ -4,6 +4,12 @@ OAuth via oauth_manager (single source of truth), streaming with stall detection
 message normalization, attribution header, metadata.
 
 Reference: free-code/src/services/api/claude.ts, client.ts, constants/betas.ts
+
+PR1 (refactor/claude-api-unify): file -> package migration. Body unchanged from
+the pre-refactor services/claude_api.py to keep test_claude_api.py 100% green
+under monkeypatch.setattr(api_mod, "_cached_client", ...). New submodules
+(errors.py, retry.py, ...) are added in subsequent PRs and import state from
+this __init__ namespace as needed.
 """
 
 import hashlib
@@ -14,6 +20,24 @@ import time
 import uuid
 
 import anthropic
+
+__all__ = [
+    "CC_VERSION",
+    "CC_ENTRYPOINT",
+    "MAX_RETRIES",
+    "MODEL_BETAS",
+    "RETRY_BACKOFF_BASE",
+    "_build_cached_system",
+    "_get_attribution_header",
+    "_get_metadata",
+    "_inject_cache_breakpoints",
+    "_retry_backoff_base",
+    "_session_id",
+    "_stream_once",
+    "call_direct",
+    "get_client",
+    "normalize_messages",
+]
 
 from config import (
     CLAUDE_MAX_TOKENS,
