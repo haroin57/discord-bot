@@ -21,7 +21,30 @@ import uuid
 
 import anthropic
 
+from services.claude_api.errors import (
+    _classify_error,
+    _error_message,
+    _is_transient,
+    _redact_secrets,
+    classify_anthropic_error,
+)
+from services.claude_api.retry import (
+    BASE_BACKOFF_S,
+    DEFAULT_MAX_ATTEMPTS,
+    MAX_BACKOFF_S,
+    TRANSIENT_MAX_ATTEMPTS,
+    check_and_record_retry_budget,
+    compute_backoff,
+)
+from services.claude_api.session_store import (
+    SESSION_TTL_S,
+    _clear_session_time,
+    _is_session_fresh,
+    _record_session_time,
+)
+
 __all__ = [
+    # client / streaming (PR1)
     "CC_VERSION",
     "CC_ENTRYPOINT",
     "MAX_RETRIES",
@@ -37,6 +60,24 @@ __all__ = [
     "call_direct",
     "get_client",
     "normalize_messages",
+    # errors (PR2)
+    "_classify_error",
+    "_error_message",
+    "_is_transient",
+    "_redact_secrets",
+    "classify_anthropic_error",
+    # retry (PR2)
+    "BASE_BACKOFF_S",
+    "DEFAULT_MAX_ATTEMPTS",
+    "MAX_BACKOFF_S",
+    "TRANSIENT_MAX_ATTEMPTS",
+    "check_and_record_retry_budget",
+    "compute_backoff",
+    # session_store (PR2)
+    "SESSION_TTL_S",
+    "_clear_session_time",
+    "_is_session_fresh",
+    "_record_session_time",
 ]
 
 from config import (
