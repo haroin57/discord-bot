@@ -42,6 +42,13 @@ from services.claude_api.session_store import (
     _is_session_fresh,
     _record_session_time,
 )
+from services.claude_api.mcp_client import (
+    McpServerHandle,
+    call_mcp_tool,
+    kill_orphan_mcp_processes,
+    mcp_tools_to_anthropic,
+    spawn_servers,
+)
 from services.claude_api.stall import StallWatchdog
 from services.claude_api.status import _safe_status, _tool_input_hint
 
@@ -84,6 +91,12 @@ __all__ = [
     "StallWatchdog",
     "_safe_status",
     "_tool_input_hint",
+    # mcp_client (PR4)
+    "McpServerHandle",
+    "call_mcp_tool",
+    "kill_orphan_mcp_processes",
+    "mcp_tools_to_anthropic",
+    "spawn_servers",
 ]
 
 from config import (
