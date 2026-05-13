@@ -41,6 +41,7 @@ from config import (
 )
 from services.oauth_manager import (
     ensure_valid_token,
+    init as oauth_init,
     make_async_api_key_client,
     make_async_oauth_client,
 )
@@ -241,6 +242,11 @@ async def _make_api_client(restricted: bool) -> anthropic.AsyncAnthropic:
                 "X-Claude-Code-Session-Id": _session_id,
             },
         )
+    # bot startup paths only call oauth_init() lazily through mem0 or the
+    # sync get_client(); on a cold call_with_tools the token is still
+    # uninitialized. Idempotent init() before ensure_valid_token() guarantees
+    # _access_token is populated before make_async_oauth_client reads it.
+    oauth_init()
     await ensure_valid_token()
     return make_async_oauth_client(
         default_headers={
