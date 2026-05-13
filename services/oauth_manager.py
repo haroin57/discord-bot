@@ -364,11 +364,39 @@ def _merge_oauth_headers(headers: dict | None) -> dict:
     return out
 
 
+async def _sanitize_outgoing_request(request) -> None:
+    """httpx event hook: strip Python-SDK-only headers + dedupe.
+
+    - ``x-stainless-async`` is sent only by the Python AsyncAnthropic client
+      and is a strong "this is python" signal to subscriber-tier gating.
+    - ``x-stainless-timeout`` ends up duplicated as "NOT_GIVEN, 600" when
+      default_headers and the SDK's own auto-fill collide; collapse it.
+    """
+    h = request.headers
+    if "x-stainless-async" in h:
+        del h["x-stainless-async"]
+    # httpx Headers are case-insensitive; get_list returns every value.
+    timeouts = h.get_list("x-stainless-timeout")
+    if len(timeouts) > 1 or (timeouts and "NOT_GIVEN" in timeouts[0]):
+        del h["x-stainless-timeout"]
+        h["x-stainless-timeout"] = "600"
+
+
+def _make_http_client_with_hook():
+    import httpx
+    return httpx.AsyncClient(
+        event_hooks={"request": [_sanitize_outgoing_request]},
+        timeout=600.0,
+    )
+
+
 def make_async_oauth_client(**kwargs):
     """Build an AsyncAnthropic that authenticates via the OAuth Bearer token.
 
     The sync-side monkey patch does not cover AsyncAnthropic, so this factory
-    direct-injects ``auth_token`` instead of relying on the patch.
+    direct-injects ``auth_token`` instead of relying on the patch. We also
+    install a custom httpx client whose request hook strips Python-only
+    Stainless headers so the call looks more like the Node CLI.
     """
     import anthropic
     if _access_token is None:
@@ -376,6 +404,7 @@ def make_async_oauth_client(**kwargs):
     kwargs.pop("api_key", None)
     kwargs["auth_token"] = _access_token
     kwargs["default_headers"] = _merge_oauth_headers(kwargs.pop("default_headers", None))
+    kwargs.setdefault("http_client", _make_http_client_with_hook())
     return anthropic.AsyncAnthropic(**kwargs)
 
 
@@ -384,11 +413,13 @@ def make_async_api_key_client(api_key: str, **kwargs):
 
     Used by the restricted-mode path so non-admin calls do not consume the
     OAuth subscription quota. Does NOT go through the sync-side OAuth patch
-    and does NOT add OAUTH_BETA_HEADER (subscriber-tier only).
+    and does NOT add OAUTH_BETA_HEADER (subscriber-tier only). Same
+    Stainless-header-sanitizing http_client hook as the OAuth path.
     """
     import anthropic
     kwargs.pop("auth_token", None)  # never mix
     kwargs["api_key"] = api_key
+    kwargs.setdefault("http_client", _make_http_client_with_hook())
     return anthropic.AsyncAnthropic(**kwargs)
 
 

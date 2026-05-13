@@ -21,23 +21,26 @@ CC_ENTRYPOINT = "cli"  # Matches the real claude-cli User-Agent suffix.
 # is what we want to mimic since we have the same surface shape (no GUI).
 USER_AGENT = f"claude-cli/{CC_VERSION} (external, {CC_ENTRYPOINT})"
 
-# Minimal subscriber-tier beta set. Per spacewander_lzx's "Anthropic Beta
-# Header 全景" writeup, several beta headers REQUIRE matching body fields:
-#   interleaved-thinking-2025-05-14 → body needs "thinking": {"type": ...}
-#   effort-2025-11-24               → body needs "output_config": {effort: }
-#   context-management-2025-06-27   → body needs "context_management": {...}
-#   advanced-tool-use-2025-11-20    → tool schemas need defer_loading
-#   redact-thinking-2026-02-12      → requires thinking enabled
-# Advertising them without the matching body fields triggers 429 / 400.
-# We currently send a plain messages payload, so we keep only the four
-# subscriber-essential betas and add the others back as we add the body
-# fields they require.
+# Beta list captured verbatim from the real claude-cli 2.1.92 against
+# /v1/messages with model=claude-opus-4-6 (mitmproxy 2026-05-13). Every
+# beta in this list is paired with a body field below (THINKING_CONFIG,
+# OUTPUT_CONFIG) so the server accepts them.
 MODEL_BETAS = [
     "claude-code-20250219",
     "oauth-2025-04-20",
     "context-1m-2025-08-07",
+    "interleaved-thinking-2025-05-14",
+    "redact-thinking-2026-02-12",
+    "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
+    "advanced-tool-use-2025-11-20",
+    "effort-2025-11-24",
 ]
+
+# Body fields the CLI always sends alongside the betas above.
+THINKING_CONFIG = {"type": "adaptive"}
+OUTPUT_CONFIG = {"effort": "medium"}
+CLAUDE_MAX_TOKENS_OPUS = 64000
 
 _session_id = str(uuid.uuid4())
 

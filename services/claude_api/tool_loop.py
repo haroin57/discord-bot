@@ -29,7 +29,10 @@ import anthropic
 from config import CLAUDE_MAX_TOKENS
 
 from services.claude_api.client import (
+    CLAUDE_MAX_TOKENS_OPUS,
     CLI_IDENTITY_TEXT,
+    OUTPUT_CONFIG,
+    THINKING_CONFIG,
     get_attribution_header_value,
     get_metadata,
 )
@@ -182,13 +185,22 @@ async def run_agent_loop(
         # we're in the warning zone, so we don't trip the probabilistic throttle.
         await maybe_wait_before_request()
 
+        # Body fields the CLI always pairs with its betas. interleaved-
+        # thinking-2025-05-14 needs ``thinking``; effort-2025-11-24 needs
+        # ``output_config``. Sending the betas without these triggers 400.
+        max_tokens = (
+            CLAUDE_MAX_TOKENS_OPUS if "opus" in (model or "").lower()
+            else CLAUDE_MAX_TOKENS
+        )
         stream_kwargs = dict(
             model=model,
-            max_tokens=CLAUDE_MAX_TOKENS,
+            max_tokens=max_tokens,
             system=cached_system,
             messages=messages,
             betas=extra_betas,
             metadata=get_metadata(),
+            thinking=THINKING_CONFIG,
+            extra_body={"output_config": OUTPUT_CONFIG},
         )
         if tools_for_api:
             stream_kwargs["tools"] = tools_for_api
