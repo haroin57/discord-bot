@@ -14,6 +14,7 @@ handle, so ``kill_orphan_mcp_processes()`` falls back to the same cmdline
 substring scan as services/claude_sdk.py (``_MCP_CMDLINE_PATTERNS``).
 """
 
+import asyncio
 import logging
 import os
 from contextlib import AsyncExitStack
@@ -133,27 +134,23 @@ def mcp_tools_to_anthropic(handles: dict[str, McpServerHandle]) -> list[dict]:
     return out
 
 
-async def call_mcp_tool(
-    handles: dict[str, McpServerHandle],
-    qualified_name: str,
-    args: dict,
-) -> str:
-    """Dispatch a ``mcp__server__tool`` call to the right session.
-
-    Stringifies the response content blocks (TextContent / ImageContent /
-    EmbeddedResource) since Anthropic's ``tool_result.content`` is a string.
-    """
+def _parse_qualified_tool_name(qualified_name: str) -> tuple[str, str]:
+    """Split ``mcp__server__tool`` into ``(server, tool_name)``."""
     try:
         _, server, tool_name = qualified_name.split("__", 2)
     except ValueError as exc:
         raise ValueError(
             f"malformed MCP tool name {qualified_name!r}, want mcp__server__tool",
         ) from exc
+    return server, tool_name
 
-    handle = handles.get(server)
-    if handle is None:
-        raise KeyError(f"MCP server '{server}' is not spawned")
 
+async def _dispatch_tool_call(handle: McpServerHandle, tool_name: str, args: dict) -> str:
+    """Call a tool on a live handle and stringify the response content blocks.
+
+    Anthropic's ``tool_result.content`` is a string, so TextContent /
+    ImageContent / EmbeddedResource blocks are flattened to text here.
+    """
     result = await handle.session.call_tool(tool_name, args)
 
     parts: list[str] = []
@@ -169,6 +166,80 @@ async def call_mcp_tool(
             # Unknown / embedded resource — fall back to repr.
             parts.append(str(block))
     return "\n".join(parts) or "(empty)"
+
+
+async def call_mcp_tool(
+    handles: dict[str, McpServerHandle],
+    qualified_name: str,
+    args: dict,
+) -> str:
+    """Dispatch a ``mcp__server__tool`` call to the right session.
+
+    Deprecated for direct use inside the agent loop — prefer
+    :class:`McpPool` which adds auto-spawn fallback. Kept for backwards
+    compatibility with tests and any caller that already manages handles.
+    """
+    server, tool_name = _parse_qualified_tool_name(qualified_name)
+    handle = handles.get(server)
+    if handle is None:
+        raise KeyError(f"MCP server '{server}' is not spawned")
+    return await _dispatch_tool_call(handle, tool_name, args)
+
+
+@dataclass
+class McpPool:
+    """Pool of MCP server handles with on-demand spawn support.
+
+    Keyword-matched servers can be spawned eagerly via :meth:`spawn_eager`
+    (warmup); any other configured server is spawned the moment Claude
+    actually tries to call one of its tools via :meth:`call_tool`. The
+    caller's :class:`AsyncExitStack` owns all spawned subprocesses, so
+    every handle is torn down when the conversation finishes.
+
+    The per-server ``_spawn_locks`` use a double-checked-locking pattern:
+    two concurrent ``ensure_spawned("mem0")`` calls block on the same lock
+    and only one ``_spawn_one`` call actually runs.
+    """
+
+    stack: AsyncExitStack
+    available_configs: dict[str, dict]
+    handles: dict[str, McpServerHandle] = field(default_factory=dict)
+    _spawn_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+
+    async def ensure_spawned(self, name: str) -> McpServerHandle:
+        """Return an existing handle or lazy-spawn the configured server."""
+        if name in self.handles:
+            return self.handles[name]
+        lock = self._spawn_locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            if name in self.handles:  # double-checked locking
+                return self.handles[name]
+            cfg = self.available_configs.get(name)
+            if cfg is None:
+                raise KeyError(
+                    f"MCP server '{name}' not configured "
+                    f"(available: {list(self.available_configs)})"
+                )
+            handle = await _spawn_one(self.stack, name, cfg)
+            log.info(
+                "MCP spawned (lazy): %s (%d tools)", name, len(handle.tools),
+            )
+            self.handles[name] = handle
+            return handle
+
+    async def spawn_eager(self, names: list[str]) -> None:
+        """Warmup: spawn the listed servers up-front. Failures are non-fatal."""
+        for n in names:
+            try:
+                await self.ensure_spawned(n)
+            except Exception as exc:
+                log.error("MCP spawn (eager) failed for %s: %s", n, exc)
+
+    async def call_tool(self, qualified_name: str, args: dict) -> str:
+        """Dispatch ``mcp__server__tool``; lazy-spawn the server if needed."""
+        server, tool_name = _parse_qualified_tool_name(qualified_name)
+        handle = await self.ensure_spawned(server)
+        return await _dispatch_tool_call(handle, tool_name, args)
 
 
 def kill_orphan_mcp_processes() -> int:

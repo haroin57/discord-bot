@@ -43,6 +43,7 @@ from services.claude_api.session_store import (
     _record_session_time,
 )
 from services.claude_api.mcp_client import (
+    McpPool,
     McpServerHandle,
     call_mcp_tool,
     kill_orphan_mcp_processes,
@@ -116,6 +117,7 @@ __all__ = [
     "_safe_status",
     "_tool_input_hint",
     # mcp_client (PR4)
+    "McpPool",
     "McpServerHandle",
     "call_mcp_tool",
     "kill_orphan_mcp_processes",

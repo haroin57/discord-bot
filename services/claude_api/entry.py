@@ -36,6 +36,7 @@ from config import (
     RESTRICTED_ANTHROPIC_API_KEY,
     RESTRICTED_CLAUDE_MAX_PARALLEL,
     RESTRICTED_SYSTEM_PROMPT,
+    MCP_SERVERS,
     SYSTEM_PROMPT,
     get_mcp_servers_by_keys,
     pick_mcp_servers,
@@ -61,9 +62,8 @@ from services.claude_api.errors import (
     classify_anthropic_error,
 )
 from services.claude_api.mcp_client import (
-    call_mcp_tool,
+    McpPool,
     mcp_tools_to_anthropic,
-    spawn_servers,
 )
 from services.claude_api.restricted import (
     RESTRICTED_MAX_TURNS,
@@ -364,13 +364,19 @@ async def call_with_tools(
         tool_ctx = ToolContext(cwd=cwd, restricted=restricted, channel_id=channel_id)
 
         async with AsyncExitStack() as stack:
-            # 6. Spawn MCP servers
-            mcp_handles = await spawn_servers(chosen_mcp_cfg, stack) if chosen_mcp_cfg else {}
-            advertised_tools = advertised_tools + mcp_tools_to_anthropic(mcp_handles)
+            # 6. MCP pool: keyword-matched servers are spawned eagerly, the
+            # rest are spawned lazily the moment kanae calls one of their
+            # tools. restricted users get an empty config so auto-spawn
+            # can't surface tools they shouldn't see.
+            pool_available = {} if restricted else MCP_SERVERS
+            pool = McpPool(stack=stack, available_configs=pool_available)
+            if chosen_mcp_cfg:
+                await pool.spawn_eager(list(chosen_mcp_cfg))
+            advertised_tools = advertised_tools + mcp_tools_to_anthropic(pool.handles)
 
             async def _execute_tool(name: str, args: dict) -> str:
                 if name.startswith("mcp__"):
-                    return await call_mcp_tool(mcp_handles, name, args)
+                    return await pool.call_tool(name, args)
                 return await execute_builtin_tool(name, args, tool_ctx)
 
             # 7. API client
