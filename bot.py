@@ -8,7 +8,7 @@ import io
 import logging
 import re
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 import aiohttp
 import discord
@@ -218,8 +218,10 @@ def _cap_text(text: str, limit: int) -> str:
 # Daily quota tracking for non-admin callers (M-4)
 # ---------------------------------------------------------------------------
 _QUOTA_WINDOW_S = 24 * 60 * 60
-# user_id -> list of request epoch seconds within the window
-_daily_quota: OrderedDict[int, list[float]] = OrderedDict()
+# user_id -> deque of request epoch seconds within the window. deque keeps
+# entries in insertion (= time) order, so we can popleft expired entries in
+# O(expired) instead of rebuilding a new list every call.
+_daily_quota: OrderedDict[int, deque[float]] = OrderedDict()
 
 
 def _check_daily_quota(user_id: int) -> tuple[bool, int]:
@@ -227,13 +229,17 @@ def _check_daily_quota(user_id: int) -> tuple[bool, int]:
     if RESTRICTED_DAILY_QUOTA <= 0:
         return True, -1
     now = time.time()
-    bucket = _daily_quota.get(user_id, [])
-    bucket = [t for t in bucket if now - t < _QUOTA_WINDOW_S]
-    if len(bucket) >= RESTRICTED_DAILY_QUOTA:
+    cutoff = now - _QUOTA_WINDOW_S
+    bucket = _daily_quota.get(user_id)
+    if bucket is None:
+        bucket = deque()
         _daily_quota[user_id] = bucket
+    while bucket and bucket[0] < cutoff:
+        bucket.popleft()
+    if len(bucket) >= RESTRICTED_DAILY_QUOTA:
+        _daily_quota.move_to_end(user_id)
         return False, 0
     bucket.append(now)
-    _daily_quota[user_id] = bucket
     _daily_quota.move_to_end(user_id)
     while len(_daily_quota) > MAX_COOLDOWN_ENTRIES:
         _daily_quota.popitem(last=False)

@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 import aiohttp
@@ -1248,7 +1248,7 @@ class TestOnMessageAdminAndQuota:
         monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 1)
 
         # Exhaust quota for user 55555
-        bot._daily_quota[55555] = [time.time()]
+        bot._daily_quota[55555] = deque([time.time()])
 
         msg = _make_message(content="かなえ hi", author_id=55555)
         await self._dispatch(msg)
@@ -1418,7 +1418,7 @@ class TestCheckDailyQuota:
         import bot
         monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 2)
         bot._daily_quota.clear()
-        bot._daily_quota[77777] = [time.time(), time.time()]
+        bot._daily_quota[77777] = deque([time.time(), time.time()])
         allowed, remaining = bot._check_daily_quota(77777)
         assert allowed is False
         assert remaining == 0
@@ -1438,7 +1438,7 @@ class TestCheckDailyQuota:
         monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 5)
         bot._daily_quota.clear()
         # Old entry outside the 24h window
-        bot._daily_quota[11111] = [time.time() - 90000]
+        bot._daily_quota[11111] = deque([time.time() - 90000])
         allowed, remaining = bot._check_daily_quota(11111)
         assert allowed is True
         assert remaining == 4  # the expired entry was evicted
