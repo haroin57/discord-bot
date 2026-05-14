@@ -16,6 +16,7 @@ Flow:
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -67,18 +68,19 @@ _handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
 _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 log.addHandler(_handler)
 
-# Time patterns
-_TIME_PATTERNS = {
-    (0, 7): "睡眠中。たまに寝返りを打ったり、夢を見たりする",
-    (7, 9): "朝の準備。目覚まし、洗顔、着替え、朝食",
-    (9, 12): "午前の仕事。コーディング、コードレビュー、ミーティング",
-    (12, 14): "昼休み。自炊か買い物、昼寝、SNS",
-    (14, 18): "午後の仕事。集中コーディング、調査、ドキュメント",
-    (18, 21): "夕方〜夜。夕食準備、食事、片付け、DTM、ゲーム、アニメ",
-    (21, 24): "夜。風呂、リラックス、読書、ネットサーフィン、就寝準備",
-}
+# Multi-run guard. Each Sonnet daily call + Haiku summary call can each
+# take 20-40 s under load; the cron fires every 15 min. Without a lock,
+# a slow generation overlaps with the next cron tick and both processes
+# end up fighting over the SAME Claude session-id (the summary session
+# in particular crashed with "Session ID … is already in use", which
+# then forced the session-id-rotate-and-retry path on every cycle,
+# permanently breaking the incremental summary). Use a single flock
+# file the cron tick must hold for the entire run.
+_XDG_STATE = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))) / "discord-bot"
+LOCK_PATH = _XDG_STATE / "kanae_daily.lock"
 
-# Event type weights
+# Event type weights — only stochastic flavour we keep injecting; time-of-day
+# patterns were retired so Sonnet decides activities from the timestamp alone.
 _EVENT_WEIGHTS = [
     ("routine", 70),
     ("minor_event", 20),
@@ -90,13 +92,6 @@ _EVENT_WEIGHTS = [
 def _pick_event_type() -> str:
     types, weights = zip(*_EVENT_WEIGHTS)
     return random.choices(types, weights=weights, k=1)[0]
-
-
-def _get_time_pattern(hour: int) -> str:
-    for (start, end), desc in _TIME_PATTERNS.items():
-        if start <= hour < end:
-            return desc
-    return "自由時間"
 
 
 def _collect_recent_conversation() -> str:
@@ -149,8 +144,6 @@ def _build_daily_prompt(
     conversation: str,
 ) -> str:
     weekday = ["月", "火", "水", "木", "金", "土", "日"][now.weekday()]
-    hour = now.hour
-    time_pattern = _get_time_pattern(hour)
 
     event_hints = {
         "routine": "日常の延長。特別なことは起きない",
@@ -167,12 +160,8 @@ def _build_daily_prompt(
 - 22歳、プログラマー、一人暮らし
 - 自宅の仕事部屋（6畳、デスク、モニター2台）で在宅勤務
 - 先輩（haroin）に好意を抱いている
-- 毎日エナジードリンクを飲む（1日1本に減らす予定）
 - DTM環境あり（モニターアーム、マイクアーム、スピーカー左右配置）
 - えっちなことに興味津々
-
-## 時間帯別パターン
-{time_pattern}
 
 ## 現在の状況
 時刻: {now.strftime('%Y-%m-%d %H:%M')}（{weekday}）
@@ -191,7 +180,7 @@ def _build_daily_prompt(
 - 前のエントリからの自然な推移を意識する（突然場所が変わらない）
 - 五感の描写を含める（音、匂い、温度、触感、視覚）
 - thought はツンデレ。素直になりたいけどなれない内心
-- 睡眠中（0-7時）は基本的に寝ている。時々夢を見る
+- 時刻を見て活動を判断する（深夜は睡眠か夜更かし、朝は身支度、仕事時間はコーディング等）
 
 ## 出力（JSON 1行のみ。説明・前置き・コードブロック禁止）
 {{"activity":"10-20字","detail":"5-10文","mood":"good|normal|bad","thought":"内心","event_type":"{event_type}","importance":1-10}}"""
@@ -204,7 +193,7 @@ def _build_summary_prompt(prev_summary: str, new_entry: DailyEntry) -> str:
     )
     return f"""以下の「前回の要約」に「新しいエントリ」を組み込んで、かなえの今日一日の流れを要約してください。
 古い情報は徐々に圧縮し、直近の出来事は鮮明に残してください。
-500トークン以内で出力してください。コードブロック・前置き禁止。プレーンテキストのみ。
+要約本文は 500 トークン以内 / プレーンテキスト。
 
 ## 前回の要約
 {prev_summary or '(なし — 今日最初のエントリ)'}
@@ -212,8 +201,8 @@ def _build_summary_prompt(prev_summary: str, new_entry: DailyEntry) -> str:
 ## 新しいエントリ
 {entry_text}
 
-## 出力
-要約テキストのみ。"""
+## 出力 (JSON 1 行のみ。前置き・コードブロック禁止)
+{{"summary":"<更新後の要約本文>"}}"""
 
 
 def _push_to_mem0(entry: DailyEntry) -> None:
@@ -234,7 +223,37 @@ def _push_to_mem0(entry: DailyEntry) -> None:
         log.warning("Mem0 push failed: %s", exc)
 
 
+def _acquire_lock() -> int | None:
+    """Non-blocking flock acquire. Returns the fd, or None on contention."""
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(LOCK_PATH, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
 def main() -> int:
+    lock_fd = _acquire_lock()
+    if lock_fd is None:
+        log.info("skip: another kanae_daily run already in progress")
+        return 0
+    try:
+        return _run()
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
+def _run() -> int:
     now = datetime.now(JST)
     log.info("=== kanae_daily start at %s ===", now.strftime("%H:%M"))
 

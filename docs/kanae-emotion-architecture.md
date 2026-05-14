@@ -56,17 +56,16 @@ on_message
 
 ### 2. 沈黙時 (silence)
 
-**トリガー**: bot 内 30 分 asyncio タイマー (JST 7-24時のみ)
+**トリガー**: bot 内 30 分 asyncio タイマー (24h、時刻フィルタなし)
 
 ```
 silence_tick_loop
   └─ 30 分 sleep
-       ├─ 0-7時なら skip
+       ├─ daemon dead なら skip
        ├─ is_conversation_active なら skip
        ├─ load_state
        ├─ llm_transition_via_daemon(mode="silence", ...)
-       │   └─ validator
-       │       └─ loneliness 下限保証: min(1.0, silence_hours × 0.02)
+       │   └─ validator (BOUNDS clamp のみ)
        ├─ save_state
        └─ self_initiate を後段で呼ぶ
 ```
@@ -77,7 +76,7 @@ silence_tick_loop
 
 ```
 self_initiate.maybe_send_self_initiated
-  ├─ quiet hours (1-7時) / cooldown (1h) gate
+  ├─ cooldown (1h) gate のみ  ※ 時刻ガードなし、深夜判断は LLM へ
   ├─ generate_telos (動機判定)
   │   ├─ loneliness_overflow  (loneliness > 0.7)
   │   ├─ share_joy            (valence + arousal 高)
@@ -85,8 +84,8 @@ self_initiate.maybe_send_self_initiated
   │   ├─ affection_expression
   │   ├─ topic_driven         (curiosity 高)
   │   └─ reconciliation       (valence 負 + affection 高)
-  ├─ should_suppress (ツンデレ / プライド / 深夜の抑制ダイス)
   ├─ Claude CLI one-shot (Sonnet 相当) でメッセージ生成
+  │   (プロンプトに JST 時刻 + consecutive_self_initiated 注入)
   ├─ channel.send (Discord)
   └─ consecutive_self_initiated++ / cooldown sentinel touch
 ```
@@ -190,7 +189,21 @@ LLM の判断を信じる方針なので、急変ロールバックや lonelines
 - ❌ subprocess.run 毎ターン起動 (常駐 daemon 化)
 - ❌ trigger 整合性チェック / 急変ロールバック (LLM 出力を全面採用)
 - ❌ silence パスの loneliness 下限保証 (沈黙が長くても LLM が低く保てば変わらない)
-- ❌ `should_suppress` のツンデレ/プライド/深夜ダイス抑制 (`<kanae_state>` に JST 時刻 + `consecutive_self_initiated` を入れて LLM 自身に判断させる)
+- ❌ `should_suppress` のツンデレ/プライド/深夜ダイス抑制
+- ❌ 時間帯ベースのコード制御 (cron 7-23 時、bot 内 silence_tick の 0-7 時 skip、self_initiate の `quiet_hour_range`、daily の `_TIME_PATTERNS`) — **JST 時刻だけ LLM に渡して、寝てるか起きてるか・話しかけるか我慢するかは全部 LLM 判断**
+
+## 時間ベースの判断は全部 LLM へ
+
+時刻ベースのガードはコードから一切取り除いた。残ってる時刻関連の処理は **「現在時刻 (JST) をプロンプトに埋めるだけ」** の以下 3 箇所:
+
+| 注入先 | 表記 |
+|---|---|
+| `<kanae_state>` ブロック ([format.py](services/emotion/format.py)) | `現在: 2026-05-14 (木) 20:42 JST [夜]` |
+| emotion daemon プロンプト ([llm_transition.py](services/emotion/llm_transition.py)) | `時刻: 2026-05-14 20:42（木）` |
+| 自発メッセージ生成プロンプト ([self_initiate.py](services/emotion/self_initiate.py)) | `# 現在時刻 (JST)\n2026-05-14 20:42 (Thu)` |
+| daily 生成プロンプト ([scripts/kanae_daily.py](scripts/kanae_daily.py)) | `時刻: 2026-05-14 20:42（木）` |
+
+cron は `*/15 * * * *` で 24h 動く。深夜 3 時に daily が走っても Sonnet が時刻を見て「寝てる」と描写し、寝てるかなえの dream entry が生成される。LLM が「今は深夜だから話しかけない」と判断して自発連絡を見送るのも LLM の自由。
 
 ## `<kanae_state>` ブロックの形 (現行)
 

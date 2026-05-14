@@ -43,8 +43,8 @@ async def schedule_feedback(
     """
     state_dir = Path(state_dir)
 
-    from services.emotion.runtime import get_emotion_daemon
-    daemon = get_emotion_daemon()
+    from services.emotion.runtime import EMOTION_CTX
+    daemon = EMOTION_CTX.get()
     if daemon is None or not daemon.is_alive:
         log.info("emotion feedback: daemon unavailable, skipping turn")
         return

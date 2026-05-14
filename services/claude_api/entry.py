@@ -18,11 +18,7 @@ return the localized error message without retrying.
 """
 
 import asyncio
-import base64
 import logging
-import uuid as _uuid
-import os
-import re
 import time
 from contextlib import AsyncExitStack
 
@@ -30,10 +26,8 @@ import anthropic
 
 from config import (
     ADMIN_MAX_TURNS,
-    ATTACHMENT_DIR,
     CLAUDE_MAX_PARALLEL,
     CWD,
-    RESTRICTED_ANTHROPIC_API_KEY,
     RESTRICTED_CLAUDE_MAX_PARALLEL,
     RESTRICTED_SYSTEM_PROMPT,
     MCP_SERVERS,
@@ -43,21 +37,11 @@ from services.mcp_selector import (
     get_mcp_servers_by_keys,
     pick_mcp_servers,
 )
-from services.oauth_manager import (
-    ensure_valid_token,
-    init as oauth_init,
-    make_async_api_key_client,
-    make_async_oauth_client,
-    prime_subscriber_session,
-)
 from services.session import SessionInfo, append_jsonl, load_history_channel
-from utils.image_validator import validate_image_bytes
 
 from services.claude_api.client import (
     CC_VERSION,
     MODEL_BETAS,
-    USER_AGENT,
-    _session_id,
 )
 from services.claude_api.errors import (
     _error_message,
@@ -101,88 +85,15 @@ claude_semaphore = asyncio.Semaphore(CLAUDE_MAX_PARALLEL)
 restricted_claude_semaphore = asyncio.Semaphore(RESTRICTED_CLAUDE_MAX_PARALLEL)
 
 
-_IMAGE_MAX_BYTES = 8 * 1024 * 1024  # 8 MB. base64 inflates ~1.33x, so worst-case
-# per image ≈ 10.7 MB of string payload; × _IMAGE_MAX_COUNT = ~85 MB peak.
-# Per-message hard cap so a malicious / runaway parser doesn't OOM us.
-_IMAGE_MAX_COUNT = 8
-
-# <attached_images>\n- /path (Use the Read tool to view this image)\n- /path\n</attached_images>
-_ATTACHED_IMAGES_BLOCK_RE = re.compile(
-    r"<attached_images>\s*(?P<body>.*?)\s*</attached_images>",
-    re.DOTALL,
+# Image processing moved to services/claude_api/image_processor.py.
+# Re-export with the original underscore-prefixed names so existing
+# call sites and test patches keep working.
+from services.claude_api.image_processor import (
+    IMAGE_MAX_BYTES as _IMAGE_MAX_BYTES,
+    IMAGE_MAX_COUNT as _IMAGE_MAX_COUNT,
+    extract_attached_image_blocks as _extract_attached_image_blocks,
+    safe_image_path as _safe_image_path,
 )
-
-
-def _safe_image_path(path: str) -> str | None:
-    """Validate that ``path`` is under ATTACHMENT_DIR, not a symlink escape,
-    and small enough. Returns the canonical realpath or None."""
-    try:
-        real_root = os.path.realpath(ATTACHMENT_DIR)
-        candidate = os.path.realpath(path)
-        if candidate != real_root and not candidate.startswith(real_root + os.sep):
-            log.warning("image rejected: outside ATTACHMENT_DIR: %s", path)
-            return None
-        st = os.stat(candidate)
-        if st.st_size > _IMAGE_MAX_BYTES:
-            log.warning("image rejected: too large (%d bytes): %s", st.st_size, path)
-            return None
-        return candidate
-    except OSError as exc:
-        log.warning("image rejected: %s (%s)", path, exc)
-        return None
-
-
-def _extract_attached_image_blocks(prompt: str) -> tuple[str, list[dict]]:
-    """Strip the last ``<attached_images>`` block and return base64 ImageBlocks.
-
-    Codex v3 #10: only the *last* occurrence is treated as bot-generated, so
-    a user typing the literal tag in their message is not parsed. The block
-    is removed from the prompt entirely after extraction so the Read-tool
-    hint inside it doesn't fool the model.
-    """
-    match = None
-    # rfind via iteration — re has no rsearch helper.
-    for m in _ATTACHED_IMAGES_BLOCK_RE.finditer(prompt):
-        match = m
-    if match is None:
-        return prompt, []
-
-    body = match.group("body")
-    paths: list[str] = []
-    for line in body.splitlines():
-        line = line.strip()
-        if not line.startswith("-"):
-            continue
-        token = line.lstrip("-").strip().split(" ", 1)[0]
-        if token:
-            paths.append(token)
-
-    blocks: list[dict] = []
-    for path in paths[:_IMAGE_MAX_COUNT]:
-        real = _safe_image_path(path)
-        if real is None:
-            continue
-        try:
-            with open(real, "rb") as fh:
-                data = fh.read(_IMAGE_MAX_BYTES + 1)
-        except OSError as exc:
-            log.warning("image rejected: %s (%s)", real, exc)
-            continue
-        mime, err = validate_image_bytes(data, max_bytes=_IMAGE_MAX_BYTES)
-        if mime is None:
-            log.warning("image rejected: %s (%s)", real, err)
-            continue
-        blocks.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": mime,
-                "data": base64.b64encode(data).decode("ascii"),
-            },
-        })
-
-    stripped = prompt[: match.start()] + prompt[match.end():]
-    return stripped.strip(), blocks
 
 
 def _resolve_session(
@@ -218,51 +129,9 @@ def _resolve_session(
     return get_mcp_servers_by_keys(list(chosen_mcp_keys)), False
 
 
-async def _make_api_client(restricted: bool) -> anthropic.AsyncAnthropic:
-    """Return the right AsyncAnthropic client for this call."""
-    # Headers the real claude-cli sends. The X-Stainless-* fields identify
-    # the SDK (Node 0.80.0) to Anthropic's server-side subscriber-tier
-    # gating; sending the Python SDK values ("python", "CPython", "0.88.0")
-    # appears to demote the call out of the subscriber bucket and triggers
-    # the immediate HTTP 429s we kept seeing. Mimic the Node CLI exactly.
-    cli_headers = {
-        "x-app": "cli",
-        "User-Agent": USER_AGENT,
-        "X-Claude-Code-Session-Id": _session_id,
-        "X-Stainless-Lang": "js",
-        "X-Stainless-Package-Version": "0.80.0",
-        "X-Stainless-Runtime": "node",
-        "X-Stainless-Runtime-Version": "v24.14.1",
-        "X-Stainless-OS": "Linux",
-        "X-Stainless-Arch": "x64",
-        "X-Stainless-Timeout": "600",
-        "accept-language": "*",
-        "sec-fetch-mode": "cors",
-        # The real CLI generates a fresh UUID per /v1/messages POST. We can
-        # only set the header once at client-construction time (anthropic SDK
-        # default_headers); a tool_loop with multiple turns will reuse it.
-        # Servers seem to accept that, but if 429 reasoning ever shows
-        # client-id reuse as a discriminator, hoist this into a httpx
-        # request hook for true per-request rotation.
-        "x-client-request-id": str(_uuid.uuid4()),
-    }
-    if restricted and RESTRICTED_ANTHROPIC_API_KEY:
-        return make_async_api_key_client(
-            RESTRICTED_ANTHROPIC_API_KEY,
-            default_headers=cli_headers,
-        )
-    # bot startup paths only call oauth_init() lazily through mem0 or the
-    # sync get_client(); on a cold call_with_tools the token is still
-    # uninitialized. Idempotent init() before ensure_valid_token() guarantees
-    # _access_token is populated before make_async_oauth_client reads it.
-    oauth_init()
-    await ensure_valid_token()
-    # Subscriber session prime: replay the CLI's /api/oauth/profile and
-    # /api/oauth/claude_cli/roles GETs. Once per process. Without this,
-    # we've seen 429s with zero ratelimit-unified headers (= subscriber
-    # tier not recognized).
-    await prime_subscriber_session()
-    return make_async_oauth_client(default_headers=cli_headers)
+# Anthropic client construction moved to services/claude_api/client_factory.py.
+# Re-export with the legacy name for any direct callers / test patches.
+from services.claude_api.client_factory import make_api_client as _make_api_client
 
 
 async def call_with_tools(

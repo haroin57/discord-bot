@@ -64,7 +64,6 @@ async def maybe_send_self_initiated(
     bot,                      # discord.Client (for channel.send)
     state_dir: Path,
     history_dir: Path | None = None,
-    quiet_hour_range: tuple[int, int] = (1, 7),
     cooldown_sentinel: Path | None = None,
     repo_dir: Path | None = None,
 ) -> bool:
@@ -80,9 +79,9 @@ async def maybe_send_self_initiated(
     try:
         now = datetime.now(JST)
 
-        # 1. Time-window / cooldown gates (cheap, do first)
-        if quiet_hour_range[0] <= now.hour < quiet_hour_range[1]:
-            return False
+        # Cooldown gate only — quiet-hours suppression is delegated to
+        # the LLM, which sees the JST timestamp on every prompt and can
+        # decide for itself whether "深夜だから寝てる" applies.
         if cooldown_sentinel.exists():
             age = time.time() - cooldown_sentinel.stat().st_mtime
             if age < COOLDOWN_S:

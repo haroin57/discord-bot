@@ -311,9 +311,7 @@ async def _silence_tick_loop() -> None:
     in flight to avoid clobbering it.
     """
     import asyncio as _asyncio
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     from pathlib import Path as _Path
-    JST = _tz(_td(hours=9))
     interval_s = 1800  # 30 min
     while True:
         try:
@@ -321,9 +319,9 @@ async def _silence_tick_loop() -> None:
         except _asyncio.CancelledError:
             return
         try:
-            now = _dt.now(JST)
-            if now.hour < 7 or now.hour >= 24:
-                continue  # quiet hours; cron schedule mirrors this
+            # No quiet-hours gate — the JST timestamp is in <kanae_state>
+            # and the silence prompt, so the LLM decides for itself
+            # whether "深夜だから寝てる" should suppress the response.
             if _emotion_daemon is None or not _emotion_daemon.is_alive:
                 continue
             if _emotion_daemon.is_conversation_active:
@@ -387,8 +385,8 @@ async def _patched_close() -> None:
             log.warning("emotion daemon stop failed: %s", exc)
         _emotion_daemon = None
         try:
-            from services.emotion.runtime import set_emotion_daemon
-            set_emotion_daemon(None)
+            from services.emotion.runtime import EMOTION_CTX
+            EMOTION_CTX.set(None)
         except Exception:
             pass
     if _http_session and not _http_session.closed:
@@ -462,8 +460,8 @@ async def on_ready():
                 _emotion_daemon = daemon
                 # Expose the daemon to feedback.py / silence-tick callers
                 # without dragging bot's globals through their imports.
-                from services.emotion.runtime import set_emotion_daemon
-                set_emotion_daemon(daemon)
+                from services.emotion.runtime import EMOTION_CTX
+                EMOTION_CTX.set(daemon)
                 log.info("emotion daemon ready (pid=%s)",
                          daemon._proc.pid if daemon._proc else "?")
             except Exception as exc:
@@ -473,6 +471,16 @@ async def on_ready():
         # daemon's session memory with feedback (no cron-vs-bot record
         # fragmentation). See v3 plan §5.3.
         _track_task(_silence_tick_loop(), name="emotion_silence_tick")
+        # 1-hour kanae-daily recap DM to haroin (先輩).
+        async def _start_hourly_summary_dm():
+            try:
+                from pathlib import Path as _Path
+                from services.emotion.daily_summary_dm import hourly_summary_dm_loop
+                repo_dir = _Path(__file__).resolve().parent
+                await hourly_summary_dm_loop(bot, _Path(STATE_DIR), repo_dir)
+            except Exception as exc:
+                log.warning("hourly summary DM loop crashed: %s", exc)
+        _track_task(_start_hourly_summary_dm(), name="hourly_summary_dm")
 
     global _vscode_sync_started
     if VSCODE_SYNC_ENABLED and not _vscode_sync_started and not vscode_sync.is_running():
