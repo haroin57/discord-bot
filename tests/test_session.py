@@ -2,9 +2,10 @@
 
 import asyncio
 import json
+import logging
 import os
 from collections import OrderedDict
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -168,7 +169,6 @@ class TestSessions:
         task = MagicMock(spec=asyncio.Task)
         task.cancelled.return_value = False
         task.exception.return_value = RuntimeError("disk full")
-        import logging
         with caplog.at_level(logging.ERROR, logger="services.session"):
             _on_save_done(task)
         assert "save_sessions failed" in caplog.text
@@ -186,6 +186,49 @@ class TestSessions:
         task.exception.side_effect = asyncio.CancelledError()
         # Should not raise
         _on_save_done(task)
+
+    def test_save_sessions_atomic_preserves_old_on_failure(self, tmp_path):
+        """Old data must survive if the JSON serialiser raises mid-write.
+
+        atomic_write_json (utils/atomic_write.py) generates a uuid-suffixed
+        tmp file and cleans it up on failure, so we only need to verify
+        the target file still has the previous contents.
+        """
+        target = str(tmp_path / "sessions.json")
+        old_sessions: OrderedDict[int, SessionInfo] = OrderedDict(
+            [(1, SessionInfo(session_id="old-sess"))]
+        )
+        save_sessions(old_sessions, _path=target)
+
+        new_sessions: OrderedDict[int, SessionInfo] = OrderedDict(
+            [(2, SessionInfo(session_id="new-sess"))]
+        )
+        with patch("utils.atomic_write.json.dumps", side_effect=RuntimeError("disk full")):
+            with pytest.raises(RuntimeError):
+                save_sessions(new_sessions, _path=target)
+
+        # No tmp files left behind (uuid-suffixed).
+        assert not list(tmp_path.glob("sessions.json.*.tmp"))
+        # Original file is intact.
+        with open(target, encoding="utf-8") as f:
+            data = json.load(f)
+        assert "1" in data
+        assert data["1"]["session_id"] == "old-sess"
+
+    def test_save_sessions_uses_atomic_replace(self, tmp_path):
+        """os.replace must be invoked under the hood so writes are atomic."""
+        target = str(tmp_path / "sessions.json")
+        s: OrderedDict[int, SessionInfo] = OrderedDict(
+            [(1, SessionInfo(session_id="x"))]
+        )
+        with patch("utils.atomic_write.os.replace", wraps=os.replace) as mock_replace:
+            save_sessions(s, _path=target)
+        assert mock_replace.call_count == 1
+        # atomic_write_json passes pathlib.Path objects, so cast for comparison.
+        tmp_arg, target_arg = mock_replace.call_args.args
+        assert str(target_arg) == target
+        tmp_str = str(tmp_arg)
+        assert tmp_str.startswith(target + ".") and tmp_str.endswith(".tmp")
 
 
 # Minimal valid Discord snowflake IDs (must be in [10**14, 10**19])
@@ -252,6 +295,22 @@ class TestJSONLHistory:
         assert len(msgs) == 5
         # Should be the last 5
         assert msgs[-1]["content"] == "m19"
+
+    def test_tail_jsonl_logs_corrupted_line(self, tmp_state_dir, caplog):
+        """A corrupted JSONL line must be skipped with a WARNING log."""
+        import config
+        path = os.path.join(config.HISTORY_DIR, f"{_CH_A}.jsonl")
+        os.makedirs(config.HISTORY_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"role": "user", "content": "good"}\n')
+            f.write("NOT_VALID_JSON\n")
+            f.write('{"role": "assistant", "content": "also good"}\n')
+
+        with caplog.at_level(logging.WARNING, logger="services.session"):
+            msgs = load_history_channel(_CH_A)
+
+        assert len(msgs) == 2
+        assert any("corrupted" in r.message.lower() for r in caplog.records)
 
 
 class TestTrimHistory:

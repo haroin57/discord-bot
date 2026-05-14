@@ -266,6 +266,75 @@ class TestMainAsync:
 
 
 # ---------------------------------------------------------------------------
+# SIGTERM graceful shutdown
+# ---------------------------------------------------------------------------
+
+class TestSigtermHandler:
+    async def test_sigterm_triggers_kill_orphan(self, monkeypatch, tmp_path):
+        """When shutdown_event fires, kill_orphan_claude_cli must be called."""
+        import signal as _signal
+
+        mod = _reload_main_async(monkeypatch, tmp_path)
+
+        monkeypatch.setattr(mod, "_setup_logging", lambda: None)
+        monkeypatch.setattr(mod, "_acquire_pidlock", lambda: None)
+        monkeypatch.setattr(mod, "validate_discord_token", lambda: "fake-token")
+        monkeypatch.setattr(mod, "DISCORD_TOKEN", "fake-token")
+        monkeypatch.setattr(mod, "WEB_API_PORT", 19999)
+
+        kill_calls = []
+        fake_bot_close_calls = []
+
+        async def _bot_start(token):
+            await asyncio.sleep(9999)
+
+        async def _bot_close():
+            fake_bot_close_calls.append(True)
+
+        fake_bot = types.SimpleNamespace(start=_bot_start, close=_bot_close)
+        fake_bot_module = types.ModuleType("bot")
+        fake_bot_module.bot = fake_bot
+
+        class FakeWebAPI:
+            def __init__(self, _b):
+                pass
+            async def start(self, port, host=None):
+                await asyncio.sleep(9999)
+
+        fake_web_api_module = types.ModuleType("web_api")
+        fake_web_api_module.WebAPI = FakeWebAPI
+
+        fake_claude_sdk = types.ModuleType("services.claude_sdk")
+        fake_claude_sdk.kill_orphan_claude_cli = lambda: kill_calls.append(True)
+
+        monkeypatch.setitem(sys.modules, "bot", fake_bot_module)
+        monkeypatch.setitem(sys.modules, "web_api", fake_web_api_module)
+        monkeypatch.setitem(sys.modules, "services.claude_sdk", fake_claude_sdk)
+
+        registered_handlers = {}
+
+        def fake_add_signal_handler(sig, cb, *args):
+            registered_handlers[sig] = (cb, args)
+
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(loop, "add_signal_handler", fake_add_signal_handler)
+
+        async def _run():
+            task = asyncio.create_task(mod.main())
+            # Yield to let main() register signal handlers
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            if _signal.SIGTERM in registered_handlers:
+                cb, args = registered_handlers[_signal.SIGTERM]
+                cb(*args)
+            await task
+
+        await _run()
+
+        assert kill_calls, "kill_orphan_claude_cli should have been called on SIGTERM"
+
+
+# ---------------------------------------------------------------------------
 # Module-level __main__ guard
 # ---------------------------------------------------------------------------
 

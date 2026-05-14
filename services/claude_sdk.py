@@ -540,7 +540,9 @@ async def call_with_tools(
                 tool_count = 0
                 t_start = time.monotonic()
 
-                # SRE-H5: shared mutable cell for watchdog
+                # SRE-H5: shared mutable cell for watchdog. Re-allocated on
+                # every attempt so flags from a prior attempt cannot leak
+                # into the next retry (review H-SEC-3 robustness note).
                 last_msg_time_cell: list[float] = [time.monotonic()]
                 _stall_warned: list[bool] = [False]
                 _stream_idle: list[bool] = [False]
