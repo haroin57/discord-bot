@@ -397,6 +397,12 @@ _MEMORY_TRIGGERS = tuple(kw.lower() for kw in (
     "記憶", "覚えて", "覚えとい", "覚えてる", "思い出", "忘れた", "忘れない",
     "mem0", "memory", "remember", "recall", "過去の",
     "前に話した", "前に言った", "以前", "昔話した",
+    # Internal-module references — when the user talks about the Mem0 code
+    # (search.py / dedup / extract / ingest / mcp_mem0), they almost always
+    # want to *test* it, which means kanae will need mcp__mem0__search.
+    "search.py", "dedup", "extract.py", "ingest.py", "mcp__mem0",
+    "mcp_mem0", "mem0_server",
+    "記憶検索", "メモリ検索", "ベクトル検索", "セマンティック検索",
 ))
 _PAPER_TRIGGERS = tuple(kw.lower() for kw in (
     # "scholar" without a qualifier was a false-positive risk (matches

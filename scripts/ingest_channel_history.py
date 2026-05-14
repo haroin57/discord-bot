@@ -17,6 +17,9 @@ import logging
 import os
 import sys
 import time
+from datetime import timezone, timedelta
+
+_JST = timezone(timedelta(hours=9))
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -91,8 +94,15 @@ async def ingest_pairs(
     dry_run: bool = False,
     delay: float = 1.0,
     batch_size: int = 5,
+    concurrency: int = 1,
+    subject: str = "self",
 ) -> dict:
     """Feed message pairs through Mem0 ingestion pipeline.
+
+    ``concurrency`` controls how many ``add_memories`` calls run in
+    parallel; ``delay`` is kept for backwards compat but only applies
+    when ``concurrency<=1`` (legacy batched-sequential mode). ``subject``
+    selects the extractor ("self" → senpai facts, "kanae" → kanae facts).
 
     Returns stats dict.
     """
@@ -101,33 +111,61 @@ async def ingest_pairs(
     stats = {"total": len(pairs), "ingested": 0, "skipped": 0, "errors": 0,
              "kept": 0, "dup": 0, "low": 0}
 
-    for i in range(0, len(pairs), batch_size):
-        batch = pairs[i:i + batch_size]
-        for user_msg, bot_reply in batch:
-            user_text = user_msg.content or ""
-            # Skip very short messages (commands, reactions, etc.)
+    progress_lock = asyncio.Lock()
+    progress = {"done": 0}
+
+    def _build_inputs(user_msg, bot_reply):
+        user_text = user_msg.content or ""
+        assistant_text = bot_reply.content if bot_reply else ""
+        # Annotate both texts with the wall-clock JST timestamp so the
+        # extractor can attach when-it-happened context to each fact.
+        user_ts = user_msg.created_at.astimezone(_JST).strftime("%Y-%m-%d %H:%M")
+        user_text_ts = f"[{user_ts} JST] {user_text}"
+        if bot_reply is not None:
+            bot_ts = bot_reply.created_at.astimezone(_JST).strftime("%Y-%m-%d %H:%M")
+            assistant_text_ts = f"[{bot_ts} JST] {assistant_text}"
+        else:
+            assistant_text_ts = assistant_text
+        meta = {
+            "channel_id": str(user_msg.channel.id),
+            "channel_name": getattr(user_msg.channel, "name", "DM"),
+            "source": "history_ingest" + ("_kanae" if subject == "kanae" else ""),
+            "created_at": user_msg.created_at.isoformat(),
+            "created_at_unix": int(user_msg.created_at.timestamp()),
+        }
+        return user_text, user_text_ts, assistant_text_ts, meta
+
+    async def _ingest_one(user_msg, bot_reply, sem: asyncio.Semaphore | None):
+        # Skip filters: very short user messages (haroin) for self mode; for
+        # kanae mode skip when the bot reply itself is missing or too short.
+        user_text = user_msg.content or ""
+        assistant_text = bot_reply.content if bot_reply else ""
+        if subject == "kanae":
+            if not bot_reply or len(assistant_text.strip()) < 20:
+                stats["skipped"] += 1
+                return
+        else:
             if len(user_text.strip()) < 10:
                 stats["skipped"] += 1
-                continue
+                return
 
-            assistant_text = bot_reply.content if bot_reply else ""
+        _, user_text_ts, assistant_text_ts, meta = _build_inputs(user_msg, bot_reply)
 
-            if dry_run:
-                log.info("DRY-RUN: would ingest user='%s' bot='%s'",
-                         user_text[:80], (assistant_text or "")[:80])
-                stats["ingested"] += 1
-                continue
+        if dry_run:
+            preview_text = (assistant_text_ts or "") if subject == "kanae" else user_text_ts
+            log.info("DRY-RUN [subject=%s] would ingest: '%s'",
+                     subject, preview_text[:90])
+            stats["ingested"] += 1
+            return
 
+        async def _do():
             try:
                 result = await add_memories(
-                    user_text=user_text,
-                    assistant_text=assistant_text,
+                    user_text=user_text_ts,
+                    assistant_text=assistant_text_ts,
                     user_id=user_id,
-                    metadata={
-                        "channel_id": str(user_msg.channel.id),
-                        "channel_name": getattr(user_msg.channel, "name", "DM"),
-                        "source": "history_ingest",
-                    },
+                    metadata=meta,
+                    subject=subject,
                 )
                 if result and isinstance(result, dict):
                     stats["kept"] += result.get("kept", 0)
@@ -138,14 +176,40 @@ async def ingest_pairs(
             except Exception as e:
                 log.warning("Ingest error for msg %d: %s", user_msg.id, e)
                 stats["errors"] += 1
+            async with progress_lock:
+                progress["done"] += 1
+                if progress["done"] % 25 == 0 or progress["done"] == len(pairs):
+                    log.info(
+                        "Progress: %d/%d (kept=%d, dup=%d, low=%d, err=%d, skip=%d)",
+                        progress["done"], len(pairs),
+                        stats["kept"], stats["dup"], stats["low"],
+                        stats["errors"], stats["skipped"],
+                    )
 
-        # Rate limit between batches
+        if sem is None:
+            await _do()
+        else:
+            async with sem:
+                await _do()
+
+    if concurrency > 1:
+        sem = asyncio.Semaphore(concurrency)
+        await asyncio.gather(
+            *(_ingest_one(u, b, sem) for u, b in pairs),
+            return_exceptions=True,
+        )
+        return stats
+
+    # Legacy batched-sequential path (concurrency<=1)
+    for i in range(0, len(pairs), batch_size):
+        batch = pairs[i:i + batch_size]
+        for user_msg, bot_reply in batch:
+            await _ingest_one(user_msg, bot_reply, None)
         if i + batch_size < len(pairs):
             log.info("Progress: %d/%d (kept=%d, dup=%d, low=%d)",
                      min(i + batch_size, len(pairs)), len(pairs),
                      stats["kept"], stats["dup"], stats["low"])
             await asyncio.sleep(delay)
-
     return stats
 
 
@@ -172,8 +236,16 @@ class HistoryBot(discord.Client):
         args = self.args
         target_user_id = int(args.user_id)
 
+        # Resolve the Mem0 storage namespace. For kanae mode we ALWAYS write
+        # under the bot's own ID (regardless of --user-id, which only filters
+        # which human's turns to pair against).
+        if args.subject == "kanae":
+            mem0_user_id = str(self.user.id) if self.user else "kanae"
+            log.info("subject=kanae → Mem0 namespace = bot id %s", mem0_user_id)
+        else:
+            mem0_user_id = str(args.user_id)
+
         if args.all_channels:
-            # Ingest from all text channels in all guilds
             channels = []
             for guild in self.guilds:
                 for ch in guild.text_channels:
@@ -192,11 +264,23 @@ class HistoryBot(discord.Client):
             if not pairs:
                 continue
 
+            # For kanae mode, drop pairs without a bot reply (can't extract
+            # kanae facts from a missing utterance).
+            if args.subject == "kanae":
+                before = len(pairs)
+                pairs = [(u, b) for (u, b) in pairs if b is not None]
+                log.info(
+                    "kanae mode: kept %d/%d pairs with bot replies",
+                    len(pairs), before,
+                )
+
             stats = await ingest_pairs(
-                pairs, args.user_id,
+                pairs, mem0_user_id,
                 dry_run=args.dry_run,
                 delay=args.delay,
                 batch_size=args.batch_size,
+                concurrency=args.concurrency,
+                subject=args.subject,
             )
             for k in grand_stats:
                 grand_stats[k] += stats[k]
@@ -216,11 +300,14 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--channel-id", help="Discord channel ID to ingest")
     group.add_argument("--all-channels", action="store_true", help="Ingest from all text channels")
-    parser.add_argument("--user-id", required=True, help="Discord user ID to extract messages for")
+    parser.add_argument("--user-id", required=True, help="Discord user ID to filter senpai messages by (for kanae mode this is just the pairing filter; Mem0 namespace is bot id)")
     parser.add_argument("--limit", type=int, default=500, help="Max messages to fetch per channel")
     parser.add_argument("--dry-run", action="store_true", help="Log what would be ingested without storing")
-    parser.add_argument("--delay", type=float, default=1.5, help="Delay between batches (seconds)")
-    parser.add_argument("--batch-size", type=int, default=5, help="Messages per batch")
+    parser.add_argument("--delay", type=float, default=1.5, help="Delay between batches (concurrency<=1 only)")
+    parser.add_argument("--batch-size", type=int, default=5, help="Messages per batch (concurrency<=1 only)")
+    parser.add_argument("--concurrency", type=int, default=1, help="Parallel ingest tasks (overrides batch/delay)")
+    parser.add_argument("--subject", choices=["self", "kanae"], default="self",
+                        help="Which extractor to use: 'self' = senpai facts (default), 'kanae' = bot self-facts")
     args = parser.parse_args()
 
     token = os.environ.get("DISCORD_TOKEN")

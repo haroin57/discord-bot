@@ -24,7 +24,12 @@ def _ensure_stub(name: str, **attrs):
 _ensure_stub("services.oauth_manager",
              ensure_valid_token=AsyncMock(),
              get_access_token=MagicMock(return_value="tok"),
-             init=MagicMock())
+             init=MagicMock(),
+             make_async_oauth_client=MagicMock(),
+             make_async_api_key_client=MagicMock(),
+             make_sync_api_key_client=MagicMock(),
+             prime_subscriber_session=AsyncMock(),
+             get_client=MagicMock())
 
 # Now we can import the modules under test.
 from services.mem0.extract import (  # noqa: E402

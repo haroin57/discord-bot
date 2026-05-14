@@ -203,10 +203,14 @@ class TestAddMemoriesGatePath:
 class TestClientDedup:
     @pytest.mark.asyncio
     async def test_near_dup_search_match_drops_fact(self, patch_deps):
-        """If search returns a result above threshold, the fact is dropped."""
+        """If search returns a result within hard-drop distance, fact is dropped.
+
+        Uses score=0.05 (distance under DEDUP_HARD_DROP_DISTANCE=0.15) so the
+        2-stage dedup short-circuits without calling Haiku. mem0's Chroma
+        adapter returns *distance* not similarity — small score = duplicate."""
         facts = [{"speaker": "self", "text": "TypeScriptが好き", "importance": 4,
                   "category": "tech", "subcategory": "ts", "tags": []}]
-        patch_deps["search"].return_value = [{"score": 0.92}]
+        patch_deps["search"].return_value = [{"score": 0.05}]
         with (
             patch("services.mem0.ingest.extract_facts_for_self", new_callable=AsyncMock, return_value=facts),
             patch("config.MEM0_GATE_ENABLED", True),

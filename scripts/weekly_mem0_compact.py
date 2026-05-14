@@ -119,6 +119,13 @@ async def main() -> None:
         tier = meta.get("tier")
         importance = meta.get("importance")
         dedup_id = meta.get("dedup_group_id")
+        # Hebbian-style reinforcement counter set by services.mem0.reinforce.
+        # Highly-mentioned facts ride out the archive sweep even when their
+        # tier / importance would normally flag them.
+        try:
+            mention_count = int(meta.get("mention_count") or 1)
+        except (TypeError, ValueError):
+            mention_count = 1
         created = _parse_dt(m.get("created_at"))
 
         if cat:
@@ -143,6 +150,9 @@ async def main() -> None:
             and (importance or 0) <= 2
             and created
             and created < cold_cut
+            # Spare frequently-mentioned facts from the archive sweep even
+            # if they look stale by tier/importance. ≥ 4 mentions ⇒ keep.
+            and mention_count < 4
         ):
             archive_candidates.append(m)
 

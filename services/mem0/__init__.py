@@ -10,7 +10,8 @@ Public API re-exports for `from services.mem0 import ...`. Internal modules:
 """
 
 from services.mem0.client import (
-    MEM0_RELEVANCE_THRESHOLD,
+    MEM0_RELEVANCE_MAX_DISTANCE,
+    MEM0_RELEVANCE_THRESHOLD,  # back-compat alias; see client.py
     delete_memory,
     get_all_memories,
 )
@@ -24,6 +25,7 @@ from services.mem0.search import (
 )
 
 __all__ = [
+    "MEM0_RELEVANCE_MAX_DISTANCE",
     "MEM0_RELEVANCE_THRESHOLD",
     "add_memories",
     "delete_memory",
