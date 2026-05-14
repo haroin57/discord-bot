@@ -6,13 +6,18 @@ Discord messages.
 
 import asyncio
 import logging
-from collections import Counter
+from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from services.vscode_sync.parser import SyncEvent
 
 _MAX_CHUNK_CHARS = 1800
+# Bound the in-flight buffer dict + "seen sessions" set so a long-running
+# bot doesn't drift up over time. Real workloads stay far below these
+# caps; they exist as guard rails against burst / leak.
+_MAX_BUFFERS = 100
+_MAX_SEEN = 1000
 
 _NOISE_GLYPH = {
     "Read": "🔍",
@@ -81,10 +86,25 @@ class EventAggregator:
     ):
         self._flush = flush_callback
         self._flush_interval = flush_interval
-        self._buffers: dict[str, _SessionBuffer] = {}
+        # OrderedDict so we can LRU-evict oldest pending buffers when we
+        # hit the cap. set + deque pair keeps "seen sessions" bounded:
+        # the deque preserves insertion order for eviction, the set keeps
+        # membership lookup O(1).
+        self._buffers: OrderedDict[str, _SessionBuffer] = OrderedDict()
         self._sessions_seen: set[str] = set()
+        self._sessions_seen_q: deque[str] = deque()
         self._flush_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        self._log = logging.getLogger(__name__)
+
+    def _mark_seen(self, session_id: str) -> None:
+        if session_id in self._sessions_seen:
+            return
+        if len(self._sessions_seen_q) >= _MAX_SEEN:
+            evicted = self._sessions_seen_q.popleft()
+            self._sessions_seen.discard(evicted)
+        self._sessions_seen_q.append(session_id)
+        self._sessions_seen.add(session_id)
 
     def push(self, event: SyncEvent) -> None:
         buf = self._buffers.get(event.session_id)
@@ -100,10 +120,22 @@ class EventAggregator:
                 session_started=event.session_id in self._sessions_seen,
             )
             self._buffers[event.session_id] = buf
-            self._sessions_seen.add(event.session_id)
+            self._mark_seen(event.session_id)
+            # Drop oldest pending buffers if over the cap. We deliberately
+            # do *not* synchronously flush them — the flush callback may
+            # block on Discord I/O, and dropping a stale buffer is the
+            # safer failure mode under memory pressure.
+            while len(self._buffers) > _MAX_BUFFERS:
+                dropped, _ = self._buffers.popitem(last=False)
+                if dropped != event.session_id:
+                    self._log.warning(
+                        "vscode_sync: dropped pending buffer for %s (over cap %d)",
+                        dropped, _MAX_BUFFERS,
+                    )
         else:
             buf.cwd = event.cwd
             buf.git_branch = event.git_branch
+            self._buffers.move_to_end(event.session_id)
 
         if event.kind == "user_prompt":
             buf.user_prompts.append(event.payload.get("text", ""))
@@ -176,4 +208,4 @@ class EventAggregator:
             await self._do_flush()
 
     def mark_session_started(self, session_id: str) -> None:
-        self._sessions_seen.add(session_id)
+        self._mark_seen(session_id)

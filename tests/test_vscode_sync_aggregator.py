@@ -170,3 +170,79 @@ def test_split_chunks_handles_oversize_line():
     out = _split_chunks(line, limit=1800)
     assert all(len(c) <= 1800 for c in out)
     assert "".join(out) == line
+
+
+# ---------------------------------------------------------------------------
+# Memory bound: _buffers + _sessions_seen must not grow without limit (P2-6)
+# ---------------------------------------------------------------------------
+
+def test_sessions_seen_bounded(monkeypatch):
+    """Adding more than _MAX_SEEN sessions evicts oldest from the set."""
+    from services.vscode_sync import aggregator as agg_mod
+
+    monkeypatch.setattr(agg_mod, "_MAX_SEEN", 5)
+
+    async def cb(content: str):
+        pass
+
+    agg = agg_mod.EventAggregator(flush_callback=cb, flush_interval=10.0)
+    for i in range(20):
+        agg._mark_seen(f"s{i}")
+    assert len(agg._sessions_seen) == 5
+    assert len(agg._sessions_seen_q) == 5
+    # Oldest should be gone
+    assert "s0" not in agg._sessions_seen
+    # Most recent should be present
+    assert "s19" in agg._sessions_seen
+
+
+async def test_buffers_lru_evicts_when_over_cap(monkeypatch):
+    """push() evicts oldest pending buffer when over MAX_BUFFERS."""
+    from services.vscode_sync import aggregator as agg_mod
+
+    monkeypatch.setattr(agg_mod, "_MAX_BUFFERS", 3)
+
+    async def cb(content: str):
+        pass
+
+    agg = agg_mod.EventAggregator(flush_callback=cb, flush_interval=10.0)
+    try:
+        # 5 distinct sessions, cap=3 → oldest 2 evicted, newest 3 kept
+        for i in range(5):
+            agg.push(_ev("user_prompt", sid=f"s{i}", text=f"prompt {i}"))
+        assert len(agg._buffers) == 3
+        assert "s0" not in agg._buffers
+        assert "s1" not in agg._buffers
+        assert "s2" in agg._buffers
+        assert "s3" in agg._buffers
+        assert "s4" in agg._buffers
+    finally:
+        if agg._flush_task and not agg._flush_task.done():
+            agg._flush_task.cancel()
+
+
+async def test_buffers_lru_touch_on_subsequent_push(monkeypatch):
+    """A second push for the same session moves it to MRU end."""
+    from services.vscode_sync import aggregator as agg_mod
+
+    monkeypatch.setattr(agg_mod, "_MAX_BUFFERS", 3)
+
+    async def cb(content: str):
+        pass
+
+    agg = agg_mod.EventAggregator(flush_callback=cb, flush_interval=10.0)
+    try:
+        agg.push(_ev("user_prompt", sid="s0", text="a"))
+        agg.push(_ev("user_prompt", sid="s1", text="b"))
+        agg.push(_ev("user_prompt", sid="s2", text="c"))
+        # touch s0 → MRU
+        agg.push(_ev("user_prompt", sid="s0", text="a2"))
+        # push s3 → should evict s1 (now oldest), not s0
+        agg.push(_ev("user_prompt", sid="s3", text="d"))
+        assert "s0" in agg._buffers
+        assert "s1" not in agg._buffers
+        assert "s2" in agg._buffers
+        assert "s3" in agg._buffers
+    finally:
+        if agg._flush_task and not agg._flush_task.done():
+            agg._flush_task.cancel()

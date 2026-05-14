@@ -43,7 +43,13 @@ async def fetch_channel_messages(
     target_user_id: int,
     limit: int = 500,
 ) -> list[tuple[discord.Message, discord.Message | None]]:
-    """Fetch messages from a channel, pairing user messages with bot replies.
+    """Stream channel history and pair user messages with their bot replies.
+
+    Peak memory is O(window) instead of O(channel.history(limit)) — earlier
+    versions materialised the full history list, which on a 500-msg fetch
+    held tens of MB of Discord Message objects in RAM. We keep a small
+    "pending" deque of user messages awaiting a reply within the next 4
+    messages and emit pairs as soon as the window closes.
 
     Returns list of (user_msg, bot_reply_or_None).
     """
@@ -55,35 +61,59 @@ async def fetch_channel_messages(
             log.error("Cannot access channel %d: %s", channel_id, e)
             return []
 
-    log.info("Fetching up to %d messages from #%s (%d)", limit, getattr(channel, "name", "?"), channel_id)
+    log.info("Streaming up to %d messages from #%s (%d)",
+             limit, getattr(channel, "name", "?"), channel_id)
 
-    messages: list[discord.Message] = []
-    async for msg in channel.history(limit=limit, oldest_first=True):
-        messages.append(msg)
-
-    log.info("Fetched %d total messages", len(messages))
-
-    # Build pairs: user message + next bot reply (if any)
-    pairs: list[tuple[discord.Message, discord.Message | None]] = []
     bot_id = client.user.id if client.user else None
+    # Match the prior algorithm's i+1..i+5 lookahead.
+    window = 5
+    pending: list[tuple[discord.Message, int]] = []  # (user_msg, count_since)
+    pairs: list[tuple[discord.Message, discord.Message | None]] = []
+    fetched = 0
 
-    for i, msg in enumerate(messages):
-        if msg.author.id != target_user_id:
-            continue
-        # Look for the next message from the bot as a reply
-        bot_reply = None
-        for j in range(i + 1, min(i + 5, len(messages))):
-            candidate = messages[j]
-            if candidate.author.bot and (bot_id is None or candidate.author.id == bot_id):
-                # Check if it's a reply to this message or just the next bot message
-                if (candidate.reference and candidate.reference.message_id == msg.id) or \
-                   candidate.author.id == bot_id:
-                    bot_reply = candidate
+    async for msg in channel.history(limit=limit, oldest_first=True):
+        fetched += 1
+
+        # Age out pending entries that have outlived the lookahead window.
+        next_pending: list[tuple[discord.Message, int]] = []
+        for um, count in pending:
+            if count >= window:
+                pairs.append((um, None))
+            else:
+                next_pending.append((um, count + 1))
+        pending = next_pending
+
+        is_bot_reply = (
+            msg.author.bot
+            and (bot_id is None or msg.author.id == bot_id)
+        )
+        if is_bot_reply:
+            ref_id = msg.reference.message_id if msg.reference else None
+            matched_idx: int | None = None
+            # Prefer the explicit reply target.
+            for idx, (um, _) in enumerate(pending):
+                if ref_id is not None and ref_id == um.id:
+                    matched_idx = idx
                     break
-        pairs.append((msg, bot_reply))
+            # Fall back to oldest pending — matches the previous "first bot
+            # message after the user" attribution.
+            if matched_idx is None and pending:
+                matched_idx = 0
+            if matched_idx is not None:
+                um, _ = pending.pop(matched_idx)
+                pairs.append((um, msg))
+        elif msg.author.id == target_user_id:
+            pending.append((msg, 0))
 
-    log.info("Found %d user messages (target=%d) with %d having bot replies",
-             len(pairs), target_user_id, sum(1 for _, r in pairs if r))
+    # Flush leftover pending (no reply seen before history ended).
+    for um, _ in pending:
+        pairs.append((um, None))
+
+    log.info(
+        "Streamed %d messages, found %d pairs (target=%d, %d with bot reply)",
+        fetched, len(pairs), target_user_id,
+        sum(1 for _, r in pairs if r),
+    )
     return pairs
 
 
