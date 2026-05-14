@@ -106,7 +106,8 @@ _IMAGE_MAGIC = (
     (b"GIF89a", "image/gif"),
     (b"RIFF", "image/webp"),  # actual check below requires "WEBP" at offset 8
 )
-_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+_IMAGE_MAX_BYTES = 8 * 1024 * 1024  # 8 MB. base64 inflates ~1.33x, so worst-case
+# per image ≈ 10.7 MB of string payload; × _IMAGE_MAX_COUNT = ~85 MB peak.
 # Per-message hard cap so a malicious / runaway parser doesn't OOM us.
 _IMAGE_MAX_COUNT = 8
 

@@ -1505,3 +1505,50 @@ class TestGetChannelSema:
         bot._get_channel_sema(3)  # should evict channel 1 (oldest, not locked)
         assert 1 not in bot._channel_semas
         bot._channel_semas.clear()
+
+    def test_lru_eviction_skips_locked_head(self, monkeypatch):
+        """locked sema が先頭にあっても、後ろの idle を evict する。"""
+        import asyncio
+        import bot
+        monkeypatch.setattr("bot.MAX_CHANNEL_SEMAS", 2)
+        bot._channel_semas.clear()
+
+        async def run():
+            bot._get_channel_sema(1)
+            s1 = bot._channel_semas[1]
+            await s1.acquire()  # channel 1 を locked にする
+            bot._get_channel_sema(2)
+            bot._get_channel_sema(3)
+            # over=1。先頭の 1 は locked で skip、idle の 2 が evict される。
+            assert 1 in bot._channel_semas
+            assert 2 not in bot._channel_semas
+            assert 3 in bot._channel_semas
+            s1.release()
+
+        asyncio.run(run())
+        bot._channel_semas.clear()
+
+    def test_lru_eviction_bounded_when_many_locked(self, monkeypatch):
+        """先頭に locked が積み上がっても、辞書は cap 付近で頭打ちする。"""
+        import asyncio
+        import bot
+        monkeypatch.setattr("bot.MAX_CHANNEL_SEMAS", 5)
+        bot._channel_semas.clear()
+
+        async def run():
+            holders = []
+            # 5 個 locked、その後に 10 個 idle を追加 → idle 側が順次 evict される
+            for cid in range(1, 6):
+                bot._get_channel_sema(cid)
+                s = bot._channel_semas[cid]
+                await s.acquire()
+                holders.append(s)
+            for cid in range(100, 110):
+                bot._get_channel_sema(cid)
+            # locked 5 個は残る + 直近 idle 1 個 ＝ 6 個程度に収まる
+            assert len(bot._channel_semas) <= 6
+            for s in holders:
+                s.release()
+
+        asyncio.run(run())
+        bot._channel_semas.clear()

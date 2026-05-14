@@ -156,12 +156,24 @@ def _get_channel_sema(channel_id: int) -> asyncio.Semaphore:
         _channel_semas[channel_id] = sema
     else:
         _channel_semas.move_to_end(channel_id)
-    # Evict idle (not currently locked) LRU entries when over limit.
-    while len(_channel_semas) > MAX_CHANNEL_SEMAS:
-        oldest_id, oldest_sema = next(iter(_channel_semas.items()))
-        if oldest_sema.locked() or oldest_id == channel_id:
-            break
-        _channel_semas.pop(oldest_id, None)
+    # Evict idle (not currently locked) LRU entries when over limit. The
+    # previous version broke out of the loop on the first locked entry,
+    # which meant a head full of locked semas pinned the dict above its
+    # cap and never evicted idle entries further back. Walk a snapshot
+    # of keys and stop only after `over` entries have been removed.
+    if len(_channel_semas) > MAX_CHANNEL_SEMAS:
+        over = len(_channel_semas) - MAX_CHANNEL_SEMAS
+        evicted = 0
+        for oldest_id in list(_channel_semas.keys()):
+            if evicted >= over:
+                break
+            if oldest_id == channel_id:
+                continue
+            oldest_sema = _channel_semas[oldest_id]
+            if oldest_sema.locked():
+                continue
+            _channel_semas.pop(oldest_id, None)
+            evicted += 1
     return sema
 
 log.info("Loaded %d sessions from disk", len(sessions))
