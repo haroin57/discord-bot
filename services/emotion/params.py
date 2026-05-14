@@ -108,9 +108,13 @@ EVENT_DELTAS: dict[str, dict[str, float]] = {
         "valence": +0.50, "arousal": +0.25, "loneliness": -0.40,
         "anxiety": -0.25, "affection": +0.15, "curiosity": +0.05,
     },
+    "silence_6h": {
+        "valence": -0.02, "arousal": -0.05, "loneliness": +0.10,
+        "anxiety": +0.05, "curiosity": +0.08,
+    },
     "silence_12h": {
         "valence": -0.05, "arousal": -0.10, "loneliness": +0.25,
-        "anxiety": +0.10, "affection": -0.02,
+        "anxiety": +0.10, "affection": -0.02, "curiosity": +0.05,
     },
     "silence_24h": {
         "valence": -0.10, "arousal": -0.15, "loneliness": +0.40,

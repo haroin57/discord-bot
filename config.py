@@ -133,8 +133,12 @@ CLAUDE_TRANSIENT_MAX_ATTEMPTS = int(os.environ.get("CLAUDE_TRANSIENT_MAX_ATTEMPT
 CLAUDE_MAX_BACKOFF_S = int(os.environ.get("CLAUDE_MAX_BACKOFF_S", "60"))
 
 # Stream quality (free-code: queryModelWithStreaming)
-STREAM_STALL_THRESHOLD_S = 30
-STREAM_IDLE_TIMEOUT_S = 90
+# IDLE_TIMEOUT bumped from 90 → 300 (2026-05-14): adaptive extended thinking
+# with mixed-format prior_history (loaded since the resume fix) can keep the
+# SSE stream silent past 90s while the model is still thinking. 300s gives
+# headroom without unbounded waits.
+STREAM_STALL_THRESHOLD_S = int(os.environ.get("STREAM_STALL_THRESHOLD_S", "30"))
+STREAM_IDLE_TIMEOUT_S = int(os.environ.get("STREAM_IDLE_TIMEOUT_S", "300"))
 
 # OAuth (free-code: checkAndRefreshOAuthTokenIfNeeded)
 TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000
@@ -454,10 +458,13 @@ def _bool_env(name: str, default: bool) -> bool:
     return v.lower() in ("1", "true", "yes", "on")
 MEM0_LEGACY_CONTEXT = _bool_env("MEM0_LEGACY_CONTEXT", False)             # P1: True で旧 channel-history 流入挙動に戻す
 MEM0_GATE_ENABLED = _bool_env("MEM0_GATE_ENABLED", True)                   # P2: False で Mem0 標準抽出にフォールバック
-MEM0_GATE_MIN_IMPORTANCE = int(os.environ.get("MEM0_GATE_MIN_IMPORTANCE", "3"))
+MEM0_GATE_MIN_IMPORTANCE = int(os.environ.get("MEM0_GATE_MIN_IMPORTANCE", "2"))
 MEM0_GATE_MODEL = os.environ.get("MEM0_GATE_MODEL", "claude-haiku-4-5-20251001")
 MEM0_CLIENT_DEDUP_ENABLED = _bool_env("MEM0_CLIENT_DEDUP_ENABLED", True)   # P2.5
 MEM0_CLIENT_DEDUP_THRESHOLD = float(os.environ.get("MEM0_CLIENT_DEDUP_THRESHOLD", "0.85"))
+MEM0_DEDUP_TWO_STAGE = _bool_env("MEM0_DEDUP_TWO_STAGE", True)            # P4: 2段階dedup (LLM判定)
+MEM0_DEDUP_SEARCH_LIMIT = int(os.environ.get("MEM0_DEDUP_SEARCH_LIMIT", "5"))
+MEM0_DEDUP_DRY_RUN = _bool_env("MEM0_DEDUP_DRY_RUN", False)               # P4: dry-run (dropせずログのみ)
 MEM0_SMART_SEARCH = _bool_env("MEM0_SMART_SEARCH", True)                   # P3
 
 _github_token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
@@ -467,3 +474,21 @@ if _github_token:
         "url": "https://api.githubcopilot.com/mcp/",
         "headers": {"Authorization": f"Bearer {_github_token}"},
     }
+
+# ---------------------------------------------------------------------------
+# VSCode Claude Code → Discord thread sync
+# Posts via the bot's own Discord connection (bot.get_channel(...).send) —
+# no webhook setup required. Bot must be a member of the target thread.
+# ---------------------------------------------------------------------------
+VSCODE_SYNC_ENABLED = os.environ.get("VSCODE_SYNC_ENABLED", "false").lower() == "true"
+VSCODE_SYNC_THREAD_ID = int(os.environ.get("VSCODE_SYNC_THREAD_ID", "0") or "0")
+VSCODE_SYNC_PROJECTS_ROOT = os.environ.get(
+    "VSCODE_SYNC_PROJECTS_ROOT", os.path.expanduser("~/.claude/projects")
+)
+VSCODE_SYNC_FLUSH_INTERVAL = float(os.environ.get("VSCODE_SYNC_FLUSH_INTERVAL", "2.0"))
+VSCODE_SYNC_IDLE_NOTIFY_SECONDS = int(os.environ.get("VSCODE_SYNC_IDLE_NOTIFY_SECONDS", "300"))
+
+if VSCODE_SYNC_ENABLED and VSCODE_SYNC_THREAD_ID <= 0:
+    raise RuntimeError(
+        "VSCODE_SYNC_ENABLED=true but VSCODE_SYNC_THREAD_ID is not set"
+    )

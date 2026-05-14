@@ -12,6 +12,7 @@ from collections import OrderedDict
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from config import (
@@ -29,8 +30,15 @@ from config import (
     RESTRICTED_COOLDOWN_SECONDS,
     RESTRICTED_DAILY_QUOTA,
     STATE_DIR,
+    VSCODE_SYNC_ENABLED,
+    VSCODE_SYNC_FLUSH_INTERVAL,
+    VSCODE_SYNC_IDLE_NOTIFY_SECONDS,
+    VSCODE_SYNC_PROJECTS_ROOT,
+    VSCODE_SYNC_THREAD_ID,
 )
 from services.claude_sdk import _is_session_fresh, call_with_tools, kill_orphan_claude_cli
+from services import vscode_sync
+from services.vscode_sync.discord_post import make_post_callback
 from services.mem0_service import add_memories, format_memories_for_prompt, search_memories, search_memories_smart
 from services.session import SessionInfo, load_history_channel, load_sessions, update_session
 from utils.attachments import (
@@ -106,6 +114,9 @@ _background_tasks: set[asyncio.Task] = set()
 # Phase G/D5: one-shot guard so the on_ready cleanup doesn't fire again on
 # every Discord reconnect (which is otherwise harmless but wasteful).
 _cleanup_scheduled: bool = False
+# Same idea for the vscode_sync daemon: on_ready fires on every reconnect
+# and run_daemon() must not be scheduled twice.
+_vscode_sync_started: bool = False
 
 
 def _track_task(coro, *, name: str | None = None) -> asyncio.Task:
@@ -319,6 +330,19 @@ async def on_ready():
             name="cleanup_stale_attachments",
         )
 
+    global _vscode_sync_started
+    if VSCODE_SYNC_ENABLED and not _vscode_sync_started and not vscode_sync.is_running():
+        _vscode_sync_started = True
+        _track_task(
+            vscode_sync.run_daemon(
+                post_callback=make_post_callback(bot, VSCODE_SYNC_THREAD_ID),
+                projects_root=VSCODE_SYNC_PROJECTS_ROOT,
+                flush_interval=VSCODE_SYNC_FLUSH_INTERVAL,
+                idle_notify_seconds=VSCODE_SYNC_IDLE_NOTIFY_SECONDS,
+            ),
+            name="vscode_sync",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Segmented response sender (table images + text)
@@ -411,6 +435,66 @@ async def _send_segmented(
             _os.remove(p)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Slash commands
+# ---------------------------------------------------------------------------
+@bot.tree.command(name="vscode-sync", description="VSCode Claude Code → Discord 同期の切替 (admin only)")
+@app_commands.describe(action="on で開始 / off で停止 / status で状態確認")
+@app_commands.choices(action=[
+    app_commands.Choice(name="on", value="on"),
+    app_commands.Choice(name="off", value="off"),
+    app_commands.Choice(name="status", value="status"),
+])
+async def vscode_sync_cmd(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("admin only", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    if action.value == "status":
+        running = vscode_sync.is_running()
+        await interaction.followup.send(
+            f"vscode_sync: {'running' if running else 'stopped'} "
+            f"(enabled={VSCODE_SYNC_ENABLED}, thread={VSCODE_SYNC_THREAD_ID})",
+            ephemeral=True,
+        )
+        return
+
+    global _vscode_sync_started
+
+    if action.value == "on":
+        if vscode_sync.is_running():
+            await interaction.followup.send("already running", ephemeral=True)
+            return
+        if VSCODE_SYNC_THREAD_ID <= 0:
+            await interaction.followup.send(
+                "VSCODE_SYNC_THREAD_ID が未設定です",
+                ephemeral=True,
+            )
+            return
+        _vscode_sync_started = True
+        _track_task(
+            vscode_sync.run_daemon(
+                post_callback=make_post_callback(bot, VSCODE_SYNC_THREAD_ID),
+                projects_root=VSCODE_SYNC_PROJECTS_ROOT,
+                flush_interval=VSCODE_SYNC_FLUSH_INTERVAL,
+                idle_notify_seconds=VSCODE_SYNC_IDLE_NOTIFY_SECONDS,
+            ),
+            name="vscode_sync",
+        )
+        await interaction.followup.send("started", ephemeral=True)
+        return
+
+    # action.value == "off"
+    await vscode_sync.stop_daemon()
+    _vscode_sync_started = False
+    await interaction.followup.send("stopped", ephemeral=True)
 
 
 @bot.event

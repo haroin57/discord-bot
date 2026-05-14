@@ -5,6 +5,7 @@ Public API re-exports for `from services.mem0 import ...`. Internal modules:
   ingest   — add_memories (P2 gate + legacy fallback)
   search   — search/search_multi/search_smart + rewrite/rerank
   extract  — extract_facts_for_self + _classify_for_metadata
+  dedup    — two-stage dedup (cosine + LLM judgment)
   format   — format_memories_for_prompt
 """
 

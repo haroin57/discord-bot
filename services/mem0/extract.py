@@ -132,12 +132,14 @@ _EXTRACT_PROMPT = """以下の会話ターンから、長期記憶として保�
 - 抽出対象は <user_text>(送信者本人の発話) と <assistant_text>(bot応答内に出てくる本人状態)のみ
 - <context_hint> の他者発話・参考情報は **絶対に fact 化しない**(speaker=='other' になる内容は不要)
 - 雑談・短い相槌・LLM自己言及・一般論は出力しない
-- importance < 3 は出力しない
+- importance < 2 は出力しない
 - 1 fact は日本語 120字以内、canonical キーワード優先 (toeic-prep / ashitabo / kanae-bot / clannad-routes 等)
 - category は personal/project/tech/science/hobby/invest/ops/meta のいずれか
+- **嗜好表明も fact として拾う**: 「〜が好き」「〜をずっと聴いてる」「〜にハマってる」「〜が気になる」「〜を繰り返し見てる」等の表現は preference fact として importance=2〜3 で抽出する
+- **行動パターン・習慣も拾う**: 「最近〜してる」「毎日〜」「よく〜する」等
 
 以下の JSON のみ返してください(説明・前置き・コードフェンス不要):
-{{"facts":[{{"speaker":"self","text":"<日本語fact>","importance":<3-5>,"category":"<one of 8>","subcategory":"<kebab-case>","tags":["<tag>"]}}]}}
+{{"facts":[{{"speaker":"self","text":"<日本語fact>","importance":<2-5>,"category":"<one of 8>","subcategory":"<kebab-case>","tags":["<tag>"]}}]}}
 
 該当事実が無ければ facts は空配列で構いません。"""
 

@@ -256,7 +256,7 @@ class TestBuildPrompt:
     """Tests for the async build_prompt method."""
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def test_basic_prompt_contains_header_and_user_text(self):
         result = self._run(PromptBuilder.build_prompt(

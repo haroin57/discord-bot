@@ -47,6 +47,7 @@ async def add_memories(
     from config import (
         MEM0_GATE_ENABLED, MEM0_GATE_MIN_IMPORTANCE,
         MEM0_CLIENT_DEDUP_ENABLED, MEM0_CLIENT_DEDUP_THRESHOLD,
+        MEM0_DEDUP_TWO_STAGE, MEM0_DEDUP_SEARCH_LIMIT, MEM0_DEDUP_DRY_RUN,
     )
 
     try:
@@ -99,37 +100,60 @@ async def add_memories(
                 deduped.append(f)
             candidates = deduped
 
-            # Parallel near-dup check: previously each candidate awaited its
-            # own search serially. asyncio.gather lets ChromaDB embed+query
-            # all candidates concurrently and cuts per-ingest latency from
-            # O(N * ~150ms) to O(~150ms).
+            # Parallel near-dup check with optional 2-stage LLM judgment.
             kept: list[dict] = candidates
             if MEM0_CLIENT_DEDUP_ENABLED and candidates:
+                search_limit = MEM0_DEDUP_SEARCH_LIMIT
                 dedup_results = await asyncio.gather(
-                    *(search_memories(f["text"], user_id, limit=3) for f in candidates),
+                    *(search_memories(f["text"], user_id, limit=search_limit) for f in candidates),
                     return_exceptions=True,
                 )
-                kept = []
-                for f, near in zip(candidates, dedup_results):
-                    if isinstance(near, Exception):
-                        # Fail-open: if the search errored, do not silently
-                        # drop a potentially novel fact. Log via search itself.
-                        kept.append(f)
-                        continue
-                    if any((r.get("score") or 0) >= MEM0_CLIENT_DEDUP_THRESHOLD for r in near):
-                        skip_dup += 1
-                    else:
-                        kept.append(f)
+
+                if MEM0_DEDUP_TWO_STAGE:
+                    from services.mem0.dedup import check_near_dup
+                    kept = []
+                    # Run 2-stage checks in parallel
+                    async def _check_one(f, near):
+                        if isinstance(near, Exception):
+                            return (f, False)
+                        is_dup, reason = await check_near_dup(
+                            f["text"], f.get("category"), near,
+                            dry_run=MEM0_DEDUP_DRY_RUN,
+                        )
+                        return (f, is_dup)
+                    check_results = await asyncio.gather(
+                        *(_check_one(f, near) for f, near in zip(candidates, dedup_results)),
+                    )
+                    for f, is_dup in check_results:
+                        if is_dup and not MEM0_DEDUP_DRY_RUN:
+                            skip_dup += 1
+                        else:
+                            kept.append(f)
+                else:
+                    # Legacy single-threshold dedup
+                    kept = []
+                    for f, near in zip(candidates, dedup_results):
+                        if isinstance(near, Exception):
+                            kept.append(f)
+                            continue
+                        if any((r.get("score") or 0) >= MEM0_CLIENT_DEDUP_THRESHOLD for r in near):
+                            skip_dup += 1
+                        else:
+                            kept.append(f)
 
             # Parallel raw insert: same rationale — three ChromaDB writes in
             # serial added ~3 x latency. asyncio.gather them and tolerate
             # individual failures via return_exceptions.
             async def _insert_one(f: dict):
                 fact_meta = dict(base_meta)
+                imp = int(f.get("importance", 3))
+                # importance=2 → force tier=Warm so weekly compact ages it out faster
+                tier = 2 if imp <= 2 else f.get("tier")
                 fact_meta.update({
                     "category":    f.get("category"),
                     "subcategory": f.get("subcategory"),
-                    "importance":  f.get("importance"),
+                    "importance":  imp,
+                    "tier":        tier,
                     "tags":        f.get("tags") or [],
                 })
                 try:

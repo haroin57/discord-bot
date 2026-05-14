@@ -13,29 +13,26 @@ import uuid
 
 log = logging.getLogger(__name__)
 
+# === Auto-captured CLI identity block ===
+# Values below are refreshed by scripts/refresh_cli_identity.sh (cron'd to
+# run daily). DO NOT edit between the marker comments; manual edits will be
+# clobbered on the next refresh run.
+# AUTO-CAPTURE-START
 CC_VERSION = "2.1.92"
-CC_ENTRYPOINT = "cli"  # Matches the real claude-cli User-Agent suffix.
-
-# User-Agent the real CLI uses. Captured via mitmproxy on /v1/messages from
-# claude-cli 2.1.92. The desktop bundle ships "Claude-Desktop" but the CLI
-# is what we want to mimic since we have the same surface shape (no GUI).
-USER_AGENT = f"claude-cli/{CC_VERSION} (external, {CC_ENTRYPOINT})"
-
-# Beta list captured verbatim from the real claude-cli 2.1.92 against
-# /v1/messages with model=claude-opus-4-6 (mitmproxy 2026-05-13). Every
-# beta in this list is paired with a body field below (THINKING_CONFIG,
-# OUTPUT_CONFIG) so the server accepts them.
+CC_ENTRYPOINT = "sdk-cli"
 MODEL_BETAS = [
     "claude-code-20250219",
     "oauth-2025-04-20",
-    "context-1m-2025-08-07",
     "interleaved-thinking-2025-05-14",
-    "redact-thinking-2026-02-12",
     "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
     "advanced-tool-use-2025-11-20",
     "effort-2025-11-24",
 ]
+CLI_IDENTITY_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+# AUTO-CAPTURE-END
+
+USER_AGENT = f"claude-cli/{CC_VERSION} (external, {CC_ENTRYPOINT})"
 
 # Body fields the CLI always sends alongside the betas above.
 THINKING_CONFIG = {"type": "adaptive"}
@@ -43,12 +40,6 @@ OUTPUT_CONFIG = {"effort": "medium"}
 CLAUDE_MAX_TOKENS_OPUS = 64000
 
 _session_id = str(uuid.uuid4())
-
-
-# Identity prefix the real CLI sends as system[1] (mitmproxy capture
-# 2026-05-13). Must be sent verbatim — server-side OAuth-subscriber
-# gating appears to inspect this string.
-CLI_IDENTITY_TEXT = "You are Claude Code, Anthropic's official CLI for Claude."
 
 
 def _load_cli_default_system_prompt() -> str:

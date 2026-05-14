@@ -62,7 +62,7 @@ from services.emotion.state import (  # noqa: E402
 )
 from services.emotion.lock import LOCK_FILENAME, emotion_lock  # noqa: E402
 from services.emotion.telos import Motivation, generate_telos, should_suppress  # noqa: E402
-from services.emotion.transition import apply_time_decay  # noqa: E402
+from services.emotion.transition import apply_event, apply_time_decay  # noqa: E402
 
 # ────────────────────────── constants / paths ───────────────────────────────
 # Single delivery target. DM dispatch was removed 2026-05-13; if it ever comes
@@ -298,6 +298,33 @@ def main() -> int:
                     except (TypeError, ValueError):
                         elapsed_hours = 0.0
                 state = apply_time_decay(state, elapsed_hours)
+
+                # Fire discrete silence events based on hours since last
+                # senpai interaction.  Each threshold fires at most once per
+                # silence stretch: we check the *previous* elapsed vs the
+                # *current* elapsed so the event triggers on the tick that
+                # first crosses the boundary.
+                silence_hours = 0.0
+                li = state.last_interaction
+                if li and li.timestamp:
+                    try:
+                        last_ts = datetime.fromisoformat(li.timestamp)
+                        if last_ts.tzinfo is None:
+                            last_ts = last_ts.replace(tzinfo=JST)
+                        silence_hours = max(0.0, (now - last_ts).total_seconds() / 3600.0)
+                    except (TypeError, ValueError):
+                        pass
+                # prev_silence = silence_hours - elapsed_hours (time at last tick)
+                prev_silence = max(0.0, silence_hours - elapsed_hours)
+                for threshold, event_name in [
+                    (6, "silence_6h"),
+                    (12, "silence_12h"),
+                    (24, "silence_24h"),
+                ]:
+                    if prev_silence < threshold <= silence_hours:
+                        state = apply_event(state, event_name)
+                        log.info("silence event: %s (silence=%.1fh)", event_name, silence_hours)
+
                 state.updated_at = now.isoformat()
 
                 if in_quiet:

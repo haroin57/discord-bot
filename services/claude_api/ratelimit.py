@@ -142,17 +142,17 @@ def get_state() -> RateLimitState:
 def should_block() -> tuple[bool, str]:
     """Return ``(True, reason)`` if a new request must be refused outright.
 
-    Hits when binding window is past hard reset (utilization >= 1.0) and
-    fallback says 100% throttle — sending now is guaranteed 429.
+    Conservative: only refuse when the probabilistic throttle is essentially
+    100%. Subscription-bucket ``rejected`` and ``utilization >= 1.0`` do NOT
+    block — claude.ai Extra Usage is server-side auto-switch, so when the
+    subscription window is full the server itself decides whether to bill
+    via the overage path (returning 200) or actually 429 us. Pre-emptively
+    refusing here would prevent the overage path from ever being exercised
+    (observed 2026-05-14: status=rejected but the live CLI keeps getting
+    200 OK + overage-in-use=true).
     """
     if _state.fallback_percentage >= 0.99:
         return True, "API throttle active (fallback=100%)"
-    if _state.status == "rejected":
-        return True, "rate-limit status=rejected"
-    if _state.representative == "seven_day" and _state.seven_d_utilization >= 1.0:
-        return True, f"7d quota exhausted; resets at {_state.seven_d_reset}"
-    if _state.representative == "five_hour" and _state.five_h_utilization >= 1.0:
-        return True, f"5h quota exhausted; resets at {_state.five_h_reset}"
     return False, ""
 
 

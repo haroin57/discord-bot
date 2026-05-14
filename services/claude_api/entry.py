@@ -20,6 +20,7 @@ return the localized error message without retrying.
 import asyncio
 import base64
 import logging
+import uuid as _uuid
 import os
 import re
 import time
@@ -46,7 +47,7 @@ from services.oauth_manager import (
     make_async_oauth_client,
     prime_subscriber_session,
 )
-from services.session import SessionInfo
+from services.session import SessionInfo, append_jsonl, load_history_channel
 
 from services.claude_api.client import (
     CC_VERSION,
@@ -207,29 +208,33 @@ def _resolve_session(
     sessions: dict[int, SessionInfo],
     channel_id: int,
     chosen_mcp_keys: set[str],
-) -> dict[str, dict]:
-    """Apply the MCP-subset / TTL rules and return the MCP config to spawn.
+) -> tuple[dict[str, dict], bool]:
+    """Apply the MCP-subset / TTL rules and return ``(mcp_cfg, resumable)``.
 
     Mirrors services/claude_sdk.py:606-625. May mutate ``sessions`` by
     invalidating an incompatible-MCP session.
+
+    ``resumable`` is True when the caller may load prior turns from the
+    JSONL transcript and seed them into the agent loop. False whenever
+    the session is missing, stale, or MCP-incompatible.
     """
     info = sessions.get(channel_id)
     if info is None or not _is_session_fresh(channel_id):
         if info is not None:
             sessions.pop(channel_id, None)
             _clear_session_time(channel_id)
-        return get_mcp_servers_by_keys(list(chosen_mcp_keys))
+        return get_mcp_servers_by_keys(list(chosen_mcp_keys)), False
 
     stored = set(info.mcp_server_keys or [])
     if chosen_mcp_keys <= stored:
         # Compatible session — reuse the same MCP set we had before so
         # tool_use blocks from earlier turns still route correctly.
-        return get_mcp_servers_by_keys(list(stored))
+        return get_mcp_servers_by_keys(list(stored)), True
 
     # MCP mismatch — drop the session and start fresh.
     sessions.pop(channel_id, None)
     _clear_session_time(channel_id)
-    return get_mcp_servers_by_keys(list(chosen_mcp_keys))
+    return get_mcp_servers_by_keys(list(chosen_mcp_keys)), False
 
 
 async def _make_api_client(restricted: bool) -> anthropic.AsyncAnthropic:
@@ -252,6 +257,13 @@ async def _make_api_client(restricted: bool) -> anthropic.AsyncAnthropic:
         "X-Stainless-Timeout": "600",
         "accept-language": "*",
         "sec-fetch-mode": "cors",
+        # The real CLI generates a fresh UUID per /v1/messages POST. We can
+        # only set the header once at client-construction time (anthropic SDK
+        # default_headers); a tool_loop with multiple turns will reuse it.
+        # Servers seem to accept that, but if 429 reasoning ever shows
+        # client-id reuse as a discriminator, hoist this into a httpx
+        # request hook for true per-request rotation.
+        "x-client-request-id": str(_uuid.uuid4()),
     }
     if restricted and RESTRICTED_ANTHROPIC_API_KEY:
         return make_async_api_key_client(
@@ -306,8 +318,11 @@ async def call_with_tools(
         chosen_mcp_keys = set(chosen_mcp_cfg.keys())
 
         # 3. Session resume (admin only — restricted is stateless).
+        resumable = False
         if not restricted:
-            chosen_mcp_cfg = _resolve_session(sessions, channel_id, chosen_mcp_keys)
+            chosen_mcp_cfg, resumable = _resolve_session(
+                sessions, channel_id, chosen_mcp_keys
+            )
             chosen_mcp_keys = set(chosen_mcp_cfg.keys())
 
         # 4. Build the user message with optional inlined images.
@@ -318,10 +333,20 @@ async def call_with_tools(
         else:
             user_content = prompt_text
 
-        # In-memory conversation history. Caller (bot.py) owns the disk
-        # persistence layer (services/session.py append_jsonl); tool_loop
-        # does not write the assistant turn to disk.
-        history: list[dict] = []
+        # 4b. Load prior conversation turns from JSONL when the session is
+        # resumable. Anthropic Messages API is stateless: server-side resume
+        # by session_id does not exist, so we must replay the transcript on
+        # every turn — the same trick the official `claude --resume` does
+        # against ~/.claude/projects/<cwd>/<session_id>.jsonl.
+        prior_history: list[dict] = []
+        if resumable:
+            try:
+                prior_history = await asyncio.to_thread(
+                    load_history_channel, channel_id
+                )
+            except Exception as exc:
+                log.warning("[ch=%d] history load failed: %s", channel_id, exc)
+                prior_history = []
 
         # 5. Per-call settings
         if restricted:
@@ -362,14 +387,12 @@ async def call_with_tools(
 
                 async with StallWatchdog(channel_id, status_callback) as watchdog:
                     try:
-                        # Build the user message from scratch each attempt so
-                        # a partial transcript from a failed turn does not
-                        # poison the next attempt.
-                        history = [{"role": "user", "content": user_content}]
-                        # run_agent_loop appends its own user turn — pass an
-                        # empty history and let it handle the conversation
-                        # from a fresh prompt each retry.
-                        history_for_loop: list[dict] = []
+                        # Seed each attempt with a fresh copy of the prior
+                        # transcript so a partial / failed retry does not
+                        # poison the next attempt. run_agent_loop appends
+                        # the current user turn itself, so we do NOT add
+                        # the new prompt here.
+                        history_for_loop: list[dict] = list(prior_history)
                         result = await run_agent_loop(
                             prompt if not image_blocks else user_content,
                             channel_id,
@@ -426,4 +449,34 @@ async def call_with_tools(
         if result.synthetic_session_id:
             sessions[channel_id] = session_info
             _record_session_time(channel_id)
+
+        # 10. Persist this turn's user/assistant pair to the JSONL transcript
+        # so the next call (within TTL) can replay it.
+        #
+        # We persist the *full* prompt bot.py built for this turn — including
+        # the <retrieved_memories> block, the trusted/strict header, and the
+        # <untrusted_user_input> wrapper — not just raw_user_text. This is the
+        # only way Mem0 context survives into the next turn: bot.py skips Mem0
+        # search for short follow-ups (MEM0_MIN_QUERY_LENGTH=20) and the API
+        # is stateless, so without this persistence a short reply after a
+        # long Mem0-seeded turn would lose all recall.
+        #
+        # We use prompt_text (the image-blocks-stripped text) so massive
+        # base64 image payloads do not bloat the JSONL.
+        # Failures here (disk full, perms) must not abort the request.
+        if prompt_text and response_text:
+            try:
+                await asyncio.to_thread(
+                    append_jsonl,
+                    channel_id,
+                    {"role": "user", "content": prompt_text},
+                )
+                await asyncio.to_thread(
+                    append_jsonl,
+                    channel_id,
+                    {"role": "assistant", "content": response_text},
+                )
+            except Exception as exc:
+                log.warning("[ch=%d] history append failed: %s", channel_id, exc)
+
         return response_text, session_info if result.synthetic_session_id else None

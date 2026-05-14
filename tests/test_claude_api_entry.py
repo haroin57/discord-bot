@@ -137,8 +137,9 @@ class TestResolveSession:
             lambda keys: {k: {"command": "echo"} for k in keys},
         )
         sessions: dict = {}
-        out = _resolve_session(sessions, 1, {"brave-search"})
-        assert "brave-search" in out
+        cfg, resumable = _resolve_session(sessions, 1, {"brave-search"})
+        assert "brave-search" in cfg
+        assert resumable is False
         assert sessions == {}
 
     def test_reuses_when_subset(self, monkeypatch):
@@ -149,9 +150,10 @@ class TestResolveSession:
             lambda keys: {k: {"command": "echo"} for k in keys},
         )
         sessions = {1: SessionInfo(session_id="abc", mcp_server_keys=["brave-search", "x-scraper"])}
-        out = _resolve_session(sessions, 1, {"brave-search"})
+        cfg, resumable = _resolve_session(sessions, 1, {"brave-search"})
         # Subset → stored full set is reused.
-        assert set(out.keys()) == {"brave-search", "x-scraper"}
+        assert set(cfg.keys()) == {"brave-search", "x-scraper"}
+        assert resumable is True
         assert 1 in sessions
         ss._clear_session_time(1)
 
@@ -163,10 +165,11 @@ class TestResolveSession:
             lambda keys: {k: {"command": "echo"} for k in keys},
         )
         sessions = {1: SessionInfo(session_id="abc", mcp_server_keys=["brave-search"])}
-        out = _resolve_session(sessions, 1, {"x-scraper"})
+        cfg, resumable = _resolve_session(sessions, 1, {"x-scraper"})
         # Needed key not in stored → session dropped, fresh set spawned.
         assert sessions == {}
-        assert set(out.keys()) == {"x-scraper"}
+        assert set(cfg.keys()) == {"x-scraper"}
+        assert resumable is False
 
 
 # ---------------------------------------------------------------------------

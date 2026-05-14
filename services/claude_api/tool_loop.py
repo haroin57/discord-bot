@@ -32,7 +32,6 @@ from services.claude_api.client import (
     CLAUDE_MAX_TOKENS_OPUS,
     CLI_DEFAULT_SYSTEM_PROMPT,
     CLI_IDENTITY_TEXT,
-    OUTPUT_CONFIG,
     THINKING_CONFIG,
     get_attribution_header_value,
     get_metadata,
@@ -219,9 +218,12 @@ async def run_agent_loop(
         # we're in the warning zone, so we don't trip the probabilistic throttle.
         await maybe_wait_before_request()
 
-        # Body fields the CLI always pairs with its betas. interleaved-
-        # thinking-2025-05-14 needs ``thinking``; effort-2025-11-24 needs
-        # ``output_config``. Sending the betas without these triggers 400.
+        # Body fields the CLI pairs with its betas. interleaved-thinking-
+        # 2025-05-14 needs ``thinking``. ``output_config`` used to be paired
+        # with effort-2025-11-24 but the 2026-05-14 capture shows the live
+        # CLI sending ``extra_body: null``, so we dropped it (sending it was
+        # not breaking the request but was contributing to the bot being
+        # classified outside the overage-eligible cohort).
         max_tokens = (
             CLAUDE_MAX_TOKENS_OPUS if "opus" in (model or "").lower()
             else CLAUDE_MAX_TOKENS
@@ -234,7 +236,6 @@ async def run_agent_loop(
             betas=extra_betas,
             metadata=get_metadata(),
             thinking=THINKING_CONFIG,
-            extra_body={"output_config": OUTPUT_CONFIG},
         )
         if tools_for_api:
             stream_kwargs["tools"] = tools_for_api
