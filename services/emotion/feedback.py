@@ -1,39 +1,31 @@
-"""Emotion feedback loop — analyze interaction + update state.
+"""Emotion feedback loop — LLM-based transition on each conversation turn.
 
-Called from bot.py / web_api.py right after a successful Claude response.
-Runs as a fire-and-forget background task so it never adds latency to the
-reply send. The whole call is wrapped in a try/except so an analyzer
-failure or lock timeout cannot break the calling path.
+Called from bot.py right after a successful Claude response. Runs as a
+fire-and-forget background task so it never adds latency to the reply send.
 
-Threading model:
-- analyze_interaction is async (anthropic Haiku call) — awaited directly.
-- load_state / apply_event / save_state are sync, and emotion_lock is a
-  sync context manager. We run the lock-protected RMW inside
-  asyncio.to_thread so the event loop is never blocked even if the lock
-  is contended by the cron tick (kanae_emotion_tick.py).
+2026-06-14 v3: Switched to the persistent emotion-session daemon (held in
+`services.emotion.runtime`). The daemon is shared with the silence tick;
+both paths await `daemon.query()` serialized by an `asyncio.Lock` inside
+the daemon. We flag `is_conversation_active=True` for the duration so the
+silence tick can skip its turn rather than queue behind in-flight feedback.
+
+Fall-through: if the daemon isn't ready (failed to spawn / hasn't started
+yet / mid-restart) we skip this turn rather than block on the legacy
+subprocess.run path. The next turn will retry.
 """
 
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 
-from services.emotion.analyzer import analyze_interaction
 from services.emotion.lock import LOCK_FILENAME, emotion_lock
-from services.emotion.state import LastInteraction, load_state, save_state
-from services.emotion.transition import apply_event
+from services.emotion.state import load_state, save_state
 
 log = logging.getLogger(__name__)
 
 STATE_FILENAME = "kanae_emotion.json"
-
-# Cron tick poll interval is fine-grained (kanae_emotion_tick.py acquires
-# the same flock for its decay+telos RMW). A 5 s budget is more than enough
-# for that tick to release; longer would just delay the bot's housekeeping
-# without benefit.
 _LOCK_TIMEOUT_S = 5.0
 
 
@@ -44,60 +36,87 @@ async def schedule_feedback(
     state_dir: str | Path,
     history_tail: str = "",
 ) -> None:
-    """Apply one feedback event derived from a finished turn.
+    """Apply one LLM-based emotion update derived from a finished turn.
 
     Designed to be called as ``asyncio.create_task(schedule_feedback(...))``
-    from the bot. ``state_dir`` is the directory holding kanae_emotion.json
-    and kanae_emotion.lock — passed in (not imported from config) so the
-    same function works for both the Discord bot and the web API path and
-    so tests can point it at a tmp dir.
-
-    All exceptions are caught and logged; never raises.
+    from the bot. All exceptions are caught and logged; never raises.
     """
     state_dir = Path(state_dir)
-    state_path = state_dir / STATE_FILENAME
-    lock_path = state_dir / LOCK_FILENAME
 
+    from services.emotion.runtime import get_emotion_daemon
+    daemon = get_emotion_daemon()
+    if daemon is None or not daemon.is_alive:
+        log.info("emotion feedback: daemon unavailable, skipping turn")
+        return
+
+    daemon.is_conversation_active = True
     try:
-        event = await analyze_interaction(
+        await _daemon_transition_and_save(
+            daemon=daemon,
             user_text=user_text,
             assistant_text=assistant_text,
             history_tail=history_tail,
+            state_dir=state_dir,
         )
-    except Exception as exc:  # analyzer should already self-handle, defense in depth
-        log.warning("emotion analyze_interaction failed: %s", exc)
+    except Exception as exc:
+        log.warning("emotion feedback failed: %s", exc)
+    finally:
+        # Always release the flag even on failure so the silence tick
+        # doesn't get permanently locked out.
+        daemon.is_conversation_active = False
+
+
+async def _daemon_transition_and_save(
+    *,
+    daemon,
+    user_text: str,
+    assistant_text: str,
+    history_tail: str,
+    state_dir: Path,
+) -> None:
+    """Daemon-backed LLM transition + atomic state save."""
+    from services.emotion.llm_transition import llm_transition_via_daemon
+
+    state_path = state_dir / STATE_FILENAME
+    lock_path = state_dir / LOCK_FILENAME
+
+    state = await asyncio.to_thread(load_state, state_path)
+    # validator stamps last_interaction from conversation_meta — no need
+    # for a separate dataclasses.replace pass here.
+    new_state = await llm_transition_via_daemon(
+        state,
+        daemon,
+        mode="conversation",
+        state_dir=state_dir,
+        user_text=user_text,
+        assistant_text=assistant_text,
+        history_tail=history_tail,
+        conversation_meta={
+            "topics": [],
+            "quality": 0.7,
+            "senpai_engagement": 0.7,
+        },
+    )
+    if new_state is None:
+        log.warning("emotion feedback: daemon returned None, keeping previous state")
         return
 
     try:
-        await asyncio.to_thread(_apply_and_save, event, state_path, lock_path)
+        await asyncio.to_thread(
+            _save_under_lock, new_state, state_path, lock_path
+        )
     except TimeoutError:
-        log.warning("emotion feedback: lock contended for >%ss, skipping", _LOCK_TIMEOUT_S)
-    except Exception as exc:
-        log.warning("emotion feedback RMW failed: %s", exc)
+        log.warning("emotion feedback: state-file lock contended >%ss, skip save",
+                    _LOCK_TIMEOUT_S)
+        return
+
+    log.info(
+        "emotion feedback (daemon): v=%.2f lo=%.2f af=%.2f",
+        new_state.valence, new_state.loneliness, new_state.affection,
+    )
 
 
-def _apply_and_save(event: dict, state_path: Path, lock_path: Path) -> None:
-    """Synchronous RMW under flock. Runs inside ``asyncio.to_thread``."""
+def _save_under_lock(state, state_path: Path, lock_path: Path) -> None:
+    """Synchronous save with the shared flock; runs inside to_thread."""
     with emotion_lock(lock_path, blocking=True, timeout=_LOCK_TIMEOUT_S):
-        state = load_state(state_path)
-        state = apply_event(
-            state,
-            event.get("event_type", "short_reply"),
-            float(event.get("intensity", 0.5)),
-        )
-        state = dataclasses.replace(
-            state,
-            last_interaction=LastInteraction(
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                quality=float(event.get("intimacy_level", 0.5)),
-                initiated_by="senpai",
-                topics=list(event.get("topics") or [])[:5],
-                duration_minutes=0.0,
-                senpai_responsiveness=float(event.get("senpai_engagement", 0.5)),
-            ),
-        )
         save_state(state, state_path)
-        log.info(
-            "emotion feedback applied: event=%s intensity=%.2f topics=%s",
-            event.get("event_type"), event.get("intensity"), event.get("topics"),
-        )

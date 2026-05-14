@@ -1,4 +1,13 @@
-"""Tests for services.emotion.feedback.schedule_feedback."""
+"""Tests for services.emotion.feedback.schedule_feedback.
+
+NOTE (2026-06-14 v3 migration): these tests were written against the
+algebraic apply_event + analyze_interaction path that has been replaced by
+the persistent emotion-session daemon. They're skipped wholesale until
+P4b's daemon-mocked rewrite lands — exercising them today would assert
+behaviour we deliberately removed. See the v3 plan §15 P4b for the new
+test plan (mock EmotionSessionDaemon.query and verify the state-save +
+flag-toggle contract).
+"""
 
 import asyncio
 import tempfile
@@ -6,6 +15,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+
+pytest.skip(
+    "v3 migration: feedback.py now routes through the persistent daemon; "
+    "these tests target the obsolete apply_event path and will be rewritten "
+    "as part of P4b.",
+    allow_module_level=True,
+)
 
 from services.emotion import feedback as feedback_mod
 from services.emotion.feedback import schedule_feedback

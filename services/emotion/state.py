@@ -59,6 +59,14 @@ class EmotionState:
 
     last_interaction: LastInteraction = field(default_factory=LastInteraction)
     consecutive_self_initiated: int = 0
+    emotion_journal: list[dict] = field(default_factory=list)
+    # v3: LLM-supplied display labels. The renderer in format.py used to
+    # threshold-bucket the six floats into strings ("嬉しい", "拗ね気味" etc.);
+    # now the LLM emits them alongside the numerics so the displayed mood
+    # stays consistent with the model's own reasoning. Optional on load
+    # for backwards compatibility — old state files just rendered "普通".
+    derived_labels: list[str] = field(default_factory=list)
+    labels: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -87,6 +95,30 @@ class EmotionState:
         kwargs["version"] = int(d.get("version", CURRENT_VERSION))
         kwargs["updated_at"] = str(d.get("updated_at", "") or "")
         kwargs["consecutive_self_initiated"] = int(d.get("consecutive_self_initiated", 0) or 0)
+
+        # emotion_journal: ring buffer of recent emotion snapshots. v3
+        # widens this from 10 → 25 so the early-morning affection peak
+        # still influences a late-night silence transition.
+        raw_journal = d.get("emotion_journal")
+        if isinstance(raw_journal, list):
+            kwargs["emotion_journal"] = [
+                e for e in raw_journal if isinstance(e, dict)
+            ][-25:]
+        else:
+            kwargs["emotion_journal"] = []
+
+        # v3 LLM-supplied label fields. Tolerate missing / wrong-type for
+        # state files written by older code paths.
+        raw_derived = d.get("derived_labels")
+        if isinstance(raw_derived, list):
+            kwargs["derived_labels"] = [str(s) for s in raw_derived if s][:3]
+        else:
+            kwargs["derived_labels"] = []
+        raw_labels = d.get("labels")
+        if isinstance(raw_labels, dict):
+            kwargs["labels"] = {str(k): str(v) for k, v in raw_labels.items() if v}
+        else:
+            kwargs["labels"] = {}
 
         # Old state files may still carry a "momentum" object — silently
         # ignored. from_dict's tolerance ensures we don't break on it.

@@ -117,6 +117,11 @@ _cleanup_scheduled: bool = False
 # Same idea for the vscode_sync daemon: on_ready fires on every reconnect
 # and run_daemon() must not be scheduled twice.
 _vscode_sync_started: bool = False
+# Persistent emotion-session daemon (v3 plan). Long-lived Claude CLI
+# subprocess shared by feedback.py and the silence tick. None until
+# on_ready successfully spawns it; readers must null-check.
+_emotion_daemon = None  # type: object | None
+_emotion_daemon_started: bool = False
 
 
 def _track_task(coro, *, name: str | None = None) -> asyncio.Task:
@@ -279,9 +284,95 @@ bot = commands.Bot(
 _orig_close = bot.close
 
 
+async def _silence_tick_loop() -> None:
+    """Drive the LLM-based emotion silence updates from inside the bot.
+
+    Replaces the cron `scripts/kanae_emotion_tick.py` decay path (telos
+    selection still lives in that script until P7). Runs every 30 min
+    between JST 07:00 and 24:00. Skips when a conversation feedback is
+    in flight to avoid clobbering it.
+    """
+    import asyncio as _asyncio
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from pathlib import Path as _Path
+    JST = _tz(_td(hours=9))
+    interval_s = 1800  # 30 min
+    while True:
+        try:
+            await _asyncio.sleep(interval_s)
+        except _asyncio.CancelledError:
+            return
+        try:
+            now = _dt.now(JST)
+            if now.hour < 7 or now.hour >= 24:
+                continue  # quiet hours; cron schedule mirrors this
+            if _emotion_daemon is None or not _emotion_daemon.is_alive:
+                continue
+            if _emotion_daemon.is_conversation_active:
+                # Wait for the conversation feedback to finish — re-check
+                # on the next 30 min tick. Skipping is fine; the loneliness
+                # floor still advances through the validator's silence path
+                # whenever we do run.
+                continue
+
+            from services.emotion.feedback import STATE_FILENAME, _LOCK_TIMEOUT_S, _save_under_lock
+            from services.emotion.llm_transition import llm_transition_via_daemon
+            from services.emotion.lock import LOCK_FILENAME
+            from services.emotion.state import load_state
+
+            state_dir = _Path(STATE_DIR)
+            state_path = state_dir / STATE_FILENAME
+            lock_path = state_dir / LOCK_FILENAME
+
+            state = await _asyncio.to_thread(load_state, state_path)
+            new_state = await llm_transition_via_daemon(
+                state, _emotion_daemon,
+                mode="silence",
+                state_dir=state_dir,
+            )
+            if new_state is not None:
+                try:
+                    await _asyncio.to_thread(
+                        _save_under_lock, new_state, state_path, lock_path,
+                    )
+                except TimeoutError:
+                    log.warning("silence tick: state-file lock contended, skip save")
+
+            # ── Phase 2: telos-driven self-initiated proactive message ──
+            # Replaces the cron-driven kanae_emotion_tick.py path. Reads
+            # the freshly-updated state (now or before, both are fine —
+            # generate_telos is pure on the loaded state). Cooldown +
+            # quiet-hour gating + state bump live in self_initiate.
+            try:
+                from services.emotion.self_initiate import maybe_send_self_initiated
+                await maybe_send_self_initiated(
+                    bot=bot,
+                    state_dir=state_dir,
+                    repo_dir=state_dir.parent,
+                )
+            except Exception as exc:
+                log.warning("self_initiate dispatch failed: %s", exc)
+        except Exception as exc:
+            log.warning("silence tick iteration failed (non-fatal): %s", exc)
+
+
 async def _patched_close() -> None:
-    global _http_session
+    global _http_session, _emotion_daemon
     log.info("Closing bot and cleaning up resources...")
+    # Shut down the persistent emotion-session daemon before anything else
+    # so an in-flight `daemon.query()` from feedback.py doesn't lose its
+    # event loop mid-await.
+    if _emotion_daemon is not None:
+        try:
+            await _emotion_daemon.stop(timeout=5.0)
+        except Exception as exc:
+            log.warning("emotion daemon stop failed: %s", exc)
+        _emotion_daemon = None
+        try:
+            from services.emotion.runtime import set_emotion_daemon
+            set_emotion_daemon(None)
+        except Exception:
+            pass
     if _http_session and not _http_session.closed:
         await _http_session.close()
         _http_session = None
@@ -329,6 +420,41 @@ async def on_ready():
             asyncio.to_thread(cleanup_stale_attachments),
             name="cleanup_stale_attachments",
         )
+
+    # Spawn the persistent emotion-session daemon once per process. Failure
+    # is non-fatal: the bot keeps running and feedback.py will fall back to
+    # the legacy subprocess.run path or simply not update emotion state.
+    global _emotion_daemon, _emotion_daemon_started
+    if not _emotion_daemon_started:
+        _emotion_daemon_started = True
+        async def _start_emotion_daemon():
+            global _emotion_daemon
+            try:
+                from pathlib import Path as _Path
+                from services.emotion.persistent_session import EmotionSessionDaemon
+                from services.emotion.session import EMOTION as EMOTION_KEY
+                repo_dir = _Path(__file__).resolve().parent
+                daemon = EmotionSessionDaemon(
+                    EMOTION_KEY,
+                    STATE_DIR,
+                    model="haiku",
+                    cwd=str(repo_dir),
+                )
+                await daemon.start()
+                _emotion_daemon = daemon
+                # Expose the daemon to feedback.py / silence-tick callers
+                # without dragging bot's globals through their imports.
+                from services.emotion.runtime import set_emotion_daemon
+                set_emotion_daemon(daemon)
+                log.info("emotion daemon ready (pid=%s)",
+                         daemon._proc.pid if daemon._proc else "?")
+            except Exception as exc:
+                log.warning("emotion daemon spawn failed: %s", exc)
+        _track_task(_start_emotion_daemon(), name="emotion_daemon_start")
+        # 30-min silence tick — runs in-process so it shares the emotion
+        # daemon's session memory with feedback (no cron-vs-bot record
+        # fragmentation). See v3 plan §5.3.
+        _track_task(_silence_tick_loop(), name="emotion_silence_tick")
 
     global _vscode_sync_started
     if VSCODE_SYNC_ENABLED and not _vscode_sync_started and not vscode_sync.is_running():
@@ -685,11 +811,22 @@ async def on_message(message: discord.Message):
         # Always recall Mem0 memories so Claude has long-term context,
         # even on resumed sessions. Skip only for very short messages
         # (stickers, "はい", "うん", etc.) where embedding search won't match.
+        kanae_self_task: asyncio.Task | None = None
         if len(raw_user_text) >= MEM0_MIN_QUERY_LENGTH:
             # P3 (2026-05-12): smart search (Haiku rewrite + LLM rerank) を初実戦投入
             mem0_task: asyncio.Task | None = asyncio.create_task(
                 search_memories_smart(raw_user_text, mem0_user_id, limit=5)
             )
+            # P5 (2026-05-14): also pull kanae's own self-facts so she stays
+            # consistent with her past statements / preferences. Admin-only
+            # because the bot ID namespace contains opinionated text we don't
+            # want to surface to random users.
+            if caller_is_admin and bot.user is not None:
+                kanae_self_task = asyncio.create_task(
+                    search_memories_smart(
+                        raw_user_text, str(bot.user.id), limit=3,
+                    )
+                )
         else:
             mem0_task = None
 
@@ -878,6 +1015,27 @@ async def on_message(message: discord.Message):
             except Exception as e:
                 log.warning("Mem0 recall failed (non-fatal): %s", e)
 
+        # Kanae self-memory recall — injects facts about kanae herself so
+        # she stays consistent with prior statements/character. Stored
+        # under the bot's own user_id namespace via the kanae extractor in
+        # scripts/ingest_channel_history.py --subject kanae.
+        if kanae_self_task is not None:
+            try:
+                kanae_results = await kanae_self_task
+                kanae_block = format_memories_for_prompt(kanae_results)
+                if kanae_block:
+                    prompt = (
+                        f"<kanae_self_memory>\n"
+                        f"{kanae_block}\n"
+                        f"</kanae_self_memory>\n\n{prompt}"
+                    )
+                    log.info(
+                        "Mem0(kanae self): injected %d self-memories",
+                        len(kanae_results),
+                    )
+            except Exception as e:
+                log.warning("Mem0 kanae self-recall failed (non-fatal): %s", e)
+
         # Emotion state — admin only, prepended *before* mem0/header so the
         # model reads its own internal state first. emotion_task was started
         # alongside the Mem0 task above; non-admins always get None.
@@ -1039,6 +1197,43 @@ async def on_message(message: discord.Message):
                     )
 
             _track_task(_mem0_store(), name="mem0_store")
+
+            # P5 (2026-05-14): also extract kanae's own self-facts in
+            # real-time and store under the bot's user_id namespace.
+            # Mirrors the haroin path but with subject="kanae" so the
+            # extractor uses _EXTRACT_KANAE_PROMPT (services/mem0/extract.py)
+            # and treats response_text (kanae's utterance) as the subject.
+            if bot.user is not None:
+                kanae_self_user_id = str(bot.user.id)
+
+                async def _kanae_self_store():
+                    try:
+                        ctx_hint = _ctx_for_mem0 if MEM0_LEGACY_CONTEXT else ""
+                        log.info(
+                            "Mem0 ingest(kanae): uid=%s user_text=%d "
+                            "assistant=%d ctx=%d",
+                            kanae_self_user_id,
+                            len(raw_user_text), len(response_text), len(ctx_hint),
+                        )
+                        await add_memories(
+                            user_text=raw_user_text,
+                            assistant_text=response_text,
+                            user_id=kanae_self_user_id,
+                            context_hint=ctx_hint,
+                            subject="kanae",
+                            metadata={
+                                "channel_id": str(message.channel.id),
+                                "channel_name": getattr(message.channel, "name", "DM"),
+                                "source": "realtime_kanae",
+                            },
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "Mem0 kanae self-store failed: %s (channel=%s)",
+                            exc, message.channel.id,
+                        )
+
+                _track_task(_kanae_self_store(), name="kanae_self_store")
 
             # Emotion feedback — analyze this turn + persist new state.
             # Same admin gate as Mem0 (non-admin neither reads nor writes

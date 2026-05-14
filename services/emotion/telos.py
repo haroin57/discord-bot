@@ -102,26 +102,17 @@ def should_suppress(
     now: datetime,
     rng: random.Random | None = None,
 ) -> bool:
-    """Personality-driven hold-back. Pure given `rng`.
+    """No-op stub kept for callers that still pass through here.
 
-    Three guards:
-      - **ツンデレ抑制** — high affection paired with low expression
-        comfort means she sometimes refuses to say it out loud.
-      - **プライド抑制** — after 2 consecutive self-initiated pings, she
-        backs off rather than look needy.
-      - **深夜抑制** — late evening (≥22 JST) with weak urgency means she
-        waits until morning. Stronger urgencies (>0.8) override this.
+    The previous ツンデレ / プライド / 深夜 抑制 dice rolls were retired
+    2026-06-14 — they pre-empted decisions the LLM is now equipped to
+    make itself: the `<kanae_state>` block carries JST timestamp +
+    `consecutive_self_initiated`, and the proactive-message prompt
+    receives the same fields. Telos still selects a motivation; whether
+    to actually send the message is left entirely to the LLM's reply.
+
+    Kept as a function so existing call sites don't need to change while
+    we're confirming the new approach. Always returns False.
     """
-    rng = rng or random
-
-    if telos.type == "affection_expression" and rng.random() < TSUNDERE_GATE * 0.6:
-        return True
-
-    if (state.consecutive_self_initiated >= MAX_CONSECUTIVE_SELF_INITIATED
-            and rng.random() < 0.7):
-        return True
-
-    if now.hour >= LATE_NIGHT_HOUR_START and telos.urgency < 0.8 and rng.random() < 0.6:
-        return True
-
+    del state, telos, now, rng
     return False

@@ -1,7 +1,7 @@
 """Kanae emotion architecture — teleological (purpose-driven) contact model.
 
-See docs/kanae-emotion-architecture.md and the plan at
-~/.claude/plans/mossy-noodling-bunny.md for the design rationale.
+See docs/kanae-emotion-architecture.md and the transition plan at
+docs/2026-06-14-emotion-llm-transition-plan.md for the design rationale.
 
 Public surface re-exports the most-used names so callers don't need to know
 the internal module layout.

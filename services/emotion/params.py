@@ -213,3 +213,24 @@ SECONDARY_EMOTION_THRESHOLDS: dict[str, float] = {
 DECAY_QUALITY_WEIGHT = 0.6
 DECAY_RESPONSIVENESS_WEIGHT = 0.4
 assert abs(DECAY_QUALITY_WEIGHT + DECAY_RESPONSIVENESS_WEIGHT - 1.0) < 1e-9
+
+# ---------------------------------------------------------------------------
+# LLM Emotion Engine parameters (2026-06-14 transition plan)
+# ---------------------------------------------------------------------------
+# Model choices for Claude CLI
+LLM_TRANSITION_MODEL = "haiku"    # emotion engine
+DAILY_MODEL = "sonnet"            # daily life simulator
+
+# Daily journal
+DAILY_BUFFER_SIZE = 96            # ~24h at 15min intervals
+DAILY_CONTEXT_COUNT = 8           # recent entries in prompt
+DAILY_SUMMARY_MAX_TOKENS = 500    # incremental summary target
+
+# CLI timeouts (seconds)
+CLI_TIMEOUT = 90                  # daily (Sonnet, heavier)
+CLI_TIMEOUT_EMOTION = 60          # emotion (Haiku, lighter)
+CLI_TIMEOUT_SUMMARY = 30          # summary (Haiku, small)
+
+# Deprecated (kept for fallback): LONELINESS_RATE_PER_HOUR,
+# ANXIETY_RATE_PER_HOUR, EVENT_DELTAS, INERTIA event blending,
+# DECAY_QUALITY_* modifiers — all superseded by LLM-based transition

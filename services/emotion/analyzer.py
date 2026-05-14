@@ -38,15 +38,18 @@ _PROMPT = """以下の会話 1 ターンを分析して JSON 1行で返してく
 ユーザー(先輩): {user_text}
 アシスタント(かなえ): {assistant_text}
 
-判定:
-- event_type: senpai_initiated / long_good_chat / short_reply / praised / sweet_words / conflict / read_ignore のどれか
-- intensity: 0.0-1.0
-- topics: 1-3個の短い日本語キーワード(配列)
-- intimacy_level: 親密さ 0.0-1.0
-- senpai_engagement: 先輩の関与度 0.0-1.0
-- conflict_detected: bool
+出力スキーマ (必ずこの 6 フィールドのみ、他のフィールド禁止):
+{{"event_type": "<senpai_initiated|long_good_chat|short_reply|praised|sweet_words|conflict|read_ignore>",
+"intensity": <0.0-1.0>,
+"topics": [<1-3個の短い日本語キーワード>],
+"intimacy_level": <0.0-1.0>,
+"senpai_engagement": <0.0-1.0>,
+"conflict_detected": <true|false>}}
 
-出力: JSON 1行のみ。コードブロックや前置きは禁止。
+ルール:
+- analysis / reasoning / explanation などの追加フィールドは禁止
+- 文字列値はすべて二重引用符 ("..."); シングルクォート禁止
+- コードブロック・前置き・後置き禁止、JSON 1 行のみ
 """
 
 
@@ -81,10 +84,18 @@ async def analyze_interaction(
     try:
         resp = await client.messages.create(
             model=os.environ.get("EMOTION_ANALYZER_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=300,
+            # Was 300; Haiku occasionally smuggled an "analysis" prose field
+            # into the JSON and ran out of tokens mid-string ("...intimac"),
+            # producing "Unterminated string" parse failures and a wasted
+            # fallback. 600 leaves headroom for the 6-field schema without
+            # encouraging the model to keep talking.
+            max_tokens=600,
             messages=[{"role": "user", "content": prompt}],
         )
-        text = resp.content[0].text.strip()
+        text = next(
+            (b.text for b in getattr(resp, "content", []) or [] if getattr(b, "text", None)),
+            "",
+        ).strip()
     except Exception as exc:
         log.warning("emotion analyzer: Haiku call failed: %s", exc)
         return dict(_FALLBACK)
