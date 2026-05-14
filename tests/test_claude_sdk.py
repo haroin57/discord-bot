@@ -1425,9 +1425,7 @@ class TestSecurityFixes:
         """M3: pick_mcp_servers must only receive raw_user_text, never the full prompt."""
         received_args = []
 
-        real_pick = None
-        import config as _cfg
-        real_pick = _cfg.pick_mcp_servers
+        from services.mcp_selector import pick_mcp_servers as real_pick
 
         def recording_pick(text):
             received_args.append(text)

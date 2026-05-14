@@ -20,6 +20,7 @@ from config import (
     MAX_IMAGE_ATTACHMENTS,
     MAX_RESPONSE_IMAGES,
 )
+from utils.image_validator import identify_image_mime
 
 # Broader allow-list for admin users. Admin requests are already gated in
 # bot.py so we can safely allow /home/ubuntu here while still enforcing
@@ -52,18 +53,6 @@ TEXT_CONTENT_TYPES = {
 }
 MAX_TEXT_ATTACHMENT_BYTES = 100 * 1024  # 100KB cap for inline text
 MAX_TEXT_ATTACHMENTS = 3
-
-# First bytes of supported image formats. Used by extract_image_paths to
-# reject files whose extension was faked to sneak a secret past the filter.
-_IMAGE_MAGIC_PREFIXES: tuple[bytes, ...] = (
-    b"\x89PNG\r\n\x1a\n",   # PNG
-    b"\xff\xd8\xff",         # JPEG
-    b"GIF87a",               # GIF
-    b"GIF89a",               # GIF
-    b"RIFF",                 # WebP (RIFF....WEBP)
-    b"<svg",                 # SVG (ascii)
-    b"<?xml",                # SVG with XML declaration
-)
 
 # Bound total concurrent image downloads (module-wide, shared across channels).
 _download_semaphore = asyncio.Semaphore(ATTACHMENT_DL_CONCURRENCY)
@@ -205,7 +194,7 @@ def _has_image_magic(path: str) -> bool:
             head = fh.read(12)
     except OSError:
         return False
-    return any(head.startswith(m) for m in _IMAGE_MAGIC_PREFIXES)
+    return identify_image_mime(head, allow_svg=True) is not None
 
 
 def normalize_image_filenames(text: str) -> str:

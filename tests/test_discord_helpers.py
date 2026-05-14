@@ -254,11 +254,18 @@ class TestCacheGetSet:
         _cache_set((1, 2, False), "hello")
         assert _cache_get((1, 2, False)) == "hello"
 
-    def test_cache_expired_returns_none(self):
+    def test_cache_expired_returns_none(self, monkeypatch):
         import utils.discord_helpers as dh
+        import utils.cache as cache_mod
+        from config import THREAD_CONTEXT_CACHE_TTL_S
         key = (3, 4, False)
-        # Insert with past expiry
-        dh._thread_context_cache[key] = (time.monotonic() - 1, "expired")
+        # Insert via the normal API, then jump the clock past TTL.
+        _cache_set(key, "expired")
+        original = cache_mod.time.monotonic
+        monkeypatch.setattr(
+            cache_mod.time, "monotonic",
+            lambda: original() + THREAD_CONTEXT_CACHE_TTL_S + 1.0,
+        )
         assert _cache_get(key) is None
         assert key not in dh._thread_context_cache
 
@@ -484,7 +491,7 @@ class TestFetchThreadContext:
 
         # Pre-populate cache
         cache_key = (100, 200, False)
-        dh._thread_context_cache[cache_key] = (time.monotonic() + 9999, "cached context")
+        dh._thread_context_cache.set(cache_key, "cached context")
 
         result = await fetch_thread_context(thread, before_msg, caller_is_admin=False)
         assert result == "cached context"
@@ -579,8 +586,8 @@ class TestFetchThreadContext:
         before_msg.id = 204
 
         # Pre-populate both admin and non-admin cache entries
-        dh._thread_context_cache[(104, 204, True)] = (time.monotonic() + 9999, "admin-context")
-        dh._thread_context_cache[(104, 204, False)] = (time.monotonic() + 9999, "nonadmin-context")
+        dh._thread_context_cache.set((104, 204, True), "admin-context")
+        dh._thread_context_cache.set((104, 204, False), "nonadmin-context")
 
         admin_result = await fetch_thread_context(thread, before_msg, caller_is_admin=True)
         nonadmin_result = await fetch_thread_context(thread, before_msg, caller_is_admin=False)
@@ -600,7 +607,7 @@ class TestFetchChannelContext:
         before_msg = MagicMock()
         before_msg.id = 600
 
-        dh._thread_context_cache[(500, 600, False)] = (time.monotonic() + 9999, "cached channel")
+        dh._thread_context_cache.set((500, 600, False), "cached channel")
         result = await fetch_channel_context(channel, before_msg, caller_is_admin=False)
         assert result == "cached channel"
 

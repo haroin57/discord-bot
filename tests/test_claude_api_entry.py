@@ -11,15 +11,18 @@ import pytest
 from services.claude_api import entry as entry_mod
 from services.claude_api.entry import (
     _extract_attached_image_blocks,
-    _identify_image,
     _resolve_session,
     _safe_image_path,
 )
 from services.session import SessionInfo
 
+# _identify_image was inlined into utils.image_validator; keep the legacy
+# alias here so existing assertions can stay readable.
+from utils.image_validator import identify_image_mime as _identify_image
+
 
 # ---------------------------------------------------------------------------
-# Image identification
+# Image identification (now delegated to utils.image_validator)
 # ---------------------------------------------------------------------------
 class TestIdentifyImage:
     def test_png(self):

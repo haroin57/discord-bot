@@ -48,6 +48,8 @@ from config import (
     SETTINGS_PATH,
     STATE_DIR,
     SYSTEM_PROMPT,
+)
+from services.mcp_selector import (
     get_mcp_servers_by_keys,
     pick_mcp_servers,
 )

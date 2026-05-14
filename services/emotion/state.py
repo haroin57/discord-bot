@@ -1,9 +1,9 @@
 """Persistent emotion state — load/save with atomic file replacement.
 
-Mirrors the uuid-tmp + os.replace pattern from services/session.py:119
-(`save_sessions`) so concurrent writers can't corrupt the JSON. State files
-are written with mode 0o600 because conversation-derived affection levels
-shouldn't be world-readable on a multi-user host.
+Persist via utils.atomic_write so concurrent writers (bot hook + cron
+tick) can't corrupt the JSON. State files are written with mode 0o600
+because conversation-derived affection levels shouldn't be world-readable
+on a multi-user host.
 """
 
 from __future__ import annotations
@@ -11,11 +11,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from services.emotion.params import INITIAL_STATE
+from utils.atomic_write import atomic_write_json
 
 log = logging.getLogger(__name__)
 
@@ -171,32 +171,7 @@ def load_state(path: str | os.PathLike) -> EmotionState:
 def save_state(state: EmotionState, path: str | os.PathLike) -> None:
     """Atomically write state to `path` with mode 0o600.
 
-    Same uuid-tmp + os.replace pattern as services/session.py:save_sessions
-    so two concurrent writers (cron tick + bot hook) cannot interleave and
-    leave a half-written JSON.
+    Uses utils.atomic_write so two concurrent writers (cron tick + bot
+    hook) cannot interleave and leave a half-written JSON.
     """
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = p.with_name(f"{p.name}.{uuid.uuid4().hex}.tmp")
-    payload = json.dumps(state.to_dict(), ensure_ascii=False, indent=2)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
-    fd = os.open(tmp_path, flags, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        fd = None  # fdopen took ownership
-        os.replace(tmp_path, p)
-    except Exception:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        # Best-effort cleanup so a failed write doesn't leave .tmp turds.
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    atomic_write_json(path, state.to_dict())

@@ -10,9 +10,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
+
+from utils.atomic_write import atomic_write_json, atomic_write_text
 
 log = logging.getLogger(__name__)
 
@@ -74,31 +75,7 @@ def save_daily(entries: list[DailyEntry], state_dir: str | os.PathLike) -> None:
     """Persist daily journal (ring buffer, max DAILY_BUFFER_SIZE)."""
     entries = entries[-DAILY_BUFFER_SIZE:]
     p = Path(state_dir) / DAILY_FILENAME
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(f"{p.name}.{uuid.uuid4().hex}.tmp")
-    payload = json.dumps(
-        {"entries": [e.to_dict() for e in entries]},
-        ensure_ascii=False, indent=2,
-    )
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        fd = None
-        os.replace(tmp, p)
-    except Exception:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    atomic_write_json(p, {"entries": [e.to_dict() for e in entries]})
 
 
 def load_summary(state_dir: str | os.PathLike) -> str:
@@ -115,27 +92,7 @@ def load_summary(state_dir: str | os.PathLike) -> str:
 def save_summary(text: str, state_dir: str | os.PathLike) -> None:
     """Persist the daily summary."""
     p = Path(state_dir) / SUMMARY_FILENAME
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        fd = None
-        os.replace(tmp, p)
-    except Exception:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(p, text)
 
 
 def format_recent_entries(entries: list[DailyEntry], count: int = 8) -> str:

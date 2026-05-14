@@ -38,6 +38,8 @@ from config import (
     RESTRICTED_SYSTEM_PROMPT,
     MCP_SERVERS,
     SYSTEM_PROMPT,
+)
+from services.mcp_selector import (
     get_mcp_servers_by_keys,
     pick_mcp_servers,
 )
@@ -49,6 +51,7 @@ from services.oauth_manager import (
     prime_subscriber_session,
 )
 from services.session import SessionInfo, append_jsonl, load_history_channel
+from utils.image_validator import validate_image_bytes
 
 from services.claude_api.client import (
     CC_VERSION,
@@ -98,14 +101,6 @@ claude_semaphore = asyncio.Semaphore(CLAUDE_MAX_PARALLEL)
 restricted_claude_semaphore = asyncio.Semaphore(RESTRICTED_CLAUDE_MAX_PARALLEL)
 
 
-# Magic-byte signatures for allowed image MIME types.
-_IMAGE_MAGIC = (
-    (b"\x89PNG\r\n\x1a\n", "image/png"),
-    (b"\xff\xd8\xff", "image/jpeg"),
-    (b"GIF87a", "image/gif"),
-    (b"GIF89a", "image/gif"),
-    (b"RIFF", "image/webp"),  # actual check below requires "WEBP" at offset 8
-)
 _IMAGE_MAX_BYTES = 8 * 1024 * 1024  # 8 MB. base64 inflates ~1.33x, so worst-case
 # per image ≈ 10.7 MB of string payload; × _IMAGE_MAX_COUNT = ~85 MB peak.
 # Per-message hard cap so a malicious / runaway parser doesn't OOM us.
@@ -116,18 +111,6 @@ _ATTACHED_IMAGES_BLOCK_RE = re.compile(
     r"<attached_images>\s*(?P<body>.*?)\s*</attached_images>",
     re.DOTALL,
 )
-
-
-def _identify_image(data: bytes) -> str | None:
-    """Return MIME if ``data`` opens with a recognized image header."""
-    if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
-        return "image/webp"
-    for magic, mime in _IMAGE_MAGIC:
-        if mime == "image/webp":
-            continue  # handled above
-        if data.startswith(magic):
-            return mime
-    return None
 
 
 def _safe_image_path(path: str) -> str | None:
@@ -182,15 +165,12 @@ def _extract_attached_image_blocks(prompt: str) -> tuple[str, list[dict]]:
         try:
             with open(real, "rb") as fh:
                 data = fh.read(_IMAGE_MAX_BYTES + 1)
-            if len(data) > _IMAGE_MAX_BYTES:
-                log.warning("image rejected: oversized on read: %s", real)
-                continue
-            mime = _identify_image(data[:16])
-            if mime is None:
-                log.warning("image rejected: unrecognized magic: %s", real)
-                continue
         except OSError as exc:
             log.warning("image rejected: %s (%s)", real, exc)
+            continue
+        mime, err = validate_image_bytes(data, max_bytes=_IMAGE_MAX_BYTES)
+        if mime is None:
+            log.warning("image rejected: %s (%s)", real, err)
             continue
         blocks.append({
             "type": "image",
