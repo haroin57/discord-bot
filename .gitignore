@@ -23,3 +23,8 @@ __pycache__/
 credentials*.json
 *.pem
 *.key
+
+# mitmproxy capture artifacts contain OAuth bearer tokens — never commit raw
+# dumps. Only redacted JSON (produced by scripts/redact_capture.py) is safe.
+*.mitm
+docs/captures/**/*_raw.json

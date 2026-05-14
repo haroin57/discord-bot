@@ -2,12 +2,12 @@
 
 import re
 import logging
-import time
-from collections import OrderedDict
 from urllib.parse import urlparse
 
 import aiohttp
 import discord
+
+from utils.cache import TTLLRUCache
 
 from config import (
     ADMIN_USER_IDS,
@@ -25,28 +25,21 @@ from config import (
 
 log = logging.getLogger(__name__)
 
-# TTL + LRU cache: (channel_id, before_message_id) -> (expiry_ts, text)
-# Keeps brief conversational bursts fast without staleness risk.
-_thread_context_cache: OrderedDict[tuple[int, int], tuple[float, str]] = OrderedDict()
+# TTL + LRU cache: (channel_id, before_message_id) -> text. Keeps brief
+# conversational bursts fast without staleness risk. Implementation lives
+# in utils.cache so it can be reused for other caches in the future.
+_thread_context_cache: TTLLRUCache[tuple[int, int], str] = TTLLRUCache(
+    maxsize=THREAD_CONTEXT_CACHE_MAX,
+    ttl_s=THREAD_CONTEXT_CACHE_TTL_S,
+)
 
 
 def _cache_get(key: tuple[int, int]) -> str | None:
-    entry = _thread_context_cache.get(key)
-    if entry is None:
-        return None
-    expiry, text = entry
-    if time.monotonic() >= expiry:
-        _thread_context_cache.pop(key, None)
-        return None
-    _thread_context_cache.move_to_end(key)
-    return text
+    return _thread_context_cache.get(key)
 
 
 def _cache_set(key: tuple[int, int], text: str) -> None:
-    _thread_context_cache[key] = (time.monotonic() + THREAD_CONTEXT_CACHE_TTL_S, text)
-    _thread_context_cache.move_to_end(key)
-    while len(_thread_context_cache) > THREAD_CONTEXT_CACHE_MAX:
-        _thread_context_cache.popitem(last=False)
+    _thread_context_cache.set(key, text)
 
 # ---------------------------------------------------------------------------
 # Mention stripping (pre-compiled regex cache)

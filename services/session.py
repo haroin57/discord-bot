@@ -17,6 +17,7 @@ from config import (
     MAX_SESSIONS,
     SESSIONS_PATH,
 )
+from utils.atomic_write import atomic_write_json
 
 log = logging.getLogger(__name__)
 
@@ -117,7 +118,6 @@ def load_sessions() -> OrderedDict[int, SessionInfo]:
 
 def save_sessions(s: OrderedDict[int, SessionInfo], *, _path: str | None = None) -> None:
     target = _path or SESSIONS_PATH
-    tmp = target + ".tmp"
     data = {
         str(k): {
             "session_id": v.session_id,
@@ -125,19 +125,7 @@ def save_sessions(s: OrderedDict[int, SessionInfo], *, _path: str | None = None)
         }
         for k, v in s.items()
     }
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, target)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    atomic_write_json(target, data)
 
 
 def update_session(
@@ -254,11 +242,21 @@ def _tail_jsonl(path: str, max_entries: int) -> list[dict]:
                 lines_found += buf.count(b"\n")
             chunks.reverse()
             text = b"".join(chunks).decode("utf-8", errors="replace")
+            # If we stopped before BOF, the first decoded "line" is almost
+            # always a partial record left over from where the chunk boundary
+            # bisected an entry. Trying to json.loads() that half-record was
+            # the source of the steady stream of "Skipping corrupted JSONL
+            # line: Expecting value" warnings on every load. Drop it.
+            reached_bof = (pos == 0)
     except OSError:
         return []
 
+    lines = text.splitlines()
+    if lines and not reached_bof:
+        lines = lines[1:]
+
     messages: list[dict] = []
-    for line in text.splitlines():
+    for line in lines:
         line = line.strip()
         if not line:
             continue

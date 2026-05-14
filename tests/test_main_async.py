@@ -128,6 +128,36 @@ class TestAcquirePidlock:
         fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
         fh.close()
 
+    def test_release_callback_cleans_up(self, monkeypatch, tmp_path):
+        """The _release atexit callback should unlock and remove the pidfile."""
+        import atexit
+        mod = _reload_main_async(monkeypatch, tmp_path)
+        pid_path = str(tmp_path / "bot3.pid")
+        monkeypatch.setattr(mod, "PIDFILE", pid_path)
+        monkeypatch.setattr(mod, "_pidfile_handle", None)
+
+        registered = []
+        original_register = atexit.register
+
+        def _capture_register(func, *args, **kwargs):
+            registered.append(func)
+            return original_register(func, *args, **kwargs)
+
+        monkeypatch.setattr(atexit, "register", _capture_register)
+
+        mod._acquire_pidlock()
+
+        # Find and call _release (last registered callback that is not _log_listener.stop)
+        release_fn = next(
+            (f for f in reversed(registered) if f.__name__ == "_release"),
+            None,
+        )
+        assert release_fn is not None, "_release should be registered with atexit"
+
+        # Call it — should not raise and should remove the pidfile
+        release_fn()
+        assert not os.path.isfile(pid_path)
+
 
 # ---------------------------------------------------------------------------
 # main() — async
@@ -164,7 +194,7 @@ class TestMainAsync:
         async def _fake_bot_start(token):
             gathered.append(("bot.start", token))
 
-        async def _fake_web_start(port):
+        async def _fake_web_start(port, host=None):
             gathered.append(("web_api.start", port))
 
         # Build fake bot and WebAPI

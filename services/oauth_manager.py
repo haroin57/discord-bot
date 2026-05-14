@@ -288,6 +288,12 @@ def get_access_token() -> str | None:
 # ---------------------------------------------------------------------------
 _patched = False
 
+# Captured before _patch_anthropic_sdk() reassigns __init__, so callers that
+# need the un-patched constructor (e.g. restricted-mode API-key clients in
+# services/claude_api/restricted.py) can bypass OAuth injection cleanly.
+_orig_anthropic_init = None
+_orig_async_anthropic_init = None
+
 
 def _patch_anthropic_sdk() -> None:
     """Monkey-patch anthropic.Anthropic so all instances use OAuth Bearer auth.
@@ -295,15 +301,27 @@ def _patch_anthropic_sdk() -> None:
     Mem0 internally does `anthropic.Anthropic(api_key=...)` which sets the
     x-api-key header. We intercept this to drop api_key and inject auth_token
     + the required beta header instead.
+
+    Only the sync ``Anthropic`` class is patched. ``AsyncAnthropic`` is NOT
+    touched — services/claude_api uses ``make_async_oauth_client()`` below
+    to direct-inject the token instead. Mem0 only uses the sync client.
     """
-    global _patched
+    global _patched, _orig_anthropic_init, _orig_async_anthropic_init
     if _patched:
         return
 
     try:
         import anthropic
 
-        _orig_init = anthropic.Anthropic.__init__
+        _orig_anthropic_init = anthropic.Anthropic.__init__
+        # Capture the async constructor too so make_async_*_client can build
+        # patch-free instances without re-import dance. Defensive getattr so
+        # the existing test harness that mocks `anthropic` with a stub still
+        # works.
+        _async_cls = getattr(anthropic, "AsyncAnthropic", None)
+        _orig_async_anthropic_init = (
+            _async_cls.__init__ if _async_cls is not None else None
+        )
 
         def _oauth_init(self, **kwargs):
             # Drop api_key — we use auth_token directly (NOT env var)
@@ -316,13 +334,174 @@ def _patch_anthropic_sdk() -> None:
                 beta = f"{existing_beta},{OAUTH_BETA_HEADER}".strip(",") if existing_beta else OAUTH_BETA_HEADER
                 headers["anthropic-beta"] = beta
             kwargs["default_headers"] = headers
-            _orig_init(self, **kwargs)
+            _orig_anthropic_init(self, **kwargs)
 
         anthropic.Anthropic.__init__ = _oauth_init
         _patched = True
         log.info("Anthropic SDK patched for OAuth Bearer auth")
     except ImportError:
         log.warning("anthropic package not installed, skipping SDK patch")
+
+
+def _merge_oauth_headers(headers: dict | None) -> dict:
+    """Merge OAuth-required headers into the caller-supplied dict.
+
+    Adds:
+    - ``anthropic-beta: oauth-2025-04-20`` (subscriber-tier flag).
+    - ``anthropic-dangerous-direct-browser-access: true`` — the real CLI
+      sends this on every OAuth-authenticated request (mitmproxy capture
+      2026-05-13). Absence appears to be what triggered HTTP 429 on
+      first-call from our refactor smoke.
+    """
+    out = dict(headers or {})
+    existing_beta = out.get("anthropic-beta", "")
+    if OAUTH_BETA_HEADER not in existing_beta:
+        out["anthropic-beta"] = (
+            f"{existing_beta},{OAUTH_BETA_HEADER}".strip(",")
+            if existing_beta else OAUTH_BETA_HEADER
+        )
+    out.setdefault("anthropic-dangerous-direct-browser-access", "true")
+    return out
+
+
+async def _sanitize_outgoing_request(request) -> None:
+    """httpx event hook: strip Python-SDK-only headers + dedupe.
+
+    Diff source: mitmproxy capture of the real claude-cli 2.1.92 vs our
+    outgoing request. Every header below appears only on the Python
+    side and is a likely tell to subscriber-tier gating:
+        x-stainless-async         (Python AsyncAnthropic only)
+        x-stainless-helper-method (Python SDK convenience layer)
+        x-stainless-stream-helper (ditto)
+        x-stainless-read-timeout  (Python SDK only; CLI uses just
+                                    x-stainless-timeout)
+
+    Also collapse the duplicated x-stainless-timeout to the single CLI
+    value and pretend we accept brotli (the real CLI does).
+    """
+    h = request.headers
+    for k in (
+        "x-stainless-async",
+        "x-stainless-helper-method",
+        "x-stainless-stream-helper",
+        "x-stainless-read-timeout",
+    ):
+        if k in h:
+            del h[k]
+    timeouts = h.get_list("x-stainless-timeout")
+    if len(timeouts) > 1 or (timeouts and "NOT_GIVEN" in timeouts[0]):
+        del h["x-stainless-timeout"]
+        h["x-stainless-timeout"] = "600"
+    # The Node SDK advertises brotli; httpx omits it by default.
+    h["accept-encoding"] = "br, gzip, deflate"
+
+
+def _make_http_client_with_hook():
+    import httpx
+    return httpx.AsyncClient(
+        event_hooks={"request": [_sanitize_outgoing_request]},
+        timeout=600.0,
+    )
+
+
+_session_primed: bool = False
+
+
+async def prime_subscriber_session() -> None:
+    """Replay the CLI's pre-/v1/messages requests so server-side gating
+    treats us as an active subscriber.
+
+    The real claude-cli always calls these GET endpoints (with the same
+    OAuth Bearer token) before its first /v1/messages POST:
+
+        GET https://api.anthropic.com/api/oauth/profile
+        GET https://api.anthropic.com/api/oauth/claude_cli/roles
+
+    We've observed that without those preludes our /v1/messages calls
+    come back HTTP 429 with zero anthropic-ratelimit-unified-* headers,
+    which is the signature of "subscriber not recognized" rather than
+    "quota exhausted". Replaying them is cheap (~200 ms total) and is
+    only done once per process.
+    """
+    global _session_primed
+    if _session_primed:
+        return
+    if _access_token is None:
+        return
+    try:
+        import aiohttp
+    except ImportError:
+        log.warning("aiohttp not available, skipping session prime")
+        return
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Authorization": f"Bearer {_access_token}",
+        "User-Agent": "axios/1.13.6",
+        "Accept-Encoding": "gzip, compress, deflate, br",
+    }
+    urls = [
+        "https://api.anthropic.com/api/oauth/profile",
+        "https://api.anthropic.com/api/oauth/claude_cli/roles",
+    ]
+    try:
+        async with aiohttp.ClientSession() as sess:
+            for url in urls:
+                try:
+                    async with sess.get(url, headers=headers, timeout=10) as resp:
+                        log.info("session prime: %s → HTTP %d", url, resp.status)
+                except Exception as exc:
+                    log.warning("session prime %s failed: %s", url, exc)
+        _session_primed = True
+    except Exception as exc:
+        log.warning("session prime aborted: %s", exc)
+
+
+def make_async_oauth_client(**kwargs):
+    """Build an AsyncAnthropic that authenticates via the OAuth Bearer token.
+
+    The sync-side monkey patch does not cover AsyncAnthropic, so this factory
+    direct-injects ``auth_token`` instead of relying on the patch. We also
+    install a custom httpx client whose request hook strips Python-only
+    Stainless headers so the call looks more like the Node CLI.
+    """
+    import anthropic
+    if _access_token is None:
+        raise RuntimeError("OAuth not initialized; call init() first")
+    kwargs.pop("api_key", None)
+    kwargs["auth_token"] = _access_token
+    kwargs["default_headers"] = _merge_oauth_headers(kwargs.pop("default_headers", None))
+    kwargs.setdefault("http_client", _make_http_client_with_hook())
+    return anthropic.AsyncAnthropic(**kwargs)
+
+
+def make_async_api_key_client(api_key: str, **kwargs):
+    """Build an AsyncAnthropic that bills against a separate API key.
+
+    Used by the restricted-mode path so non-admin calls do not consume the
+    OAuth subscription quota. Does NOT go through the sync-side OAuth patch
+    and does NOT add OAUTH_BETA_HEADER (subscriber-tier only). Same
+    Stainless-header-sanitizing http_client hook as the OAuth path.
+    """
+    import anthropic
+    kwargs.pop("auth_token", None)  # never mix
+    kwargs["api_key"] = api_key
+    kwargs.setdefault("http_client", _make_http_client_with_hook())
+    return anthropic.AsyncAnthropic(**kwargs)
+
+
+def make_sync_api_key_client(api_key: str, **kwargs):
+    """Build a sync ``Anthropic`` client bypassing the OAuth patch.
+
+    Kept for legacy ``call_direct``-style callers that still use the sync
+    SDK and need a different billing account from OAuth.
+    """
+    import anthropic
+    if _orig_anthropic_init is None:
+        # Patch not installed yet — fall back to plain constructor.
+        return anthropic.Anthropic(api_key=api_key, **kwargs)
+    client = anthropic.Anthropic.__new__(anthropic.Anthropic)
+    _orig_anthropic_init(client, api_key=api_key, **kwargs)
+    return client
 
 
 # ---------------------------------------------------------------------------

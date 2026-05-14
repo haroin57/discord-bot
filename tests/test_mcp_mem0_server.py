@@ -364,6 +364,7 @@ class TestListAllTool:
 class TestDeleteTool:
     @pytest.mark.asyncio
     async def test_delete_success(self):
+        _svc("get_all_memories").return_value = [{"id": "abc-123", "memory": "x"}]
         _svc("delete_memory").return_value = True
         out = await _m.delete(memory_id="abc-123")
         assert "deleted abc-123" in out
@@ -371,6 +372,7 @@ class TestDeleteTool:
 
     @pytest.mark.asyncio
     async def test_delete_failure(self):
+        _svc("get_all_memories").return_value = [{"id": "xyz", "memory": "x"}]
         _svc("delete_memory").return_value = False
         out = await _m.delete(memory_id="xyz")
         assert "delete failed" in out
@@ -378,6 +380,7 @@ class TestDeleteTool:
 
     @pytest.mark.asyncio
     async def test_delete_none_return(self):
+        _svc("get_all_memories").return_value = [{"id": "nope", "memory": "x"}]
         _svc("delete_memory").return_value = None
         out = await _m.delete(memory_id="nope")
         assert "delete failed" in out

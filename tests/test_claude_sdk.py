@@ -1,4 +1,10 @@
-"""Tests for services/claude_sdk.py — call_with_tools with mocked SDK."""
+"""Tests for services/claude_sdk.py — call_with_tools with mocked SDK.
+
+PR8 (refactor/claude-api-unify) flipped the dispatcher default to "api".
+These tests target the SDK-backed legacy implementation, so we force the
+backend back to "sdk" for the duration of this file. The whole module is
+deleted in PR9 along with services/claude_sdk.py itself.
+"""
 
 import asyncio
 import os
@@ -9,6 +15,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from config import needs_tools
+
+
+@pytest.fixture(autouse=True)
+def _force_sdk_backend(monkeypatch):
+    monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +598,7 @@ class TestRestrictedOptions:
 
     @pytest.mark.asyncio
     async def test_restricted_read_tool_with_image(self):
-        """Restricted callers with image attachment get Read in allowed_tools."""
+        """H3: restricted callers get allowed_tools=[] even when has_image_attachment=True."""
         async def fake_query(*args, **kwargs):
             yield _make_result_msg(result="ok", session_id=None)
 
@@ -596,7 +607,7 @@ class TestRestrictedOptions:
             await call_with_tools("画像を確認", 60004, {}, restricted=True,
                                   has_image_attachment=True, raw_user_text="画像を確認")
             options = mock_q.call_args.kwargs.get("options") or mock_q.call_args[1]["options"]
-            assert "Read" in options.allowed_tools
+            assert options.allowed_tools == []
 
     @pytest.mark.asyncio
     async def test_restricted_max_turns(self):
@@ -927,6 +938,411 @@ class TestStreamProcessing:
             assert any("📨" in c for c in calls)
 
 
+class TestKillOrphanClaude:
+    def test_returns_zero_when_no_children(self):
+        """kill_orphan_claude_cli returns 0 when no matching descendants exist."""
+        import psutil as _psutil
+        from unittest.mock import patch, MagicMock
+        from services.claude_sdk import kill_orphan_claude_cli
+
+        mock_me = MagicMock()
+        mock_me.children.return_value = []
+        with patch("psutil.Process", return_value=mock_me):
+            result = kill_orphan_claude_cli()
+        assert result == 0
+
+    def test_kills_claude_named_process(self):
+        """kill_orphan_claude_cli terminates process named 'claude'."""
+        import psutil as _psutil
+        from unittest.mock import patch, MagicMock, call
+        from services.claude_sdk import kill_orphan_claude_cli
+
+        mock_child = MagicMock()
+        mock_child.name.return_value = "claude"
+        mock_child.cmdline.return_value = ["/usr/bin/claude"]
+
+        mock_me = MagicMock()
+        mock_me.children.return_value = [mock_child]
+
+        with patch("psutil.Process", return_value=mock_me):
+            with patch("psutil.wait_procs", return_value=([], [])):
+                result = kill_orphan_claude_cli()
+        assert result == 1
+        mock_child.terminate.assert_called_once()
+
+    def test_kills_mcp_server_process(self):
+        """kill_orphan_claude_cli terminates process with mcp-server- in cmdline."""
+        import psutil as _psutil
+        from unittest.mock import patch, MagicMock
+        from services.claude_sdk import kill_orphan_claude_cli
+
+        mock_child = MagicMock()
+        mock_child.name.return_value = "node"
+        mock_child.cmdline.return_value = ["node", "/usr/lib/mcp-server-memory/index.js"]
+
+        mock_me = MagicMock()
+        mock_me.children.return_value = [mock_child]
+
+        with patch("psutil.Process", return_value=mock_me):
+            with patch("psutil.wait_procs", return_value=([], [])):
+                result = kill_orphan_claude_cli()
+        assert result == 1
+
+    def test_handles_exception_gracefully(self):
+        """kill_orphan_claude_cli returns 0 on unexpected psutil exception."""
+        from unittest.mock import patch
+        from services.claude_sdk import kill_orphan_claude_cli
+
+        with patch("psutil.Process", side_effect=RuntimeError("boom")):
+            result = kill_orphan_claude_cli()
+        assert result == 0
+
+    def test_kills_alive_process_with_sigkill(self):
+        """Processes still alive after SIGTERM get SIGKILL."""
+        import psutil as _psutil
+        from unittest.mock import patch, MagicMock
+        from services.claude_sdk import kill_orphan_claude_cli
+
+        mock_child = MagicMock()
+        mock_child.name.return_value = "claude"
+        mock_child.cmdline.return_value = ["claude"]
+
+        mock_me = MagicMock()
+        mock_me.children.return_value = [mock_child]
+
+        # alive list contains the child → SIGKILL should be called
+        with patch("psutil.Process", return_value=mock_me):
+            with patch("psutil.wait_procs", return_value=([], [mock_child])):
+                result = kill_orphan_claude_cli()
+        mock_child.kill.assert_called_once()
+        assert result == 1
+
+
+class TestStderrHelperExceptions:
+    def test_read_stderr_buffer_exception(self):
+        """_read_stderr_buffer returns '' when read raises."""
+        from services.claude_sdk import _read_stderr_buffer
+        from unittest.mock import MagicMock
+
+        bad = MagicMock()
+        bad.flush.side_effect = IOError("disk error")
+        result = _read_stderr_buffer(bad)
+        assert result == ""
+
+    def test_read_stderr_buffer_text_mode(self):
+        """_read_stderr_buffer handles text content (not bytes)."""
+        import tempfile
+        from services.claude_sdk import _read_stderr_buffer
+
+        buf = tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+")
+        buf.write("text mode content")
+        result = _read_stderr_buffer(buf)
+        assert "text mode content" in result
+        buf.close()
+
+
+class TestH2StderrFileSave:
+    @pytest.mark.asyncio
+    async def test_stderr_saved_to_disk_on_error(self, tmp_path, monkeypatch):
+        """H2: when error has stderr, it's saved to STATE_DIR with mode 0o600."""
+        import services.claude_sdk as sdk
+        monkeypatch.setattr(sdk, "STATE_DIR", str(tmp_path))
+
+        call_count = {"n": 0}
+
+        async def error_with_stderr(*args, **kwargs):
+            call_count["n"] += 1
+            # Write something to debug_stderr before raising
+            opts = kwargs.get("options")
+            if opts and hasattr(opts, "debug_stderr") and opts.debug_stderr:
+                opts.debug_stderr.write(b"some stderr content with error details")
+            raise RuntimeError("authentication failed 401")
+            yield
+
+        with patch("services.claude_sdk.query", side_effect=error_with_stderr):
+            from services.claude_sdk import call_with_tools
+            text, info = await call_with_tools(
+                "hello", 11001, {}, raw_user_text="hello"
+            )
+
+        debug_file = tmp_path / "stderr_ch11001.log"
+        assert debug_file.exists()
+        stat = os.stat(str(debug_file))
+        assert (stat.st_mode & 0o777) == 0o600
+
+
+class TestCliExitResumeRetry:
+    @pytest.mark.asyncio
+    async def test_cli_exit_with_resume_retries_fresh(self):
+        """cli_exit on a resumed session clears session and retries fresh."""
+        from services.session import SessionInfo
+        from services.claude_sdk import _record_session_time
+
+        sessions = {95001: SessionInfo(session_id="stale-sess", mcp_server_keys=[])}
+        _record_session_time(95001)
+
+        call_count = {"n": 0}
+
+        async def cli_exit_then_ok(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("exit code 1 session mismatch")
+            yield _make_result_msg(result="fresh response", session_id="new-sess")
+
+        with patch("services.claude_sdk.query", side_effect=cli_exit_then_ok):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                from services.claude_sdk import call_with_tools
+                text, info = await call_with_tools(
+                    "hello", 95001, sessions, raw_user_text="hello"
+                )
+        assert text == "fresh response"
+        assert call_count["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_retry_status_callback_called(self):
+        """Status callback is called with retry message on retryable errors."""
+        call_count = {"n": 0}
+        callback = AsyncMock()
+
+        async def flaky_query(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] < 2:
+                raise RuntimeError("overloaded 529")
+            yield _make_result_msg(result="ok after retry")
+
+        with patch("services.claude_sdk.query", side_effect=flaky_query):
+            with patch("services.claude_sdk.BASE_BACKOFF_S", 0):
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    from services.claude_sdk import call_with_tools
+                    text, info = await call_with_tools(
+                        "hello", 95002, {}, status_callback=callback,
+                        raw_user_text="hello"
+                    )
+        assert text == "ok after retry"
+        calls = [str(c) for c in callback.call_args_list]
+        assert any("🔄" in c for c in calls)
+
+
+class TestCoverageGaps:
+    def test_cleanup_stderr_exception_on_close(self):
+        """_cleanup_stderr silently ignores exception when fileobj.close() raises."""
+        from services.claude_sdk import _cleanup_stderr
+        from unittest.mock import MagicMock
+
+        bad = MagicMock()
+        bad.closed = False
+        bad.close.side_effect = IOError("cannot close")
+        # Should not raise
+        _cleanup_stderr(bad)
+
+    def test_kill_orphan_psutil_none(self):
+        """kill_orphan_claude_cli returns 0 when psutil is None."""
+        import services.claude_sdk as sdk
+        original = sdk.psutil
+        sdk.psutil = None
+        try:
+            result = sdk.kill_orphan_claude_cli()
+        finally:
+            sdk.psutil = original
+        assert result == 0
+
+    def test_kill_orphan_child_no_such_process(self):
+        """NoSuchProcess during child enumeration is silently skipped."""
+        import psutil as _psutil
+        from unittest.mock import patch, MagicMock
+        from services.claude_sdk import kill_orphan_claude_cli
+
+        mock_child = MagicMock()
+        mock_child.name.side_effect = _psutil.NoSuchProcess(pid=9999)
+
+        mock_me = MagicMock()
+        mock_me.children.return_value = [mock_child]
+
+        with patch("psutil.Process", return_value=mock_me):
+            result = kill_orphan_claude_cli()
+        assert result == 0
+
+    def test_kill_orphan_terminate_no_such_process(self):
+        """NoSuchProcess during terminate() is silently ignored."""
+        import psutil as _psutil
+        from unittest.mock import patch, MagicMock
+        from services.claude_sdk import kill_orphan_claude_cli
+
+        mock_child = MagicMock()
+        mock_child.name.return_value = "claude"
+        mock_child.cmdline.return_value = ["claude"]
+        mock_child.terminate.side_effect = _psutil.NoSuchProcess(pid=9998)
+
+        mock_me = MagicMock()
+        mock_me.children.return_value = [mock_child]
+
+        with patch("psutil.Process", return_value=mock_me):
+            with patch("psutil.wait_procs", return_value=([], [])):
+                result = kill_orphan_claude_cli()
+        assert result == 1
+
+    def test_kill_orphan_kill_no_such_process(self):
+        """NoSuchProcess during kill() is silently ignored."""
+        import psutil as _psutil
+        from unittest.mock import patch, MagicMock
+        from services.claude_sdk import kill_orphan_claude_cli
+
+        mock_child = MagicMock()
+        mock_child.name.return_value = "claude"
+        mock_child.cmdline.return_value = ["claude"]
+        mock_child.kill.side_effect = _psutil.NoSuchProcess(pid=9997)
+
+        mock_me = MagicMock()
+        mock_me.children.return_value = [mock_child]
+
+        with patch("psutil.Process", return_value=mock_me):
+            with patch("psutil.wait_procs", return_value=([], [mock_child])):
+                result = kill_orphan_claude_cli()
+        assert result == 1
+
+    def test_tool_input_hint_exception(self):
+        """_tool_input_hint returns '' when an exception occurs."""
+        from services.claude_sdk import _tool_input_hint
+
+        # Pass a non-dict that will cause an exception in .get()
+        class BadDict:
+            def get(self, key, default=None):
+                raise RuntimeError("boom")
+            def __bool__(self):
+                return True
+            def values(self):
+                raise RuntimeError("boom")
+
+        result = _tool_input_hint("Bash", BadDict())
+        assert result == ""
+
+    @pytest.mark.asyncio
+    async def test_thinking_block_empty_thinking(self):
+        """ThinkingBlock with empty/None thinking is skipped without error."""
+        from claude_code_sdk import AssistantMessage
+        from claude_code_sdk.types import ThinkingBlock
+
+        callback = AsyncMock()
+
+        async def thinking_empty_query(*args, **kwargs):
+            am = MagicMock(spec=AssistantMessage)
+            tb = MagicMock(spec=ThinkingBlock)
+            tb.thinking = ""  # empty → should not call callback
+            am.content = [tb]
+            yield am
+            yield _make_result_msg()
+
+        with patch("services.claude_sdk.query", side_effect=thinking_empty_query):
+            from services.claude_sdk import call_with_tools
+            text, info = await call_with_tools("hello", 110001, {}, status_callback=callback,
+                                               raw_user_text="hello")
+        # callback should not have been called with 💭 (no thinking content)
+        calls = [str(c) for c in callback.call_args_list]
+        assert not any("💭" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_tool_use_block_with_dict_input(self):
+        """ToolUseBlock with dict input triggers status callback with hint."""
+        from claude_code_sdk import AssistantMessage
+        from claude_code_sdk.types import ToolUseBlock
+
+        callback = AsyncMock()
+
+        async def tool_dict_query(*args, **kwargs):
+            am = MagicMock(spec=AssistantMessage)
+            block = MagicMock(spec=ToolUseBlock)
+            block.name = "Bash"
+            block.input = {"command": "ls /tmp"}
+            am.content = [block]
+            yield am
+            yield _make_result_msg()
+
+        with patch("services.claude_sdk.query", side_effect=tool_dict_query):
+            from services.claude_sdk import call_with_tools
+            await call_with_tools("run", 110002, {}, status_callback=callback,
+                                  raw_user_text="run")
+        calls = [str(c) for c in callback.call_args_list]
+        assert any("Bash" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_cli_exit_partial_response_break(self):
+        """cli_exit with response_text already set returns partial text."""
+        from claude_code_sdk import ResultMessage
+
+        async def result_then_exit(*args, **kwargs):
+            # Yield a result message first, then raise cli_exit
+            msg = _make_result_msg(result="partial text", session_id="p2")
+            yield msg
+            raise RuntimeError("exit code 1")
+
+        with patch("services.claude_sdk.query", side_effect=result_then_exit):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                from services.claude_sdk import call_with_tools
+                text, info = await call_with_tools(
+                    "hello", 110003, {}, raw_user_text="hello"
+                )
+        # partial text was already set before the exit error
+        assert text == "partial text"
+
+    @pytest.mark.asyncio
+    async def test_broken_session_cleared_on_unknown_error(self):
+        """Unknown error during call clears broken session from dict."""
+        from services.session import SessionInfo
+        from services.claude_sdk import _record_session_time
+
+        sessions = {110004: SessionInfo(session_id="broken-sess", mcp_server_keys=[])}
+        _record_session_time(110004)
+
+        call_count = {"n": 0}
+
+        async def unknown_error(*args, **kwargs):
+            call_count["n"] += 1
+            raise RuntimeError("something weird happened in sdk")
+            yield
+
+        with patch("services.claude_sdk.query", side_effect=unknown_error):
+            with patch("services.claude_sdk.TRANSIENT_MAX_ATTEMPTS", 1):
+                with patch("services.claude_sdk.DEFAULT_MAX_ATTEMPTS", 1):
+                    with patch("asyncio.sleep", new_callable=AsyncMock):
+                        from services.claude_sdk import call_with_tools
+                        text, info = await call_with_tools(
+                            "hello", 110004, sessions, raw_user_text="hello"
+                        )
+        assert 110004 not in sessions
+
+
+class TestRetryBudgetLRU:
+    @pytest.mark.asyncio
+    async def test_lru_eviction_when_dict_too_large(self):
+        """LRU eviction removes oldest channel when _retry_budget exceeds max size."""
+        import services.claude_sdk as sdk
+        from services.claude_sdk import _RETRY_BUDGET_MAX_CHANNELS
+
+        # Fill budget dict to max capacity
+        sdk._retry_budget.clear()
+        for i in range(_RETRY_BUDGET_MAX_CHANNELS):
+            sdk._retry_budget[i] = [time.monotonic() - 120]  # stale timestamps
+
+        call_count = {"n": 0}
+
+        async def flaky_query(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] < 2:
+                raise RuntimeError("overloaded 529")
+            yield _make_result_msg(result="ok")
+
+        with patch("services.claude_sdk.query", side_effect=flaky_query):
+            with patch("services.claude_sdk.BASE_BACKOFF_S", 0):
+                with patch("asyncio.sleep", new_callable=AsyncMock):
+                    from services.claude_sdk import call_with_tools
+                    await call_with_tools("hello", 999998, {}, raw_user_text="hello")
+
+        # Dict should not have grown beyond max + 1
+        assert len(sdk._retry_budget) <= _RETRY_BUDGET_MAX_CHANNELS + 1
+        # Clean up
+        sdk._retry_budget.clear()
+
+
 class TestSecurityFixes:
     """Tests for H2, H3, M3, M5 security fixes."""
 
@@ -1009,9 +1425,7 @@ class TestSecurityFixes:
         """M3: pick_mcp_servers must only receive raw_user_text, never the full prompt."""
         received_args = []
 
-        real_pick = None
-        import config as _cfg
-        real_pick = _cfg.pick_mcp_servers
+        from services.mcp_selector import pick_mcp_servers as real_pick
 
         def recording_pick(text):
             received_args.append(text)

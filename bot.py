@@ -8,10 +8,11 @@ import io
 import logging
 import re
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from config import (
@@ -28,8 +29,16 @@ from config import (
     MEM0_MIN_QUERY_LENGTH,
     RESTRICTED_COOLDOWN_SECONDS,
     RESTRICTED_DAILY_QUOTA,
+    STATE_DIR,
+    VSCODE_SYNC_ENABLED,
+    VSCODE_SYNC_FLUSH_INTERVAL,
+    VSCODE_SYNC_IDLE_NOTIFY_SECONDS,
+    VSCODE_SYNC_PROJECTS_ROOT,
+    VSCODE_SYNC_THREAD_ID,
 )
 from services.claude_sdk import _is_session_fresh, call_with_tools, kill_orphan_claude_cli
+from services import vscode_sync
+from services.vscode_sync.discord_post import make_post_callback
 from services.mem0_service import add_memories, format_memories_for_prompt, search_memories, search_memories_smart
 from services.session import SessionInfo, load_history_channel, load_sessions, update_session
 from utils.attachments import (
@@ -54,6 +63,7 @@ from utils.discord_helpers import (
 )
 from utils.markdown_parser import TextSegment, TableSegment, MathSegment, has_tables, has_math, mask_code_blocks, parse_segments
 from utils.math_renderer import render_math_image
+from utils.response_sanitizer import strip_numeric_inline_code
 from utils.table_renderer import render_table_image
 
 log = logging.getLogger(__name__)
@@ -104,6 +114,14 @@ _background_tasks: set[asyncio.Task] = set()
 # Phase G/D5: one-shot guard so the on_ready cleanup doesn't fire again on
 # every Discord reconnect (which is otherwise harmless but wasteful).
 _cleanup_scheduled: bool = False
+# Same idea for the vscode_sync daemon: on_ready fires on every reconnect
+# and run_daemon() must not be scheduled twice.
+_vscode_sync_started: bool = False
+# Persistent emotion-session daemon (v3 plan). Long-lived Claude CLI
+# subprocess shared by feedback.py and the silence tick. None until
+# on_ready successfully spawns it; readers must null-check.
+_emotion_daemon = None  # type: object | None
+_emotion_daemon_started: bool = False
 
 
 def _track_task(coro, *, name: str | None = None) -> asyncio.Task:
@@ -138,12 +156,24 @@ def _get_channel_sema(channel_id: int) -> asyncio.Semaphore:
         _channel_semas[channel_id] = sema
     else:
         _channel_semas.move_to_end(channel_id)
-    # Evict idle (not currently locked) LRU entries when over limit.
-    while len(_channel_semas) > MAX_CHANNEL_SEMAS:
-        oldest_id, oldest_sema = next(iter(_channel_semas.items()))
-        if oldest_sema.locked() or oldest_id == channel_id:
-            break
-        _channel_semas.pop(oldest_id, None)
+    # Evict idle (not currently locked) LRU entries when over limit. The
+    # previous version broke out of the loop on the first locked entry,
+    # which meant a head full of locked semas pinned the dict above its
+    # cap and never evicted idle entries further back. Walk a snapshot
+    # of keys and stop only after `over` entries have been removed.
+    if len(_channel_semas) > MAX_CHANNEL_SEMAS:
+        over = len(_channel_semas) - MAX_CHANNEL_SEMAS
+        evicted = 0
+        for oldest_id in list(_channel_semas.keys()):
+            if evicted >= over:
+                break
+            if oldest_id == channel_id:
+                continue
+            oldest_sema = _channel_semas[oldest_id]
+            if oldest_sema.locked():
+                continue
+            _channel_semas.pop(oldest_id, None)
+            evicted += 1
     return sema
 
 log.info("Loaded %d sessions from disk", len(sessions))
@@ -188,8 +218,10 @@ def _cap_text(text: str, limit: int) -> str:
 # Daily quota tracking for non-admin callers (M-4)
 # ---------------------------------------------------------------------------
 _QUOTA_WINDOW_S = 24 * 60 * 60
-# user_id -> list of request epoch seconds within the window
-_daily_quota: OrderedDict[int, list[float]] = OrderedDict()
+# user_id -> deque of request epoch seconds within the window. deque keeps
+# entries in insertion (= time) order, so we can popleft expired entries in
+# O(expired) instead of rebuilding a new list every call.
+_daily_quota: OrderedDict[int, deque[float]] = OrderedDict()
 
 
 def _check_daily_quota(user_id: int) -> tuple[bool, int]:
@@ -197,13 +229,17 @@ def _check_daily_quota(user_id: int) -> tuple[bool, int]:
     if RESTRICTED_DAILY_QUOTA <= 0:
         return True, -1
     now = time.time()
-    bucket = _daily_quota.get(user_id, [])
-    bucket = [t for t in bucket if now - t < _QUOTA_WINDOW_S]
-    if len(bucket) >= RESTRICTED_DAILY_QUOTA:
+    cutoff = now - _QUOTA_WINDOW_S
+    bucket = _daily_quota.get(user_id)
+    if bucket is None:
+        bucket = deque()
         _daily_quota[user_id] = bucket
+    while bucket and bucket[0] < cutoff:
+        bucket.popleft()
+    if len(bucket) >= RESTRICTED_DAILY_QUOTA:
+        _daily_quota.move_to_end(user_id)
         return False, 0
     bucket.append(now)
-    _daily_quota[user_id] = bucket
     _daily_quota.move_to_end(user_id)
     while len(_daily_quota) > MAX_COOLDOWN_ENTRIES:
         _daily_quota.popitem(last=False)
@@ -266,9 +302,93 @@ bot = commands.Bot(
 _orig_close = bot.close
 
 
+async def _silence_tick_loop() -> None:
+    """Drive the LLM-based emotion silence updates from inside the bot.
+
+    Replaces the cron `scripts/kanae_emotion_tick.py` decay path (telos
+    selection still lives in that script until P7). Runs every 30 min
+    between JST 07:00 and 24:00. Skips when a conversation feedback is
+    in flight to avoid clobbering it.
+    """
+    import asyncio as _asyncio
+    from pathlib import Path as _Path
+    interval_s = 1800  # 30 min
+    while True:
+        try:
+            await _asyncio.sleep(interval_s)
+        except _asyncio.CancelledError:
+            return
+        try:
+            # No quiet-hours gate — the JST timestamp is in <kanae_state>
+            # and the silence prompt, so the LLM decides for itself
+            # whether "深夜だから寝てる" should suppress the response.
+            if _emotion_daemon is None or not _emotion_daemon.is_alive:
+                continue
+            if _emotion_daemon.is_conversation_active:
+                # Wait for the conversation feedback to finish — re-check
+                # on the next 30 min tick. Skipping is fine; the loneliness
+                # floor still advances through the validator's silence path
+                # whenever we do run.
+                continue
+
+            from services.emotion.feedback import STATE_FILENAME, _LOCK_TIMEOUT_S, _save_under_lock
+            from services.emotion.llm_transition import llm_transition_via_daemon
+            from services.emotion.lock import LOCK_FILENAME
+            from services.emotion.state import load_state
+
+            state_dir = _Path(STATE_DIR)
+            state_path = state_dir / STATE_FILENAME
+            lock_path = state_dir / LOCK_FILENAME
+
+            state = await _asyncio.to_thread(load_state, state_path)
+            new_state = await llm_transition_via_daemon(
+                state, _emotion_daemon,
+                mode="silence",
+                state_dir=state_dir,
+            )
+            if new_state is not None:
+                try:
+                    await _asyncio.to_thread(
+                        _save_under_lock, new_state, state_path, lock_path,
+                    )
+                except TimeoutError:
+                    log.warning("silence tick: state-file lock contended, skip save")
+
+            # ── Phase 2: telos-driven self-initiated proactive message ──
+            # Replaces the cron-driven kanae_emotion_tick.py path. Reads
+            # the freshly-updated state (now or before, both are fine —
+            # generate_telos is pure on the loaded state). Cooldown +
+            # quiet-hour gating + state bump live in self_initiate.
+            try:
+                from services.emotion.self_initiate import maybe_send_self_initiated
+                await maybe_send_self_initiated(
+                    bot=bot,
+                    state_dir=state_dir,
+                    repo_dir=state_dir.parent,
+                )
+            except Exception as exc:
+                log.warning("self_initiate dispatch failed: %s", exc)
+        except Exception as exc:
+            log.warning("silence tick iteration failed (non-fatal): %s", exc)
+
+
 async def _patched_close() -> None:
-    global _http_session
+    global _http_session, _emotion_daemon
     log.info("Closing bot and cleaning up resources...")
+    # Shut down the persistent emotion-session daemon before anything else
+    # so an in-flight `daemon.query()` from feedback.py doesn't lose its
+    # event loop mid-await.
+    if _emotion_daemon is not None:
+        try:
+            await _emotion_daemon.stop(timeout=5.0)
+        except Exception as exc:
+            log.warning("emotion daemon stop failed: %s", exc)
+        _emotion_daemon = None
+        try:
+            from services.emotion.runtime import EMOTION_CTX
+            EMOTION_CTX.set(None)
+        except Exception:
+            pass
     if _http_session and not _http_session.closed:
         await _http_session.close()
         _http_session = None
@@ -315,6 +435,64 @@ async def on_ready():
         _track_task(
             asyncio.to_thread(cleanup_stale_attachments),
             name="cleanup_stale_attachments",
+        )
+
+    # Spawn the persistent emotion-session daemon once per process. Failure
+    # is non-fatal: the bot keeps running and feedback.py will fall back to
+    # the legacy subprocess.run path or simply not update emotion state.
+    global _emotion_daemon, _emotion_daemon_started
+    if not _emotion_daemon_started:
+        _emotion_daemon_started = True
+        async def _start_emotion_daemon():
+            global _emotion_daemon
+            try:
+                from pathlib import Path as _Path
+                from services.emotion.persistent_session import EmotionSessionDaemon
+                from services.emotion.session import EMOTION as EMOTION_KEY
+                repo_dir = _Path(__file__).resolve().parent
+                daemon = EmotionSessionDaemon(
+                    EMOTION_KEY,
+                    STATE_DIR,
+                    model="haiku",
+                    cwd=str(repo_dir),
+                )
+                await daemon.start()
+                _emotion_daemon = daemon
+                # Expose the daemon to feedback.py / silence-tick callers
+                # without dragging bot's globals through their imports.
+                from services.emotion.runtime import EMOTION_CTX
+                EMOTION_CTX.set(daemon)
+                log.info("emotion daemon ready (pid=%s)",
+                         daemon._proc.pid if daemon._proc else "?")
+            except Exception as exc:
+                log.warning("emotion daemon spawn failed: %s", exc)
+        _track_task(_start_emotion_daemon(), name="emotion_daemon_start")
+        # 30-min silence tick — runs in-process so it shares the emotion
+        # daemon's session memory with feedback (no cron-vs-bot record
+        # fragmentation). See v3 plan §5.3.
+        _track_task(_silence_tick_loop(), name="emotion_silence_tick")
+        # 1-hour kanae-daily recap DM to haroin (先輩).
+        async def _start_hourly_summary_dm():
+            try:
+                from pathlib import Path as _Path
+                from services.emotion.daily_summary_dm import hourly_summary_dm_loop
+                repo_dir = _Path(__file__).resolve().parent
+                await hourly_summary_dm_loop(bot, _Path(STATE_DIR), repo_dir)
+            except Exception as exc:
+                log.warning("hourly summary DM loop crashed: %s", exc)
+        _track_task(_start_hourly_summary_dm(), name="hourly_summary_dm")
+
+    global _vscode_sync_started
+    if VSCODE_SYNC_ENABLED and not _vscode_sync_started and not vscode_sync.is_running():
+        _vscode_sync_started = True
+        _track_task(
+            vscode_sync.run_daemon(
+                post_callback=make_post_callback(bot, VSCODE_SYNC_THREAD_ID),
+                projects_root=VSCODE_SYNC_PROJECTS_ROOT,
+                flush_interval=VSCODE_SYNC_FLUSH_INTERVAL,
+                idle_notify_seconds=VSCODE_SYNC_IDLE_NOTIFY_SECONDS,
+            ),
+            name="vscode_sync",
         )
 
 
@@ -409,6 +587,66 @@ async def _send_segmented(
             _os.remove(p)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Slash commands
+# ---------------------------------------------------------------------------
+@bot.tree.command(name="vscode-sync", description="VSCode Claude Code → Discord 同期の切替 (admin only)")
+@app_commands.describe(action="on で開始 / off で停止 / status で状態確認")
+@app_commands.choices(action=[
+    app_commands.Choice(name="on", value="on"),
+    app_commands.Choice(name="off", value="off"),
+    app_commands.Choice(name="status", value="status"),
+])
+async def vscode_sync_cmd(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("admin only", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    if action.value == "status":
+        running = vscode_sync.is_running()
+        await interaction.followup.send(
+            f"vscode_sync: {'running' if running else 'stopped'} "
+            f"(enabled={VSCODE_SYNC_ENABLED}, thread={VSCODE_SYNC_THREAD_ID})",
+            ephemeral=True,
+        )
+        return
+
+    global _vscode_sync_started
+
+    if action.value == "on":
+        if vscode_sync.is_running():
+            await interaction.followup.send("already running", ephemeral=True)
+            return
+        if VSCODE_SYNC_THREAD_ID <= 0:
+            await interaction.followup.send(
+                "VSCODE_SYNC_THREAD_ID が未設定です",
+                ephemeral=True,
+            )
+            return
+        _vscode_sync_started = True
+        _track_task(
+            vscode_sync.run_daemon(
+                post_callback=make_post_callback(bot, VSCODE_SYNC_THREAD_ID),
+                projects_root=VSCODE_SYNC_PROJECTS_ROOT,
+                flush_interval=VSCODE_SYNC_FLUSH_INTERVAL,
+                idle_notify_seconds=VSCODE_SYNC_IDLE_NOTIFY_SECONDS,
+            ),
+            name="vscode_sync",
+        )
+        await interaction.followup.send("started", ephemeral=True)
+        return
+
+    # action.value == "off"
+    await vscode_sync.stop_daemon()
+    _vscode_sync_started = False
+    await interaction.followup.send("stopped", ephemeral=True)
 
 
 @bot.event
@@ -599,13 +837,41 @@ async def on_message(message: discord.Message):
         # Always recall Mem0 memories so Claude has long-term context,
         # even on resumed sessions. Skip only for very short messages
         # (stickers, "はい", "うん", etc.) where embedding search won't match.
+        kanae_self_task: asyncio.Task | None = None
         if len(raw_user_text) >= MEM0_MIN_QUERY_LENGTH:
             # P3 (2026-05-12): smart search (Haiku rewrite + LLM rerank) を初実戦投入
             mem0_task: asyncio.Task | None = asyncio.create_task(
                 search_memories_smart(raw_user_text, mem0_user_id, limit=5)
             )
+            # P5 (2026-05-14): also pull kanae's own self-facts so she stays
+            # consistent with her past statements / preferences. Admin-only
+            # because the bot ID namespace contains opinionated text we don't
+            # want to surface to random users.
+            if caller_is_admin and bot.user is not None:
+                kanae_self_task = asyncio.create_task(
+                    search_memories_smart(
+                        raw_user_text, str(bot.user.id), limit=3,
+                    )
+                )
         else:
             mem0_task = None
+
+        # Emotion state — read-only here, admin only. Off the hot path via
+        # to_thread because load_state does sync file I/O. Non-admin returns
+        # None so neither the file is read nor the block injected.
+        async def _load_emotion():
+            if not caller_is_admin:
+                return None
+            try:
+                from pathlib import Path as _Path
+                from services.emotion.state import load_state as _load_state
+                return await asyncio.to_thread(
+                    _load_state, _Path(STATE_DIR) / "kanae_emotion.json",
+                )
+            except Exception as exc:
+                log.warning("emotion load failed (non-fatal): %s", exc)
+                return None
+        emotion_task: asyncio.Task | None = asyncio.create_task(_load_emotion())
 
         reply_context, ref_attachments = await reply_task
         all_attachments = list(message.attachments) + ref_attachments
@@ -775,6 +1041,44 @@ async def on_message(message: discord.Message):
             except Exception as e:
                 log.warning("Mem0 recall failed (non-fatal): %s", e)
 
+        # Kanae self-memory recall — injects facts about kanae herself so
+        # she stays consistent with prior statements/character. Stored
+        # under the bot's own user_id namespace via the kanae extractor in
+        # scripts/ingest_channel_history.py --subject kanae.
+        if kanae_self_task is not None:
+            try:
+                kanae_results = await kanae_self_task
+                kanae_block = format_memories_for_prompt(kanae_results)
+                if kanae_block:
+                    prompt = (
+                        f"<kanae_self_memory>\n"
+                        f"{kanae_block}\n"
+                        f"</kanae_self_memory>\n\n{prompt}"
+                    )
+                    log.info(
+                        "Mem0(kanae self): injected %d self-memories",
+                        len(kanae_results),
+                    )
+            except Exception as e:
+                log.warning("Mem0 kanae self-recall failed (non-fatal): %s", e)
+
+        # Emotion state — admin only, prepended *before* mem0/header so the
+        # model reads its own internal state first. emotion_task was started
+        # alongside the Mem0 task above; non-admins always get None.
+        emotion_state = None
+        try:
+            emotion_state = await emotion_task
+        except Exception as exc:
+            log.warning("emotion task failed (non-fatal): %s", exc)
+        if emotion_state is not None:
+            try:
+                from services.emotion.format import format_emotion_for_prompt
+                kanae_block = format_emotion_for_prompt(emotion_state)
+                if kanae_block:
+                    prompt = f"{kanae_block}\n\n{prompt}"
+            except Exception as exc:
+                log.warning("emotion block render failed (non-fatal): %s", exc)
+
         # Final global size cap to bound cost and context.
         prompt = _cap_text(prompt, MAX_PROMPT_CHARS)
 
@@ -848,6 +1152,12 @@ async def on_message(message: discord.Message):
             has_image_attachment=bool(image_paths),
         )
 
+        # Strip backticks Claude sometimes wraps around pure numeric/currency
+        # tokens (e.g. `746,404`, `300K-`). Discord renders inline code as a
+        # white-boxed block which makes figure-heavy replies hard to read.
+        # Real code (`range(10)`, `os.path`, `/tmp/foo.png`) is preserved.
+        response_text = strip_numeric_inline_code(response_text)
+
         # Cancel any pending delayed status edit before deleting the message.
         pending_status_task = _pending_status.get("task")
         if pending_status_task and not pending_status_task.done():
@@ -913,6 +1223,59 @@ async def on_message(message: discord.Message):
                     )
 
             _track_task(_mem0_store(), name="mem0_store")
+
+            # P5 (2026-05-14): also extract kanae's own self-facts in
+            # real-time and store under the bot's user_id namespace.
+            # Mirrors the haroin path but with subject="kanae" so the
+            # extractor uses _EXTRACT_KANAE_PROMPT (services/mem0/extract.py)
+            # and treats response_text (kanae's utterance) as the subject.
+            if bot.user is not None:
+                kanae_self_user_id = str(bot.user.id)
+
+                async def _kanae_self_store():
+                    try:
+                        ctx_hint = _ctx_for_mem0 if MEM0_LEGACY_CONTEXT else ""
+                        log.info(
+                            "Mem0 ingest(kanae): uid=%s user_text=%d "
+                            "assistant=%d ctx=%d",
+                            kanae_self_user_id,
+                            len(raw_user_text), len(response_text), len(ctx_hint),
+                        )
+                        await add_memories(
+                            user_text=raw_user_text,
+                            assistant_text=response_text,
+                            user_id=kanae_self_user_id,
+                            context_hint=ctx_hint,
+                            subject="kanae",
+                            metadata={
+                                "channel_id": str(message.channel.id),
+                                "channel_name": getattr(message.channel, "name", "DM"),
+                                "source": "realtime_kanae",
+                            },
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "Mem0 kanae self-store failed: %s (channel=%s)",
+                            exc, message.channel.id,
+                        )
+
+                _track_task(_kanae_self_store(), name="kanae_self_store")
+
+            # Emotion feedback — analyze this turn + persist new state.
+            # Same admin gate as Mem0 (non-admin neither reads nor writes
+            # emotion state). Fire-and-forget; never blocks the response.
+            async def _emotion_feedback():
+                try:
+                    from services.emotion.feedback import schedule_feedback
+                    await schedule_feedback(
+                        user_text=raw_user_text,
+                        assistant_text=response_text,
+                        state_dir=STATE_DIR,
+                    )
+                except Exception as exc:
+                    log.warning("emotion feedback failed (non-fatal): %s", exc)
+
+            _track_task(_emotion_feedback(), name="emotion_feedback")
 
         # Extract file paths from response. For non-admin sessions the
         # model has no file-system tools, so any path it "outputs" can only

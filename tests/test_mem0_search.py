@@ -43,23 +43,25 @@ class TestSearchMemories:
 
     @pytest.mark.asyncio
     async def test_plain_search_returns_filtered_results(self, monkeypatch):
+        # score is *distance* (small = similar). max_distance=1.0 keeps 0.1
+        # and 0.9, drops 1.5 (too far to be relevant).
         mem_client = MagicMock()
         mem_client.search.return_value = {
             "results": [
-                _make_memory("1", 0.9),
-                _make_memory("2", 0.1),  # below threshold 0.3 → filtered
-                _make_memory("3", 0.5),
+                _make_memory("1", 0.1),
+                _make_memory("2", 1.5),  # distance > MAX → filtered out
+                _make_memory("3", 0.9),
             ]
         }
         monkeypatch.setattr(f"{_PATCH_BASE}._get_mem0", lambda: mem_client)
         monkeypatch.setattr(f"{_PATCH_BASE}.ensure_valid_token", AsyncMock())
         monkeypatch.setattr(f"{_PATCH_BASE}._refresh_mem0_client_token", lambda: None)
-        monkeypatch.setattr(f"{_PATCH_BASE}.MEM0_RELEVANCE_THRESHOLD", 0.3)
+        monkeypatch.setattr(f"{_PATCH_BASE}.MEM0_RELEVANCE_MAX_DISTANCE", 1.0)
 
         from services.mem0.search import search_memories
         result = await search_memories("query", "user1")
         assert len(result) == 2
-        assert all(r["score"] >= 0.3 for r in result)
+        assert all(r["score"] <= 1.0 for r in result)
 
     @pytest.mark.asyncio
     async def test_passes_limit_to_mem_search(self, monkeypatch):
@@ -89,12 +91,13 @@ class TestSearchMemories:
     @pytest.mark.asyncio
     async def test_accepts_list_response(self, monkeypatch):
         mem_client = MagicMock()
+        # distance 0.8 ≤ MAX=1.0 → kept
         raw = [_make_memory("a", 0.8)]
         mem_client.search.return_value = raw
         monkeypatch.setattr(f"{_PATCH_BASE}._get_mem0", lambda: mem_client)
         monkeypatch.setattr(f"{_PATCH_BASE}.ensure_valid_token", AsyncMock())
         monkeypatch.setattr(f"{_PATCH_BASE}._refresh_mem0_client_token", lambda: None)
-        monkeypatch.setattr(f"{_PATCH_BASE}.MEM0_RELEVANCE_THRESHOLD", 0.3)
+        monkeypatch.setattr(f"{_PATCH_BASE}.MEM0_RELEVANCE_MAX_DISTANCE", 1.0)
 
         from services.mem0.search import search_memories
         result = await search_memories("q", "u")
@@ -147,7 +150,8 @@ class TestSearchMemoriesMulti:
         assert "uniq" in ids
 
     @pytest.mark.asyncio
-    async def test_sorted_by_score_desc(self, monkeypatch):
+    async def test_sorted_by_score_asc(self, monkeypatch):
+        """score is distance (small = similar), so merged order is ascending."""
         async def fake_search(q, uid, limit=8):
             return [_make_memory("a", 0.4), _make_memory("b", 0.9), _make_memory("c", 0.6)]
 
@@ -156,7 +160,7 @@ class TestSearchMemoriesMulti:
         from services.mem0.search import search_memories_multi
         result = await search_memories_multi(["q"], "u")
         scores = [r["score"] for r in result]
-        assert scores == sorted(scores, reverse=True)
+        assert scores == sorted(scores)
 
     @pytest.mark.asyncio
     async def test_exception_in_one_query_is_skipped(self, monkeypatch):
@@ -320,6 +324,15 @@ class TestRerankMemories:
 # ---------------------------------------------------------------------------
 
 class TestSearchMemoriesSmart:
+    @pytest.fixture(autouse=True)
+    def _stub_alias_expand(self, monkeypatch):
+        """Alias expansion would touch the real sqlite graph DB; stub it
+        out by default so smart-pipeline tests stay deterministic."""
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._expand_query_via_graph",
+            AsyncMock(return_value=[]),
+        )
+
     @pytest.mark.asyncio
     async def test_full_pipeline(self, monkeypatch):
         variants = ["kw1", "kw2"]
@@ -333,6 +346,45 @@ class TestSearchMemoriesSmart:
         from services.mem0.search import search_memories_smart
         result = await search_memories_smart("q", "u", limit=3)
         assert result == reranked
+
+    @pytest.mark.asyncio
+    async def test_alias_variants_appended_to_queries(self, monkeypatch):
+        """When graph alias expansion fires, the canonical/alias forms are
+        passed to search_memories_multi alongside the original query."""
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._expand_query_via_graph",
+            AsyncMock(return_value=["CLANNAD", "Clannad"]),
+        )
+        monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
+        multi_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", multi_mock)
+        monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]))
+
+        from services.mem0.search import search_memories_smart
+        await search_memories_smart("クラナド", "u")
+        passed = multi_mock.call_args.args[0]
+        assert passed[0] == "クラナド"
+        assert "CLANNAD" in passed
+        assert "Clannad" in passed
+
+    @pytest.mark.asyncio
+    async def test_alias_expansion_runs_even_with_rewrite_disabled(self, monkeypatch):
+        """Alias expansion is a sqlite lookup — should not depend on
+        LLM rewrite being enabled."""
+        alias_mock = AsyncMock(return_value=["CLANNAD"])
+        monkeypatch.setattr(f"{_PATCH_BASE}._expand_query_via_graph", alias_mock)
+        multi_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", multi_mock)
+        monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=["unused"]))
+        monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]))
+
+        from services.mem0.search import search_memories_smart
+        await search_memories_smart("クラナド", "u", rewrite=False)
+        alias_mock.assert_awaited_once()
+        passed = multi_mock.call_args.args[0]
+        assert "CLANNAD" in passed
+        # rewrite was disabled so the haiku-derived "unused" must NOT appear
+        assert "unused" not in passed
 
     @pytest.mark.asyncio
     async def test_rewrite_disabled(self, monkeypatch):
@@ -373,6 +425,17 @@ class TestSearchMemoriesSmart:
         await search_memories_smart("q", "u")
         queries_passed = multi_mock.call_args.args[0]
         assert queries_passed.count("q") == 1
+
+    @pytest.mark.asyncio
+    async def test_alias_expansion_failure_is_non_fatal(self, monkeypatch):
+        """If the graph DB is unavailable, smart search must still proceed
+        with just the original (and rewrite) queries."""
+        from services.mem0.search import _expand_query_via_graph
+        # Force the underlying find_entity to blow up — _expand_query_via_graph
+        # should swallow it and return [].
+        with patch("services.mem0.graph.find_entity", side_effect=RuntimeError("disk full")):
+            out = await _expand_query_via_graph("anything", "u")
+        assert out == []
 
     @pytest.mark.asyncio
     async def test_both_disabled_plain_search(self, monkeypatch):

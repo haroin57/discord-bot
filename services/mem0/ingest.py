@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 from services.mem0.client import _get_mem0, _refresh_mem0_client_token
-from services.mem0.extract import extract_facts_for_self
+from services.mem0.extract import extract_facts_for_kanae, extract_facts_for_self
 from services.mem0.search import search_memories
 from services.oauth_manager import ensure_valid_token
 
@@ -19,11 +19,17 @@ async def add_memories(
     user_text: str | None = None,
     assistant_text: str | None = None,
     context_hint: str = "",
+    subject: str = "self",
 ) -> dict | None:
     """Store conversation for fact extraction.
 
     Supports both legacy `(messages, user_id, metadata)` and new
     `(user_text=, assistant_text=, user_id=, context_hint=, metadata=)`.
+
+    ``subject`` selects the extractor:
+    - "self"  (default) — facts about the human (senpai) from user_text
+    - "kanae" — facts about Kanae herself from assistant_text;
+      ``user_id`` should be kanae's Mem0 namespace (her Discord bot ID).
     """
     # ── 1. Normalize signature into (user_text, assistant_text, context_hint) ──
     if messages is not None and user_text is None:
@@ -47,6 +53,7 @@ async def add_memories(
     from config import (
         MEM0_GATE_ENABLED, MEM0_GATE_MIN_IMPORTANCE,
         MEM0_CLIENT_DEDUP_ENABLED, MEM0_CLIENT_DEDUP_THRESHOLD,
+        MEM0_DEDUP_TWO_STAGE, MEM0_DEDUP_SEARCH_LIMIT, MEM0_DEDUP_DRY_RUN,
     )
 
     try:
@@ -69,7 +76,29 @@ async def add_memories(
 
         # ── 2. Gate path (P2): Haiku → filter → infer=False raw insert ──
         if MEM0_GATE_ENABLED:
-            facts = await extract_facts_for_self(user_text, assistant_text, context_hint)
+            if subject == "kanae":
+                # senpai_text=context, kanae_text=subject of extraction
+                facts = await extract_facts_for_kanae(
+                    senpai_text=user_text,
+                    kanae_text=assistant_text,
+                    context_hint=context_hint,
+                )
+            else:
+                facts = await extract_facts_for_self(
+                    user_text, assistant_text, context_hint,
+                )
+            # Diagnostic: show every extracted fact text. Helps trace why a
+            # turn produced unexpected dedup hits (candidate vs existing).
+            if facts:
+                _previews = [
+                    f"[{f.get('speaker','?')}|imp={f.get('importance','?')}] "
+                    f"{(f.get('text') or '')[:120]}"
+                    for f in facts
+                ]
+                log.info(
+                    "Mem0 gate: extracted %d facts user=...%s | %s",
+                    len(facts), str(user_id)[-4:], " || ".join(_previews),
+                )
 
             # Cheap synchronous filter pass first — drops obvious non-self /
             # low-importance facts without firing any ChromaDB queries.
@@ -99,41 +128,105 @@ async def add_memories(
                 deduped.append(f)
             candidates = deduped
 
-            # Parallel near-dup check: previously each candidate awaited its
-            # own search serially. asyncio.gather lets ChromaDB embed+query
-            # all candidates concurrently and cuts per-ingest latency from
-            # O(N * ~150ms) to O(~150ms).
+            # Parallel near-dup check with optional 2-stage LLM judgment.
             kept: list[dict] = candidates
             if MEM0_CLIENT_DEDUP_ENABLED and candidates:
+                search_limit = MEM0_DEDUP_SEARCH_LIMIT
                 dedup_results = await asyncio.gather(
-                    *(search_memories(f["text"], user_id, limit=3) for f in candidates),
+                    *(search_memories(f["text"], user_id, limit=search_limit) for f in candidates),
                     return_exceptions=True,
                 )
-                kept = []
-                for f, near in zip(candidates, dedup_results):
-                    if isinstance(near, Exception):
-                        # Fail-open: if the search errored, do not silently
-                        # drop a potentially novel fact. Log via search itself.
-                        kept.append(f)
-                        continue
-                    if any((r.get("score") or 0) >= MEM0_CLIENT_DEDUP_THRESHOLD for r in near):
-                        skip_dup += 1
-                    else:
-                        kept.append(f)
+
+                if MEM0_DEDUP_TWO_STAGE:
+                    from services.mem0.dedup import check_near_dup
+                    from services.mem0.reinforce import reinforce_existing
+                    kept = []
+                    # Run 2-stage checks in parallel
+                    async def _check_one(f, near):
+                        if isinstance(near, Exception):
+                            return (f, False, None)
+                        is_dup, reason, existing_id = await check_near_dup(
+                            f["text"], f.get("category"), near,
+                            dry_run=MEM0_DEDUP_DRY_RUN,
+                        )
+                        return (f, is_dup, existing_id)
+                    check_results = await asyncio.gather(
+                        *(_check_one(f, near) for f, near in zip(candidates, dedup_results)),
+                    )
+                    reinforced_ids: list[str] = []
+                    for f, is_dup, existing_id in check_results:
+                        if is_dup and not MEM0_DEDUP_DRY_RUN:
+                            skip_dup += 1
+                            if existing_id:
+                                reinforced_ids.append(existing_id)
+                        else:
+                            kept.append(f)
+                    # Hebbian reinforcement: bump mention_count on each
+                    # existing fact that absorbed a duplicate candidate.
+                    # Fire-and-await in parallel; failures are non-fatal.
+                    if reinforced_ids:
+                        await asyncio.gather(
+                            *(reinforce_existing(mem, mid) for mid in reinforced_ids),
+                            return_exceptions=True,
+                        )
+                else:
+                    # Legacy single-threshold dedup. NOTE: score is *distance*
+                    # (small = similar), so we drop when score is BELOW the
+                    # threshold, not above. Threshold default in config.py is
+                    # 0.85 which is way too loose under this corrected
+                    # semantic; set MEM0_CLIENT_DEDUP_THRESHOLD=0.20 if you
+                    # actually rely on this path.
+                    kept = []
+                    for f, near in zip(candidates, dedup_results):
+                        if isinstance(near, Exception):
+                            kept.append(f)
+                            continue
+                        if any(
+                            (r.get("score") if r.get("score") is not None else 99) <= MEM0_CLIENT_DEDUP_THRESHOLD
+                            for r in near
+                        ):
+                            skip_dup += 1
+                        else:
+                            kept.append(f)
 
             # Parallel raw insert: same rationale — three ChromaDB writes in
             # serial added ~3 x latency. asyncio.gather them and tolerate
             # individual failures via return_exceptions.
             async def _insert_one(f: dict):
                 fact_meta = dict(base_meta)
+                imp = int(f.get("importance", 3))
+                # importance=2 → force tier=Warm so weekly compact ages it out faster.
+                # Otherwise default to tier=1 (Hot); Sonnet's extract prompt
+                # doesn't emit `tier`, so f.get("tier") is normally None and
+                # ChromaDB rejects None values — that previously dropped every
+                # importance>=3 fact silently with
+                # "Cannot convert Python object to MetadataValue".
+                tier = 2 if imp <= 2 else int(f.get("tier") or 1)
+                # ChromaDB metadata values must be scalar (str/int/float/bool).
+                # Storing the tag list as-is raises
+                # "argument 'metadatas': Cannot convert Python object to
+                # MetadataValue" and the whole `mem.add` call aborts — every
+                # fact in that turn is dropped on the floor. Join with a
+                # delimiter ChromaDB can store; search-time consumers can
+                # split back on the same separator if/when they need the list
+                # shape.
+                raw_tags = f.get("tags") or []
+                tags_csv = ",".join(
+                    str(t).replace(",", " ") for t in raw_tags if str(t).strip()
+                )
+                # Coerce category/subcategory to strings; None is rejected.
                 fact_meta.update({
-                    "category":    f.get("category"),
-                    "subcategory": f.get("subcategory"),
-                    "importance":  f.get("importance"),
-                    "tags":        f.get("tags") or [],
+                    "category":    str(f.get("category") or "meta"),
+                    "subcategory": str(f.get("subcategory") or ""),
+                    "importance":  imp,
+                    "tier":        tier,
+                    "tags":        tags_csv,
                 })
+                # Final guard: drop any None values base_meta might still
+                # contain (e.g. channel_id when called from a script).
+                fact_meta = {k: v for k, v in fact_meta.items() if v is not None}
                 try:
-                    return await asyncio.to_thread(
+                    res = await asyncio.to_thread(
                         mem.add,
                         [{"role": "user", "content": f["text"]}],
                         user_id=user_id, metadata=fact_meta, infer=False,
@@ -141,6 +234,36 @@ async def add_memories(
                 except Exception as e:
                     log.warning("Mem0 raw insert failed: %s", e)
                     return None
+                # Graph layer: link entities extracted by Sonnet to this new
+                # fact. Errors are non-fatal — the fact is already stored.
+                try:
+                    entities = f.get("entities") or []
+                    if entities and isinstance(res, dict):
+                        fact_ids: list[str] = []
+                        for r in (res.get("results") or []):
+                            fid = r.get("id") if isinstance(r, dict) else None
+                            if fid:
+                                fact_ids.append(fid)
+                        if fact_ids:
+                            from services.mem0 import graph
+                            for ent in entities:
+                                if not isinstance(ent, dict):
+                                    continue
+                                name = ent.get("name")
+                                etype = ent.get("type")
+                                aliases = ent.get("aliases") or []
+                                if not name or not etype:
+                                    continue
+                                eid = await asyncio.to_thread(
+                                    graph.upsert_entity,
+                                    name, etype, str(user_id), aliases=aliases,
+                                )
+                                if eid:
+                                    for fid in fact_ids:
+                                        await asyncio.to_thread(graph.add_edge, fid, eid)
+                except Exception as e:
+                    log.warning("graph update failed (non-fatal): %s", e)
+                return res
 
             insert_results = await asyncio.gather(*(_insert_one(f) for f in kept)) if kept else []
             results = [r for r in insert_results if r is not None]

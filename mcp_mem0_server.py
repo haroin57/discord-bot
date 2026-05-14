@@ -112,6 +112,15 @@ async def search(
     merged candidates. Smart mode adds ~1-3 s of latency from two extra Haiku
     round-trips; enable it only when default search misses what you need.
 
+    Each returned memory carries a `metadata` dict. Notable fields:
+      - category / subcategory / tags : taxonomy from extract.py
+      - importance (1-5) : reinforced by +1 on each duplicate hit
+      - tier (0=Live, 1=Hot, 2=Warm, 3=Cold) : weekly_compact decay state
+      - mention_count : Hebbian counter, bumped when a duplicate is ingested
+      - reinforced_at (list[int]) / last_reinforced_at : reinforcement history
+      - value_class : noise/transient/preference/decision/knowledge/episodic
+      - created_at / created_at_unix : ingest time (when present)
+
     Args:
         query: Natural language query describing what you want to recall.
         limit: Max number of memories to return (default 5).
@@ -188,6 +197,10 @@ async def list_all(user_id: str = DEFAULT_USER_ID, limit: int = 50) -> str:
     """List memories Mem0 holds for the given user (truncated to `limit`).
 
     Use `search` for targeted lookups — list_all is for sampling/overview.
+
+    Each memory's `metadata` dict has the same shape as `search` returns
+    (category, importance, tier, mention_count, reinforced_at, value_class,
+    created_at_unix, …). See the `search` docstring for definitions.
 
     Args:
         user_id: Mem0 user key (default: 先輩's Discord ID).

@@ -133,8 +133,12 @@ CLAUDE_TRANSIENT_MAX_ATTEMPTS = int(os.environ.get("CLAUDE_TRANSIENT_MAX_ATTEMPT
 CLAUDE_MAX_BACKOFF_S = int(os.environ.get("CLAUDE_MAX_BACKOFF_S", "60"))
 
 # Stream quality (free-code: queryModelWithStreaming)
-STREAM_STALL_THRESHOLD_S = 30
-STREAM_IDLE_TIMEOUT_S = 90
+# IDLE_TIMEOUT bumped from 90 → 300 (2026-05-14): adaptive extended thinking
+# with mixed-format prior_history (loaded since the resume fix) can keep the
+# SSE stream silent past 90s while the model is still thinking. 300s gives
+# headroom without unbounded waits.
+STREAM_STALL_THRESHOLD_S = int(os.environ.get("STREAM_STALL_THRESHOLD_S", "30"))
+STREAM_IDLE_TIMEOUT_S = int(os.environ.get("STREAM_IDLE_TIMEOUT_S", "300"))
 
 # OAuth (free-code: checkAndRefreshOAuthTokenIfNeeded)
 TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000
@@ -188,10 +192,34 @@ def needs_tools(text: str) -> bool:
 # System prompt
 # ---------------------------------------------------------------------------
 def load_system_prompt() -> str:
+    """Concatenate ~/.claude/CLAUDE.md (global) and discord-bot/CLAUDE.md.
+
+    The global file is the source of truth for the "佐藤かなえ" persona
+    + git safety rules + workflow conventions. The project file is the
+    Discord-specific override and comes last so it wins on conflicts.
+    """
+    parts: list[str] = []
+    global_md = os.path.expanduser("~/.claude/CLAUDE.md")
+    if os.path.isfile(global_md):
+        try:
+            with open(global_md, encoding="utf-8") as f:
+                parts.append(
+                    "# Contents of ~/.claude/CLAUDE.md "
+                    "(global instructions, the persona lives here)\n\n"
+                    + f.read()
+                )
+        except OSError:
+            pass
     claude_md = os.path.join(BOT_DIR, "CLAUDE.md")
     if os.path.isfile(claude_md):
         with open(claude_md, encoding="utf-8") as f:
-            return f.read()
+            parts.append(
+                "# Contents of CLAUDE.md "
+                "(project instructions; Discord-specific adjustments)\n\n"
+                + f.read()
+            )
+    if parts:
+        return "\n\n---\n\n".join(parts)
     return (
         "You are a helpful assistant running as a Discord bot. "
         "Answer concisely. You have full access to the local machine's filesystem and shell. "
@@ -350,67 +378,9 @@ MCP_SERVERS: dict = {
 }
 
 
-# Keyword sets used by pick_mcp_servers(). Cheap substring scans on the
-# user's raw text — model is still free to refuse / pick differently, this
-# only decides which subprocesses we spin up for the request.
-# Tuples are pre-lowercased at module load so pick_mcp_servers() can compare
-# without a per-call .lower() on each keyword.
-_WEB_TRIGGERS = tuple(kw.lower() for kw in (
-    "検索", "調べて", "ググって", "ニュース",
-    "twitter", "x.com", "ツイート", "tweet", "trend", "トレンド",
-    "search", "ググ", "Brave", "x ", "X(", "X検索",
-))
-_HEAVY_TRIGGERS = tuple(kw.lower() for kw in (
-    "ブラウズ", "browse", "スクリーンショット", "screenshot",
-    "playwright", "puppeteer", "render", "webページを開",
-    "サイトを開", "アクセスして",
-))
-_MEMORY_TRIGGERS = tuple(kw.lower() for kw in (
-    "記憶", "覚えて", "覚えとい", "覚えてる", "思い出", "忘れた", "忘れない",
-    "mem0", "memory", "remember", "recall", "過去の",
-    "前に話した", "前に言った", "以前", "昔話した",
-))
-_PAPER_TRIGGERS = tuple(kw.lower() for kw in (
-    # "scholar" without a qualifier was a false-positive risk (matches
-    # "scholarship", "scholar's", etc.). Use disambiguated forms only.
-    "論文", "paper", "arxiv", "学術", "引用文献", "citation",
-    "google scholar", "semantic scholar", "scholar.google",
-))
-_DOCS_TRIGGERS = tuple(kw.lower() for kw in (
-    # Library / framework docs lookup via context7 MCP. Includes English +
-    # Japanese cues; pre-lowercased so pick_mcp_servers skips .lower() per kw.
-    "context7", "docs", "ドキュメント", "公式ドキュメント", "api reference",
-    "リファレンス", "ライブラリ", "library", "使い方", "how to use",
-    "npm package", "pypi", "github.com/",
-))
-
-
-def get_mcp_servers_by_keys(keys: list[str]) -> dict:
-    """Reconstruct MCP server config dict from a list of server name keys."""
-    return {k: v for k, v in MCP_SERVERS.items() if k in keys}
-
-
-def pick_mcp_servers(raw_user_text: str) -> dict:
-    """Return the minimal MCP server set needed for this request.
-
-    BASE is always loaded. WEB / HEAVY / MEMORY tiers are added only when the
-    user text actually mentions something that would need them. The huge win
-    is NOT loading playwright (~500MB chromium) or ChromaDB on every chat
-    reply.
-    """
-    text = (raw_user_text or "").lower()
-    servers = dict(MCP_SERVERS_BASE)
-    if any(kw in text for kw in _WEB_TRIGGERS):
-        servers.update(MCP_SERVERS_WEB)
-    if any(kw in text for kw in _HEAVY_TRIGGERS):
-        servers.update(MCP_SERVERS_HEAVY)
-    if any(kw in text for kw in _MEMORY_TRIGGERS):
-        servers.update(MCP_SERVERS_MEMORY)
-    if any(kw in text for kw in _PAPER_TRIGGERS):
-        servers.update(MCP_SERVERS_PAPER)
-    if any(kw in text for kw in _DOCS_TRIGGERS):
-        servers.update(MCP_SERVERS_DOCS)
-    return servers
+# MCP server selection logic moved to services/mcp_selector.py.
+# Import directly from there — config.py is the source of credentials
+# and tier dicts, not the dispatch logic.
 
 # ---------------------------------------------------------------------------
 # Web API
@@ -430,10 +400,13 @@ def _bool_env(name: str, default: bool) -> bool:
     return v.lower() in ("1", "true", "yes", "on")
 MEM0_LEGACY_CONTEXT = _bool_env("MEM0_LEGACY_CONTEXT", False)             # P1: True で旧 channel-history 流入挙動に戻す
 MEM0_GATE_ENABLED = _bool_env("MEM0_GATE_ENABLED", True)                   # P2: False で Mem0 標準抽出にフォールバック
-MEM0_GATE_MIN_IMPORTANCE = int(os.environ.get("MEM0_GATE_MIN_IMPORTANCE", "3"))
+MEM0_GATE_MIN_IMPORTANCE = int(os.environ.get("MEM0_GATE_MIN_IMPORTANCE", "2"))
 MEM0_GATE_MODEL = os.environ.get("MEM0_GATE_MODEL", "claude-haiku-4-5-20251001")
 MEM0_CLIENT_DEDUP_ENABLED = _bool_env("MEM0_CLIENT_DEDUP_ENABLED", True)   # P2.5
 MEM0_CLIENT_DEDUP_THRESHOLD = float(os.environ.get("MEM0_CLIENT_DEDUP_THRESHOLD", "0.85"))
+MEM0_DEDUP_TWO_STAGE = _bool_env("MEM0_DEDUP_TWO_STAGE", True)            # P4: 2段階dedup (LLM判定)
+MEM0_DEDUP_SEARCH_LIMIT = int(os.environ.get("MEM0_DEDUP_SEARCH_LIMIT", "5"))
+MEM0_DEDUP_DRY_RUN = _bool_env("MEM0_DEDUP_DRY_RUN", False)               # P4: dry-run (dropせずログのみ)
 MEM0_SMART_SEARCH = _bool_env("MEM0_SMART_SEARCH", True)                   # P3
 
 _github_token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
@@ -443,3 +416,21 @@ if _github_token:
         "url": "https://api.githubcopilot.com/mcp/",
         "headers": {"Authorization": f"Bearer {_github_token}"},
     }
+
+# ---------------------------------------------------------------------------
+# VSCode Claude Code → Discord thread sync
+# Posts via the bot's own Discord connection (bot.get_channel(...).send) —
+# no webhook setup required. Bot must be a member of the target thread.
+# ---------------------------------------------------------------------------
+VSCODE_SYNC_ENABLED = os.environ.get("VSCODE_SYNC_ENABLED", "false").lower() == "true"
+VSCODE_SYNC_THREAD_ID = int(os.environ.get("VSCODE_SYNC_THREAD_ID", "0") or "0")
+VSCODE_SYNC_PROJECTS_ROOT = os.environ.get(
+    "VSCODE_SYNC_PROJECTS_ROOT", os.path.expanduser("~/.claude/projects")
+)
+VSCODE_SYNC_FLUSH_INTERVAL = float(os.environ.get("VSCODE_SYNC_FLUSH_INTERVAL", "2.0"))
+VSCODE_SYNC_IDLE_NOTIFY_SECONDS = int(os.environ.get("VSCODE_SYNC_IDLE_NOTIFY_SECONDS", "300"))
+
+if VSCODE_SYNC_ENABLED and VSCODE_SYNC_THREAD_ID <= 0:
+    raise RuntimeError(
+        "VSCODE_SYNC_ENABLED=true but VSCODE_SYNC_THREAD_ID is not set"
+    )

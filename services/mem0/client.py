@@ -8,7 +8,15 @@ from services.oauth_manager import ensure_valid_token, get_access_token, init as
 
 log = logging.getLogger(__name__)
 
-MEM0_RELEVANCE_THRESHOLD = 0.3  # Drop memories with score below this
+# Mem0's Chroma adapter returns ``score = distance`` (small = similar; see
+# services/mem0/dedup.py header). Filter out anything past this distance —
+# rerank handles fine-grained quality, so this only needs to drop obvious
+# garbage, not borderline matches.
+MEM0_RELEVANCE_MAX_DISTANCE = 1.0
+# Back-compat alias for any caller still importing the old name. DO NOT use
+# in new code — the semantic flipped from "min similarity" to "max distance"
+# on 2026-05-14 when we discovered the codebase was filtering backwards.
+MEM0_RELEVANCE_THRESHOLD = MEM0_RELEVANCE_MAX_DISTANCE
 
 _mem0_instance = None
 _init_attempted = False
@@ -49,7 +57,14 @@ async def get_anthropic_client():
         # already built the right client while we were waiting.
         if _async_anthropic_client is None or token != _async_anthropic_token:
             from anthropic import AsyncAnthropic
-            _async_anthropic_client = AsyncAnthropic(auth_token=token)
+            # max_retries=0 — Mem0 ingest treats any 429 as fail-open, and
+            # the SDK's default 5x retry on rate-limit-error turns one burst
+            # into 5 wasted calls, ratcheting the per-minute limiter for the
+            # next caller. Bumped from default 2 to 0 on 2026-05-14 after
+            # the channel-history ingest saturated the account.
+            _async_anthropic_client = AsyncAnthropic(
+                auth_token=token, max_retries=0,
+            )
             _async_anthropic_token = token
     return _async_anthropic_client
 

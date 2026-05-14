@@ -59,12 +59,18 @@ async def _classify_for_metadata(messages: list[dict]) -> dict:
         if not conv_parts:
             return {}
         conv = "\n".join(conv_parts)
-        resp = await client.messages.create(
+        from services.mem0.cli_compat import cli_messages_create, extract_text
+        resp = await cli_messages_create(
+            client,
             model=os.environ.get("MEM0_CLASSIFY_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=200,
-            messages=[{"role": "user", "content": _CLASSIFY_PROMPT.format(conv=conv)}],
+            max_tokens=2000,
+            user_message=_CLASSIFY_PROMPT.format(conv=conv),
+            task_prompt=(
+                "You classify Mem0 memories into "
+                "category/subcategory/importance/tier/tags. Return JSON only."
+            ),
         )
-        text = resp.content[0].text.strip()
+        text = extract_text(resp).strip()
         # strip codeblock if any
         if text.startswith("```"):
             text = text.split("```", 2)[1]
@@ -128,18 +134,53 @@ _EXTRACT_PROMPT = """以下の会話ターンから、長期記憶として保�
 {assistant_text}
 </assistant_text>
 
-抽出ルール:
+== 最重要ルール (これを破ったら抽出失敗扱い) ==
+
+1. **固有名詞を含む発話は必ず fact 化する** ― 知名度・あなたの認知の有無・発話の長さに関係なく抽出すること:
+   - あなた(LLM)が知らない名前 (アーティスト・楽曲・作品・人物・サービス・技術・店名等) でも、ユーザーが固有名詞として言及していれば **そのまま** fact 化する
+   - 「自分が知らない / 訓練データに無い → 一般化する / skip する」は **絶対にダメ**。固有名詞の **判定者はあなたではなくユーザー**
+   - カタカナ・英大文字混じり・漢字熟語・特殊表記 (例: "TAKU INOUE", "Namitape", "沙耶の唄", "虚淵玄", "my terminal") は基本すべて固有名詞として扱う
+   - 短い発話 (50字未満) でも、固有名詞 + 述語 (好き/聴いた/見た/読んだ/触ってる/悩んでる/ハマってる/気になる/質問した等) が含まれていれば **必ず** 抽出
+   - OK 例:
+     - 「TAKU INOUE すき」 → 「TAKU INOUE の音楽が好き」(知らない名前でも抽出)
+     - 「Namitape の my terminal をリピートしてる」(短くても抽出)
+     - 「沙耶の唄が好き」「虚淵玄の脚本好き」(複数固有名詞は別 fact)
+     - 「クラナドのアフター編で泣いた」(作品名 + 感情)
+   - NG 例 (これらは絶対に出してはならない):
+     - 「ある音楽プロデューサーが好き」「電子音楽家が好き」「ある作品が好き」(知らない名前を抽象化)
+     - 短いから skip / 知らないから skip / 一般化して保存
+   - 1 ターン内に複数の固有名詞があれば **別々の fact** として出す
+
+2. **固有名詞は fact text にそのまま含めること**:
+   - 抽象パターン (「取り返しのつかなさを描く作品が好き」) と固有名詞 fact (「沙耶の唄が好き」) は **両方とも抽出** してよい (dedup 側で reinforce されるだけ)
+   - entities フィールドは fact text と独立。entities に入れたから fact text から消す、は禁止
+
+== その他のルール ==
+
 - 抽出対象は <user_text>(送信者本人の発話) と <assistant_text>(bot応答内に出てくる本人状態)のみ
 - <context_hint> の他者発話・参考情報は **絶対に fact 化しない**(speaker=='other' になる内容は不要)
-- 雑談・短い相槌・LLM自己言及・一般論は出力しない
-- importance < 3 は出力しない
-- 1 fact は日本語 120字以内、canonical キーワード優先 (toeic-prep / ashitabo / kanae-bot / clannad-routes 等)
+- **嗜好表明も拾う**: 「〜が好き」「〜をずっと聴いてる」「〜にハマってる」「〜が気になる」「〜を繰り返し見てる」等は preference fact として importance=2〜3 で抽出
+- **行動パターン・習慣も拾う**: 「最近〜してる」「毎日〜」「よく〜する」「〜を始めた」等
+- **知識・経験表明も拾う**: 「〜を知ってる」「〜やったことある」「〜読んだ」「〜見た」等
+- skip していいのは「うん」「そうだね」「了解」「ありがとう」のような content-free な相槌のみ。固有名詞 or 明確な感情/嗜好/行動が含まれていれば長さに関わらず skip しない
+- LLM自己言及・一般論は出力しない
+- importance < 2 は出力しない (ただし固有名詞 + 嗜好/行動/知識 はデフォルトで importance=2 以上で出すこと)
+- 1 fact は日本語 120字以内
 - category は personal/project/tech/science/hobby/invest/ops/meta のいずれか
 
-以下の JSON のみ返してください(説明・前置き・コードフェンス不要):
-{{"facts":[{{"speaker":"self","text":"<日本語fact>","importance":<3-5>,"category":"<one of 8>","subcategory":"<kebab-case>","tags":["<tag>"]}}]}}
+== entities フィールド ==
 
-該当事実が無ければ facts は空配列で構いません。"""
+- その fact が言及する固有名詞 / 概念を 0〜3 個入れる
+- name: canonical 表記 ("Rust", "Namitape", "クラナド", "佐藤かなえ", "TAKU INOUE" 等。原文の表記が canonical ならそのまま)
+- type: person / project / tech / media / place / concept のいずれか
+- aliases: 表記揺れ (省略可)。["ナミテープ", "namitape"] のように同義表現
+
+== 出力フォーマット ==
+
+以下の JSON のみ返してください(説明・前置き・コードフェンス不要):
+{{"facts":[{{"speaker":"self","text":"<日本語fact、固有名詞そのまま>","importance":<2-5>,"category":"<one of 8>","subcategory":"<kebab-case>","tags":["<tag>"],"entities":[{{"name":"<canonical>","type":"<one of 6>","aliases":["<alias>"]}}]}}]}}
+
+該当事実が無ければ facts は空配列で構いません。**ただし出力前に <user_text> を再走査し、カタカナ語・英大文字混じり・漢字熟語等の固有名詞が含まれていないか確認すること**。含まれていれば「知らない名前だから」を理由に skip してはならない。"""
 
 
 async def extract_facts_for_self(
@@ -156,26 +197,201 @@ async def extract_facts_for_self(
         if client is None:
             return []
         from config import MEM0_GATE_MODEL  # local import to allow .env reload
-        resp = await client.messages.create(
+        from services.mem0.cli_compat import cli_messages_create, extract_text
+        # max_tokens=4000 — Sonnet 4.6 with adaptive thinking can spend several
+        # hundred tokens on the thinking block; 600 left the visible TextBlock
+        # truncated mid-JSON and the parse would silently bail to []. Generous
+        # cap is fine because Sonnet stops at end_turn well before this.
+        resp = await cli_messages_create(
+            client,
             model=MEM0_GATE_MODEL,
-            max_tokens=600,
-            messages=[{"role": "user", "content": _EXTRACT_PROMPT.format(
+            max_tokens=4000,
+            user_message=_EXTRACT_PROMPT.format(
                 context_hint=_strip_extract_breakout_tags(context_hint or "(none)")[:1000],
                 user_text=_strip_extract_breakout_tags(user_text or "")[:2000],
                 assistant_text=_strip_extract_breakout_tags(assistant_text or "")[:2000],
-            )}],
+            ),
+            task_prompt=(
+                "You extract self-attributable facts from a Discord "
+                "conversation turn. Return JSON only."
+            ),
         )
-        text = resp.content[0].text.strip()
+        text = extract_text(resp).strip()
         if text.startswith("```"):
             text = text.split("```", 2)[1]
             if text.startswith("json"):
                 text = text[4:]
             text = text.rsplit("```", 1)[0].strip()
+        if not text:
+            # ThinkingBlock consumed all tokens / no TextBlock returned.
+            log.warning(
+                "extract_facts_for_self: empty TextBlock (stop_reason=%s, "
+                "content_block_types=%s)",
+                getattr(resp, "stop_reason", "?"),
+                [type(b).__name__ for b in (getattr(resp, "content", []) or [])],
+            )
+            return []
         import json as _json
-        data = _json.loads(text)
+        try:
+            data = _json.loads(text)
+        except _json.JSONDecodeError as exc:
+            # Log a preview so we can diagnose truncation / format drift.
+            log.warning(
+                "extract_facts_for_self: JSON parse failed (%s); text_tail=%r",
+                exc, text[-200:],
+            )
+            return []
         facts = data.get("facts", [])
+        # Diagnostic: when Sonnet returns {"facts":[]} despite a non-trivial
+        # user_text, log inputs + raw response so we can tell whether the
+        # extractor missed a proper noun, abstracted it away, or the user
+        # genuinely said nothing fact-worthy.
+        if not facts and (user_text or "").strip():
+            log.info(
+                "extract_facts_for_self: returned 0 facts "
+                "(user_text=%r, assistant_text=%r, raw_resp=%r)",
+                (user_text or "")[:160],
+                (assistant_text or "")[:160],
+                text[:400],
+            )
         # Double-defense: drop anything not marked self regardless of LLM claim
         return [f for f in facts if isinstance(f, dict) and f.get("speaker") == "self" and f.get("text")]
     except Exception as exc:
         log.warning("extract_facts_for_self failed: %s", exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Kanae self-fact extraction (P5, 2026-05-14)
+# ---------------------------------------------------------------------------
+# Mirror of extract_facts_for_self but extracting facts about Kanae (the bot)
+# from her own utterances. Stored under kanae's Mem0 user_id so retrieval at
+# chat time can inject her past statements / preferences and keep her
+# character consistent across sessions.
+_EXTRACT_KANAE_PROMPT = """以下の会話ターンから、長期記憶として保存すべき「かなえ (Discord bot 本人) に関する事実」だけを抽出してください。
+
+<context_hint>
+{context_hint}
+</context_hint>
+
+<senpai_text>
+{senpai_text}
+</senpai_text>
+
+<kanae_text>
+{kanae_text}
+</kanae_text>
+
+== 最重要ルール (これを破ったら抽出失敗扱い) ==
+
+1. **抽出対象は <kanae_text> のみ** ― かなえ自身の発話・表現・判断・感情から fact 化
+   - <senpai_text> は文脈として参照するが、そこから fact 化しない
+   - 「先輩は X が好き」のような **先輩 fact** は出力禁止 (別 Mem0 空間に保存される)
+   - OK: 「TAKU INOUE について先輩から教わって興味を示した」(かなえの行動)
+   - OK: 「Mem0 の dedup 実装を理解している」(かなえの知識)
+   - NG: 「先輩は TAKU INOUE が好き」 (先輩 fact)
+
+2. **固有名詞は省略せず fact text にそのまま含めること**:
+   - OK: 「Mem0 の cosine distance/similarity の取り違えバグを発見し、修正案を提示した」
+   - NG: 「あるバグを発見した」(固有名詞を消した抽象化禁止)
+   - カタカナ・英大文字混じり・漢字熟語等の固有名詞は基本そのまま entity 化
+
+== 抽出する fact の種類 (かなえ本人の状態) ==
+
+- 嗜好: 「○○に興味を示した」「○○を好む」
+- 性格・スタイル: 「上から目線だが敬語を保つ」「えっちなことに積極的」「先輩呼びは haroin のみ」
+- 感情: 「先輩への好意を表現した」「焼きもち焼いた」「照れた」「不安を見せた」
+- 知識: 「○○について知っている」「○○の構造を理解している」
+- 行動パターン: 「○○のときに○○する傾向」「先輩のテンションに合わせる」「5 行以内で簡潔に返す」
+- 意見・判断: 「○○について○○と考えている」「○○を提案した」「○○の方針を選んだ」
+
+== その他のルール ==
+
+- 雑談・相槌・LLM自己言及 (「了解です」「分かりました」だけ): 出力しない
+- importance < 2 は出力しない
+- 1 fact は日本語 120字以内
+- category は personal/project/tech/science/hobby/invest/ops/meta のいずれか
+  - personal: かなえと先輩の関係性、感情、性格特性
+  - project: 開発プロジェクトへの関与・知識
+  - tech: 技術的知識・スタイル
+  - science: 物理/数学/思想/哲学
+  - hobby: 嗜好・趣味
+  - invest: 投資への意見
+  - ops: 開発環境・運用
+  - meta: スタイル・対話メタ
+
+== entities フィールド ==
+
+- その fact が言及する固有名詞 / 概念を 0〜3 個入れる
+- name: canonical 表記
+- type: person / project / tech / media / place / concept
+- aliases: 表記揺れ (省略可)
+
+== 出力フォーマット ==
+
+JSON のみ返してください (説明・前置き・コードフェンス不要):
+{{"facts":[{{"speaker":"self","text":"<日本語fact、固有名詞そのまま>","importance":<2-5>,"category":"<one of 8>","subcategory":"<kebab-case>","tags":["<tag>"],"entities":[{{"name":"<canonical>","type":"<one of 6>","aliases":["<alias>"]}}]}}]}}
+
+該当事実が無ければ facts は空配列で OK。"""
+
+
+async def extract_facts_for_kanae(
+    senpai_text: str, kanae_text: str, context_hint: str = "",
+) -> list[dict]:
+    """Extract self-facts about Kanae (the bot) from one conversational turn.
+
+    Mirrors extract_facts_for_self but inverts the subject: kanae_text is
+    the subject of extraction, senpai_text is context. ``speaker='self'``
+    in the returned JSON refers to *Kanae* in this call site, and the
+    caller should store these under kanae's Mem0 user_id.
+    """
+    try:
+        from services.mem0.client import get_anthropic_client
+        client = await get_anthropic_client()
+        if client is None:
+            return []
+        from config import MEM0_GATE_MODEL
+        from services.mem0.cli_compat import cli_messages_create, extract_text
+        resp = await cli_messages_create(
+            client,
+            model=MEM0_GATE_MODEL,
+            max_tokens=4000,
+            user_message=_EXTRACT_KANAE_PROMPT.format(
+                context_hint=_strip_extract_breakout_tags(context_hint or "(none)")[:1000],
+                senpai_text=_strip_extract_breakout_tags(senpai_text or "")[:2000],
+                kanae_text=_strip_extract_breakout_tags(kanae_text or "")[:2000],
+            ),
+            task_prompt=(
+                "You extract self-attributable facts about Kanae (the AI bot) "
+                "from her own utterances. Return JSON only."
+            ),
+        )
+        text = extract_text(resp).strip()
+        if text.startswith("```"):
+            text = text.split("```", 2)[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.rsplit("```", 1)[0].strip()
+        if not text:
+            log.warning(
+                "extract_facts_for_kanae: empty TextBlock (stop_reason=%s)",
+                getattr(resp, "stop_reason", "?"),
+            )
+            return []
+        import json as _json
+        try:
+            data = _json.loads(text)
+        except _json.JSONDecodeError as exc:
+            log.warning(
+                "extract_facts_for_kanae: JSON parse failed (%s); tail=%r",
+                exc, text[-200:],
+            )
+            return []
+        facts = data.get("facts", [])
+        return [
+            f for f in facts
+            if isinstance(f, dict) and f.get("speaker") == "self" and f.get("text")
+        ]
+    except Exception as exc:
+        log.warning("extract_facts_for_kanae failed: %s", exc)
         return []
