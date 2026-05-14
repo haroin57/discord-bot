@@ -254,11 +254,21 @@ def _tail_jsonl(path: str, max_entries: int) -> list[dict]:
                 lines_found += buf.count(b"\n")
             chunks.reverse()
             text = b"".join(chunks).decode("utf-8", errors="replace")
+            # If we stopped before BOF, the first decoded "line" is almost
+            # always a partial record left over from where the chunk boundary
+            # bisected an entry. Trying to json.loads() that half-record was
+            # the source of the steady stream of "Skipping corrupted JSONL
+            # line: Expecting value" warnings on every load. Drop it.
+            reached_bof = (pos == 0)
     except OSError:
         return []
 
+    lines = text.splitlines()
+    if lines and not reached_bof:
+        lines = lines[1:]
+
     messages: list[dict] = []
-    for line in text.splitlines():
+    for line in lines:
         line = line.strip()
         if not line:
             continue
