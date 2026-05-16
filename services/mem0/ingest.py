@@ -20,6 +20,7 @@ async def add_memories(
     assistant_text: str | None = None,
     context_hint: str = "",
     subject: str = "self",
+    pre_extracted_facts: list[dict] | None = None,
 ) -> dict | None:
     """Store conversation for fact extraction.
 
@@ -30,6 +31,13 @@ async def add_memories(
     - "self"  (default) — facts about the human (senpai) from user_text
     - "kanae" — facts about Kanae herself from assistant_text;
       ``user_id`` should be kanae's Mem0 namespace (her Discord bot ID).
+
+    ``pre_extracted_facts`` — when supplied, skips the Haiku extraction
+    step and uses the provided facts as-is. The caller (currently bot.py
+    on the kanae path) extracts both facts and interests in one Haiku
+    call via `extract_kanae_signals`, then hands the facts here so we
+    don't pay for a second extraction. Each fact must already be in the
+    same shape `extract_facts_for_kanae` would have returned.
     """
     # ── 1. Normalize signature into (user_text, assistant_text, context_hint) ──
     if messages is not None and user_text is None:
@@ -64,7 +72,17 @@ async def add_memories(
         # overwrite trust-relevant keys (gate_version, timestamp, importance,
         # category, tags). New caller-controlled keys must be added here
         # explicitly.
-        _ALLOWED_CALLER_META = {"channel_id", "channel_name", "source"}
+        # `persona` / `episode_id` / `interest_tags` were added 2026-05-15
+        # for the kanae_self model — they let the recall path filter
+        # kanae's own facts vs. senpai facts and link a fact back to the
+        # episode that produced it. `interest_tags` must be a CSV string
+        # because ChromaDB rejects list-valued metadata (see the tags
+        # handling in _insert_one below); the caller is responsible for
+        # the CSV conversion.
+        _ALLOWED_CALLER_META = {
+            "channel_id", "channel_name", "source",
+            "persona", "episode_id", "interest_tags",
+        }
         base_meta = {
             "timestamp": int(_time.time()),
             "gate_version": "v2" if MEM0_GATE_ENABLED else "v1",
@@ -76,16 +94,24 @@ async def add_memories(
 
         # ── 2. Gate path (P2): Haiku → filter → infer=False raw insert ──
         if MEM0_GATE_ENABLED:
-            if subject == "kanae":
+            if pre_extracted_facts is not None:
+                # Caller already ran the extractor (e.g. extract_kanae_signals
+                # in bot.py) and is passing facts in to avoid a duplicate
+                # Haiku call. We trust the shape because the extractor and
+                # the caller share a module-internal contract.
+                facts = pre_extracted_facts
+            elif subject == "kanae":
                 # senpai_text=context, kanae_text=subject of extraction
                 facts = await extract_facts_for_kanae(
                     senpai_text=user_text,
                     kanae_text=assistant_text,
                     context_hint=context_hint,
+                    user_id=str(user_id) if user_id else None,
                 )
             else:
                 facts = await extract_facts_for_self(
                     user_text, assistant_text, context_hint,
+                    user_id=str(user_id) if user_id else None,
                 )
             # Diagnostic: show every extracted fact text. Helps trace why a
             # turn produced unexpected dedup hits (candidate vs existing).

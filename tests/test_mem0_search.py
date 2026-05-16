@@ -439,7 +439,10 @@ class TestSearchMemoriesSmart:
 
     @pytest.mark.asyncio
     async def test_both_disabled_plain_search(self, monkeypatch):
-        mems = [_make_memory("x", 0.9)]
+        # Score must stay under MEM0_FINAL_RELEVANCE_MAX_DISTANCE (default 0.65)
+        # or smart-path's final filter will drop the result. 0.4 is a safe
+        # "relevant" distance for this assertion.
+        mems = [_make_memory("x", 0.4)]
         monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", AsyncMock(return_value=mems))
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock())
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock())

@@ -324,7 +324,7 @@ class TestSignatureNormalization:
         """messages list is parsed into user_text / assistant_text for gate path."""
         facts_seen = {}
 
-        async def capture_extract(user_text, assistant_text, context_hint=""):
+        async def capture_extract(user_text, assistant_text, context_hint="", **kwargs):
             facts_seen["user_text"] = user_text
             facts_seen["assistant_text"] = assistant_text
             return []
@@ -351,7 +351,7 @@ class TestSignatureNormalization:
         """role=system in messages list sets context_hint for gate extract."""
         hints_seen = {}
 
-        async def capture_extract(user_text, assistant_text, context_hint=""):
+        async def capture_extract(user_text, assistant_text, context_hint="", **kwargs):
             hints_seen["context_hint"] = context_hint
             return []
 

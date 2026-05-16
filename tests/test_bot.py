@@ -271,7 +271,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=12345)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("response text", "sess-1")), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("response text", "sess-1", False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -294,7 +294,7 @@ class TestOnMessage:
         msg.mentions = [mock_bot_user]
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -319,7 +319,7 @@ class TestOnMessage:
         msg.role_mentions = [role_mock]
 
         with patch("bot.strip_mention", return_value="hey"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hey"), \
@@ -414,7 +414,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=12345)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=(long_text, None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=(long_text, None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -436,7 +436,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=12345)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("chunk1", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("chunk1", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -459,7 +459,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=12345)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("c1c2", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("c1c2", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -501,7 +501,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=12345, channel_id=555)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -544,7 +544,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=77777)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -569,7 +569,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=3)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -590,7 +590,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=12345)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", "new-sess-id")), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", "new-sess-id", True)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -611,7 +611,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=12345)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -632,7 +632,7 @@ class TestOnMessage:
 
         msg = _make_message(content="hello", is_dm=True, author_id=12345)
 
-        with patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("hi", None)), \
+        with patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("hi", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -653,7 +653,7 @@ class TestOnMessage:
         msg.add_reaction = AsyncMock(side_effect=discord.errors.Forbidden(MagicMock(), "no perms"))
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -678,7 +678,7 @@ class TestOnMessage:
         async def capture_call_with_tools(prompt, *args, **kwargs):
             nonlocal captured_prompt
             captured_prompt = prompt
-            return ("ok", None)
+            return ("ok", None, False)
 
         with patch("bot.strip_mention", return_value="hello"), \
              patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call_with_tools), \
@@ -709,7 +709,7 @@ class TestOnMessage:
         async def capture_call_with_tools(prompt, *args, **kwargs):
             nonlocal captured_prompt
             captured_prompt = prompt
-            return ("ok", None)
+            return ("ok", None, False)
 
         with patch("bot.strip_mention", return_value="hello"), \
              patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call_with_tools), \
@@ -750,7 +750,7 @@ class TestOnMessage:
         async def capture_call(prompt, *args, **kwargs):
             nonlocal captured_prompt
             captured_prompt = prompt
-            return ("ok", None)
+            return ("ok", None, False)
 
         with patch("bot.strip_mention", return_value="hello"), \
              patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
@@ -783,7 +783,7 @@ class TestOnMessage:
             msg = _make_message(content="かなえ hello", author_id=12345)
 
             with patch("bot.strip_mention", return_value="hello"), \
-                 patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("check " + tmp_path, None)), \
+                 patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("check " + tmp_path, None, False)), \
                  patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
                  patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
                  patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -810,7 +810,7 @@ class TestOnMessage:
         msg.reply = AsyncMock(return_value=status_msg)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -838,7 +838,7 @@ class TestOnMessage:
         async def capture_call(prompt, *args, **kwargs):
             nonlocal captured_prompt
             captured_prompt = prompt
-            return ("ok", None)
+            return ("ok", None, False)
 
         with patch("bot.strip_mention", return_value="hello"), \
              patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
@@ -1161,7 +1161,12 @@ async def test_tree_sync_only_runs_once():
     import bot
 
     bot._tree_synced = False
-    bot._cleanup_scheduled = True  # skip cleanup branch
+    # Pre-set every guard flag so on_ready short-circuits all the background
+    # task spawns (emotion daemon, silence tick, hourly summary etc.).
+    # Otherwise their long-running loops leak into subsequent tests and the
+    # whole test_bot.py suite hangs.
+    bot._cleanup_scheduled = True
+    bot._emotion_daemon_started = True
 
     mock_tree_sync = AsyncMock(return_value=[MagicMock(), MagicMock()])
     mock_tree = MagicMock()
@@ -1184,6 +1189,7 @@ async def test_tree_sync_only_runs_once():
     # Reset for other tests
     bot._tree_synced = False
     bot._cleanup_scheduled = False
+    bot._emotion_daemon_started = False
 
 
 def test_attachments_capped_at_10():
@@ -1258,7 +1264,9 @@ class TestOnMessageAdminAndQuota:
 
     @pytest.mark.asyncio
     async def test_delete_command_non_admin_rejected(self, monkeypatch):
-        """Non-admin sending delete command gets access denied."""
+        """Non-admin DM is silently dropped at the DM admin gate
+        (bot.py: ``if is_dm and not is_admin: return``) before the delete
+        handler runs. Silent drop IS the security contract — no reply."""
         import bot
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {99999})  # 12345 is NOT admin
 
@@ -1271,8 +1279,7 @@ class TestOnMessageAdminAndQuota:
 
         await self._dispatch(msg)
 
-        calls = msg.reply.call_args_list
-        assert any("admin" in str(c).lower() or "❌" in str(c) for c in calls)
+        msg.reply.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_delete_command_admin_success(self, monkeypatch):
@@ -1327,7 +1334,7 @@ class TestOnMessageAdminAndQuota:
             msg = _make_message(content="かなえ hello", author_id=12345)
 
             with patch("bot.strip_mention", return_value="hello"), \
-                 patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("see " + tmp_path, None)), \
+                 patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("see " + tmp_path, None, False)), \
                  patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
                  patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
                  patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -1357,7 +1364,7 @@ class TestOnMessageAdminAndQuota:
         async def capture_call(prompt, *args, **kwargs):
             nonlocal captured_prompt
             captured_prompt = prompt
-            return ("ok", None)
+            return ("ok", None, False)
 
         with patch("bot.strip_mention", return_value="hello"), \
              patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
@@ -1388,7 +1395,7 @@ class TestOnMessageAdminAndQuota:
         msg = _make_message(content="かなえ hello", author_id=400)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \

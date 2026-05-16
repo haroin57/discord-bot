@@ -122,23 +122,80 @@ def _normalize_name(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Appellation resolution (§2 of docs/mem0-dedup-issues.md)
+# ---------------------------------------------------------------------------
+# Maps common appellations to their canonical proper noun. The second tuple
+# element is a frozenset of user_ids the mapping applies to, or ``None`` for
+# all users. Keep this small and unambiguous — when in doubt, leave the
+# appellation alone and let the extractor record it as a standalone entity.
+_APPELLATION_MAP: dict[str, tuple[str, frozenset[str] | None]] = {
+    "先輩": ("haroin", None),
+    "お父さん": ("b0nchichi", None),
+    "お父様": ("b0nchichi", None),
+}
+
+
+def _resolve_appellation(name: str, user_id: str) -> tuple[str, list[str]]:
+    """Resolve an appellation to its canonical proper noun.
+
+    Returns ``(canonical, extra_aliases)``. When the input is not an
+    appellation we know about (or the user_id is out of scope), the name is
+    returned unchanged and ``extra_aliases`` is empty.
+    """
+    entry = _APPELLATION_MAP.get(name)
+    if entry is None:
+        return name, []
+    canonical, allowed_users = entry
+    if allowed_users is not None and user_id not in allowed_users:
+        return name, []
+    return canonical, [name]
+
+
+# ---------------------------------------------------------------------------
 # Entity upsert / lookup
 # ---------------------------------------------------------------------------
 def upsert_entity(
     name: str, type: str, user_id: str, *, aliases: Iterable[str] = (),
 ) -> int:
-    """Insert-or-update an entity. Returns the entity id."""
+    """Insert-or-update an entity. Returns the entity id.
+
+    Alias-aware lookup order (§1 of docs/mem0-dedup-issues.md):
+      1. Resolve appellations (``先輩`` → ``haroin``) before any DB lookup.
+      2. Single OR-merged SELECT: hit if canonical_name matches the candidate
+         name OR any candidate alias, OR if any of those surface forms are
+         already registered in entity_aliases.
+      3. On hit: bump mention_count and register all candidate surface forms
+         (name + aliases) as aliases unless they already match the canonical.
+      4. On miss: INSERT a new entity, then register the alias rows.
+    """
     name = _normalize_name(name)
     if not name or not type or not user_id:
         return 0
+    name, appellation_aliases = _resolve_appellation(name, user_id)
+    norm_aliases: list[str] = []
+    seen: set[str] = {name}
+    for raw in list(aliases) + appellation_aliases:
+        a = _normalize_name(raw)
+        if a and a not in seen:
+            norm_aliases.append(a)
+            seen.add(a)
     now = int(time.time())
+    # Build the surface-form set used both for lookup and for later alias
+    # registration. We use it twice so collapse to a tuple after dedup.
+    surface_forms = (name, *norm_aliases)
+    placeholders = ",".join("?" for _ in surface_forms)
+    lookup_sql = (
+        f"SELECT id FROM entities "
+        f"WHERE user_id=? AND ("
+        f"canonical_name IN ({placeholders}) "
+        f"OR id IN (SELECT entity_id FROM entity_aliases "
+        f"WHERE alias IN ({placeholders}))"
+        f") LIMIT 1"
+    )
     with _conn() as c, _db_lock:
-        cur = c.execute(
-            "SELECT id, mention_count FROM entities "
-            "WHERE canonical_name=? AND user_id=?",
-            (name, user_id),
-        )
-        row = cur.fetchone()
+        row = c.execute(
+            lookup_sql, (user_id, *surface_forms, *surface_forms),
+        ).fetchone()
         if row:
             eid = row["id"]
             c.execute(
@@ -153,19 +210,26 @@ def upsert_entity(
                 (name, type, user_id, now),
             )
             eid = cur.lastrowid
-        for alias in aliases:
-            alias = _normalize_name(alias)
-            if not alias or alias == name:
+        # Register every surface form (name + aliases) that isn't already the
+        # canonical_name of the resolved entity. On the new-INSERT path this
+        # naturally skips ``name``; on the merge path it registers ``name``
+        # as an alias of the existing canonical too.
+        existing_canonical = c.execute(
+            "SELECT canonical_name FROM entities WHERE id=?", (eid,),
+        ).fetchone()["canonical_name"]
+        for sf in surface_forms:
+            if sf == existing_canonical:
                 continue
             try:
                 c.execute(
                     "INSERT OR IGNORE INTO entity_aliases(entity_id, alias) "
                     "VALUES (?, ?)",
-                    (eid, alias),
+                    (eid, sf),
                 )
             except sqlite3.IntegrityError:
                 pass
         c.commit()
+    _invalidate_top_entities_cache(user_id)
     return int(eid)
 
 
@@ -292,6 +356,59 @@ def delete_fact_edges(fact_id: str) -> int:
         )
         c.commit()
         return cur.rowcount or 0
+
+
+# ---------------------------------------------------------------------------
+# Top-N canonical names — used by extract prompts to anchor canonical forms
+# (§5a of docs/mem0-dedup-issues.md).
+# ---------------------------------------------------------------------------
+_TOP_ENTITIES_TTL_SEC = 300
+# {(user_id, limit): (expires_at_epoch, list[str])}
+_top_entities_cache: dict[tuple[str, int], tuple[float, list[str]]] = {}
+_top_entities_lock = threading.Lock()
+
+
+def _invalidate_top_entities_cache(user_id: str | None = None) -> None:
+    """Drop cached top-entities. Called from upsert_entity on writes."""
+    with _top_entities_lock:
+        if user_id is None:
+            _top_entities_cache.clear()
+            return
+        for key in [k for k in _top_entities_cache if k[0] == user_id]:
+            _top_entities_cache.pop(key, None)
+
+
+def invalidate_top_entities_cache(user_id: str | None = None) -> None:
+    """Public alias for tests and scripts that mutate the DB out-of-band."""
+    _invalidate_top_entities_cache(user_id)
+
+
+def get_top_entities(user_id: str, limit: int = 30) -> list[str]:
+    """Return up to ``limit`` canonical_name strings, ordered by mention_count.
+
+    Filters out entities with mention_count < 2 — first-mention noise tends to
+    poison the canonical dictionary the extractor sees. Results are cached for
+    ``_TOP_ENTITIES_TTL_SEC`` per (user_id, limit) and invalidated on writes.
+    """
+    if not user_id or limit <= 0:
+        return []
+    key = (str(user_id), int(limit))
+    now = time.time()
+    with _top_entities_lock:
+        hit = _top_entities_cache.get(key)
+        if hit and hit[0] > now:
+            return list(hit[1])
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT canonical_name FROM entities "
+            "WHERE user_id=? AND mention_count >= 2 "
+            "ORDER BY mention_count DESC, id ASC LIMIT ?",
+            (str(user_id), int(limit)),
+        ).fetchall()
+    names = [r["canonical_name"] for r in rows]
+    with _top_entities_lock:
+        _top_entities_cache[key] = (now + _TOP_ENTITIES_TTL_SEC, list(names))
+    return names
 
 
 # ---------------------------------------------------------------------------
