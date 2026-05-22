@@ -459,6 +459,14 @@ MEM0_HYBRID_ENABLED = _bool_env("MEM0_HYBRID_ENABLED", True)
 MEM0_BM25_RRF_K = int(os.environ.get("MEM0_BM25_RRF_K", "60"))
 MEM0_BM25_LIMIT = int(os.environ.get("MEM0_BM25_LIMIT", "20"))
 
+# Phase B-1 (mem0-recall-hybrid-hyde-kg): HyDE rewrite. When True, smart_search
+# also asks Haiku to generate a hypothetical fact answering the user's
+# question, then searches with that string in parallel with keyword variants.
+# Adds ~1 Haiku call per turn ($0.0001), but paraphrases questions into the
+# fact-statement form Mem0 actually stores, dramatically improving recall on
+# conversational queries.
+MEM0_HYDE_ENABLED = _bool_env("MEM0_HYDE_ENABLED", True)
+
 # Stable namespace for kanae's own Mem0 entries. Both the bot's runtime
 # hook (bot.py) and the daily summary script (scripts/kanae_daily.py)
 # must write to the same user_id, otherwise her self-facts split into

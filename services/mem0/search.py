@@ -191,6 +191,79 @@ _RERANK_PROMPT = """以下のMem0検索結果のうち、ユーザーの元ク�
 {{"top":[3,1,5]}}"""
 
 
+# Phase B-1 (mem0-recall-hybrid-hyde-kg): HyDE prompt. Generates a single
+# *fact-shaped* sentence in the form Mem0 would have stored it, so cosine
+# search aligns with the actual fact content rather than the question form.
+_HYDE_PROMPT = """ユーザーの質問に対して、Mem0 (長期記憶) に保存されている可能性のある「事実文」を1つ仮想的に生成してください。
+
+ユーザーの質問: {query}
+
+== ルール ==
+- 1文 (50字以内、日本語)
+- 「先輩は〜」「〜が好き」「〜したことがある」のような事実 statement の形
+- 固有名詞があれば質問文のものをそのまま使う
+- 知らない情報を作るのではなく、質問の意図を「答えうる fact」の形に書き換える
+  - 質問: 「先輩はいぶきが好きだっけ?」 → 「先輩は砺波いぶきが好き」
+  - 質問: 「Rust の話前にしたっけ?」 → 「先輩は Rust async について話した」
+- 答えにくい場合は質問の主要キーワードを並べただけの文でよい
+
+以下のJSONのみ返してください:
+{{"hypothetical":"<生成された事実文>"}}"""
+
+
+async def _generate_hypothetical_fact(query: str) -> str:
+    """HyDE-style hypothetical answer (Phase B-1).
+
+    Returns a short fact-shaped sentence that paraphrases the user's
+    question into the form an actual Mem0 fact would take, then the
+    caller embeds it alongside the original query so cosine search lands
+    closer to the real stored fact.
+
+    Empty string on any failure / too-short input. The smart-search
+    pipeline tolerates empty variants without retry cost.
+    """
+    q = (query or "").strip()
+    if len(q) < 8:
+        return ""
+    try:
+        from config import MEM0_HYDE_ENABLED
+        if not MEM0_HYDE_ENABLED:
+            return ""
+    except Exception:
+        pass
+    try:
+        from services.mem0.client import get_anthropic_client
+        client = await get_anthropic_client()
+        if client is None:
+            return ""
+        safe_query = q[:500].replace("{", "{{").replace("}", "}}")
+        from services.mem0.cli_compat import cli_messages_create, extract_text
+        resp = await cli_messages_create(
+            client,
+            model=os.environ.get("MEM0_HYDE_MODEL", "claude-haiku-4-5-20251001"),
+            max_tokens=int(os.environ.get("MEM0_HYDE_MAX_TOKENS", "200")),
+            user_message=_HYDE_PROMPT.format(query=safe_query),
+            task_prompt=(
+                "You generate a single hypothetical fact statement that "
+                "would answer the user's question. Return JSON only."
+            ),
+        )
+        text = extract_text(resp).strip()
+        if text.startswith("```"):
+            text = text.split("```", 2)[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.rsplit("```", 1)[0].strip()
+        import json as _json
+        out = _json.loads(text).get("hypothetical", "")
+        if isinstance(out, str):
+            return out.strip()
+        return ""
+    except Exception as exc:
+        log.warning("hyde failed (non-fatal): %s", exc)
+        return ""
+
+
 async def _rewrite_query(query: str) -> list[str]:
     """Expand a user query into canonical-keyword variants via Haiku."""
     try:
@@ -384,10 +457,20 @@ async def search_memories_smart(
             if a not in queries:
                 queries.append(a)
     if rewrite:
-        variants = await _rewrite_query(query)
+        # Phase B-1: run rewrite + HyDE in parallel. HyDE generates a single
+        # fact-shaped sentence ("先輩は砺波いぶきが好き") that paraphrases the
+        # question, so embedding lands near the actual stored fact. The
+        # rewrite path yields canonical keyword variants. Both feed into
+        # search_memories_multi which dedupes and merges.
+        variants_task = _rewrite_query(query)
+        hyde_task = _generate_hypothetical_fact(query)
+        variants, hyde = await asyncio.gather(variants_task, hyde_task)
         for v in variants:
             if v and v not in queries:
                 queries.append(v)
+        if hyde and hyde not in queries:
+            log.info("hyde: %r → %r", (query or "")[:60], hyde[:80])
+            queries.append(hyde)
     # Phase A-1: hybrid retrieval (vector + BM25 RRF fusion). Falls back to
     # vector-only when MEM0_HYBRID_ENABLED=false. Same return shape as
     # search_memories_multi, so the downstream rerank / graph_expand keep

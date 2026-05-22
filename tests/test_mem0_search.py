@@ -333,6 +333,15 @@ class TestSearchMemoriesSmart:
             AsyncMock(return_value=[]),
         )
 
+    @pytest.fixture(autouse=True)
+    def _stub_hyde(self, monkeypatch):
+        """HyDE talks to Anthropic; stub to empty string by default so
+        smart-pipeline tests that focus on other behavior stay quiet."""
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._generate_hypothetical_fact",
+            AsyncMock(return_value=""),
+        )
+
     @pytest.mark.asyncio
     async def test_full_pipeline(self, monkeypatch):
         variants = ["kw1", "kw2"]
@@ -449,6 +458,125 @@ class TestSearchMemoriesSmart:
         from services.mem0.search import search_memories_smart
         result = await search_memories_smart("q", "u", limit=5, rewrite=False, rerank=False)
         assert result == mems
+
+
+# ---------------------------------------------------------------------------
+# HyDE (Phase B-1)
+# ---------------------------------------------------------------------------
+
+class TestHydeGeneration:
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_short_query(self):
+        from services.mem0.search import _generate_hypothetical_fact
+        assert await _generate_hypothetical_fact("") == ""
+        assert await _generate_hypothetical_fact("       ") == ""
+        assert await _generate_hypothetical_fact("short") == ""  # <8 chars
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_disabled(self, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "MEM0_HYDE_ENABLED", False, raising=False)
+        from services.mem0.search import _generate_hypothetical_fact
+        assert await _generate_hypothetical_fact("いぶきの髪色を覚えてる？") == ""
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_client_none(self, monkeypatch):
+        async def _no_client():
+            return None
+        monkeypatch.setattr("services.mem0.client.get_anthropic_client", _no_client)
+        from services.mem0.search import _generate_hypothetical_fact
+        assert await _generate_hypothetical_fact("先輩はいぶきが好き?") == ""
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_json_error(self, monkeypatch):
+        fake_client = AsyncMock()
+        fake_client.messages.create = AsyncMock(
+            return_value=_make_anthropic_resp("not json at all"),
+        )
+        monkeypatch.setattr(
+            "services.mem0.client.get_anthropic_client",
+            AsyncMock(return_value=fake_client),
+        )
+        from services.mem0.search import _generate_hypothetical_fact
+        result = await _generate_hypothetical_fact("先輩はいぶきが好き?")
+        assert result == ""
+
+    @pytest.mark.asyncio
+    async def test_extracts_hypothetical_from_json(self, monkeypatch):
+        fake_client = AsyncMock()
+        fake_client.messages.create = AsyncMock(
+            return_value=_make_anthropic_resp(
+                '{"hypothetical":"先輩は砺波いぶきが好き"}',
+            ),
+        )
+        monkeypatch.setattr(
+            "services.mem0.client.get_anthropic_client",
+            AsyncMock(return_value=fake_client),
+        )
+        from services.mem0.search import _generate_hypothetical_fact
+        result = await _generate_hypothetical_fact("先輩はいぶきが好き?")
+        assert result == "先輩は砺波いぶきが好き"
+
+    @pytest.mark.asyncio
+    async def test_strips_code_fence(self, monkeypatch):
+        fake_client = AsyncMock()
+        fake_client.messages.create = AsyncMock(
+            return_value=_make_anthropic_resp(
+                '```json\n{"hypothetical":"先輩はRustが好き"}\n```',
+            ),
+        )
+        monkeypatch.setattr(
+            "services.mem0.client.get_anthropic_client",
+            AsyncMock(return_value=fake_client),
+        )
+        from services.mem0.search import _generate_hypothetical_fact
+        result = await _generate_hypothetical_fact("先輩はRustの話してた?")
+        assert result == "先輩はRustが好き"
+
+
+class TestSmartSearchHydeIntegration:
+    @pytest.fixture(autouse=True)
+    def _stub_alias_expand(self, monkeypatch):
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._expand_query_via_graph",
+            AsyncMock(return_value=[]),
+        )
+
+    @pytest.mark.asyncio
+    async def test_hyde_string_passed_to_multi_search(self, monkeypatch):
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._generate_hypothetical_fact",
+            AsyncMock(return_value="先輩は砺波いぶきが好き"),
+        )
+        multi_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid", multi_mock)
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]),
+        )
+        from services.mem0.search import search_memories_smart
+        await search_memories_smart("先輩はいぶきが好き?", "u")
+        queries = multi_mock.call_args.args[0]
+        assert "先輩は砺波いぶきが好き" in queries
+
+    @pytest.mark.asyncio
+    async def test_hyde_not_called_when_rewrite_disabled(self, monkeypatch):
+        rewrite_mock = AsyncMock(return_value=["unused"])
+        hyde_mock = AsyncMock(return_value="should_not_be_called")
+        monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", rewrite_mock)
+        monkeypatch.setattr(f"{_PATCH_BASE}._generate_hypothetical_fact", hyde_mock)
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._search_multi_hybrid", AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]),
+        )
+        from services.mem0.search import search_memories_smart
+        await search_memories_smart("先輩はいぶきが好き?", "u", rewrite=False)
+        rewrite_mock.assert_not_called()
+        hyde_mock.assert_not_called()
 
 
 class TestPostRerankGateRedesign:
