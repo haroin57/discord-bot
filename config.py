@@ -451,6 +451,14 @@ MEM0_DEDUP_SEARCH_LIMIT = int(os.environ.get("MEM0_DEDUP_SEARCH_LIMIT", "5"))
 MEM0_DEDUP_DRY_RUN = _bool_env("MEM0_DEDUP_DRY_RUN", False)               # P4: dry-run (dropせずログのみ)
 MEM0_SMART_SEARCH = _bool_env("MEM0_SMART_SEARCH", True)                   # P3
 
+# Phase A-1 (mem0-recall-hybrid-hyde-kg): BM25 hybrid retrieval over sqlite FTS5.
+# When True, smart_search runs vector search and BM25 in parallel and fuses
+# their ranked lists via Reciprocal Rank Fusion. Falls back to vector-only
+# when False or when the FTS5 index is missing/empty.
+MEM0_HYBRID_ENABLED = _bool_env("MEM0_HYBRID_ENABLED", True)
+MEM0_BM25_RRF_K = int(os.environ.get("MEM0_BM25_RRF_K", "60"))
+MEM0_BM25_LIMIT = int(os.environ.get("MEM0_BM25_LIMIT", "20"))
+
 # Stable namespace for kanae's own Mem0 entries. Both the bot's runtime
 # hook (bot.py) and the daily summary script (scripts/kanae_daily.py)
 # must write to the same user_id, otherwise her self-facts split into

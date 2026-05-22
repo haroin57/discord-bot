@@ -86,6 +86,83 @@ async def search_memories_multi(
 
 
 # ---------------------------------------------------------------------------
+# BM25 hybrid retrieval (Phase A-1 of mem0-recall-hybrid-hyde-kg)
+# ---------------------------------------------------------------------------
+async def search_memories_hybrid(
+    query: str, user_id: str, limit: int = 8,
+) -> list[dict]:
+    """Run vector search and BM25 in parallel, fuse via Reciprocal Rank Fusion.
+
+    Falls back to vector-only on any BM25 error so this is a strict
+    superset of ``search_memories`` semantics — never *fewer* hits than the
+    vector path alone.
+
+    When ``MEM0_HYBRID_ENABLED`` is False (env), behaves exactly like
+    ``search_memories`` for that one query. This is the per-query flag we
+    want; the smart-search multi-query merge sits a layer above.
+    """
+    try:
+        from config import MEM0_HYBRID_ENABLED, MEM0_BM25_RRF_K, MEM0_BM25_LIMIT
+    except Exception:
+        MEM0_HYBRID_ENABLED, MEM0_BM25_RRF_K, MEM0_BM25_LIMIT = True, 60, 20
+    if not MEM0_HYBRID_ENABLED:
+        return await search_memories(query, user_id, limit=limit)
+
+    from services.mem0 import bm25_index
+    vector_task = search_memories(query, user_id, limit=limit)
+    bm25_task = asyncio.to_thread(
+        bm25_index.search_bm25, query, user_id, MEM0_BM25_LIMIT,
+    )
+    vector_hits, bm25_hits = await asyncio.gather(
+        vector_task, bm25_task, return_exceptions=True,
+    )
+    if isinstance(vector_hits, Exception):
+        log.warning("hybrid: vector search failed: %s", vector_hits)
+        vector_hits = []
+    if isinstance(bm25_hits, Exception):
+        log.warning("hybrid: bm25 search failed: %s", bm25_hits)
+        bm25_hits = []
+    fused = bm25_index.rrf_merge(
+        vector_hits, bm25_hits, k=MEM0_BM25_RRF_K, limit=limit,
+    )
+    if bm25_hits:
+        log.info(
+            "hybrid: q=%r vector=%d bm25=%d fused=%d",
+            (query or "")[:60], len(vector_hits), len(bm25_hits), len(fused),
+        )
+    return fused
+
+
+async def _search_multi_hybrid(
+    queries: list[str], user_id: str, limit: int = 8,
+) -> list[dict]:
+    """Multi-query merge that uses ``search_memories_hybrid`` per query.
+
+    Mirrors ``search_memories_multi`` structure 1:1 so callers downstream
+    don't notice the swap. We keep the merge dedup-by-id + score-ascending
+    sort here too because RRF-only ordering would defeat the LLM rerank's
+    reinforcement-boost math (which subtracts from distance).
+    """
+    if not queries:
+        return []
+    tasks = [search_memories_hybrid(q, user_id, limit=limit) for q in queries]
+    all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    seen_ids: set[str] = set()
+    merged: list[dict] = []
+    for result_set in all_results:
+        if isinstance(result_set, Exception):
+            continue
+        for r in result_set:
+            mid = r.get("id", r.get("memory", ""))
+            if mid not in seen_ids:
+                seen_ids.add(mid)
+                merged.append(r)
+    merged.sort(key=lambda x: x.get("score") if x.get("score") is not None else 99)
+    return merged[:limit]
+
+
+# ---------------------------------------------------------------------------
 # Search-time query rewriting + re-ranking (P3)
 # ---------------------------------------------------------------------------
 _REWRITE_PROMPT = """ユーザーの記憶検索クエリを、Mem0で類似ヒットしやすい正準キーワード3〜5個に変換してください。
@@ -311,7 +388,11 @@ async def search_memories_smart(
         for v in variants:
             if v and v not in queries:
                 queries.append(v)
-    candidates = await search_memories_multi(queries, user_id, limit=20)
+    # Phase A-1: hybrid retrieval (vector + BM25 RRF fusion). Falls back to
+    # vector-only when MEM0_HYBRID_ENABLED=false. Same return shape as
+    # search_memories_multi, so the downstream rerank / graph_expand keep
+    # working unchanged.
+    candidates = await _search_multi_hybrid(queries, user_id, limit=20)
 
     # Graph expansion (Obsidian-style 1-hop): for each top-3 candidate,
     # look up its linked entities and surface sibling facts that share an

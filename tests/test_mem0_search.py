@@ -340,7 +340,7 @@ class TestSearchMemoriesSmart:
         reranked = merged[:3]
 
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=variants))
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", AsyncMock(return_value=merged))
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",AsyncMock(return_value=merged))
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=reranked))
 
         from services.mem0.search import search_memories_smart
@@ -357,7 +357,7 @@ class TestSearchMemoriesSmart:
         )
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
         multi_mock = AsyncMock(return_value=[])
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", multi_mock)
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",multi_mock)
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]))
 
         from services.mem0.search import search_memories_smart
@@ -374,7 +374,7 @@ class TestSearchMemoriesSmart:
         alias_mock = AsyncMock(return_value=["CLANNAD"])
         monkeypatch.setattr(f"{_PATCH_BASE}._expand_query_via_graph", alias_mock)
         multi_mock = AsyncMock(return_value=[])
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", multi_mock)
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",multi_mock)
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=["unused"]))
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]))
 
@@ -391,7 +391,7 @@ class TestSearchMemoriesSmart:
         multi_mock = AsyncMock(return_value=[])
         rewrite_mock = AsyncMock(return_value=["x"])
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", rewrite_mock)
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", multi_mock)
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",multi_mock)
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]))
 
         from services.mem0.search import search_memories_smart
@@ -405,7 +405,7 @@ class TestSearchMemoriesSmart:
     async def test_rerank_disabled(self, monkeypatch):
         mems = [_make_memory(str(i), 0.5) for i in range(10)]
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", AsyncMock(return_value=mems))
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",AsyncMock(return_value=mems))
         rerank_mock = AsyncMock(return_value=mems[:5])
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", rerank_mock)
 
@@ -418,7 +418,7 @@ class TestSearchMemoriesSmart:
         """If rewrite returns the same query, it should not be duplicated."""
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=["q", "other"]))
         multi_mock = AsyncMock(return_value=[])
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", multi_mock)
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",multi_mock)
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]))
 
         from services.mem0.search import search_memories_smart
@@ -442,7 +442,7 @@ class TestSearchMemoriesSmart:
         # ADR-0002: rerank=False path uses MEM0_RELEVANCE_MAX_DISTANCE
         # (1.2) as the sanity gate. 0.4 is well under either threshold.
         mems = [_make_memory("x", 0.4)]
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", AsyncMock(return_value=mems))
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",AsyncMock(return_value=mems))
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock())
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock())
 
@@ -466,7 +466,7 @@ class TestPostRerankGateRedesign:
         # return them verbatim.
         candidates = [_make_memory("上伊那ぼたん 漫画", 0.92)]
         reranked = list(candidates)
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", AsyncMock(return_value=candidates))
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",AsyncMock(return_value=candidates))
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=reranked))
 
@@ -483,7 +483,7 @@ class TestPostRerankGateRedesign:
         # If the LLM judges nothing relevant, return empty — not the raw
         # candidate set.
         candidates = [_make_memory("x", 0.4), _make_memory("y", 0.5)]
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", AsyncMock(return_value=candidates))
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",AsyncMock(return_value=candidates))
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]))
 
@@ -500,7 +500,7 @@ class TestPostRerankGateRedesign:
             _make_memory("kept-id", 0.9, text="kept"),
             _make_memory("dropped-id", 1.3, text="dropped"),
         ]
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", AsyncMock(return_value=mems))
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",AsyncMock(return_value=mems))
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock())
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock())
 

@@ -289,6 +289,21 @@ async def add_memories(
                                         await asyncio.to_thread(graph.add_edge, fid, eid)
                 except Exception as e:
                     log.warning("graph update failed (non-fatal): %s", e)
+                # Phase A-1: index the new fact in the BM25 FTS5 store so
+                # hybrid retrieval can rescue exact-term matches that cosine
+                # missed. Errors are non-fatal — the fact is already stored.
+                try:
+                    if isinstance(res, dict):
+                        from services.mem0 import bm25_index
+                        for r in (res.get("results") or []):
+                            fid = r.get("id") if isinstance(r, dict) else None
+                            if fid:
+                                await asyncio.to_thread(
+                                    bm25_index.index_fact,
+                                    fid, f["text"], str(user_id),
+                                )
+                except Exception as e:
+                    log.warning("bm25 index update failed (non-fatal): %s", e)
                 return res
 
             insert_results = await asyncio.gather(*(_insert_one(f) for f in kept)) if kept else []
