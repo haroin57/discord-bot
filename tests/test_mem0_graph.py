@@ -155,7 +155,8 @@ class TestEdges:
 class TestStats:
     def test_stats_empty(self):
         s = graph_mod.stats()
-        assert s == {"entities": 0, "edges": 0, "aliases": 0}
+        # `relations` field added in Phase C-1; zero on a fresh DB.
+        assert s == {"entities": 0, "edges": 0, "aliases": 0, "relations": 0}
 
     def test_stats_populated(self):
         e1 = graph_mod.upsert_entity("Rust", "tech", "uid", aliases=["rs"])
@@ -164,7 +165,7 @@ class TestStats:
         graph_mod.add_edge("f1", e2)
         graph_mod.add_edge("f2", e1)
         s = graph_mod.stats("uid")
-        assert s == {"entities": 2, "edges": 3, "aliases": 1}
+        assert s == {"entities": 2, "edges": 3, "aliases": 1, "relations": 0}
 
 
 class TestAliasAwareUpsert:
@@ -295,3 +296,95 @@ class TestGetTopEntities:
     def test_empty_user_returns_empty(self):
         assert graph_mod.get_top_entities("") == []
         assert graph_mod.get_top_entities("uid", limit=0) == []
+
+
+# ---------------------------------------------------------------------------
+# Phase C-1: entity_relations
+# ---------------------------------------------------------------------------
+
+class TestEntityRelations:
+    def _setup_entities(self) -> tuple[int, int]:
+        src = graph_mod.upsert_entity("先輩", "person", "uid-1")
+        dst = graph_mod.upsert_entity("砺波いぶき", "person", "uid-1")
+        return src, dst
+
+    def test_add_relation_basic(self):
+        src, dst = self._setup_entities()
+        rid = graph_mod.add_relation(src, "loves", dst, "uid-1")
+        assert rid > 0
+        rels = graph_mod.get_relations(src, direction="src")
+        assert len(rels) == 1
+        r = rels[0]
+        assert r.rel_type == "loves"
+        assert r.dst_entity_id == dst
+        assert r.valid_to is None
+
+    def test_unique_constraint_blocks_duplicate_open_row(self):
+        src, dst = self._setup_entities()
+        rid1 = graph_mod.add_relation(src, "loves", dst, "uid-1")
+        rid2 = graph_mod.add_relation(src, "loves", dst, "uid-1")
+        assert rid1 > 0
+        # INSERT OR IGNORE → rid2 is 0 because the row already exists.
+        # Either way, only one currently-valid row should exist.
+        rels = graph_mod.get_relations(src, only_valid=True)
+        assert len(rels) == 1
+
+    def test_expire_relation_sets_valid_to(self):
+        src, dst = self._setup_entities()
+        rid = graph_mod.add_relation(src, "loves", dst, "uid-1")
+        ok = graph_mod.expire_relation(rid)
+        assert ok is True
+        rels_valid = graph_mod.get_relations(src, only_valid=True)
+        assert rels_valid == []
+        rels_all = graph_mod.get_relations(src, only_valid=False)
+        assert len(rels_all) == 1
+        assert rels_all[0].valid_to is not None
+
+    def test_get_relations_by_type(self):
+        src, dst = self._setup_entities()
+        graph_mod.add_relation(src, "loves", dst, "uid-1")
+        graph_mod.add_relation(src, "knows", dst, "uid-1")
+        loves = graph_mod.get_relations(src, rel_type="loves")
+        knows = graph_mod.get_relations(src, rel_type="knows")
+        assert len(loves) == 1
+        assert len(knows) == 1
+        assert loves[0].rel_type == "loves"
+
+    def test_get_relations_direction_src_and_dst(self):
+        src, dst = self._setup_entities()
+        graph_mod.add_relation(src, "loves", dst, "uid-1")
+        src_view = graph_mod.get_relations(src, direction="src")
+        dst_view = graph_mod.get_relations(dst, direction="dst")
+        any_view = graph_mod.get_relations(src, direction="any")
+        assert len(src_view) == 1
+        assert len(dst_view) == 1
+        assert len(any_view) == 1
+
+    def test_per_user_isolation_for_relations(self):
+        a_src = graph_mod.upsert_entity("Alice", "person", "uid-A")
+        a_dst = graph_mod.upsert_entity("Bob", "person", "uid-A")
+        b_src = graph_mod.upsert_entity("Alice", "person", "uid-B")
+        b_dst = graph_mod.upsert_entity("Bob", "person", "uid-B")
+        graph_mod.add_relation(a_src, "knows", a_dst, "uid-A")
+        # uid-A has 1 relation; uid-B has none.
+        assert len(graph_mod.get_relations(a_src)) == 1
+        assert graph_mod.get_relations(b_src) == []
+
+    def test_entity_delete_cascades_to_relations(self):
+        src, dst = self._setup_entities()
+        graph_mod.add_relation(src, "loves", dst, "uid-1")
+        # Drop the dst entity directly via the underlying conn — simulates
+        # an aggressive cleanup. ON DELETE CASCADE should remove the
+        # relation row too.
+        with graph_mod._conn() as c, graph_mod._db_lock:
+            c.execute("PRAGMA foreign_keys=ON")
+            c.execute("DELETE FROM entities WHERE id=?", (dst,))
+            c.commit()
+        rels = graph_mod.get_relations(src, only_valid=False)
+        assert rels == []
+
+    def test_stats_includes_relation_count(self):
+        src, dst = self._setup_entities()
+        graph_mod.add_relation(src, "loves", dst, "uid-1")
+        s = graph_mod.stats("uid-1")
+        assert s["relations"] == 1

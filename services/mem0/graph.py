@@ -64,6 +64,34 @@ CREATE TABLE IF NOT EXISTS fact_entity_edges (
 CREATE INDEX IF NOT EXISTS idx_edges_entity ON fact_entity_edges(entity_id);
 CREATE INDEX IF NOT EXISTS idx_edges_fact   ON fact_entity_edges(fact_id);
 CREATE INDEX IF NOT EXISTS idx_aliases_alias ON entity_aliases(alias);
+
+-- Phase C-1 (mem0-recall-hybrid-hyde-kg): temporal entity relations.
+-- Stores typed edges between entities ("先輩 loves 砺波いぶき") with
+-- bitemporal validity columns so a "髪色 黒 → ハイトーン" state change
+-- ends up as two rows, one with valid_to=<change time>, the other still
+-- open. SQLite forbids expressions inside table-level UNIQUE constraints,
+-- so we enforce "at most one currently-open row per (src, rel, dst, user)"
+-- via a partial unique index where valid_to IS NULL instead.
+CREATE TABLE IF NOT EXISTS entity_relations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    src_entity_id   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    rel_type        TEXT NOT NULL,
+    dst_entity_id   INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    user_id         TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    valid_from      INTEGER,
+    valid_to        INTEGER,
+    source_fact_id  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_relations_src        ON entity_relations(src_entity_id);
+CREATE INDEX IF NOT EXISTS idx_relations_dst        ON entity_relations(dst_entity_id);
+CREATE INDEX IF NOT EXISTS idx_relations_type       ON entity_relations(rel_type);
+CREATE INDEX IF NOT EXISTS idx_relations_user_valid ON entity_relations(user_id, valid_to);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_unique_open
+    ON entity_relations(src_entity_id, rel_type, dst_entity_id, user_id)
+    WHERE valid_to IS NULL;
 """
 
 
@@ -420,8 +448,133 @@ def stats(user_id: str | None = None) -> dict:
             ents = c.execute(
                 "SELECT count(*) FROM entities WHERE user_id=?", (user_id,)
             ).fetchone()[0]
+            rels = c.execute(
+                "SELECT count(*) FROM entity_relations WHERE user_id=?",
+                (user_id,),
+            ).fetchone()[0]
         else:
             ents = c.execute("SELECT count(*) FROM entities").fetchone()[0]
+            rels = c.execute("SELECT count(*) FROM entity_relations").fetchone()[0]
         edges = c.execute("SELECT count(*) FROM fact_entity_edges").fetchone()[0]
         aliases = c.execute("SELECT count(*) FROM entity_aliases").fetchone()[0]
-    return {"entities": ents, "edges": edges, "aliases": aliases}
+    return {
+        "entities": ents, "edges": edges, "aliases": aliases,
+        "relations": rels,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase C-1: entity_relations (typed, temporal edges between entities)
+# ---------------------------------------------------------------------------
+@dataclass
+class Relation:
+    id: int
+    src_entity_id: int
+    rel_type: str
+    dst_entity_id: int
+    user_id: str
+    created_at: int
+    valid_from: int | None
+    valid_to: int | None
+    source_fact_id: str | None
+
+
+def add_relation(
+    src_id: int, rel_type: str, dst_id: int, user_id: str, *,
+    source_fact_id: str | None = None, valid_from: int | None = None,
+) -> int:
+    """Insert a typed temporal edge between two entities. Returns the row id
+    (0 on failure). The UNIQUE(..., COALESCE(valid_to, 0)) constraint lets
+    multiple historical versions coexist per (src, rel, dst) but allows
+    only one currently-valid row at a time.
+    """
+    if not src_id or not dst_id or not rel_type or not user_id:
+        return 0
+    now = int(time.time())
+    with _conn() as c, _db_lock:
+        try:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO entity_relations("
+                "src_entity_id, rel_type, dst_entity_id, user_id, "
+                "created_at, valid_from, valid_to, source_fact_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+                (int(src_id), rel_type, int(dst_id), str(user_id),
+                 now, valid_from, source_fact_id),
+            )
+            c.commit()
+            return int(cur.lastrowid or 0)
+        except Exception as exc:
+            log.warning(
+                "add_relation(%s,%s,%s) failed: %s",
+                src_id, rel_type, dst_id, exc,
+            )
+            return 0
+
+
+def expire_relation(relation_id: int, *, valid_to: int | None = None) -> bool:
+    """Set ``valid_to`` on an open relation. Idempotent: re-running with
+    the same valid_to is a no-op. Returns True on a single-row update.
+    """
+    if not relation_id:
+        return False
+    vt = int(valid_to or time.time())
+    with _conn() as c, _db_lock:
+        try:
+            cur = c.execute(
+                "UPDATE entity_relations SET valid_to=? "
+                "WHERE id=? AND (valid_to IS NULL OR valid_to=?)",
+                (vt, int(relation_id), vt),
+            )
+            c.commit()
+            return bool(cur.rowcount)
+        except Exception as exc:
+            log.warning("expire_relation(%s) failed: %s", relation_id, exc)
+            return False
+
+
+def get_relations(
+    entity_id: int, *, direction: str = "any",
+    rel_type: str | None = None, only_valid: bool = True,
+    limit: int = 50,
+) -> list[Relation]:
+    """Fetch relations involving ``entity_id``.
+
+    direction:
+      "src" — entity_id appears as src
+      "dst" — entity_id appears as dst
+      "any" — either side (default)
+    rel_type: optional filter
+    only_valid: filter out rows where valid_to <= now (default True)
+    """
+    if not entity_id:
+        return []
+    direction = (direction or "any").lower()
+    now = int(time.time())
+    where = []
+    params: list = []
+    if direction == "src":
+        where.append("src_entity_id = ?")
+        params.append(int(entity_id))
+    elif direction == "dst":
+        where.append("dst_entity_id = ?")
+        params.append(int(entity_id))
+    else:
+        where.append("(src_entity_id = ? OR dst_entity_id = ?)")
+        params.extend([int(entity_id), int(entity_id)])
+    if rel_type:
+        where.append("rel_type = ?")
+        params.append(rel_type)
+    if only_valid:
+        where.append("(valid_to IS NULL OR valid_to > ?)")
+        params.append(now)
+    sql = (
+        "SELECT id, src_entity_id, rel_type, dst_entity_id, user_id, "
+        "created_at, valid_from, valid_to, source_fact_id "
+        "FROM entity_relations WHERE "
+        + " AND ".join(where)
+        + " ORDER BY created_at DESC LIMIT ?"
+    )
+    params.append(int(limit))
+    with _conn() as c:
+        rows = c.execute(sql, params).fetchall()
+    return [Relation(**dict(r)) for r in rows]
