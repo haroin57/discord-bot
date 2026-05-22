@@ -3,23 +3,43 @@
 import asyncio
 import logging
 import os
+import time
 
 from services.oauth_manager import ensure_valid_token, get_access_token, init as oauth_init
 
 log = logging.getLogger(__name__)
 
 # Mem0's Chroma adapter returns ``score = distance`` (small = similar; see
-# services/mem0/dedup.py header). Filter out anything past this distance —
-# rerank handles fine-grained quality, so this only needs to drop obvious
-# garbage, not borderline matches.
-MEM0_RELEVANCE_MAX_DISTANCE = 1.0
+# services/mem0/dedup.py header).
+# Pre-rerank gate: applied inside search_memories() to drop candidates
+# that are physically too far before the LLM rerank ever sees them. Also
+# used as the sanity gate for the rerank=False path in
+# search_memories_smart.
+MEM0_RELEVANCE_MAX_DISTANCE = float(
+    os.environ.get("MEM0_RELEVANCE_MAX_DISTANCE", "1.2")
+)
+# DEPRECATED 2026-05-19 (ADR-0002). Previously gated the output of
+# search_memories_smart at 0.65 — but cosine distance is a poor judge
+# after an LLM rerank has already accepted the fact, and 0.65 was
+# pessimistic enough to silently kill every Japanese conversational
+# query. search_memories_smart no longer references this on the
+# rerank=True path. Kept so env config that sets the var still imports.
+MEM0_FINAL_RELEVANCE_MAX_DISTANCE = float(
+    os.environ.get("MEM0_FINAL_RELEVANCE_MAX_DISTANCE", "0.65")
+)
 # Back-compat alias for any caller still importing the old name. DO NOT use
 # in new code — the semantic flipped from "min similarity" to "max distance"
 # on 2026-05-14 when we discovered the codebase was filtering backwards.
 MEM0_RELEVANCE_THRESHOLD = MEM0_RELEVANCE_MAX_DISTANCE
 
 _mem0_instance = None
-_init_attempted = False
+# Last init failure timestamp (monotonic seconds). When set, _get_mem0()
+# returns None without re-trying until _INIT_RETRY_COOLDOWN_SEC has elapsed.
+# This replaces the old "_init_attempted = True" latch that permanently
+# disabled Mem0 after the first failure — preventing automatic recovery
+# when ChromaDB systemd-restarts.
+_init_failed_at: float | None = None
+_INIT_RETRY_COOLDOWN_SEC = 60.0
 _last_token: str | None = None
 
 # Shared AsyncAnthropic client for Haiku-backed extraction / rewrite / rerank
@@ -87,11 +107,38 @@ def _refresh_mem0_client_token() -> None:
 
 
 def _build_config() -> dict:
-    """Build Mem0 configuration from env vars."""
+    """Build Mem0 configuration from env vars.
+
+    CHROMA_MODE=server (default since 2026-05-16): connect to chromadb HTTP
+    server at CHROMA_HOST:CHROMA_PORT. This prevents the multi-process
+    write race that corrupted the HNSW index during the SEGV incident.
+
+    CHROMA_MODE=embedded: legacy direct file access (kept for rollback).
+    """
     from config import STATE_DIR
 
-    db_path = os.path.join(STATE_DIR, "mem0_db")
-    os.makedirs(db_path, exist_ok=True)
+    chroma_mode = os.environ.get("CHROMA_MODE", "server")
+    chroma_host = os.environ.get("CHROMA_HOST", "127.0.0.1")
+    chroma_port = int(os.environ.get("CHROMA_PORT", "8765"))
+    # 2026-05-16 incident: rebuilt data lives in `kanae_memories_safe`
+    # (infer=False verbatim). Once `kanae_memories_infer` rebuild finishes,
+    # swap by setting MEM0_COLLECTION_NAME=kanae_memories_infer in .env
+    # and restarting the bot. No code change required.
+    collection_name = os.environ.get("MEM0_COLLECTION_NAME", "kanae_memories_safe")
+
+    if chroma_mode == "server":
+        vector_cfg = {
+            "collection_name": collection_name,
+            "host": chroma_host,
+            "port": chroma_port,
+        }
+    else:
+        db_path = os.path.join(STATE_DIR, "mem0_db")
+        os.makedirs(db_path, exist_ok=True)
+        vector_cfg = {
+            "collection_name": collection_name,
+            "path": db_path,
+        }
 
     config: dict = {
         "llm": {
@@ -100,15 +147,11 @@ def _build_config() -> dict:
                 "model": os.environ.get("MEM0_LLM_MODEL", "claude-haiku-4-5-20251001"),
                 "temperature": 0.1,
                 "max_tokens": 2000,
-                # api_key intentionally omitted — OAuth via ANTHROPIC_AUTH_TOKEN
             },
         },
         "vector_store": {
             "provider": "chroma",
-            "config": {
-                "collection_name": "kanae_memories",
-                "path": db_path,
-            },
+            "config": vector_cfg,
         },
         "version": "v1.1",
     }
@@ -126,32 +169,58 @@ def _build_config() -> dict:
     return config
 
 
-def _get_mem0():
-    """Lazy-init singleton Mem0 instance."""
-    global _mem0_instance, _init_attempted
+def _ping_chromadb_if_server_mode() -> None:
+    """When CHROMA_MODE=server, verify the ChromaDB HTTP server is reachable.
 
-    if _init_attempted:
+    Raises an exception on failure so the caller can mark init as failed
+    and trigger the cooldown-based retry path.
+    """
+    if os.environ.get("CHROMA_MODE", "server") != "server":
+        return
+    host = os.environ.get("CHROMA_HOST", "127.0.0.1")
+    port = int(os.environ.get("CHROMA_PORT", "8765"))
+    import requests
+    r = requests.get(f"http://{host}:{port}/api/v2/heartbeat", timeout=5)
+    r.raise_for_status()
+
+
+def _get_mem0():
+    """Lazy-init singleton Mem0 instance with cooldown-based retry.
+
+    On init failure, sets _init_failed_at and returns None for the next
+    _INIT_RETRY_COOLDOWN_SEC seconds before retrying. This allows
+    automatic recovery after ChromaDB systemd-restarts.
+    """
+    global _mem0_instance, _init_failed_at
+
+    if _mem0_instance is not None:
         return _mem0_instance
-    _init_attempted = True
+    if _init_failed_at is not None and (time.monotonic() - _init_failed_at) < _INIT_RETRY_COOLDOWN_SEC:
+        return None
 
     # Initialize OAuth BEFORE creating any Anthropic clients
     if not oauth_init():
         log.error("OAuth init failed — Mem0 LLM calls will not work")
 
     try:
+        _ping_chromadb_if_server_mode()
         from mem0 import Memory
 
         cfg = _build_config()
         _mem0_instance = Memory.from_config(cfg)
+        _init_failed_at = None
+        vs_cfg = cfg["vector_store"]["config"]
+        store_id = vs_cfg.get("path") or f'{vs_cfg.get("host")}:{vs_cfg.get("port")}'
         log.info(
             "Mem0 ready — llm=%s (OAuth) embedder=%s store=chroma(%s)",
             cfg["llm"]["config"]["model"],
             cfg["embedder"]["config"]["model"],
-            cfg["vector_store"]["config"]["path"],
+            store_id,
         )
     except Exception as exc:
         log.error("Mem0 init failed: %s", exc, exc_info=True)
         _mem0_instance = None
+        _init_failed_at = time.monotonic()
 
     return _mem0_instance
 

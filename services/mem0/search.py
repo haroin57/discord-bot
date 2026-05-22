@@ -3,6 +3,8 @@
 import asyncio
 import logging
 import os
+import re
+import time
 
 from services.mem0.client import (
     MEM0_RELEVANCE_MAX_DISTANCE,
@@ -14,21 +16,39 @@ from services.oauth_manager import ensure_valid_token, get_access_token, init as
 log = logging.getLogger(__name__)
 
 
-async def search_memories(query: str, user_id: str, limit: int = 8) -> list[dict]:
-    """Semantic search for relevant memories with relevance filtering.
+# Caller-side gate for the Haiku rewrite/rerank stages. The default Discord
+# turn skips these to save ~4 LLM round-trips; turns that explicitly ask for
+# recall ("覚えてる" / "前に話した" / "remember") opt in.
+_MEMORY_LLM_INTENT_RE = re.compile(
+    r"(前に話した|前に言った|以前話した|覚えてる|覚えている|覚えてます|"
+    r"記憶|思い出|思い出して|remember|recall|do you remember|what do you remember)",
+    re.IGNORECASE,
+)
 
-    mem0's Chroma adapter returns ``score = distance`` (small ⇒ similar).
-    We drop results whose distance exceeds ``MEM0_RELEVANCE_MAX_DISTANCE``.
-    Missing scores are kept (some mem0 codepaths omit the field).
-    """
+
+def should_use_memory_llm_mode(query: str, *, enabled: bool = True) -> bool:
+    """Return True iff the user message reads like an explicit recall ask."""
+    if not enabled:
+        return False
+    return bool(_MEMORY_LLM_INTENT_RE.search(query or ""))
+
+
+async def search_memories(query: str, user_id: str, limit: int = 8) -> list[dict]:
+    """Semantic search for relevant memories with relevance filtering."""
     mem = _get_mem0()
     if not mem:
         return []
     try:
-        await ensure_valid_token()  # refresh OAuth if needed
+        await ensure_valid_token()
         _refresh_mem0_client_token()
+        t0 = time.perf_counter()
         raw = await asyncio.to_thread(mem.search, query=query, user_id=user_id, limit=limit)
+        latency_ms = (time.perf_counter() - t0) * 1000.0
         results = raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+        log.info(
+            "mem0_search_latency_ms=%.1f query=%r user_id=%s limit=%d hits=%d",
+            latency_ms, (query or "")[:80], user_id, limit, len(results),
+        )
         filtered = [
             r for r in results
             if r.get("score") is None or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
@@ -107,7 +127,10 @@ async def _rewrite_query(query: str) -> list[str]:
         resp = await cli_messages_create(
             client,
             model=os.environ.get("MEM0_REWRITE_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=2000,
+            # Output is a tiny JSON {"queries": [up to 5 short strings]}.
+            # 500 tokens easily covers it; 2000 overspec inflates billed output
+            # reservation. Override via MEM0_REWRITE_MAX_TOKENS if needed.
+            max_tokens=int(os.environ.get("MEM0_REWRITE_MAX_TOKENS", "500")),
             user_message=_REWRITE_PROMPT.format(query=safe_query),
             task_prompt=(
                 "You rewrite a user search query into canonical Mem0 keywords. "
@@ -179,7 +202,10 @@ async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> 
         resp = await cli_messages_create(
             client,
             model=os.environ.get("MEM0_RERANK_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=2000,
+            # Output is {"top": [<= top_k integers]}. 400 tokens covers the
+            # JSON plus any short reasoning the model emits. Override via
+            # MEM0_RERANK_MAX_TOKENS if needed.
+            max_tokens=int(os.environ.get("MEM0_RERANK_MAX_TOKENS", "400")),
             user_message=_RERANK_PROMPT.format(
                 query=safe_query, top_k=top_k, candidates=candidates,
             ),
@@ -297,8 +323,19 @@ async def search_memories_smart(
         log.warning("graph_expand failed (non-fatal): %s", exc)
 
     if rerank:
+        # LLM rerank already judged per-fact relevance against the query.
+        # Trust its output as final — the previous post-rerank cosine gate
+        # at 0.65 silently killed every Japanese conversational query
+        # (incident 2026-05-19, ADR-0002). Plain-path callers below get a
+        # loose sanity gate instead, since no LLM judge ran there.
         return await _rerank_memories(query, candidates, top_k=limit)
-    return candidates[:limit]
+
+    from services.mem0.client import MEM0_RELEVANCE_MAX_DISTANCE
+    return [
+        r for r in candidates[:limit]
+        if r.get("score") is None
+        or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
+    ]
 
 
 async def _graph_expand_candidates(

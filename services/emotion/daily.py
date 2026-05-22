@@ -96,14 +96,18 @@ def save_summary(text: str, state_dir: str | os.PathLike) -> None:
 
 
 def format_recent_entries(entries: list[DailyEntry], count: int = 8) -> str:
-    """Format the most recent N entries for prompt injection."""
+    """Format the most recent N entries for prompt injection.
+
+    detail and thought are capped to keep the block as a concise hint,
+    not a narrative the LLM roleplays from.
+    """
     recent = entries[-count:]
     if not recent:
         return "(まだ日常ログがありません)"
     lines = []
     for e in reversed(recent):
         lines.append(
-            f"[{e.ts}] {e.activity} — {e.detail[:200]} "
-            f"(mood:{e.mood}, thought:{e.thought[:100]})"
+            f"[{e.ts}] {e.activity} — {e.detail[:120]} "
+            f"(mood:{e.mood}, thought:{e.thought[:50]})"
         )
     return "\n".join(lines)

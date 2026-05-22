@@ -18,6 +18,8 @@ chromadb>=1.0,<2.0
 psutil>=5.9,<8.0
 python-socketio[asyncio]>=5.11,<6.0
 bleach>=6.1,<7.0                 # HTML sanitization for table_renderer
+matplotlib>=3.10,<4.0            # Emotion timeseries graph (scripts/emotion_graph.py only)
+pandas>=2.2,<4.0                 # JSONL→DataFrame for graph generation
 
 # Transitive dependency floors required to pull in CVE fixes.
 # These would otherwise resolve to a vulnerable older version.

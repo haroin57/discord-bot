@@ -130,7 +130,7 @@ EVENT_DELTAS: dict[str, dict[str, float]] = {
 #     after satisfaction was removed; "high affection + good mood" is the
 #     intent and valence captures it.
 TELOS_THRESHOLDS: dict[str, float] = {
-    "loneliness_overflow": 0.6,
+    "loneliness_overflow": 0.85,
     "share_joy_valence": 0.7,
     "share_joy_arousal": 0.5,
     "anxiety_relief_anxiety": 0.5,
@@ -144,7 +144,7 @@ TELOS_THRESHOLDS: dict[str, float] = {
 
 # Suppression parameters.
 TSUNDERE_GATE = 0.5
-MAX_CONSECUTIVE_SELF_INITIATED = 2
+MAX_CONSECUTIVE_SELF_INITIATED = 3
 # Quiet-hour range as [start_hour, end_hour) in JST. The user opted out of
 # time-of-day suppression: with (0, 0) the half-open range matches no hour,
 # so QUIET_HOUR_RANGE[0] <= now.hour < QUIET_HOUR_RANGE[1] is always False.
@@ -234,3 +234,67 @@ CLI_TIMEOUT_SUMMARY = 30          # summary (Haiku, small)
 # Deprecated (kept for fallback): LONELINESS_RATE_PER_HOUR,
 # ANXIETY_RATE_PER_HOUR, EVENT_DELTAS, INERTIA event blending,
 # DECAY_QUALITY_* modifiers — all superseded by LLM-based transition
+
+# ---------------------------------------------------------------------------
+# Emotion Dynamics v2 (2026-05-16) — anti-flatness layer
+# ---------------------------------------------------------------------------
+# PoC validated in scripts/poc_emotion_dynamics.py (72h × 5 seeds).
+# See docs/.. or plan file for design rationale.
+#
+# Master toggle. False reverts to pure v3 LLM behavior (no perturb, no
+# variance/circadian/mood prompt injection, no label reset).
+import os as _os
+EMOTION_DYNAMICS_V2: bool = _os.getenv("EMOTION_DYNAMICS_V2", "1") == "1"
+
+# Mode-specific Gaussian noise σ applied AFTER LLM, BEFORE BOUNDS clamp.
+# Conversation σ is smaller — LLM moves semantically during chat, we only
+# want to break flatness in long silence periods.
+NOISE_SIGMA_CONVERSATION: dict[str, float] = {
+    "valence": 0.05, "arousal": 0.06, "loneliness": 0.04,
+    "affection": 0.03, "curiosity": 0.05, "anxiety": 0.05,
+}
+NOISE_SIGMA_SILENCE: dict[str, float] = {
+    "valence": 0.07, "arousal": 0.09, "loneliness": 0.06,
+    "affection": 0.04, "curiosity": 0.08, "anxiety": 0.07,
+}
+
+# Anti-flatness gate: when an axis's rolling std < threshold, multiply its σ.
+FLAT_STD_THRESHOLD: float = 0.06
+FLAT_NOISE_MULTIPLIER: float = 1.5
+
+# Circadian baseline shape (arousal cosine, anxiety night triangle).
+CIRCADIAN_AROUSAL_AMPLITUDE: float = 0.40
+CIRCADIAN_AROUSAL_PEAK_HOUR: int = 14
+CIRCADIAN_ANXIETY_NIGHT_BUMP: float = 0.15
+
+# Post-LLM pull strength toward circadian baseline.
+# Night (02-06h + silence mode only) doubles the arousal pull to enforce sleep.
+CIRCADIAN_PULL_AROUSAL: float = 0.07
+CIRCADIAN_PULL_AROUSAL_NIGHT: float = 0.15
+CIRCADIAN_PULL_ANXIETY: float = 0.05
+
+# Mean-reversion strength. Applied SILENCE-ONLY so conversation ticks
+# preserve the LLM's semantic moves. The reversion *target* is no longer
+# hardcoded here — it is LLM-derived and cached at .state/kanae_baseline.json
+# (see services/emotion/baseline.py). dynamics.py loads it per tick and
+# skips reversion entirely when the cache is unavailable.
+MEAN_REVERSION_STRENGTH: dict[str, float] = {
+    "valence": 0.03, "arousal": 0.02, "loneliness": 0.04,
+    "affection": 0.06, "curiosity": 0.03, "anxiety": 0.05,
+}
+
+# Daily mood seed (label + axis_bias) is shown to the LLM in the prompt
+# but NOT applied algorithmically to perturb noise μ — that would cause
+# day-long directional drift that the LLM can't override. Per-tick jitter
+# is a tiny phase-noise term layered on top.
+MOOD_BIAS_AMPLITUDE: float = 0.12
+TICK_JITTER_AMPLITUDE: float = 0.02
+
+# Skip perturb when the LLM already made a large move (don't double-correct).
+# 2026-05-17: raised from 0.12 → 0.20 so smaller LLM moves still get the
+# anti-flatness perturbation. Combined with the larger σ above, per-turn
+# variation comes up from ~±0.02 to ~±0.05–0.08.
+LARGE_LLM_JUMP_THRESHOLD: float = 0.20
+# When perturb moves an axis by ≥ this, clear its label (renderer falls
+# back to "普通" for one tick; next LLM call re-labels coherently).
+LABEL_RESET_THRESHOLD: float = 0.05

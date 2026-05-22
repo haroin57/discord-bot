@@ -514,6 +514,160 @@ async def download_text_attachments(
     return [r for r in results if r]
 
 
+# ---------------------------------------------------------------------------
+# Arbitrary binary attachments (admin only)
+# ---------------------------------------------------------------------------
+# Image / text downloaders above filter by MIME type and silently drop
+# anything else. For admins that means a .als / .zip / .pdf etc. would
+# vanish without a log line. download_arbitrary_attachments fills that
+# gap: keep any attachment that BOTH the image and text downloaders
+# rejected, save it under ATTACHMENT_DIR, and return enough metadata for
+# bot.py to render an <attached_file> prompt block.
+
+# Extensions we refuse to land on disk regardless of admin status. The
+# files never run from ATTACHMENT_DIR (no caller execs them), but the
+# denylist is defense in depth — a model that emits a path back to a
+# .sh / .exe shouldn't be able to launder one in.
+_ARBITRARY_EXT_DENY = frozenset({
+    ".exe", ".dll", ".so", ".dylib", ".bat", ".cmd", ".ps1",
+    ".sh", ".bash", ".zsh", ".msi", ".app", ".dmg", ".deb", ".rpm",
+})
+
+MAX_ARBITRARY_ATTACHMENT_BYTES = 25 * 1024 * 1024  # 25 MB — Discord upload cap
+MAX_ARBITRARY_ATTACHMENTS = 3
+
+
+def _sanitize_basename(name: str) -> str:
+    """Strip directory separators / control chars from a filename.
+
+    The result is short, ASCII-safe-ish, and never contains '/' or '..'.
+    Used for the user-visible basename only — the on-disk filename is
+    prefixed with att.id so collisions are impossible.
+    """
+    base = os.path.basename(name or "").strip()
+    # Drop anything that isn't a portable filename character. Keep dots,
+    # dashes, underscores, alphanumerics, parens, brackets; replace the
+    # rest with '_'. Trim to 80 chars so the full on-disk path stays
+    # comfortably below PATH_MAX.
+    base = re.sub(r"[^\w.\-()\[\] ]", "_", base, flags=re.UNICODE)
+    return base[:80] or "attachment"
+
+
+async def _download_arbitrary_one(
+    session: aiohttp.ClientSession, att,
+) -> dict | None:
+    """Download one non-image, non-text attachment. Returns metadata dict."""
+    size_hint = att.size or 0
+    if size_hint > MAX_ARBITRARY_ATTACHMENT_BYTES:
+        log.warning(
+            "Skipping oversized arbitrary attachment %s (%d bytes)",
+            att.filename, size_hint,
+        )
+        return None
+    if not _host_is_allowed(att.url):
+        log.warning(
+            "Rejecting non-allow-listed arbitrary attachment URL: %s", att.url,
+        )
+        return None
+    ext = os.path.splitext(att.filename or "")[1].lower()
+    if ext in _ARBITRARY_EXT_DENY:
+        log.warning(
+            "Refusing denylisted extension for %s (ext=%s)",
+            att.filename, ext,
+        )
+        return None
+    if not ext or len(ext) > 16:
+        ext = ".bin"
+    safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(att.id))[:64] or "att"
+    safe_base = _sanitize_basename(att.filename or "")
+    dest = os.path.realpath(
+        os.path.join(ATTACHMENT_DIR, f"{safe_id}-{safe_base}"),
+    )
+    att_dir_real = os.path.realpath(ATTACHMENT_DIR)
+    if not (dest == att_dir_real or dest.startswith(att_dir_real + os.sep)):
+        log.warning(
+            "Refusing arbitrary attachment dest outside ATTACHMENT_DIR: %s",
+            dest,
+        )
+        return None
+    async with _download_semaphore:
+        try:
+            async with session.get(att.url, allow_redirects=False) as resp:
+                if resp.status != 200:
+                    return None
+                total = 0
+                with open(dest, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        total += len(chunk)
+                        if total > MAX_ARBITRARY_ATTACHMENT_BYTES:
+                            log.warning(
+                                "Aborting arbitrary download of %s: exceeded %d bytes",
+                                att.filename, MAX_ARBITRARY_ATTACHMENT_BYTES,
+                            )
+                            f.close()
+                            try:
+                                os.remove(dest)
+                            except OSError:
+                                pass
+                            return None
+                        f.write(chunk)
+                log.info(
+                    "Downloaded arbitrary attachment: %s (%s, %d bytes) -> %s",
+                    att.filename, att.content_type or "?", total, dest,
+                )
+                return {
+                    "path": dest,
+                    "filename": att.filename or os.path.basename(dest),
+                    "mime": (att.content_type or "application/octet-stream"),
+                    "size": total,
+                }
+        except Exception as e:
+            log.warning(
+                "Failed to download arbitrary attachment %s: %s",
+                att.filename, e,
+            )
+            try:
+                if os.path.isfile(dest):
+                    os.remove(dest)
+            except OSError:
+                pass
+    return None
+
+
+async def download_arbitrary_attachments(
+    http_session: aiohttp.ClientSession,
+    attachments: list,
+    *,
+    caller_is_admin: bool,
+) -> list[dict]:
+    """Save admin-only non-image, non-text attachments to ATTACHMENT_DIR.
+
+    Returns a list of dicts: {path, filename, mime, size}. Non-admin
+    callers get an empty list — letting arbitrary external users land
+    binaries on disk has no upside for this bot and several downsides.
+    """
+    if not caller_is_admin or not attachments:
+        return []
+    candidates = []
+    for a in attachments:
+        ct = (a.content_type or "").split(";")[0].strip().lower()
+        if ct in IMAGE_CONTENT_TYPES or ct in TEXT_CONTENT_TYPES:
+            continue
+        candidates.append(a)
+    if not candidates:
+        return []
+    if len(candidates) > MAX_ARBITRARY_ATTACHMENTS:
+        log.warning(
+            "Capping arbitrary attachments %d -> %d",
+            len(candidates), MAX_ARBITRARY_ATTACHMENTS,
+        )
+        candidates = candidates[:MAX_ARBITRARY_ATTACHMENTS]
+    results = await asyncio.gather(
+        *[_download_arbitrary_one(http_session, a) for a in candidates],
+    )
+    return [r for r in results if r]
+
+
 def cleanup_stale_attachments() -> None:
     """Remove temp files older than 1h from attachment + render directories.
 

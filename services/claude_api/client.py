@@ -34,9 +34,31 @@ CLI_IDENTITY_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent S
 
 USER_AGENT = f"claude-cli/{CC_VERSION} (external, {CC_ENTRYPOINT})"
 
-# Body fields the CLI always sends alongside the betas above.
+# Body fields the CLI always sends alongside the betas above. These are
+# pinned verbatim from the 2026-05-14 mitm capture of claude-cli 2.1.92
+# against /v1/messages so the bot's request byte-shape matches the
+# subscriber-tier identification path.
+#
+# - thinking.type = "adaptive": let the model spend as much thinking
+#   budget as it judges necessary (no fixed cap below max_tokens).
+# - output_config.effort = "max": the absolute top of Anthropic's effort
+#   dial (low < medium < high < xhigh < max). Available on Opus 4.6 / 4.7
+#   under the effort-2025-11-24 beta. The mitm capture of claude-cli
+#   2.1.92 shows "high" because that's the CLI's default, but the dial
+#   actually goes higher — the model spends more thinking + tool calls
+#   per turn at "max" in exchange for slower / pricier responses. The
+#   bot opts in deliberately (haroin preference: correctness > cost).
+# - context_management.clear_thinking_20251015 with keep="all": the
+#   server-side bookkeeping the CLI requests for the new
+#   advanced-tool-use beta. Mirroring it keeps overage-cohort routing
+#   working under sustained load.
 THINKING_CONFIG = {"type": "adaptive"}
-OUTPUT_CONFIG = {"effort": "medium"}
+OUTPUT_CONFIG = {"effort": "max"}
+CONTEXT_MANAGEMENT_CONFIG = {
+    "edits": [
+        {"type": "clear_thinking_20251015", "keep": "all"},
+    ],
+}
 CLAUDE_MAX_TOKENS_OPUS = 64000
 
 _session_id = str(uuid.uuid4())
@@ -114,12 +136,14 @@ def get_metadata() -> dict:
     account = _read_claude_user_account()
     # The order matters: CLI sends device_id first, then account_uuid, then
     # session_id. We construct an OrderedDict-equivalent via insertion order.
-    payload: dict[str, str] = {}
-    if account.get("device_id"):
-        payload["device_id"] = account["device_id"]
-    if account.get("account_uuid"):
-        payload["account_uuid"] = account["account_uuid"]
-    payload["session_id"] = _session_id
+    # Free-code always includes device_id and account_uuid (even if empty
+    # string). Omitting them changes the JSON shape and may affect server-
+    # side subscriber identification.
+    payload: dict[str, str] = {
+        "device_id": account.get("device_id", ""),
+        "account_uuid": account.get("account_uuid", ""),
+        "session_id": _session_id,
+    }
     return {"user_id": json.dumps(payload, separators=(",", ":"))}
 
 
@@ -179,6 +203,20 @@ def _first_user_text(messages: list[dict]) -> str:
     return fallback
 
 
+def _generate_cch() -> str:
+    """Return the cch=00000 placeholder for attestation.
+
+    The real Claude Code CLI (Bun binary) computes xxHash64 of the full
+    serialized request body and replaces this placeholder at the native
+    HTTP layer. Our Python implementation does the same via an httpx
+    event hook in attestation.py:cch_request_hook().
+
+    Returning "00000" here means the system prompt carries the correct
+    placeholder that the hook will patch before the request is sent.
+    """
+    return "00000"
+
+
 def get_attribution_header_value(messages: list[dict] | None = None) -> str:
     """Build the full ``x-anthropic-billing-header: ...`` string.
 
@@ -187,18 +225,21 @@ def get_attribution_header_value(messages: list[dict] | None = None) -> str:
         first_text = first user message's text content (HBY-filtered)
         picks = first_text[4] + first_text[7] + first_text[20] ("0" if absent)
         suffix = sha256(SALT + picks + VERSION).hex[:3]
+        cch = xxHash64(body, seed) & 0xFFFFF  // computed by Bun/Zig nativeFetch
 
-    The CLI also embeds this string verbatim as ``system[0]`` INCLUDING
+    We emit cch=00000 here; attestation.py:cch_request_hook() patches
+    it with the real xxHash64 value before the request leaves the process.
+
+    The CLI embeds this string verbatim as ``system[0]`` INCLUDING
     the ``x-anthropic-billing-header: `` prefix (mitmproxy capture
-    2026-05-13: system[0].text starts with that literal). Stripping the
-    prefix was leaving a 52-char block where the CLI sends 80, byte
-    diff against the expected subscriber-tier signature.
+    2026-05-14: system[0].text starts with that literal).
     """
     text = _first_user_text(messages or [])
     picks = "".join((text[i] if len(text) > i else "0") for i in (4, 7, 20))
     raw = f"{_BILLING_SALT}{picks}{CC_VERSION}"
     suffix = hashlib.sha256(raw.encode()).hexdigest()[:3]
+    cch = _generate_cch()
     return (
         f"x-anthropic-billing-header: cc_version={CC_VERSION}.{suffix}; "
-        f"cc_entrypoint={CC_ENTRYPOINT}; cch=00000;"
+        f"cc_entrypoint={CC_ENTRYPOINT}; cch={cch};"
     )

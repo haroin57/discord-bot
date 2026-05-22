@@ -19,6 +19,7 @@ return the localized error message without retrying.
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import AsyncExitStack
 
@@ -26,6 +27,7 @@ import anthropic
 
 from config import (
     ADMIN_MAX_TURNS,
+    ATTACHMENT_DIR,
     CLAUDE_MAX_PARALLEL,
     CWD,
     RESTRICTED_CLAUDE_MAX_PARALLEL,
@@ -37,7 +39,14 @@ from services.mcp_selector import (
     get_mcp_servers_by_keys,
     pick_mcp_servers,
 )
-from services.session import SessionInfo, append_jsonl, load_history_channel
+from services.session import (
+    SessionInfo,
+    append_jsonl,
+    build_compact_history_entries,
+    load_api_replay_channel,
+    load_history_channel,
+    prompt_has_context_snapshot,
+)
 
 from services.claude_api.client import (
     CC_VERSION,
@@ -51,6 +60,7 @@ from services.claude_api.errors import (
 from services.claude_api.mcp_client import (
     McpPool,
     mcp_tools_to_anthropic,
+    static_mcp_tools_to_anthropic,
 )
 from services.claude_api.restricted import (
     RESTRICTED_MAX_TURNS,
@@ -78,7 +88,46 @@ from services.claude_api.tools import (
 
 log = logging.getLogger(__name__)
 
-MODEL = "claude-opus-4-6"
+MODEL = "claude-opus-4-7"
+
+# MCP servers whose tool schemas we advertise on every admin API request.
+# The process is still spawned lazily via McpPool.call_tool() on first use.
+# Mem0 sits here so Kanae can record durable facts without selector
+# keywords having to detect a "remember this" intent first.
+# WEB tier (x-scraper / news-curator / brave-search) joined 2026-05-16
+# after a turn-30 exhaustion: pick_mcp_servers() dropped WEB on a short
+# follow-up, so the tools fell out of advertised_tools and Kanae burned
+# the whole agent loop hunting for tools that were no longer in her
+# schema list. Static-advertise + lazy-spawn matches the mem0 pattern.
+ALWAYS_ADVERTISED_MCP_KEYS = {"mem0", "x-scraper", "news-curator", "brave-search"}
+
+_SNAPSHOT_MAX_AGE_S = int(os.environ.get("SNAPSHOT_MAX_AGE_S", "900"))
+
+def _prepend_context_snapshot(
+    user_content: "str | list[dict]", snapshot: str,
+) -> "str | list[dict]":
+    """Prepend the cached Mem0 snapshot to the next user turn.
+
+    Only used on short follow-ups whose freshly-built prompt does not
+    already carry a ``<retrieved_memories>`` / ``<kanae_self_memory>``
+    block. Materializing the snapshot here keeps recall continuity
+    across the cheap-prompt/expensive-prompt boundary that
+    MEM0_MIN_QUERY_LENGTH creates in bot.py.
+    """
+    if not snapshot:
+        return user_content
+    prefix = f"{snapshot}\n\n"
+    if isinstance(user_content, str):
+        return prefix + user_content
+    blocks = list(user_content)
+    for idx, block in enumerate(blocks):
+        if isinstance(block, dict) and block.get("type") == "text":
+            updated = dict(block)
+            updated["text"] = prefix + str(updated.get("text", ""))
+            blocks[idx] = updated
+            return blocks
+    return blocks + [{"type": "text", "text": snapshot}]
+
 
 # Concurrency: same defaults as services/claude_sdk.py.
 claude_semaphore = asyncio.Semaphore(CLAUDE_MAX_PARALLEL)
@@ -119,14 +168,21 @@ def _resolve_session(
 
     stored = set(info.mcp_server_keys or [])
     if chosen_mcp_keys <= stored:
-        # Compatible session — reuse the same MCP set we had before so
-        # tool_use blocks from earlier turns still route correctly.
         return get_mcp_servers_by_keys(list(stored)), True
 
-    # MCP mismatch — drop the session and start fresh.
-    sessions.pop(channel_id, None)
-    _clear_session_time(channel_id)
-    return get_mcp_servers_by_keys(list(chosen_mcp_keys)), False
+    # New MCP keys needed — merge into the existing set instead of
+    # dropping the session. Old tool_use blocks in the JSONL transcript
+    # stay valid because every stored key is preserved; new tools are
+    # simply added. This avoids the will_resume/resumable mismatch that
+    # previously caused complete context loss on MCP tier escalation.
+    merged = stored | chosen_mcp_keys
+    info.mcp_server_keys = sorted(merged)
+    log.info(
+        "[ch=%d] MCP merge: %s + %s → %s",
+        channel_id, sorted(stored), sorted(chosen_mcp_keys - stored),
+        info.mcp_server_keys,
+    )
+    return get_mcp_servers_by_keys(info.mcp_server_keys), True
 
 
 # Anthropic client construction moved to services/claude_api/client_factory.py.
@@ -139,16 +195,23 @@ async def call_with_tools(
     channel_id: int,
     sessions: dict[int, SessionInfo],
     status_callback=None,
+    incremental_text_callback=None,
+    tool_invocation_callback=None,
     restricted: bool = False,
     raw_user_text: str = "",
     is_thread: bool = False,
     has_image_attachment: bool = False,
-) -> tuple[str, SessionInfo | None]:
+) -> tuple[str, SessionInfo | None, bool]:
     """Direct-API replacement for services/claude_sdk.py:call_with_tools.
 
-    Signature is fixed (Plan locked condition). ``is_thread`` is currently
-    unused in the API path — the SDK path used it to gate resume eligibility,
-    but the API path's resume is history-based so the gate is irrelevant.
+    Returns ``(response_text, session_info, actually_resumed)`` where
+    ``actually_resumed`` is True only when JSONL history was loaded and
+    fed to the Messages API. bot.py uses this to detect a mismatch with
+    its own ``will_resume`` flag (which gates Lean vs Full prompt).
+
+    ``is_thread`` is currently unused in the API path — the SDK path used
+    it to gate resume eligibility, but the API path's resume is
+    history-based so the gate is irrelevant.
     """
     sema = restricted_claude_semaphore if restricted else claude_semaphore
     async with sema:
@@ -163,8 +226,10 @@ async def call_with_tools(
         # 2. MCP selection (admin only).
         if restricted:
             chosen_mcp_cfg: dict[str, dict] = {}
+            always_advertised_mcp_keys: set[str] = set()
         else:
             chosen_mcp_cfg = pick_mcp_servers(raw_user_text)
+            always_advertised_mcp_keys = set(ALWAYS_ADVERTISED_MCP_KEYS)
         chosen_mcp_keys = set(chosen_mcp_cfg.keys())
 
         # 3. Session resume (admin only — restricted is stateless).
@@ -188,15 +253,44 @@ async def call_with_tools(
         # by session_id does not exist, so we must replay the transcript on
         # every turn — the same trick the official `claude --resume` does
         # against ~/.claude/projects/<cwd>/<session_id>.jsonl.
+        # The replayed message list is only safe to feed back to the API when
+        # the MCP set still matches (resumable=True). The Mem0 snapshot on the
+        # other hand is always safe to inherit — it is opaque text, not
+        # tool_use / tool_result blocks — and is the only way short
+        # follow-ups after an MCP-mismatch turn keep their Mem0 context (see
+        # bug postmortem in docs/plans/pdf-pdf-pdf-pdf-tingly-moth.md). So we
+        # call load_api_replay_channel for everyone except restricted and
+        # only gate the prior_history assignment on resumable.
         prior_history: list[dict] = []
-        if resumable:
+        latest_context_snapshot = ""
+        if not restricted:
             try:
-                prior_history = await asyncio.to_thread(
-                    load_history_channel, channel_id
+                loaded_history, loaded_snapshot, loaded_snapshot_ts = (
+                    await asyncio.to_thread(
+                        load_api_replay_channel, channel_id
+                    )
                 )
             except Exception as exc:
                 log.warning("[ch=%d] history load failed: %s", channel_id, exc)
-                prior_history = []
+            else:
+                latest_context_snapshot = loaded_snapshot
+                if latest_context_snapshot and loaded_snapshot_ts:
+                    try:
+                        from datetime import datetime, timezone
+                        snap_dt = datetime.fromisoformat(loaded_snapshot_ts)
+                        if snap_dt.tzinfo is None:
+                            snap_dt = snap_dt.replace(tzinfo=timezone.utc)
+                        age = (datetime.now(timezone.utc) - snap_dt).total_seconds()
+                        if age > _SNAPSHOT_MAX_AGE_S:
+                            log.info(
+                                "[ch=%d] stale context snapshot dropped (age=%.0fs)",
+                                channel_id, age,
+                            )
+                            latest_context_snapshot = ""
+                    except (ValueError, TypeError):
+                        pass
+                if resumable:
+                    prior_history = loaded_history
 
         # 5. Per-call settings
         if restricted:
@@ -208,6 +302,12 @@ async def call_with_tools(
             system_prompt = SYSTEM_PROMPT
             cwd = CWD
             max_turns = ADMIN_MAX_TURNS
+            # admin path advertises builtin tools on every request. The
+            # earlier `_needs_builtin_tools` keyword gate misclassified
+            # natural follow-ups ("次のページ読んで", "20〜40読んで") as
+            # pure chat and broke ongoing tool workflows. The ~686-token
+            # schema lands in prompt cache from the second turn on, so the
+            # warm-time cost is ~68 tokens — not worth the UX hit.
             advertised_tools = builtin_tools_for_api(restricted=False)
 
         can_use_tool = make_can_use_tool(restricted=restricted)
@@ -221,8 +321,20 @@ async def call_with_tools(
             pool_available = {} if restricted else MCP_SERVERS
             pool = McpPool(stack=stack, available_configs=pool_available)
             if chosen_mcp_cfg:
-                await pool.spawn_eager(list(chosen_mcp_cfg))
-            advertised_tools = advertised_tools + mcp_tools_to_anthropic(pool.handles)
+                # Always-advertised MCPs (Mem0) are spawned lazily on first
+                # tool_use; everything else is spawned eagerly so its tools
+                # show up in advertised_tools below.
+                eager_keys = [
+                    key for key in chosen_mcp_cfg
+                    if key not in always_advertised_mcp_keys
+                ]
+                if eager_keys:
+                    await pool.spawn_eager(eager_keys)
+            advertised_tools = (
+                advertised_tools
+                + static_mcp_tools_to_anthropic(always_advertised_mcp_keys)
+                + mcp_tools_to_anthropic(pool.handles)
+            )
 
             async def _execute_tool(name: str, args: dict) -> str:
                 if name.startswith("mcp__"):
@@ -239,7 +351,7 @@ async def call_with_tools(
             for attempt in range(TRANSIENT_MAX_ATTEMPTS):
                 if attempt > 0 and not check_and_record_retry_budget(channel_id):
                     log.warning("Retry budget exhausted for ch=%d", channel_id)
-                    return _error_message("unknown"), None
+                    return _error_message("unknown"), None, False
 
                 async with StallWatchdog(channel_id, status_callback) as watchdog:
                     try:
@@ -249,8 +361,48 @@ async def call_with_tools(
                         # the current user turn itself, so we do NOT add
                         # the new prompt here.
                         history_for_loop: list[dict] = list(prior_history)
+                        user_content_for_loop = (
+                            prompt if not image_blocks else user_content
+                        )
+                        # Replay the latest Mem0 snapshot only when the
+                        # current prompt does not already carry one (short
+                        # follow-up after a MEM0_MIN_QUERY_LENGTH-gated
+                        # turn). Done once per request, not once per JSONL
+                        # row, so we don't accumulate stale recall.
+                        if (
+                            latest_context_snapshot
+                            and not prompt_has_context_snapshot(prompt_text)
+                        ):
+                            user_content_for_loop = _prepend_context_snapshot(
+                                user_content_for_loop, latest_context_snapshot
+                            )
+                            log.info(
+                                "[PROMPT_BREAKDOWN ch=%d] context_snapshot re-injected: chars=%d resumable=%s",
+                                channel_id, len(latest_context_snapshot), resumable,
+                            )
+                        # Measure final payload going to the Messages API
+                        if isinstance(user_content_for_loop, str):
+                            _user_chars = len(user_content_for_loop)
+                            _user_blocks = 1
+                        else:
+                            _user_chars = sum(
+                                len(b.get("text", "")) for b in user_content_for_loop
+                                if isinstance(b, dict)
+                            )
+                            _user_blocks = len(user_content_for_loop)
+                        _hist_chars = sum(
+                            len(m.get("content", "")) if isinstance(m.get("content"), str) else 0
+                            for m in history_for_loop if isinstance(m, dict)
+                        )
+                        log.info(
+                            "[PROMPT_BREAKDOWN ch=%d] api_payload: prior_turns=%d prior_chars=%d "
+                            "user_chars=%d user_blocks=%d system_chars=%d tools=%d resumable=%s attempt=%d",
+                            channel_id, len(history_for_loop), _hist_chars,
+                            _user_chars, _user_blocks, len(system_prompt or ""),
+                            len(advertised_tools), resumable, attempt + 1,
+                        )
                         result = await run_agent_loop(
-                            prompt if not image_blocks else user_content,
+                            user_content_for_loop,
                             channel_id,
                             history=history_for_loop,
                             system_prompt=system_prompt,
@@ -258,19 +410,23 @@ async def call_with_tools(
                             can_use_tool=can_use_tool,
                             execute_tool=_execute_tool,
                             status_callback=status_callback,
+                            incremental_text_callback=incremental_text_callback,
+                            tool_invocation_callback=tool_invocation_callback,
                             max_turns=max_turns,
                             stall_watchdog=watchdog,
                             api_client=api_client,
                             model=MODEL,
                             extra_betas=MODEL_BETAS,
-                            active_mcp_keys=sorted(chosen_mcp_keys),
+                            active_mcp_keys=sorted(
+                                chosen_mcp_keys | always_advertised_mcp_keys
+                            ),
                         )
                         response_text = result.text
                         break
                     except asyncio.CancelledError:
                         # Stall watchdog fired or shutdown — surface as timeout.
                         log.warning("[ch=%d] cancelled during agent loop", channel_id)
-                        return f"⏰ タイムアウトしました", None
+                        return f"⏰ タイムアウトしました", None, False
                     except anthropic.AnthropicError as exc:
                         category = classify_anthropic_error(exc)
                         log.error(
@@ -278,16 +434,47 @@ async def call_with_tools(
                             channel_id, attempt + 1, TRANSIENT_MAX_ATTEMPTS,
                             category, exc,
                         )
-                        if category in ("auth", "context_overflow", "max_turns"):
+                        if category == "context_overflow":
+                            # History too long — session must restart so
+                            # the next turn loads a shorter JSONL tail.
                             sessions.pop(channel_id, None)
                             _clear_session_time(channel_id)
-                            return _error_message(category), None
+                            return _error_message(category), None, False
+                        if category == "auth" and attempt == 0:
+                            # OAuth race: a sibling process (typically the
+                            # mem0-mcp MCP server) refreshed the token while
+                            # this request held an in-flight access_token,
+                            # which the auth server then revoked. Reload the
+                            # credentials file to pick up the new token and
+                            # rebuild the API client before retrying once.
+                            # A second auth failure falls through to the
+                            # "real auth problem" branch below.
+                            from services.oauth_manager import init as _oauth_reload
+                            _oauth_reload()
+                            api_client = await _make_api_client(restricted)
+                            log.info(
+                                "[ch=%d] auth retry after token reload (attempt %d→%d)",
+                                channel_id, attempt + 1, attempt + 2,
+                            )
+                            await _safe_status(
+                                status_callback,
+                                f"🔄 認証リトライ中 ({attempt + 1}/{max_attempts})",
+                            )
+                            continue
+                        if category in ("auth", "max_turns"):
+                            # auth (2nd time): genuine credential problem —
+                            # reloading didn't help, so the token is truly
+                            # invalid. Surface to user.
+                            # max_turns: tool-loop hit the per-request turn
+                            # cap — session history is still valid.
+                            return _error_message(category), None, resumable
                         if _is_transient(category) and max_attempts < TRANSIENT_MAX_ATTEMPTS:
                             max_attempts = TRANSIENT_MAX_ATTEMPTS
                         if attempt >= max_attempts - 1:
-                            sessions.pop(channel_id, None)
-                            _clear_session_time(channel_id)
-                            return _error_message(category), None
+                            # Transient errors exhausted retries — keep the
+                            # session alive so the next user message can
+                            # resume without losing context.
+                            return _error_message(category), None, resumable
                         backoff = compute_backoff(attempt)
                         await _safe_status(
                             status_callback,
@@ -297,7 +484,7 @@ async def call_with_tools(
 
         # 9. Wrap into SessionInfo
         if response_text is None or result is None:
-            return _error_message("unknown"), None
+            return _error_message("unknown"), None, False
         session_info = SessionInfo(
             session_id=result.synthetic_session_id or "",
             mcp_server_keys=result.active_mcp_keys,
@@ -309,30 +496,26 @@ async def call_with_tools(
         # 10. Persist this turn's user/assistant pair to the JSONL transcript
         # so the next call (within TTL) can replay it.
         #
-        # We persist the *full* prompt bot.py built for this turn — including
-        # the <retrieved_memories> block, the trusted/strict header, and the
-        # <untrusted_user_input> wrapper — not just raw_user_text. This is the
-        # only way Mem0 context survives into the next turn: bot.py skips Mem0
-        # search for short follow-ups (MEM0_MIN_QUERY_LENGTH=20) and the API
-        # is stateless, so without this persistence a short reply after a
-        # long Mem0-seeded turn would lose all recall.
-        #
-        # We use prompt_text (the image-blocks-stripped text) so massive
-        # base64 image payloads do not bloat the JSONL.
+        # Compact storage (2026-05-15 token-reduction plan): instead of
+        # re-saving the full rendered prompt, we keep ``raw_user_text`` plus
+        # the assistant reply, capped at COMPACT_HISTORY_USER_CHARS /
+        # COMPACT_HISTORY_ASSISTANT_CHARS. Mem0 / kanae_self_memory blocks
+        # are pulled out into ``context_snapshot`` so a short follow-up turn
+        # can still see recall context without paying for it on every row.
+        # ``build_compact_history_entries`` carries the previous snapshot
+        # forward when the current turn lacks a fresh one.
         # Failures here (disk full, perms) must not abort the request.
-        if prompt_text and response_text:
+        if response_text:
             try:
-                await asyncio.to_thread(
-                    append_jsonl,
-                    channel_id,
-                    {"role": "user", "content": prompt_text},
+                user_entry, assistant_entry = build_compact_history_entries(
+                    raw_user_text=raw_user_text or prompt_text,
+                    prompt_text=prompt_text,
+                    assistant_text=response_text,
+                    previous_context_snapshot=latest_context_snapshot,
                 )
-                await asyncio.to_thread(
-                    append_jsonl,
-                    channel_id,
-                    {"role": "assistant", "content": response_text},
-                )
+                await asyncio.to_thread(append_jsonl, channel_id, user_entry)
+                await asyncio.to_thread(append_jsonl, channel_id, assistant_entry)
             except Exception as exc:
                 log.warning("[ch=%d] history append failed: %s", channel_id, exc)
 
-        return response_text, session_info if result.synthetic_session_id else None
+        return response_text, session_info if result.synthetic_session_id else None, resumable

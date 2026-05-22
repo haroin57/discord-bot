@@ -768,6 +768,153 @@ class TestOnMessage:
             # Implementation wraps reply context in <replied_to_message> XML tag
             assert "replied_to_message" in captured_prompt
             assert "ReplyAuthor" in captured_prompt
+            # Non-self reply remains inside <untrusted_user_input>
+            wrapper_open = captured_prompt.index("<untrusted_user_input>")
+            tag_pos = captured_prompt.index("<replied_to_message")
+            assert tag_pos > wrapper_open
+
+    @pytest.mark.asyncio
+    async def test_admin_reply_to_bot_uses_trusted_tag_outside_wrapper(self, monkeypatch):
+        """admin が bot 自身のメッセージにリプライ → trusted扱い (<replied_to_trusted_message>)."""
+        import bot
+
+        ref = MagicMock()
+        ref.message_id = 222
+        ref.cached_message = None
+
+        ref_msg = AsyncMock()
+        ref_msg.author = MagicMock()
+        # Match the bot.user.id set in _reset_bot_state fixture (99900)
+        ref_msg.author.id = 99900
+        ref_msg.author.display_name = "かなえ"
+        ref_msg.content = "私の過去発言"
+        ref_msg.attachments = []
+
+        msg = _make_message(content="かなえ followup", author_id=12345, reference=ref)
+        msg.channel.fetch_message = AsyncMock(return_value=ref_msg)
+
+        captured_prompt = None
+
+        async def capture_call(prompt, *args, **kwargs):
+            nonlocal captured_prompt
+            captured_prompt = prompt
+            return ("ok", None, False)
+
+        with patch("bot.strip_mention", return_value="followup"), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="followup"), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+
+            assert captured_prompt is not None
+            assert "<replied_to_trusted_message" in captured_prompt
+            assert "かなえ" in captured_prompt
+            assert "私の過去発言" in captured_prompt
+            assert "<replied_to_message" not in captured_prompt
+            tag_pos = captured_prompt.index("<replied_to_trusted_message")
+            wrapper_open = captured_prompt.index("<untrusted_user_input>")
+            assert tag_pos < wrapper_open
+
+    @pytest.mark.asyncio
+    async def test_admin_reply_to_admin_uses_trusted_tag(self, monkeypatch):
+        """admin が他のadmin authoredメッセージにリプライ → trusted扱い."""
+        import bot
+        # Add a second admin (b0nchichi-like)
+        monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345, 22222})
+
+        ref = MagicMock()
+        ref.message_id = 333
+        ref.cached_message = None
+
+        ref_msg = AsyncMock()
+        ref_msg.author = MagicMock()
+        ref_msg.author.id = 22222  # second admin
+        ref_msg.author.display_name = "b0nchichi"
+        ref_msg.content = "お父さんからのコメント"
+        ref_msg.attachments = []
+
+        msg = _make_message(content="かなえ check this", author_id=12345, reference=ref)
+        msg.channel.fetch_message = AsyncMock(return_value=ref_msg)
+
+        captured_prompt = None
+
+        async def capture_call(prompt, *args, **kwargs):
+            nonlocal captured_prompt
+            captured_prompt = prompt
+            return ("ok", None, False)
+
+        with patch("bot.strip_mention", return_value="check this"), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="check this"), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+
+            assert captured_prompt is not None
+            assert "<replied_to_trusted_message" in captured_prompt
+            assert "b0nchichi" in captured_prompt
+            assert "お父さんからのコメント" in captured_prompt
+            tag_pos = captured_prompt.index("<replied_to_trusted_message")
+            wrapper_open = captured_prompt.index("<untrusted_user_input>")
+            assert tag_pos < wrapper_open
+
+    @pytest.mark.asyncio
+    async def test_admin_reply_to_external_user_stays_untrusted(self, monkeypatch):
+        """admin が外部ユーザー（非admin）authoredメッセージにリプライ → untrusted扱い維持."""
+        import bot
+
+        ref = MagicMock()
+        ref.message_id = 444
+        ref.cached_message = None
+
+        ref_msg = AsyncMock()
+        ref_msg.author = MagicMock()
+        ref_msg.author.id = 88888  # not in ADMIN_USER_IDS, not bot.user.id
+        ref_msg.author.display_name = "ExternalUser"
+        ref_msg.content = "外部ユーザーの発言"
+        ref_msg.attachments = []
+
+        msg = _make_message(content="かなえ hi", author_id=12345, reference=ref)
+        msg.channel.fetch_message = AsyncMock(return_value=ref_msg)
+
+        captured_prompt = None
+
+        async def capture_call(prompt, *args, **kwargs):
+            nonlocal captured_prompt
+            captured_prompt = prompt
+            return ("ok", None, False)
+
+        with patch("bot.strip_mention", return_value="hi"), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hi"), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+
+            assert captured_prompt is not None
+            # External author stays inside untrusted wrapper with the
+            # non-trusted tag.
+            assert "<replied_to_message" in captured_prompt
+            assert "<replied_to_trusted_message" not in captured_prompt
+            tag_pos = captured_prompt.index("<replied_to_message")
+            wrapper_open = captured_prompt.index("<untrusted_user_input>")
+            assert tag_pos > wrapper_open
 
     @pytest.mark.asyncio
     async def test_response_images_attached(self, monkeypatch):

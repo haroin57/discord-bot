@@ -597,7 +597,7 @@ class WebAPI:
                 ))
                 self._sid_tasks.setdefault(sid, set()).add(task)
                 try:
-                    response_text, session_id = await task
+                    response_text, session_id, _ = await task
                 finally:
                     self._sid_tasks.get(sid, set()).discard(task)
 

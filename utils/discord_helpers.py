@@ -109,8 +109,8 @@ def format_embed(embed: discord.Embed) -> str:
 MAX_CONTEXT_CHARS = 20000
 
 # 3-layer context hierarchy
-LAYER1_COUNT = 15      # Recent messages: full text
-LAYER2_COUNT = 10      # Earlier messages: summarized
+LAYER1_COUNT = 25      # Recent messages: full text
+LAYER2_COUNT = 15      # Earlier messages: summarized
 LAYER2_MAX_CHARS = 150 # Max chars per Layer 2 message
 
 

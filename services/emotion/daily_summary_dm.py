@@ -18,7 +18,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +37,19 @@ HAROIN_USER_ID = 573489206240870410
 # Loop interval. 1h matches the requested cadence; the entry window is
 # also 1h so consecutive recaps don't overlap.
 INTERVAL_S = 3600
+# Short retry interval when a cycle skipped (no entries) or failed
+# (transient quota / Discord rate limit / Claude CLI down). Keeps the
+# loop responsive without thrashing the API.
+RETRY_INTERVAL_S = 300
+
+# Sentinel file holding the mtime of the last *successful* DM send.
+# Persisting it on disk means a bot restart no longer resets the 1-hour
+# timer — on startup the loop reads this and either fires immediately
+# (catch-up) or sleeps for the remaining slice of the hour. The same
+# directory is already used by self_initiate.py for its cooldown
+# sentinel.
+_XDG_STATE = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))) / "discord-bot"
+LAST_SENT_PATH = _XDG_STATE / "hourly_summary_dm.last_sent"
 
 _SUMMARY_PROMPT = """以下は「佐藤かなえ」(後輩キャラ・先輩haroinに好意あり) の直近1時間の日常ログです。
 これを先輩への DM として送る短い近況報告にまとめてください。
@@ -51,20 +66,70 @@ _SUMMARY_PROMPT = """以下は「佐藤かなえ」(後輩キャラ・先輩haro
 """
 
 
+def _seconds_until_next_dm() -> float:
+    """Seconds until the next DM should fire, based on sentinel mtime.
+
+    Returns 0.0 when the sentinel is missing (initial run) or its mtime
+    is older than INTERVAL_S — i.e. a slot has been missed and we should
+    catch up immediately. Otherwise returns the remaining seconds of the
+    current hour-slot.
+    """
+    try:
+        last = LAST_SENT_PATH.stat().st_mtime
+    except OSError:
+        return 0.0
+    elapsed = time.time() - last
+    return max(0.0, INTERVAL_S - elapsed)
+
+
+def _touch_sentinel() -> None:
+    """Record now() as the last successful send."""
+    try:
+        LAST_SENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LAST_SENT_PATH.touch()
+    except OSError as exc:
+        log.warning("hourly_summary_dm: could not touch sentinel: %s", exc)
+
+
 async def hourly_summary_dm_loop(bot, state_dir: Path, repo_dir: Path) -> None:
-    """Forever loop: every hour DM senpai a recap of kanae's last hour."""
+    """Forever loop: every hour DM senpai a recap of kanae's last hour.
+
+    Uses a sentinel file (``LAST_SENT_PATH``) so a bot restart doesn't
+    reset the 1-hour clock — on startup we either fire immediately
+    (catch-up) or sleep the remaining slice. Only successful sends move
+    the sentinel forward; skips and failures retry in RETRY_INTERVAL_S
+    so a transient quota issue doesn't lose us a full hour.
+    """
     while True:
+        wait_s = _seconds_until_next_dm()
+        if wait_s > 0:
+            try:
+                await asyncio.sleep(wait_s)
+            except asyncio.CancelledError:
+                return
+
         try:
-            await asyncio.sleep(INTERVAL_S)
+            sent = await _run_one_cycle(bot, state_dir, repo_dir)
         except asyncio.CancelledError:
             return
-        try:
-            await _run_one_cycle(bot, state_dir, repo_dir)
         except Exception as exc:
             log.warning("hourly summary DM iteration failed: %s", exc)
+            sent = False
+
+        if sent:
+            _touch_sentinel()
+        else:
+            # Skip / failure: don't move the sentinel (so we keep being
+            # eligible to catch up on the next pass), and back off for
+            # RETRY_INTERVAL_S instead of waiting another full hour.
+            try:
+                await asyncio.sleep(RETRY_INTERVAL_S)
+            except asyncio.CancelledError:
+                return
 
 
-async def _run_one_cycle(bot, state_dir: Path, repo_dir: Path) -> None:
+async def _run_one_cycle(bot, state_dir: Path, repo_dir: Path) -> bool:
+    """Run one DM cycle. Returns True iff a DM was actually sent."""
     now = datetime.now(JST)
     cutoff = now - timedelta(hours=1)
 
@@ -72,13 +137,13 @@ async def _run_one_cycle(bot, state_dir: Path, repo_dir: Path) -> None:
     recent = [e for e in entries if _entry_is_recent(e, cutoff)]
     if not recent:
         log.info("hourly_summary_dm: no entries in last hour; skip")
-        return
+        return False
 
     text = _format_entries(recent)
     summary = await asyncio.to_thread(_generate_summary, text, repo_dir)
     if not summary:
         log.info("hourly_summary_dm: summary generation returned empty")
-        return
+        return False
 
     user = bot.get_user(HAROIN_USER_ID)
     if user is None:
@@ -86,17 +151,19 @@ async def _run_one_cycle(bot, state_dir: Path, repo_dir: Path) -> None:
             user = await bot.fetch_user(HAROIN_USER_ID)
         except Exception as exc:
             log.warning("hourly_summary_dm: fetch_user failed: %s", exc)
-            return
+            return False
     if user is None:
         log.warning("hourly_summary_dm: user %s unresolved", HAROIN_USER_ID)
-        return
+        return False
 
     try:
         await user.send(summary)
         log.info("hourly_summary_dm sent (%d entries, %d chars)",
                  len(recent), len(summary))
+        return True
     except Exception as exc:
         log.warning("hourly_summary_dm: user.send failed: %s", exc)
+        return False
 
 
 def _entry_is_recent(entry, cutoff: datetime) -> bool:

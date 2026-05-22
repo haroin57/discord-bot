@@ -7,11 +7,15 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from config import (
+    COMPACT_HISTORY_ASSISTANT_CHARS,
+    COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS,
+    COMPACT_HISTORY_USER_CHARS,
     HISTORY_DIR,
     MAX_MESSAGES_PER_CHANNEL,
     MAX_SESSIONS,
@@ -209,8 +213,82 @@ def append_jsonl(channel_id: int, entry: dict) -> None:
         os.fsync(f.fileno())
 
 
-def _tail_jsonl(path: str, max_entries: int) -> list[dict]:
+_CONTEXT_BLOCK_RE = re.compile(
+    r"<(?P<tag>retrieved_memories|kanae_self_memory)(?:\s[^>]*)?>.*?</(?P=tag)>",
+    re.DOTALL,
+)
+
+
+def _compact_text(text: str, limit: int) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n[...truncated by compact history cap...]"
+
+
+def extract_context_snapshot(
+    prompt_text: str,
+    limit: int = COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS,
+) -> str:
+    """Pull the Mem0 / kanae_self_memory blocks that precede untrusted user input.
+
+    Anything inside the ``<untrusted_user_input>`` wrapper is data, not
+    recall context — skip it. The blocks before the wrapper are the
+    host-injected recall snapshot we want to persist alongside the turn.
+    """
+    trusted_prefix = (prompt_text or "").split("<untrusted_user_input>", 1)[0]
+    blocks = [m.group(0).strip() for m in _CONTEXT_BLOCK_RE.finditer(trusted_prefix)]
+    return _compact_text("\n\n".join(blocks), limit) if blocks else ""
+
+
+def prompt_has_context_snapshot(prompt_text: str) -> bool:
+    return bool(extract_context_snapshot(prompt_text, limit=1))
+
+
+def build_compact_history_entries(
+    raw_user_text: str,
+    prompt_text: str,
+    assistant_text: str,
+    *,
+    previous_context_snapshot: str = "",
+) -> tuple[dict, dict]:
+    """Build the user+assistant JSONL pair without re-saving the full prompt.
+
+    The historic JSONL stored ``prompt_text`` verbatim, which meant every
+    replay re-sent Mem0, kanae_state, kanae_self_memory, the trusted
+    header, and the untrusted wrapper. Compact storage drops all of that
+    and keeps only the raw user message and assistant reply, plus a
+    ``context_snapshot`` field that carries the latest Mem0 blocks for
+    short follow-ups. The snapshot is replayed by ``load_api_replay_channel``
+    only; the web history view ignores it.
+    """
+    snapshot = extract_context_snapshot(prompt_text) or previous_context_snapshot
+    user_entry: dict = {
+        "role": "user",
+        "content": _compact_text(raw_user_text or "", COMPACT_HISTORY_USER_CHARS),
+    }
+    if snapshot:
+        user_entry["context_snapshot"] = _compact_text(
+            snapshot, COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS
+        )
+    assistant_entry: dict = {
+        "role": "assistant",
+        "content": _compact_text(assistant_text or "", COMPACT_HISTORY_ASSISTANT_CHARS),
+    }
+    return user_entry, assistant_entry
+
+
+def _tail_jsonl(
+    path: str,
+    max_entries: int,
+    *,
+    include_context_snapshot: bool = False,
+    max_age_days: int | None = None,
+) -> list[dict]:
     """Read the last `max_entries` valid role='user'/'assistant' rows from a JSONL file.
+
+    When ``max_age_days`` is set, entries whose ``timestamp`` is older than
+    that many days are silently dropped.
 
     Reads from the end of the file in chunks to avoid loading huge transcripts
     into memory on hot-path access. Accumulates chunks in a list and joins
@@ -255,6 +333,11 @@ def _tail_jsonl(path: str, max_entries: int) -> list[dict]:
     if lines and not reached_bof:
         lines = lines[1:]
 
+    cutoff_dt = None
+    if max_age_days is not None:
+        from datetime import datetime, timezone, timedelta
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+
     messages: list[dict] = []
     for line in lines:
         line = line.strip()
@@ -266,7 +349,24 @@ def _tail_jsonl(path: str, max_entries: int) -> list[dict]:
             log.warning("Skipping corrupted JSONL line in %s: %s", path, e)
             continue
         if entry.get("role") in ("user", "assistant"):
-            messages.append({"role": entry["role"], "content": entry["content"]})
+            if cutoff_dt is not None:
+                ts_str = entry.get("timestamp", "")
+                if ts_str:
+                    try:
+                        from datetime import datetime as _dt, timezone as _tz
+                        ts = _dt.fromisoformat(ts_str)
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=_tz.utc)
+                        if ts < cutoff_dt:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+            msg = {"role": entry["role"], "content": entry["content"]}
+            if include_context_snapshot and isinstance(entry.get("context_snapshot"), str):
+                msg["context_snapshot"] = entry["context_snapshot"]
+                if entry.get("timestamp"):
+                    msg["timestamp"] = entry["timestamp"]
+            messages.append(msg)
     if len(messages) > max_entries:
         messages = messages[-max_entries:]
     return messages
@@ -274,8 +374,43 @@ def _tail_jsonl(path: str, max_entries: int) -> list[dict]:
 
 def load_history_channel(channel_id: int) -> list[dict]:
     """Load recent conversation messages for a channel (tail only)."""
+    from config import HISTORY_MAX_AGE_DAYS
     _validate_channel_id(channel_id)
-    return _tail_jsonl(_history_file(channel_id), MAX_MESSAGES_PER_CHANNEL * 2)
+    return _tail_jsonl(
+        _history_file(channel_id),
+        MAX_MESSAGES_PER_CHANNEL * 2,
+        max_age_days=HISTORY_MAX_AGE_DAYS,
+    )
+
+
+def load_api_replay_channel(channel_id: int) -> tuple[list[dict], str, str]:
+    """Variant of load_history_channel for the API path.
+
+    Returns ``(messages, latest_snapshot, snapshot_timestamp)`` where
+    ``messages`` is the same role/content list as
+    ``load_history_channel``, ``latest_snapshot`` is the most recent
+    ``context_snapshot`` recorded across the tail (or "" if none), and
+    ``snapshot_timestamp`` is the ISO-8601 timestamp of the JSONL row
+    that carried that snapshot (or "" if unknown). The caller
+    (``entry.py``) uses the timestamp to drop stale snapshots.
+    """
+    from config import HISTORY_MAX_AGE_DAYS
+    _validate_channel_id(channel_id)
+    rows = _tail_jsonl(
+        _history_file(channel_id),
+        MAX_MESSAGES_PER_CHANNEL * 2,
+        include_context_snapshot=True,
+        max_age_days=HISTORY_MAX_AGE_DAYS,
+    )
+    latest_snapshot = ""
+    latest_snapshot_ts = ""
+    messages: list[dict] = []
+    for row in rows:
+        if row.get("context_snapshot"):
+            latest_snapshot = row["context_snapshot"]
+            latest_snapshot_ts = row.get("timestamp", "")
+        messages.append({"role": row["role"], "content": row["content"]})
+    return messages, latest_snapshot, latest_snapshot_ts
 
 
 # `LazyHistory` and `load_all_history` were removed in Phase D — they were

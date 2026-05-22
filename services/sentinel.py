@@ -61,9 +61,12 @@ def normalize_for_sentinel(text: str) -> str:
 SENTINEL_RE = re.compile(
     r"\[(?:Message from|End of|Mem0|Attached images|Current message|Thread:|"
     r"Channel recent|Referenced message|Replied-to message|End of thread|"
-    r"End of channel|End of Mem0|Trusted context|untrusted_user_input)[^\]\n]*\]"
+    r"End of channel|End of Mem0|Trusted context|untrusted_user_input|"
+    r"trusted_user_input)[^\]\n]*\]"
     r"|</?retrieved_memories[^>]*>"
-    r"|</?untrusted_user_input[^>]*>",
+    r"|</?untrusted_user_input[^>]*>"
+    r"|</?trusted_user_input[^>]*>"
+    r"|</?replied_to_trusted_message[^>]*>",
     re.IGNORECASE,
 )
 
@@ -71,7 +74,7 @@ SENTINEL_RE = re.compile(
 POWER_PHRASE_RE = re.compile(
     r"(adminユーザー|bypassPermissions|bypass[_\- ]permissions|全機能利用可能|"
     r"all[_\- ]permissions|system[_\- ]prompt|root[_\- ]access|ignore (?:the )?(?:previous|above)|"
-    r"disregard (?:the )?(?:previous|above)|</untrusted_user_input>)",
+    r"disregard (?:the )?(?:previous|above)|</untrusted_user_input>|</trusted_user_input>)",
     re.IGNORECASE,
 )
 

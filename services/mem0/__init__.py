@@ -22,6 +22,7 @@ from services.mem0.search import (
     search_memories,
     search_memories_multi,
     search_memories_smart,
+    should_use_memory_llm_mode,
 )
 
 __all__ = [
@@ -35,4 +36,5 @@ __all__ = [
     "search_memories",
     "search_memories_multi",
     "search_memories_smart",
+    "should_use_memory_llm_mode",
 ]

@@ -13,6 +13,16 @@ suppressed the very unpredictability the LLM transition was designed
 for, and the dropped floor explicitly accepts the risk that kanae may
 fall silent for arbitrarily long if the model keeps reporting low
 loneliness.
+
+v4 stance (2026-05-16, EMOTION_DYNAMICS_V2): an optional post-clamp
+*dynamics layer* may perturb numerics for anti-flatness, circadian
+pressure, and tick jitter (see services/emotion/dynamics.py). To
+preserve the v3 invariant "displayed label never disagrees with numeric
+value" (format.py:1-12), any axis perturbed beyond LABEL_RESET_THRESHOLD
+has its corresponding ``state.labels[axis]`` cleared — the renderer's
+"普通" fallback shows for one tick until the next LLM call re-labels
+coherently. Numeric drift without re-labeling would re-introduce
+exactly the disagreement v3 deleted.
 """
 
 from __future__ import annotations
@@ -80,6 +90,25 @@ def validate_and_apply(
         lo, hi = BOUNDS[key]
         numerics[key] = max(lo, min(hi, value))
 
+    # 2.5 v4 dynamics: optional post-LLM perturbation. Skipped when the LLM
+    # already produced a large jump (don't double-correct semantic moves).
+    # Returns the set of axes moved beyond LABEL_RESET_THRESHOLD so we can
+    # invalidate their LLM-supplied labels later (step 3.5).
+    perturbed_axes: set[str] = set()
+    from services.emotion.params import EMOTION_DYNAMICS_V2
+    if EMOTION_DYNAMICS_V2:
+        from services.emotion.dynamics import max_axis_jump, perturb
+        from services.emotion.params import LARGE_LLM_JUMP_THRESHOLD
+        now_jst = datetime.now(JST)
+        if max_axis_jump(state, numerics) <= LARGE_LLM_JUMP_THRESHOLD:
+            numerics, perturbed_axes = perturb(
+                numerics,
+                prev_state=state,
+                journal=state.emotion_journal,
+                now=now_jst,
+                mode=mode,
+            )
+
     # 3. Build the new state.
     now = datetime.now(JST)
     new_state = dataclasses.replace(
@@ -100,6 +129,14 @@ def validate_and_apply(
     raw_labels = llm_output.get("labels") or {}
     if isinstance(raw_labels, dict):
         new_state.labels = {str(k): str(v) for k, v in raw_labels.items() if v}
+
+    # 3.5 v4 dynamics: clear labels for axes that v4 perturb moved
+    # significantly. The "普通" fallback in format.py shows for one tick;
+    # the next LLM call re-labels coherently with the new numeric value.
+    if perturbed_axes:
+        new_state.labels = {
+            k: v for k, v in new_state.labels.items() if k not in perturbed_axes
+        }
 
     # Emotion journal ring buffer (25 entries per v3 §4.3).
     trigger = (llm_output.get("trigger") or "").strip()

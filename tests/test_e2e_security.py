@@ -153,7 +153,7 @@ class CallCapture:
 
     def __call__(self, prompt, channel_id, sessions,
                  status_callback=None, restricted=False, raw_user_text="",
-                 is_thread=False, has_image_attachment=False):
+                 is_thread=False, has_image_attachment=False, **_kwargs):
         async def _coro():
             self.calls.append({
                 "prompt": prompt,
@@ -162,7 +162,7 @@ class CallCapture:
                 "raw_user_text": raw_user_text,
             })
             from services.session import SessionInfo
-            return ("OK response", SessionInfo(session_id="session-xyz"))
+            return ("OK response", SessionInfo(session_id="session-xyz"), False)
         return _coro()
 
 
@@ -344,7 +344,7 @@ class TestRestrictedSdkOptions:
 
         monkeypatch.setattr(claude_sdk, "query", fake_query)
 
-        text, sid = await claude_sdk.call_with_tools(
+        text, sid, _ = await claude_sdk.call_with_tools(
             prompt="plain prompt",
             channel_id=123,
             sessions={},

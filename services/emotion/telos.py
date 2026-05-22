@@ -51,6 +51,13 @@ def _hours_since(iso_ts: str | None, now: datetime) -> float:
 
 def generate_telos(state: EmotionState, now: datetime) -> Motivation | None:
     """Pick the strongest motivation, or None to stay silent."""
+    # Don't pile on when senpai hasn't replied to the last few self-initiated
+    # pings — the counter is cleared by feedback._daemon_transition_and_save
+    # on the next senpai turn, so the gate releases as soon as conversation
+    # resumes.
+    if state.consecutive_self_initiated >= MAX_CONSECUTIVE_SELF_INITIATED:
+        return None
+
     motivations: list[Motivation] = []
     hrs_silent = _hours_since(state.last_interaction.timestamp, now)
 

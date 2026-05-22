@@ -439,9 +439,8 @@ class TestSearchMemoriesSmart:
 
     @pytest.mark.asyncio
     async def test_both_disabled_plain_search(self, monkeypatch):
-        # Score must stay under MEM0_FINAL_RELEVANCE_MAX_DISTANCE (default 0.65)
-        # or smart-path's final filter will drop the result. 0.4 is a safe
-        # "relevant" distance for this assertion.
+        # ADR-0002: rerank=False path uses MEM0_RELEVANCE_MAX_DISTANCE
+        # (1.2) as the sanity gate. 0.4 is well under either threshold.
         mems = [_make_memory("x", 0.4)]
         monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", AsyncMock(return_value=mems))
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock())
@@ -450,6 +449,64 @@ class TestSearchMemoriesSmart:
         from services.mem0.search import search_memories_smart
         result = await search_memories_smart("q", "u", limit=5, rewrite=False, rerank=False)
         assert result == mems
+
+
+class TestPostRerankGateRedesign:
+    """ADR-0002: post-rerank cosine gate is removed; LLM rerank is final.
+
+    Regression coverage for incident 2026-05-19 (rid=10c036ee) where the
+    legacy 0.65 gate silently dropped every Japanese conversational query.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rerank_path_returns_high_distance_results(self, monkeypatch):
+        # The incident replay: every candidate has score >> 0.65 because
+        # cosine distance on a 30-char conversational query never lands
+        # in that band. Rerank LLM accepted them, so smart search must
+        # return them verbatim.
+        candidates = [_make_memory("上伊那ぼたん 漫画", 0.92)]
+        reranked = list(candidates)
+        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", AsyncMock(return_value=candidates))
+        monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
+        monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=reranked))
+
+        from services.mem0.search import search_memories_smart
+        result = await search_memories_smart(
+            "まあまあ、上伊那ぼたんのFAでも見て落ち着きなよ", "u",
+            limit=5, rewrite=False, rerank=True,
+        )
+        assert result == reranked
+        assert result[0]["score"] == 0.92
+
+    @pytest.mark.asyncio
+    async def test_rerank_path_passes_through_empty_rerank(self, monkeypatch):
+        # If the LLM judges nothing relevant, return empty — not the raw
+        # candidate set.
+        candidates = [_make_memory("x", 0.4), _make_memory("y", 0.5)]
+        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", AsyncMock(return_value=candidates))
+        monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
+        monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]))
+
+        from services.mem0.search import search_memories_smart
+        result = await search_memories_smart("q", "u", limit=5, rewrite=False, rerank=True)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_plain_path_applies_sanity_gate_at_1_2(self, monkeypatch):
+        # rerank=False has no LLM judge, so the sanity gate stays — but
+        # at the loose MEM0_RELEVANCE_MAX_DISTANCE (1.2), not the legacy
+        # 0.65. Score 0.9 passes here; score 1.3 does not.
+        mems = [
+            _make_memory("kept-id", 0.9, text="kept"),
+            _make_memory("dropped-id", 1.3, text="dropped"),
+        ]
+        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", AsyncMock(return_value=mems))
+        monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock())
+        monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock())
+
+        from services.mem0.search import search_memories_smart
+        result = await search_memories_smart("q", "u", limit=5, rewrite=False, rerank=False)
+        assert [r.get("memory") for r in result] == ["kept"]
 
 
 # ---------------------------------------------------------------------------

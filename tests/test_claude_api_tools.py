@@ -269,3 +269,90 @@ class TestRegistry:
     async def test_unknown_tool_raises(self, tmpdir_ctx):
         with pytest.raises(KeyError):
             await execute_builtin_tool("Nope", {}, tmpdir_ctx)
+
+    def test_todo_write_advertised(self):
+        out = builtin_tools_for_api(restricted=False)
+        assert "TodoWrite" in {t["name"] for t in out}
+
+    def test_task_create_alias_resolves(self):
+        from services.claude_api.tools import BUILTIN_TOOL_ALIASES
+        assert BUILTIN_TOOL_ALIASES["TaskCreate"] == "TodoWrite"
+        assert BUILTIN_TOOL_ALIASES["task_create"] == "TodoWrite"
+        assert BUILTIN_TOOL_ALIASES["todo_write"] == "TodoWrite"
+
+
+class TestTodoWrite:
+    @pytest.mark.asyncio
+    async def test_replace_semantics(self, tmpdir_ctx):
+        todos1 = [
+            {"content": "step A", "status": "in_progress", "activeForm": "Doing A"},
+            {"content": "step B", "status": "pending", "activeForm": "Doing B"},
+        ]
+        out1 = await execute_builtin_tool("TodoWrite", {"todos": todos1}, tmpdir_ctx)
+        assert "2 todos" in out1
+        assert len(tmpdir_ctx.todos) == 2
+
+        # Replace with a smaller list — old items should be gone, not merged.
+        todos2 = [
+            {"content": "step C", "status": "pending", "activeForm": "Doing C"},
+        ]
+        await execute_builtin_tool("TodoWrite", {"todos": todos2}, tmpdir_ctx)
+        assert len(tmpdir_ctx.todos) == 1
+        assert tmpdir_ctx.todos[0]["content"] == "step C"
+
+    @pytest.mark.asyncio
+    async def test_empty_clears(self, tmpdir_ctx):
+        tmpdir_ctx.todos = [
+            {"content": "x", "status": "pending", "activeForm": "X"},
+        ]
+        out = await execute_builtin_tool("TodoWrite", {"todos": []}, tmpdir_ctx)
+        assert "cleared" in out
+        assert tmpdir_ctx.todos == []
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_status(self, tmpdir_ctx):
+        with pytest.raises(ValueError, match="status"):
+            await execute_builtin_tool(
+                "TodoWrite",
+                {"todos": [{"content": "x", "status": "done", "activeForm": "X"}]},
+                tmpdir_ctx,
+            )
+
+    @pytest.mark.asyncio
+    async def test_rejects_empty_content(self, tmpdir_ctx):
+        with pytest.raises(ValueError, match="content"):
+            await execute_builtin_tool(
+                "TodoWrite",
+                {"todos": [{"content": "", "status": "pending", "activeForm": "X"}]},
+                tmpdir_ctx,
+            )
+
+    @pytest.mark.asyncio
+    async def test_rejects_multiple_in_progress(self, tmpdir_ctx):
+        with pytest.raises(ValueError, match="in_progress"):
+            await execute_builtin_tool(
+                "TodoWrite",
+                {"todos": [
+                    {"content": "a", "status": "in_progress", "activeForm": "A"},
+                    {"content": "b", "status": "in_progress", "activeForm": "B"},
+                ]},
+                tmpdir_ctx,
+            )
+
+    @pytest.mark.asyncio
+    async def test_rejects_non_list(self, tmpdir_ctx):
+        with pytest.raises(ValueError, match="array"):
+            await execute_builtin_tool("TodoWrite", {"todos": "nope"}, tmpdir_ctx)
+
+    @pytest.mark.asyncio
+    async def test_alias_TaskCreate_routes_to_TodoWrite(self, tmpdir_ctx):
+        # Mis-named call from a model that learned the old TaskCreate name
+        # from the previous CLI default prompt must still dispatch to
+        # TodoWrite via BUILTIN_TOOL_ALIASES.
+        out = await execute_builtin_tool(
+            "TaskCreate",
+            {"todos": [{"content": "x", "status": "pending", "activeForm": "X"}]},
+            tmpdir_ctx,
+        )
+        assert "1 todos" in out
+        assert len(tmpdir_ctx.todos) == 1

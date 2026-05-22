@@ -20,6 +20,11 @@ from services.emotion.state import (
     save_state,
 )
 from services.emotion.telos import Motivation, generate_telos, should_suppress
+from services.emotion.timeseries import (
+    append_timeseries,
+    load_timeseries,
+    timeseries_size_bytes,
+)
 from services.emotion.transition import apply_event, apply_time_decay
 
 __all__ = [
@@ -32,6 +37,9 @@ __all__ = [
     "emotion_lock",
     "load_state",
     "save_state",
+    "append_timeseries",
+    "load_timeseries",
+    "timeseries_size_bytes",
     "apply_time_decay",
     "apply_event",
     "generate_telos",

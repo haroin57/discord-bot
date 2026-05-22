@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from config import KANAE_STATE_TIME_BUCKET_MIN
 from services.emotion.state import EmotionState
 
 # Fallback labels used when state.labels / state.derived_labels are empty
@@ -47,7 +48,18 @@ def _time_of_day(hour: int) -> str:
 
 
 def _format_now_jst(now: datetime) -> str:
-    """Render `now` in the form `2026-05-14 (水) 20:35 JST [夜]`."""
+    """Render `now` in the form `2026-05-14 (水) 20:35 JST [夜]`.
+
+    Minutes are floored to a ``KANAE_STATE_TIME_BUCKET_MIN`` boundary so
+    the rendered string is stable across short bursts of activity. This
+    keeps the ``<kanae_state>`` block byte-identical inside the bucket,
+    preserving the upstream prompt cache boundary that precedes it.
+    Default bucket is 5 minutes.
+    """
+    bucket = max(1, KANAE_STATE_TIME_BUCKET_MIN)
+    bucketed_minute = (now.minute // bucket) * bucket
+    if bucketed_minute != now.minute or now.second or now.microsecond:
+        now = now.replace(minute=bucketed_minute, second=0, microsecond=0)
     weekday = _WEEKDAY_JP[now.weekday()]
     date_part = now.strftime("%Y-%m-%d")
     time_part = now.strftime("%H:%M")

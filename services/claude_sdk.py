@@ -81,7 +81,7 @@ _RESTRICTED_DENY_LIST = [
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
-MODEL = "claude-opus-4-6"
+MODEL = "claude-opus-4-7"
 
 # ---------------------------------------------------------------------------
 # Timeout / turns
@@ -102,7 +102,7 @@ STREAM_IDLE_TIMEOUT_S = 120     # raise TimeoutError after 2 min of silence
 # ---------------------------------------------------------------------------
 # Session resume
 # ---------------------------------------------------------------------------
-SESSION_TTL_S = 30 * 60
+SESSION_TTL_S = int(os.environ.get("SESSION_TTL_S", str(6 * 60 * 60)))
 _session_timestamps: dict[int, float] = {}
 
 # ---------------------------------------------------------------------------
@@ -365,7 +365,7 @@ async def call_with_tools(
     raw_user_text: str = "",
     is_thread: bool = False,
     has_image_attachment: bool = False,
-) -> tuple[str, "SessionInfo | None"]:
+) -> tuple[str, "SessionInfo | None", bool]:
     """Call Claude via SDK. Model decides tool usage (free-code QueryEngine pattern)."""
     # H-3: pick the correct concurrency slot so non-admins can't starve
     # the admin pool.
@@ -448,23 +448,25 @@ async def call_with_tools(
                 needed_keys = set(chosen_mcp.keys())
                 stored_keys = set(info.mcp_server_keys)
                 if needed_keys <= stored_keys:
-                    # All needed MCP servers are in the stored session → resume
                     options.resume = info.session_id
                     options.mcp_servers = get_mcp_servers_by_keys(info.mcp_server_keys)
                     log.info("Resuming session %s for ch=%d (mcp=%s)",
                              info.session_id[:12], channel_id, stored_keys)
                 else:
-                    # New MCP servers needed → start fresh
-                    log.info("MCP mismatch for ch=%d (need=%s, have=%s), starting fresh",
-                             channel_id, needed_keys - stored_keys, stored_keys)
-                    del sessions[channel_id]
-                    _clear_session_time(channel_id)
-                    options.resume = None
+                    merged = stored_keys | needed_keys
+                    info.mcp_server_keys = sorted(merged)
+                    options.resume = info.session_id
+                    options.mcp_servers = get_mcp_servers_by_keys(info.mcp_server_keys)
+                    log.info("MCP merge for ch=%d: %s + %s → %s, resuming %s",
+                             channel_id, sorted(stored_keys),
+                             sorted(needed_keys - stored_keys),
+                             info.mcp_server_keys, info.session_id[:12])
             else:
                 options.resume = None
         else:
             options.resume = None
 
+        _actually_resumed = options.resume is not None
         response_text: str | None = None
         # Defence-in-depth: if ResultMessage.result comes back empty (e.g. the
         # CLI's deferred-tool exit path), fall back to the last TextBlock we
@@ -515,7 +517,7 @@ async def call_with_tools(
                         "Retry budget exhausted for ch=%d, giving up", channel_id
                     )
                     _cleanup_stderr(stderr_fileobj)
-                    return _error_message("unknown"), None
+                    return _error_message("unknown"), None, False
                 recent.append(now)
                 _retry_budget[channel_id] = recent
                 # LRU eviction: drop oldest entries if dict too large
@@ -707,7 +709,7 @@ async def call_with_tools(
                     await asyncio.sleep(BASE_BACKOFF_S)
                     continue
                 _cleanup_stderr(stderr_fileobj)
-                return f"⏰ タイムアウトしました（{TIMEOUT // 60}分制限）", None
+                return f"⏰ タイムアウトしました（{TIMEOUT // 60}分制限）", None, _actually_resumed
 
             except Exception as e:
                 stderr_tail = _read_stderr_buffer(stderr_fileobj)
@@ -754,12 +756,9 @@ async def call_with_tools(
 
                 # Non-retryable errors
                 if error_type in ("auth", "context_overflow", "max_turns", "cli_exit"):
-                    # cli_exit with partial response: return what we got
                     if error_type == "cli_exit" and response_text:
                         log.info("CLI exited with partial response, returning it")
                         break
-                    # Resume failure (e.g. stale session with incompatible MCP
-                    # servers): clear session and retry fresh instead of giving up.
                     if error_type == "cli_exit" and options.resume:
                         log.warning("Session resume failed (cli_exit) for ch=%d, retrying fresh", channel_id)
                         if channel_id in sessions:
@@ -768,19 +767,20 @@ async def call_with_tools(
                         options.resume = None
                         await asyncio.sleep(BASE_BACKOFF_S)
                         continue
+                    if error_type == "context_overflow":
+                        if channel_id in sessions:
+                            del sessions[channel_id]
+                        _clear_session_time(channel_id)
+                        _cleanup_stderr(stderr_fileobj)
+                        return _error_message(error_type), None, False
+                    # auth / max_turns: session state is valid, keep it
                     _cleanup_stderr(stderr_fileobj)
-                    return _error_message(error_type), None
+                    return _error_message(error_type), None, _actually_resumed
 
-                # Clear broken session
-                if channel_id in sessions:
-                    del sessions[channel_id]
-                    log.info("Cleared broken session for channel %d", channel_id)
-                _clear_session_time(channel_id)
-                options.resume = None
-
+                # Transient errors exhausted — keep session alive
                 if attempt >= max_attempts - 1:
                     _cleanup_stderr(stderr_fileobj)
-                    return _error_message(error_type), None
+                    return _error_message(error_type), None, _actually_resumed
 
                 backoff = min(BASE_BACKOFF_S * (2 ** attempt), MAX_BACKOFF_S)
                 log.info("Retrying in %ds (type=%s, attempt %d/%d)", backoff, error_type, attempt + 1, max_attempts)
@@ -793,7 +793,7 @@ async def call_with_tools(
         _cleanup_stderr(stderr_fileobj)
 
         if response_text is None:
-            return "(No response from Claude)", None
+            return "(No response from Claude)", None, False
 
         result_info: SessionInfo | None = None
         if session_id:
@@ -802,7 +802,7 @@ async def call_with_tools(
 
         log.info("Response via %s (restricted=%s) len=%d",
                  MODEL, restricted, len(response_text))
-        return response_text.strip() or "(No response from Claude)", result_info
+        return response_text.strip() or "(No response from Claude)", result_info, _actually_resumed
 
 
 # ---------------------------------------------------------------------------

@@ -50,18 +50,30 @@ if _raw_ids:
         )
     ADMIN_USER_IDS = _valid
 
+# Haroin DM channel id. Used by kanae_daily to distinguish haroin's DM
+# from other channels (b0nchichi DM, server channels) when labelling
+# speakers in the journal prompt. Optional — when unset, kanae_daily
+# auto-detects by picking the largest+most-recent history JSONL.
+_raw_haroin_dm = os.environ.get("HAROIN_DM_CHANNEL_ID", "").strip()
+HAROIN_DM_CHANNEL_ID: int | None = int(_raw_haroin_dm) if _raw_haroin_dm.isdigit() else None
+
 # ---------------------------------------------------------------------------
 # Claude
 # ---------------------------------------------------------------------------
 CWD = os.environ.get("BOT_CWD", "/home/ubuntu")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-6")
-CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "16384"))
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
+# Sonnet/Haiku per-turn output cap. 64k matches what claude-cli 2.1.92
+# sends in its own request body (2026-05-14 mitm capture); the previous
+# 16k floor was forcing the model to truncate long agent-loop turns
+# (image reviews, multi-file edits) mid-thought. CLAUDE_MAX_TOKENS_OPUS
+# already sits at 64k in client.py, so this aligns Sonnet with Opus.
+CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "64000"))
 # Per-request turn ceiling for admin (trusted) callers. Was hard-coded to 999
 # which let a single CLI invocation hold ~500MB of node/MCP child processes
-# for the full CLAUDE_TIMEOUT window. 30 is more than enough for "research →
-# tool use → write file → report" workflows; bump via env when truly needed.
-ADMIN_MAX_TURNS = int(os.environ.get("ADMIN_MAX_TURNS", "30"))
+# for the full CLAUDE_TIMEOUT window. 100 covers heavy image-review workflows
+# (10+ slide screenshots, multi-file edits); bump via env when truly needed.
+ADMIN_MAX_TURNS = int(os.environ.get("ADMIN_MAX_TURNS", "100"))
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -90,7 +102,7 @@ _ensure_mode_700(ATTACHMENT_DIR)
 # ---------------------------------------------------------------------------
 MAX_SESSIONS = 100
 MAX_HISTORY = 50
-MAX_MESSAGES_PER_CHANNEL = 20
+MAX_MESSAGES_PER_CHANNEL = 75
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 MAX_RESOLVED_LINKS = 5
 MAX_RESPONSE_IMAGES = 10
@@ -98,13 +110,38 @@ MAX_COOLDOWN_ENTRIES = 1000
 MAX_CHANNEL_SEMAS = int(os.environ.get("MAX_CHANNEL_SEMAS", "500"))
 MAX_IMAGE_ATTACHMENTS = int(os.environ.get("MAX_IMAGE_ATTACHMENTS", "5"))
 ATTACHMENT_DL_CONCURRENCY = int(os.environ.get("ATTACHMENT_DL_CONCURRENCY", "3"))
-THREAD_HISTORY_LIMIT = int(os.environ.get("THREAD_HISTORY_LIMIT", "50"))
+THREAD_HISTORY_LIMIT = int(os.environ.get("THREAD_HISTORY_LIMIT", "100"))
 THREAD_CONTEXT_CACHE_TTL_S = int(os.environ.get("THREAD_CONTEXT_CACHE_TTL_S", "30"))
 THREAD_CONTEXT_CACHE_MAX = int(os.environ.get("THREAD_CONTEXT_CACHE_MAX", "20"))
 CROSS_THREAD_CONTEXT_MESSAGES = int(os.environ.get("CROSS_THREAD_CONTEXT_MESSAGES", "5"))
 MAX_CROSS_THREAD_CONTEXTS = int(os.environ.get("MAX_CROSS_THREAD_CONTEXTS", "3"))
 MAX_CROSS_THREAD_CHARS = int(os.environ.get("MAX_CROSS_THREAD_CHARS", "3000"))
 MEM0_MIN_QUERY_LENGTH = int(os.environ.get("MEM0_MIN_QUERY_LENGTH", "20"))
+
+HISTORY_INJECTION_COUNT = int(os.environ.get("HISTORY_INJECTION_COUNT", "100"))
+HISTORY_INJECTION_CHARS_PER_MSG = int(os.environ.get("HISTORY_INJECTION_CHARS_PER_MSG", "1000"))
+HISTORY_INJECTION_MAX_CHARS = int(os.environ.get("HISTORY_INJECTION_MAX_CHARS", "60000"))
+HISTORY_MAX_AGE_DAYS = int(os.environ.get("HISTORY_MAX_AGE_DAYS", "15"))
+
+# Compact history caps for JSONL replay (token reduction plan, 2026-05-15).
+# The on-disk turn keeps the raw user text and assistant reply (not the
+# fully rendered prompt), so replay no longer re-sends Mem0/emotion/wrapper
+# bloat on every API request.
+COMPACT_HISTORY_USER_CHARS = int(os.environ.get("COMPACT_HISTORY_USER_CHARS", "2000"))
+COMPACT_HISTORY_ASSISTANT_CHARS = int(os.environ.get("COMPACT_HISTORY_ASSISTANT_CHARS", "3000"))
+COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS = int(os.environ.get("COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS", "2000"))
+
+# kanae_state timestamp bucket. Floors `now.minute` to this width so the
+# rendered <kanae_state> block stays byte-identical across short bursts,
+# preserving the upstream prompt cache boundary.
+KANAE_STATE_TIME_BUCKET_MIN = int(os.environ.get("KANAE_STATE_TIME_BUCKET_MIN", "5"))
+
+# Mem0 auto-record throttle. The host writes a turn into Mem0 only when
+# enough time has passed since the last write AND the user message is
+# substantial. Explicit "覚えて" / "remember this" bypasses the throttle.
+MEM0_AUTO_RECORD_ENABLED = os.environ.get("MEM0_AUTO_RECORD_ENABLED", "true").lower() == "true"
+MEM0_AUTO_RECORD_INTERVAL_S = int(os.environ.get("MEM0_AUTO_RECORD_INTERVAL_S", "50"))
+MEM0_AUTO_RECORD_MIN_CHARS = int(os.environ.get("MEM0_AUTO_RECORD_MIN_CHARS", "23"))
 
 # Claude CLI concurrency — 2GB RAM server can safely run ~2 CLIs in parallel
 CLAUDE_MAX_PARALLEL = int(os.environ.get("CLAUDE_MAX_PARALLEL", "2"))
@@ -118,6 +155,11 @@ RESTRICTED_CLAUDE_MAX_PARALLEL = int(os.environ.get("RESTRICTED_CLAUDE_MAX_PARAL
 # cannot burn through the owner's subscription quota.
 RESTRICTED_ANTHROPIC_API_KEY = os.environ.get("BOT_RESTRICTED_ANTHROPIC_API_KEY", "")
 
+# ---------------------------------------------------------------------------
+# Music Analysis (Gemini primary, OpenAI fallback)
+# ---------------------------------------------------------------------------
+GOOGLE_AI_API_KEY = os.environ.get("GOOGLE_AI_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 # Claude Code CLI v2.1.92+ の "ToolSearch / Deferred Tools" 最適化を無効化する。
 # Deferred tool が agent loop の最終アクションになると CLI が result="" で即終了し
 # ResultMessage.result が空になるバグ（2026-05-13 観測）を回避する。
@@ -408,6 +450,36 @@ MEM0_DEDUP_TWO_STAGE = _bool_env("MEM0_DEDUP_TWO_STAGE", True)            # P4: 
 MEM0_DEDUP_SEARCH_LIMIT = int(os.environ.get("MEM0_DEDUP_SEARCH_LIMIT", "5"))
 MEM0_DEDUP_DRY_RUN = _bool_env("MEM0_DEDUP_DRY_RUN", False)               # P4: dry-run (dropせずログのみ)
 MEM0_SMART_SEARCH = _bool_env("MEM0_SMART_SEARCH", True)                   # P3
+
+# Stable namespace for kanae's own Mem0 entries. Both the bot's runtime
+# hook (bot.py) and the daily summary script (scripts/kanae_daily.py)
+# must write to the same user_id, otherwise her self-facts split into
+# two ChromaDB collections that never get merged at recall time. Bot
+# runtime falls back to `str(bot.user.id)` if this env is unset, which
+# matches the historical behavior; the daily script has no bot client
+# so it cannot fall back and will skip the Mem0 push when this is empty.
+KANAE_BOT_USER_ID = os.environ.get("KANAE_BOT_USER_ID", "")
+
+# Kanae self-model (interests/episodes layer; see plans/kanae-self-model.md).
+# Phase 1 — interest tracker only. When False, the entire kanae_self
+# subsystem is bypassed: no signal extraction beyond facts, no state file
+# write, no prompt block injection. Phase 2/3 add their own flags.
+KANAE_SELF_INTEREST_ENABLED = _bool_env("KANAE_SELF_INTEREST_ENABLED", True)
+# Phase 2 — episode ring buffer + interest-driven mem0 query rewrite +
+# Mem0 metadata enrichment (persona/episode_id/interest_tags). Independent
+# from INTEREST_ENABLED so episode recording can be paused without
+# losing the interest layer if the latter is healthy.
+KANAE_SELF_EPISODE_ENABLED = _bool_env("KANAE_SELF_EPISODE_ENABLED", True)
+# Phase 3 — fold <kanae_state>/<kanae_interests>/<kanae_episodes>/
+# <kanae_self_memory> into a single <kanae_self> block. Off → legacy
+# four-block layout. Kept as a flag so a bad render can be reverted
+# instantly without re-deploying.
+KANAE_SELF_UNIFIED_BLOCK = _bool_env("KANAE_SELF_UNIFIED_BLOCK", True)
+
+# Hourly summary DM to haroin (services/emotion/daily_summary_dm.py).
+# Costs ~1500 tokens/hour (~36k/day) of Haiku. Default off — flip to
+# true via env when the budget is comfortable again.
+ENABLE_HOURLY_SUMMARY_DM = _bool_env("ENABLE_HOURLY_SUMMARY_DM", False)
 
 _github_token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
 if _github_token:

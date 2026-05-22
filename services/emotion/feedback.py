@@ -22,6 +22,7 @@ from pathlib import Path
 
 from services.emotion.lock import LOCK_FILENAME, emotion_lock
 from services.emotion.state import load_state, save_state
+from services.emotion.timeseries import append_timeseries
 
 log = logging.getLogger(__name__)
 
@@ -44,22 +45,39 @@ async def schedule_feedback(
     state_dir = Path(state_dir)
 
     from services.emotion.runtime import EMOTION_CTX
+    from services.emotion.skip_counters import inc as _skip_inc
     daemon = EMOTION_CTX.get()
-    if daemon is None or not daemon.is_alive:
-        log.info("emotion feedback: daemon unavailable, skipping turn")
+    if daemon is None:
+        log.info("emotion feedback: daemon not registered, skipping turn")
+        _skip_inc("daemon_not_registered", state_dir)
         return
+
+    # Note: we no longer early-return on `not daemon.is_alive`. The
+    # daemon.query() path has a lazy `_spawn_with_retry()` so handing the
+    # call through respawns a crashed daemon instead of silently dropping
+    # the turn (the previous gate was causing ~30% skip rate post-crash
+    # until the next bot restart).
+    if not daemon.is_alive:
+        log.info("emotion feedback: daemon dead, attempting lazy respawn")
 
     daemon.is_conversation_active = True
     try:
-        await _daemon_transition_and_save(
+        result = await _daemon_transition_and_save(
             daemon=daemon,
             user_text=user_text,
             assistant_text=assistant_text,
             history_tail=history_tail,
             state_dir=state_dir,
         )
+        if result == "lazy_respawn_failed":
+            _skip_inc("lazy_respawn_failed", state_dir)
+        elif result == "lock_timeout":
+            _skip_inc("lock_timeout", state_dir)
+        elif result == "ok":
+            _skip_inc("ok", state_dir)
     except Exception as exc:
         log.warning("emotion feedback failed: %s", exc)
+        _skip_inc("exception", state_dir)
     finally:
         # Always release the flag even on failure so the silence tick
         # doesn't get permanently locked out.
@@ -73,8 +91,14 @@ async def _daemon_transition_and_save(
     assistant_text: str,
     history_tail: str,
     state_dir: Path,
-) -> None:
-    """Daemon-backed LLM transition + atomic state save."""
+) -> str:
+    """Daemon-backed LLM transition + atomic state save.
+
+    Returns a short status code so the caller can update skip counters:
+      - "ok"                  — state updated successfully
+      - "lazy_respawn_failed" — daemon.query() returned None (respawn / parse failed)
+      - "lock_timeout"        — state file lock contended past timeout
+    """
     from services.emotion.llm_transition import llm_transition_via_daemon
 
     state_path = state_dir / STATE_FILENAME
@@ -99,7 +123,13 @@ async def _daemon_transition_and_save(
     )
     if new_state is None:
         log.warning("emotion feedback: daemon returned None, keeping previous state")
-        return
+        return "lazy_respawn_failed"
+
+    # Senpai responded — clear the self-initiated streak so telos can fire
+    # again once thresholds are crossed. Without this reset the counter
+    # only ever grows and the MAX_CONSECUTIVE_SELF_INITIATED guard in
+    # telos.py locks self_initiate forever.
+    new_state.consecutive_self_initiated = 0
 
     try:
         await asyncio.to_thread(
@@ -108,12 +138,20 @@ async def _daemon_transition_and_save(
     except TimeoutError:
         log.warning("emotion feedback: state-file lock contended >%ss, skip save",
                     _LOCK_TIMEOUT_S)
-        return
+        return "lock_timeout"
+
+    try:
+        await asyncio.to_thread(
+            append_timeseries, new_state, state_dir, source="conversation",
+        )
+    except Exception:
+        log.warning("emotion feedback: timeseries append failed", exc_info=True)
 
     log.info(
         "emotion feedback (daemon): v=%.2f lo=%.2f af=%.2f",
         new_state.valence, new_state.loneliness, new_state.affection,
     )
+    return "ok"
 
 
 def _save_under_lock(state, state_path: Path, lock_path: Path) -> None:

@@ -50,6 +50,14 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(os.path.join(_BOT_DIR, ".env"))
 
+# Don't refresh OAuth in this subprocess. The parent (Discord bot) owns
+# the refresh schedule; if both ends refresh independently, the child's
+# refresh invalidates the parent's in-flight access token and causes 401
+# Unauthorized on the next API call. We re-read from disk via
+# ensure_valid_token() to pick up tokens rotated by the parent.
+# MUST be set before any `services.oauth_manager` import.
+os.environ["OAUTH_NO_REFRESH"] = "1"
+
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 from services.mem0_service import (  # noqa: E402

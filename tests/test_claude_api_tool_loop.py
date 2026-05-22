@@ -11,6 +11,8 @@ from services.claude_api.stall import StallWatchdog
 from services.claude_api.tool_loop import (
     AgentLoopResult,
     _block_to_dict,
+    _detect_write_hallucination,
+    _format_tool_invocation_for_display,
     _join_final_text,
     run_agent_loop,
 )
@@ -296,3 +298,146 @@ class TestRunAgentLoop:
         )
         assert result.text == "cut off"
         assert result.synthetic_session_id is None
+
+
+class TestHallucinationDetect:
+    def test_detects_jp_claim_without_write_fire(self, caplog):
+        caplog.set_level("WARNING")
+        _detect_write_hallucination(
+            "ドキュメントを /tmp/spec.md に書きました。確認してください。",
+            fired_tools=set(),
+            channel_id=42,
+            turn=0,
+        )
+        assert any(
+            "hallucination_suspect" in r.message for r in caplog.records
+        )
+
+    def test_detects_en_claim_without_write_fire(self, caplog):
+        caplog.set_level("WARNING")
+        _detect_write_hallucination(
+            "I wrote to docs/foo.md with the plan.",
+            fired_tools={"Read"},
+            channel_id=1,
+            turn=0,
+        )
+        assert any(
+            "hallucination_suspect" in r.message for r in caplog.records
+        )
+
+    def test_silent_when_write_fired(self, caplog):
+        caplog.set_level("WARNING")
+        _detect_write_hallucination(
+            "ドキュメントを /tmp/spec.md に書きました。",
+            fired_tools={"Write"},
+            channel_id=1,
+            turn=0,
+        )
+        assert not any(
+            "hallucination_suspect" in r.message for r in caplog.records
+        )
+
+    def test_silent_when_edit_fired(self, caplog):
+        caplog.set_level("WARNING")
+        _detect_write_hallucination(
+            "/tmp/spec.md に保存しました。",
+            fired_tools={"Edit"},
+            channel_id=1,
+            turn=0,
+        )
+        assert not any(
+            "hallucination_suspect" in r.message for r in caplog.records
+        )
+
+    def test_silent_when_no_path_in_text(self, caplog):
+        # Verb-only matches (no plausible filename) must not fire — too noisy.
+        caplog.set_level("WARNING")
+        _detect_write_hallucination(
+            "対応しました。次は何しますか？",
+            fired_tools=set(),
+            channel_id=1,
+            turn=0,
+        )
+        assert not any(
+            "hallucination_suspect" in r.message for r in caplog.records
+        )
+
+    def test_silent_when_text_empty(self, caplog):
+        caplog.set_level("WARNING")
+        _detect_write_hallucination(
+            "",
+            fired_tools=set(),
+            channel_id=1,
+            turn=0,
+        )
+        assert caplog.records == []
+
+
+class TestTodoWriteDisplay:
+    def test_format_invocation_renders_counts(self):
+        out = _format_tool_invocation_for_display(
+            "TodoWrite",
+            {"todos": [
+                {"content": "a", "status": "in_progress", "activeForm": "A"},
+                {"content": "b", "status": "pending", "activeForm": "B"},
+                {"content": "c", "status": "completed", "activeForm": "C"},
+            ]},
+        )
+        assert out is not None
+        assert "TodoWrite" in out
+        assert "in_progress=1" in out
+        assert "pending=1" in out
+        assert "completed=1" in out
+        assert "[~] a" in out
+        assert "[ ] b" in out
+        assert "[x] c" in out
+
+
+class TestEffortMax:
+    """Pin the effort dial at "max" (top of low<medium<high<xhigh<max).
+
+    The CLI capture shows "high" because that's claude-cli's default, but
+    the dial actually goes higher and the bot opts in deliberately. These
+    tests fail loudly if anyone silently downgrades the bot's request.
+    """
+
+    def test_output_config_constant_is_max(self):
+        from services.claude_api.client import OUTPUT_CONFIG
+        assert OUTPUT_CONFIG == {"effort": "max"}
+
+    def test_effort_beta_still_in_betas(self):
+        # output_config.effort is only honored under the effort-2025-11-24
+        # beta — silently dropping the beta would make "max" a no-op.
+        from services.claude_api.client import MODEL_BETAS
+        assert "effort-2025-11-24" in MODEL_BETAS
+
+    @pytest.mark.asyncio
+    async def test_effort_max_reaches_stream_kwargs(self, watchdog):
+        # Capture the kwargs that run_agent_loop hands to the SDK's stream
+        # factory. The extra_body branch is where output_config rides into
+        # the /v1/messages request body.
+        captured_kwargs: dict = {}
+
+        def stream_factory(**kwargs):
+            captured_kwargs.update(kwargs)
+            return _FakeStream(
+                [],
+                _final_msg([_block("text", text="ok")], "end_turn"),
+            )
+        client = MagicMock()
+        client.beta.messages.stream = stream_factory
+
+        await run_agent_loop(
+            "hi", channel_id=1, history=[],
+            system_prompt="sys", tools_for_api=[],
+            can_use_tool=_allow_all,
+            execute_tool=AsyncMock(),
+            status_callback=_noop_status,
+            max_turns=1,
+            stall_watchdog=watchdog,
+            api_client=client,
+            model="claude-opus-4-7",
+            extra_betas=[],
+        )
+        extra_body = captured_kwargs.get("extra_body") or {}
+        assert extra_body.get("output_config") == {"effort": "max"}

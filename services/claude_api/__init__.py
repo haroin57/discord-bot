@@ -49,6 +49,7 @@ from services.claude_api.mcp_client import (
     kill_orphan_mcp_processes,
     mcp_tools_to_anthropic,
     spawn_servers,
+    static_mcp_tools_to_anthropic,
 )
 from services.claude_api.ratelimit import (
     RateLimitState,
@@ -85,8 +86,8 @@ __all__ = [
     "MODEL_BETAS",
     "RETRY_BACKOFF_BASE",
     "_build_cached_system",
-    "_get_attribution_header",
-    "_get_metadata",
+    "get_attribution_header_value",
+    "get_metadata",
     "_inject_cache_breakpoints",
     "_retry_backoff_base",
     "_session_id",
@@ -123,6 +124,7 @@ __all__ = [
     "kill_orphan_mcp_processes",
     "mcp_tools_to_anthropic",
     "spawn_servers",
+    "static_mcp_tools_to_anthropic",
     # tools (PR5)
     "BUILTIN_TOOLS",
     "ToolContext",
@@ -170,7 +172,11 @@ from services.session import (
 from services.claude_api.client import (
     CC_ENTRYPOINT,
     CC_VERSION,
+    CLI_DEFAULT_SYSTEM_PROMPT,
+    CLI_IDENTITY_TEXT,
     MODEL_BETAS,
+    get_attribution_header_value,
+    get_metadata,
 )
 
 log = logging.getLogger(__name__)
@@ -187,21 +193,9 @@ _cached_token: str | None = None
 from services.claude_api.client import _session_id  # noqa: E402
 
 
-def _get_attribution_header(messages_str: str) -> str:
-    """Build attribution header (free-code: constants/system.ts getAttributionHeader)."""
-    fingerprint = hashlib.sha256(
-        (messages_str + CC_VERSION).encode()
-    ).hexdigest()[:16]
-    return f"x-anthropic-billing-header: cc_version={CC_VERSION}.{fingerprint}; cc_entrypoint={CC_ENTRYPOINT};"
-
-
-def _get_metadata() -> dict:
-    """Build metadata object (free-code: getAPIMetadata)."""
-    return {
-        "user_id": json.dumps({
-            "session_id": _session_id,
-        }),
-    }
+# _get_attribution_header / _get_metadata removed — use client.py versions:
+#   get_attribution_header_value(messages)  → correct fingerprint + cch
+#   get_metadata()                          → includes device_id, account_uuid
 
 
 def get_client() -> anthropic.Anthropic:
@@ -289,14 +283,22 @@ def _retry_backoff_base() -> float:
 RETRY_BACKOFF_BASE = _retry_backoff_base()
 
 
-def _build_cached_system(system_prompt: str) -> list[dict]:
-    """Wrap system prompt with cache_control for Anthropic prompt caching.
+def _build_cached_system(system_prompt: str, messages: list[dict]) -> list[dict]:
+    """Build the 4-block system prompt matching tool_loop.py / CLI structure.
 
-    The server caches the KV state for this prefix (5-min TTL). Consecutive
-    requests with the same system prompt skip re-encoding those tokens,
-    cutting input cost by ~90% on the static portion.
+    system[0] = attribution header (no cache)
+    system[1] = CLI identity text (no cache)
+    system[2] = CLI default agent prompt (cache: ephemeral+global)
+    system[3] = caller-supplied prompt (no cache, changes per session)
     """
-    return [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+    attribution = get_attribution_header_value(messages)
+    return [
+        {"type": "text", "text": attribution},
+        {"type": "text", "text": CLI_IDENTITY_TEXT},
+        {"type": "text", "text": CLI_DEFAULT_SYSTEM_PROMPT,
+         "cache_control": {"type": "ephemeral", "scope": "global"}},
+        {"type": "text", "text": system_prompt},
+    ]
 
 
 def _inject_cache_breakpoints(messages: list[dict]) -> list[dict]:
@@ -336,17 +338,10 @@ def _inject_cache_breakpoints(messages: list[dict]) -> list[dict]:
 def _stream_once(api_client: anthropic.Anthropic, messages: list[dict], system_prompt: str, response_chunks: list[str]) -> None:
     """Single streaming attempt. No retry. Called from to_thread."""
     client_request_id = str(uuid.uuid4())
-    messages_str = json.dumps(messages, ensure_ascii=False)[:2000]
-    # H-8: attribution must NOT be part of the system prompt — the model
-    # should never read billing metadata as instructions. Send it as an
-    # opaque extra_header that only the API billing pipeline interprets.
-    attribution_value = _get_attribution_header(messages_str)
-    # Strip the "x-anthropic-billing-header: " prefix to get just the value,
-    # since the header name is conveyed by the dict key.
-    if ":" in attribution_value:
-        attribution_value = attribution_value.split(":", 1)[1].strip().rstrip(";")
 
-    cached_system = _build_cached_system(system_prompt)
+    # Attribution now lives in system[0] (matching tool_loop.py / real CLI).
+    # The old approach of sending it as an HTTP header was incorrect.
+    cached_system = _build_cached_system(system_prompt, messages)
     cached_messages = _inject_cache_breakpoints(messages)
 
     with api_client.beta.messages.stream(
@@ -355,10 +350,9 @@ def _stream_once(api_client: anthropic.Anthropic, messages: list[dict], system_p
         system=cached_system,
         messages=cached_messages,
         betas=MODEL_BETAS,
-        metadata=_get_metadata(),
+        metadata=get_metadata(),
         extra_headers={
             "x-client-request-id": client_request_id,
-            "x-anthropic-billing-header": attribution_value,
         },
     ) as stream:
         last_event_time = time.monotonic()

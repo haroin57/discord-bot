@@ -986,7 +986,7 @@ class TestCallWithToolsErrorPaths:
         sessions = {1: SessionInfo(session_id="old-session", mcp_server_keys=["context7", "scholarly"])}
         sdk_mod._session_timestamps[1] = time.monotonic()  # make it fresh
 
-        text, info = await sdk_mod.call_with_tools(
+        text, info, _ = await sdk_mod.call_with_tools(
             "hello", 1, sessions, raw_user_text="hello"
         )
         assert text == "recovered"
@@ -1010,7 +1010,7 @@ class TestCallWithToolsErrorPaths:
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
-        text, sid = await sdk_mod.call_with_tools(
+        text, sid, _ = await sdk_mod.call_with_tools(
             "hello", 1, {}, raw_user_text="hello"
         )
         assert "タイムアウト" in text
@@ -1029,7 +1029,7 @@ class TestCallWithToolsErrorPaths:
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
-        text, sid = await sdk_mod.call_with_tools(
+        text, sid, _ = await sdk_mod.call_with_tools(
             "hello", 1, {}, raw_user_text="hello"
         )
         assert "認証" in text
@@ -1048,7 +1048,7 @@ class TestCallWithToolsErrorPaths:
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
-        text, sid = await sdk_mod.call_with_tools(
+        text, sid, _ = await sdk_mod.call_with_tools(
             "hello", 1, {}, raw_user_text="hello"
         )
         assert "長すぎ" in text
@@ -1084,7 +1084,7 @@ class TestCallWithToolsErrorPaths:
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
-        text, info = await sdk_mod.call_with_tools(
+        text, info, _ = await sdk_mod.call_with_tools(
             "hello", 1, {}, raw_user_text="hello"
         )
         assert text == "finally"
@@ -1103,7 +1103,7 @@ class TestCallWithToolsErrorPaths:
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
-        text, sid = await sdk_mod.call_with_tools(
+        text, sid, _ = await sdk_mod.call_with_tools(
             "hello", 1, {}, raw_user_text="hello"
         )
         assert "No response" in text
@@ -1132,7 +1132,7 @@ class TestCallWithToolsErrorPaths:
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
         callback = AsyncMock()
-        text, sid = await sdk_mod.call_with_tools(
+        text, sid, _ = await sdk_mod.call_with_tools(
             "hello", 1, {}, status_callback=callback, raw_user_text="hello"
         )
         assert text == "ok"
@@ -1159,7 +1159,7 @@ class TestCallWithToolsErrorPaths:
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
-        text, sid = await sdk_mod.call_with_tools(
+        text, sid, _ = await sdk_mod.call_with_tools(
             "hello", 1, {}, raw_user_text="hello"
         )
         assert "内部エラー" in text
@@ -1187,7 +1187,7 @@ class TestCallWithToolsErrorPaths:
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
         sessions = {}
-        text, info = await sdk_mod.call_with_tools(
+        text, info, _ = await sdk_mod.call_with_tools(
             "hello", 42, sessions, raw_user_text="hello"
         )
         assert text == "done"
@@ -1221,7 +1221,7 @@ class TestCallWithToolsErrorPaths:
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
         sessions = {77: "old-stale-session"}
-        text, sid = await sdk_mod.call_with_tools(
+        text, sid, _ = await sdk_mod.call_with_tools(
             "hello", 77, sessions, raw_user_text="hello"
         )
         assert text == "ok"
