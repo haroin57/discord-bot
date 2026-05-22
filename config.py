@@ -483,6 +483,13 @@ MEM0_HIDE_ARCHIVED = _bool_env("MEM0_HIDE_ARCHIVED", True)
 # fact extraction path.
 MEM0_RELATION_EXTRACT_ENABLED = _bool_env("MEM0_RELATION_EXTRACT_ENABLED", True)
 
+# Phase C-3 (mem0-recall-hybrid-hyde-kg): episode bundle expansion. When the
+# top-1 search hit carries an episode_id, smart_search appends sibling
+# facts from the same episode so the LLM gets the full topical context.
+# Capped at MEM0_EPISODE_BUNDLE_LIMIT so MAX_PROMPT_CHARS stays sane.
+MEM0_EPISODE_BUNDLE_ENABLED = _bool_env("MEM0_EPISODE_BUNDLE_ENABLED", True)
+MEM0_EPISODE_BUNDLE_LIMIT = int(os.environ.get("MEM0_EPISODE_BUNDLE_LIMIT", "5"))
+
 # Stable namespace for kanae's own Mem0 entries. Both the bot's runtime
 # hook (bot.py) and the daily summary script (scripts/kanae_daily.py)
 # must write to the same user_id, otherwise her self-facts split into

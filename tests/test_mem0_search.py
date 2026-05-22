@@ -579,6 +579,167 @@ class TestSmartSearchHydeIntegration:
         hyde_mock.assert_not_called()
 
 
+class TestEpisodeBundle:
+    """Phase C-3: smart_search expands top-1 hit's episode_id into a
+    bundle of sibling facts."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_pipeline(self, monkeypatch):
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._expand_query_via_graph",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._generate_hypothetical_fact",
+            AsyncMock(return_value=""),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]),
+        )
+
+    @pytest.mark.asyncio
+    async def test_top_with_episode_pulls_siblings(self, monkeypatch):
+        top_hit = {
+            "id": "f1", "memory": "topic A fact",
+            "score": 0.1, "metadata": {"episode_id": "ep-42"},
+        }
+        sibling = {
+            "id": "f2", "memory": "more about A",
+            "score": None, "metadata": {"episode_id": "ep-42"},
+        }
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._search_multi_hybrid",
+            AsyncMock(return_value=[top_hit]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rerank_memories",
+            AsyncMock(return_value=[top_hit]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}.get_episode_facts",
+            AsyncMock(return_value=[sibling]),
+        )
+
+        from services.mem0.search import search_memories_smart
+        result = await search_memories_smart("q", "u", limit=5)
+        ids = [r["id"] for r in result]
+        assert "f1" in ids
+        assert "f2" in ids
+
+    @pytest.mark.asyncio
+    async def test_no_episode_skips_bundle(self, monkeypatch):
+        top_hit = {"id": "f1", "memory": "no episode", "score": 0.1, "metadata": {}}
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._search_multi_hybrid",
+            AsyncMock(return_value=[top_hit]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rerank_memories",
+            AsyncMock(return_value=[top_hit]),
+        )
+        bundle_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr(f"{_PATCH_BASE}.get_episode_facts", bundle_mock)
+
+        from services.mem0.search import search_memories_smart
+        result = await search_memories_smart("q", "u", limit=5)
+        bundle_mock.assert_not_called()
+        assert [r["id"] for r in result] == ["f1"]
+
+    @pytest.mark.asyncio
+    async def test_bundle_caps_at_limit(self, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "MEM0_EPISODE_BUNDLE_LIMIT", 2, raising=False)
+
+        top_hit = {
+            "id": "f1", "memory": "topic", "score": 0.1,
+            "metadata": {"episode_id": "ep-1"},
+        }
+        siblings = [
+            {"id": f"f{i}", "memory": "sib", "metadata": {"episode_id": "ep-1"}}
+            for i in range(2, 10)
+        ]
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._search_multi_hybrid",
+            AsyncMock(return_value=[top_hit]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rerank_memories",
+            AsyncMock(return_value=[top_hit]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}.get_episode_facts",
+            AsyncMock(return_value=siblings),
+        )
+
+        from services.mem0.search import search_memories_smart
+        result = await search_memories_smart("q", "u", limit=5)
+        # top-1 + cap (2) = 3 entries
+        assert len(result) == 3
+
+    @pytest.mark.asyncio
+    async def test_bundle_disabled_via_flag(self, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "MEM0_EPISODE_BUNDLE_ENABLED", False, raising=False)
+
+        top_hit = {
+            "id": "f1", "memory": "topic", "score": 0.1,
+            "metadata": {"episode_id": "ep-1"},
+        }
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._search_multi_hybrid",
+            AsyncMock(return_value=[top_hit]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rerank_memories",
+            AsyncMock(return_value=[top_hit]),
+        )
+        bundle_mock = AsyncMock(return_value=[{"id": "f2"}])
+        monkeypatch.setattr(f"{_PATCH_BASE}.get_episode_facts", bundle_mock)
+
+        from services.mem0.search import search_memories_smart
+        result = await search_memories_smart("q", "u", limit=5)
+        bundle_mock.assert_not_called()
+        assert [r["id"] for r in result] == ["f1"]
+
+
+class TestGetEpisodeFacts:
+    @pytest.mark.asyncio
+    async def test_uses_filters_kwarg_when_supported(self, monkeypatch):
+        mem = MagicMock()
+        mem.get_all.return_value = {
+            "results": [
+                {"id": "f1", "memory": "x", "metadata": {"episode_id": "ep-1"}},
+            ],
+        }
+        monkeypatch.setattr(f"{_PATCH_BASE}._get_mem0", lambda: mem)
+        from services.mem0.search import get_episode_facts
+        out = await get_episode_facts("ep-1", "u")
+        assert [r["id"] for r in out] == ["f1"]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_when_filters_unsupported(self, monkeypatch):
+        mem = MagicMock()
+        # First call (with filters kwarg) raises TypeError → fallback path.
+        first_call = {"counter": 0}
+
+        def _get_all(*args, **kwargs):
+            first_call["counter"] += 1
+            if "filters" in kwargs:
+                raise TypeError("unexpected kwarg 'filters'")
+            return {"results": [
+                {"id": "f1", "memory": "x",
+                 "metadata": {"episode_id": "ep-1"}},
+                {"id": "f2", "memory": "y",
+                 "metadata": {"episode_id": "ep-OTHER"}},
+            ]}
+        mem.get_all = _get_all
+        monkeypatch.setattr(f"{_PATCH_BASE}._get_mem0", lambda: mem)
+        from services.mem0.search import get_episode_facts
+        out = await get_episode_facts("ep-1", "u")
+        # Python-side filter discards ep-OTHER.
+        assert [r["id"] for r in out] == ["f1"]
+
+
 class TestMem0MetricsLog:
     """Phase B-3: smart_search must emit one [MEM0_METRICS ...] line per call."""
 

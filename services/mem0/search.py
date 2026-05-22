@@ -416,6 +416,56 @@ async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> 
         return memories[:top_k]
 
 
+async def get_episode_facts(
+    episode_id: str, user_id: str, limit: int = 30,
+) -> list[dict]:
+    """Phase C-3: fetch every Mem0 fact tagged with a given episode_id.
+
+    Used to expand smart_search's top-1 hit into the full bundle of
+    facts that shared the same session/topic boundary. Returns the
+    list of matching mem.get-shaped dicts (id, memory, score=None,
+    metadata, ...) ordered by Mem0's default — caller is expected to
+    dedupe against the existing top-K.
+
+    Mem0 SDK's ``get_all`` accepts a ``filters`` kwarg on most recent
+    versions, but the underlying ChromaDB where-clause syntax has
+    drifted; we therefore try the filtered call first and fall back
+    to "fetch all, filter in Python" so this stays robust across SDK
+    upgrades. The fallback is acceptable cost-wise: ~1500 facts in
+    storage → a couple hundred microseconds of Python filtering.
+    """
+    if not episode_id or not user_id:
+        return []
+    mem = _get_mem0()
+    if mem is None:
+        return []
+    try:
+        raw = await asyncio.to_thread(
+            mem.get_all,
+            user_id=user_id,
+            filters={"episode_id": episode_id},
+            limit=limit,
+        )
+    except TypeError:
+        # SDK doesn't accept `filters` — fall back to a full pull + filter.
+        try:
+            raw = await asyncio.to_thread(
+                mem.get_all, user_id=user_id, limit=max(limit * 10, 200),
+            )
+        except Exception as exc:
+            log.warning("get_episode_facts fallback get_all failed: %s", exc)
+            return []
+    except Exception as exc:
+        log.warning("get_episode_facts get_all failed: %s", exc)
+        return []
+    rows = raw.get("results", []) if isinstance(raw, dict) else (raw or [])
+    filtered = [
+        r for r in rows
+        if (r.get("metadata") or {}).get("episode_id") == episode_id
+    ]
+    return filtered[:limit]
+
+
 async def _expand_query_via_graph(query: str, user_id: str) -> list[str]:
     """Translate a query into its known surface-form variants via the entity
     graph. Returns ``[]`` when nothing matches exactly.
@@ -515,6 +565,43 @@ async def search_memories_smart(
         # (incident 2026-05-19, ADR-0002). Plain-path callers below get a
         # loose sanity gate instead, since no LLM judge ran there.
         reranked = await _rerank_memories(query, candidates, top_k=limit)
+        # Phase C-3: episode bundle expansion. If the top-1 hit carries an
+        # episode_id, surface a handful of sibling facts from the same
+        # episode so the LLM gets the full topical context instead of one
+        # isolated fact. Cap at MEM0_EPISODE_BUNDLE_LIMIT so we don't
+        # blow MAX_PROMPT_CHARS.
+        bundle_added = 0
+        try:
+            from config import MEM0_EPISODE_BUNDLE_ENABLED, MEM0_EPISODE_BUNDLE_LIMIT
+        except Exception:
+            MEM0_EPISODE_BUNDLE_ENABLED, MEM0_EPISODE_BUNDLE_LIMIT = True, 5
+        if MEM0_EPISODE_BUNDLE_ENABLED and reranked:
+            try:
+                top_md = reranked[0].get("metadata") or {}
+                top_episode = top_md.get("episode_id")
+                if top_episode:
+                    bundle = await get_episode_facts(top_episode, user_id, limit=15)
+                    seen = {r.get("id") for r in reranked if r.get("id")}
+                    extras = [
+                        r for r in bundle
+                        if r.get("id") and r.get("id") not in seen
+                    ]
+                    if extras:
+                        # Tag them so downstream prompt builders can render
+                        # the bundle hint differently if desired.
+                        for e in extras:
+                            e["_episode_bundle"] = True
+                            if e.get("score") is None:
+                                e["score"] = 0.85
+                        keep = extras[: max(int(MEM0_EPISODE_BUNDLE_LIMIT), 0)]
+                        bundle_added = len(keep)
+                        reranked.extend(keep)
+                        log.info(
+                            "episode_bundle: +%d facts from %s",
+                            bundle_added, top_episode,
+                        )
+            except Exception as exc:
+                log.warning("episode_bundle expansion failed (non-fatal): %s", exc)
         # Phase B-3: one-line metric so a week of journalctl can be reduced
         # to hit-rate stats with grep. Keys are positional so the regex
         # downstream stays simple.
@@ -524,9 +611,9 @@ async def search_memories_smart(
         except Exception:
             _hyb = _hyde = False
         log.info(
-            "[MEM0_METRICS query_len=%d candidates=%d kept=%d "
+            "[MEM0_METRICS query_len=%d candidates=%d kept=%d bundle=%d "
             "hybrid=%s hyde=%s rerank=on]",
-            len(query or ""), len(candidates), len(reranked),
+            len(query or ""), len(candidates), len(reranked), bundle_added,
             bool(_hyb), bool(_hyde),
         )
         return reranked
