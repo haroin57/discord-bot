@@ -579,6 +579,60 @@ class TestSmartSearchHydeIntegration:
         hyde_mock.assert_not_called()
 
 
+class TestMem0MetricsLog:
+    """Phase B-3: smart_search must emit one [MEM0_METRICS ...] line per call."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_alias_and_hyde(self, monkeypatch):
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._expand_query_via_graph",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._generate_hypothetical_fact",
+            AsyncMock(return_value=""),
+        )
+
+    @pytest.mark.asyncio
+    async def test_metric_emitted_on_rerank_path(self, monkeypatch, caplog):
+        import logging as _logging
+        caplog.set_level(_logging.INFO, logger="services.mem0.search")
+
+        mems = [_make_memory(str(i), 0.3) for i in range(5)]
+        monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._search_multi_hybrid",
+            AsyncMock(return_value=mems),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rerank_memories",
+            AsyncMock(return_value=mems[:3]),
+        )
+        from services.mem0.search import search_memories_smart
+        await search_memories_smart("query string", "u", limit=3)
+        joined = "\n".join(r.message for r in caplog.records)
+        assert "MEM0_METRICS" in joined
+        assert "kept=3" in joined
+        assert "rerank=on" in joined
+
+    @pytest.mark.asyncio
+    async def test_metric_emitted_on_plain_path(self, monkeypatch, caplog):
+        import logging as _logging
+        caplog.set_level(_logging.INFO, logger="services.mem0.search")
+
+        mems = [_make_memory(str(i), 0.3) for i in range(5)]
+        monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._search_multi_hybrid",
+            AsyncMock(return_value=mems),
+        )
+        from services.mem0.search import search_memories_smart
+        await search_memories_smart("query string", "u", limit=3, rerank=False)
+        joined = "\n".join(r.message for r in caplog.records)
+        assert "MEM0_METRICS" in joined
+        assert "rerank=off" in joined
+
+
 class TestPostRerankGateRedesign:
     """ADR-0002: post-rerank cosine gate is removed; LLM rerank is final.
 

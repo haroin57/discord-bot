@@ -335,6 +335,15 @@ async def add_memories(
                 len(facts), len(kept), skip_low, skip_other, skip_dup,
                 archived, str(user_id)[-4:],
             )
+            # Phase B-3: structured one-line metric for grep-based weekly
+            # health reports. Each key is positional so the parser stays
+            # cheap.
+            log.info(
+                "[MEM0_INGEST_METRICS extracted=%d candidates=%d kept=%d "
+                "drop_low=%d drop_other=%d drop_dup=%d archived=%d]",
+                len(facts), len(candidates), len(kept),
+                skip_low, skip_other, skip_dup, archived,
+            )
             return {"results": results, "kept": len(kept), "skipped": {
                 "low_importance": skip_low, "other_speaker": skip_other, "near_dup": skip_dup,
             }}

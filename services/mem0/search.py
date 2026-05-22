@@ -514,14 +514,35 @@ async def search_memories_smart(
         # at 0.65 silently killed every Japanese conversational query
         # (incident 2026-05-19, ADR-0002). Plain-path callers below get a
         # loose sanity gate instead, since no LLM judge ran there.
-        return await _rerank_memories(query, candidates, top_k=limit)
+        reranked = await _rerank_memories(query, candidates, top_k=limit)
+        # Phase B-3: one-line metric so a week of journalctl can be reduced
+        # to hit-rate stats with grep. Keys are positional so the regex
+        # downstream stays simple.
+        try:
+            from config import MEM0_HYBRID_ENABLED as _hyb
+            from config import MEM0_HYDE_ENABLED as _hyde
+        except Exception:
+            _hyb = _hyde = False
+        log.info(
+            "[MEM0_METRICS query_len=%d candidates=%d kept=%d "
+            "hybrid=%s hyde=%s rerank=on]",
+            len(query or ""), len(candidates), len(reranked),
+            bool(_hyb), bool(_hyde),
+        )
+        return reranked
 
     from services.mem0.client import MEM0_RELEVANCE_MAX_DISTANCE
-    return [
+    filtered = [
         r for r in candidates[:limit]
         if r.get("score") is None
         or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
     ]
+    log.info(
+        "[MEM0_METRICS query_len=%d candidates=%d kept=%d "
+        "hybrid=plain hyde=off rerank=off]",
+        len(query or ""), len(candidates), len(filtered),
+    )
+    return filtered
 
 
 async def _graph_expand_candidates(
