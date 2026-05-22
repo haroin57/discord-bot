@@ -111,14 +111,21 @@ async def check_near_dup(
     near_results: list[dict],
     *,
     dry_run: bool = False,
-) -> tuple[bool, str, str | None]:
-    """Two-stage dedup check against search results.
+    detect_conflict: bool = False,
+) -> tuple[bool, str, str | None, str | None]:
+    """Two-stage dedup check against search results, optionally classifying
+    a gray-zone-but-different candidate as an update / correction / addition.
 
-    Returns ``(is_dup, reason, existing_id)``.
+    Returns ``(is_dup, reason, existing_id, conflict_type)``.
     - is_dup=True  → candidate should be dropped; ``existing_id`` is the
       memory id of the existing fact it matched against (caller may use
-      this to reinforce the existing fact's mention_count).
-    - is_dup=False → candidate should be kept; ``existing_id`` is None.
+      this to reinforce the existing fact's mention_count). conflict_type
+      is None on the dup path.
+    - is_dup=False → candidate should be kept; ``conflict_type`` may be
+      "update" / "correction" when ``detect_conflict=True`` and the
+      candidate looks like a state change / fix of the existing fact.
+      The caller (ingest) reads conflict_type to soft-archive the
+      outdated row by setting its metadata ``valid_to=now``.
 
     When ``dry_run=True`` the function still computes the full decision
     (including the LLM judge call so we measure its agreement rate) but
@@ -150,8 +157,8 @@ async def check_near_dup(
                 candidate_text[:100], existing_text[:100], score,
             )
             if dry_run:
-                return (False, f"dry_run_would_hard_drop(distance={score:.3f})", existing_id)
-            return (True, f"hard_drop(distance={score:.3f})", existing_id)
+                return (False, f"dry_run_would_hard_drop(distance={score:.3f})", existing_id, None)
+            return (True, f"hard_drop(distance={score:.3f})", existing_id, None)
 
         if score <= DEDUP_GRAY_HIGH_DISTANCE:
             is_same = await llm_judge_same_fact(existing_text, candidate_text)
@@ -166,7 +173,25 @@ async def check_near_dup(
             )
             if is_same:
                 if dry_run:
-                    return (False, f"dry_run_would_llm_drop(distance={score:.3f})", existing_id)
-                return (True, f"llm_judged_same(distance={score:.3f})", existing_id)
+                    return (False, f"dry_run_would_llm_drop(distance={score:.3f})", existing_id, None)
+                return (True, f"llm_judged_same(distance={score:.3f})", existing_id, None)
+            # Phase B-2: gray-zone different → check whether this is an
+            # update / correction over the existing fact. Only fires when
+            # detect_conflict is opt-in (ingest reads
+            # MEM0_CONFLICT_DETECTION_ENABLED). We do not loop again on
+            # subsequent results — the first gray-zone hit is the closest
+            # cosine match and the most likely contradiction target.
+            if detect_conflict:
+                from services.mem0.conflict import classify_conflict
+                cls = await classify_conflict(existing_text, candidate_text)
+                ctype = cls.get("conflict_type", "addition")
+                if ctype in ("update", "correction"):
+                    log.info(
+                        "[CONFLICT_GRAY conflict_type=%s reason=%r existing_id=%s "
+                        "distance=%.3f]",
+                        ctype, cls.get("reason", ""), existing_id, score,
+                    )
+                    return (False, f"conflict_{ctype}(distance={score:.3f})",
+                            existing_id, ctype)
 
-    return (False, "novel", None)
+    return (False, "novel", None, None)

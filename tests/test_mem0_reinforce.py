@@ -192,7 +192,7 @@ class TestDedupSignatureChange:
         from services.mem0 import dedup
         # score is *distance* (small = similar). Hard drop when distance is
         # small enough that the texts are effectively identical.
-        is_dup, reason, existing_id = await dedup.check_near_dup(
+        is_dup, reason, existing_id, _conflict = await dedup.check_near_dup(
             "candidate text",
             "tech",
             [{"id": "existing-1", "memory": "duplicate", "score": 0.05,
@@ -206,7 +206,7 @@ class TestDedupSignatureChange:
     async def test_novel_returns_none(self):
         from services.mem0 import dedup
         # Large distance = unrelated = keep
-        is_dup, reason, existing_id = await dedup.check_near_dup(
+        is_dup, reason, existing_id, _conflict = await dedup.check_near_dup(
             "candidate text",
             "tech",
             [{"id": "x", "memory": "different", "score": 1.20}],
@@ -220,7 +220,7 @@ class TestDedupSignatureChange:
         from services.mem0 import dedup
         # Even at tiny distance (very similar text), cross-category mismatch
         # must be skipped by the category guard.
-        is_dup, reason, existing_id = await dedup.check_near_dup(
+        is_dup, reason, existing_id, _conflict = await dedup.check_near_dup(
             "candidate text",
             "tech",
             [{"id": "x", "memory": "near-identical but different category",

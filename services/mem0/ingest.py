@@ -62,6 +62,7 @@ async def add_memories(
         MEM0_GATE_ENABLED, MEM0_GATE_MIN_IMPORTANCE,
         MEM0_CLIENT_DEDUP_ENABLED, MEM0_CLIENT_DEDUP_THRESHOLD,
         MEM0_DEDUP_TWO_STAGE, MEM0_DEDUP_SEARCH_LIMIT, MEM0_DEDUP_DRY_RUN,
+        MEM0_CONFLICT_DETECTION_ENABLED,
     )
 
     try:
@@ -170,23 +171,35 @@ async def add_memories(
                     # Run 2-stage checks in parallel
                     async def _check_one(f, near):
                         if isinstance(near, Exception):
-                            return (f, False, None)
-                        is_dup, reason, existing_id = await check_near_dup(
+                            return (f, False, None, None)
+                        is_dup, reason, existing_id, conflict_type = await check_near_dup(
                             f["text"], f.get("category"), near,
                             dry_run=MEM0_DEDUP_DRY_RUN,
+                            detect_conflict=MEM0_CONFLICT_DETECTION_ENABLED,
                         )
-                        return (f, is_dup, existing_id)
+                        return (f, is_dup, existing_id, conflict_type)
                     check_results = await asyncio.gather(
                         *(_check_one(f, near) for f, near in zip(candidates, dedup_results)),
                     )
                     reinforced_ids: list[str] = []
-                    for f, is_dup, existing_id in check_results:
+                    # Phase B-2: facts that look like a state-change or
+                    # correction get their predecessor soft-archived
+                    # *after* the new row is inserted, so we record the
+                    # (existing_id, conflict_type) pair here.
+                    conflict_archive: list[tuple[str, str]] = []
+                    for f, is_dup, existing_id, conflict_type in check_results:
                         if is_dup and not MEM0_DEDUP_DRY_RUN:
                             skip_dup += 1
                             if existing_id:
                                 reinforced_ids.append(existing_id)
                         else:
                             kept.append(f)
+                            if (
+                                conflict_type in ("update", "correction")
+                                and existing_id
+                                and not MEM0_DEDUP_DRY_RUN
+                            ):
+                                conflict_archive.append((existing_id, conflict_type))
                     # Hebbian reinforcement: bump mention_count on each
                     # existing fact that absorbed a duplicate candidate.
                     # Fire-and-await in parallel; failures are non-fatal.
@@ -309,9 +322,18 @@ async def add_memories(
             insert_results = await asyncio.gather(*(_insert_one(f) for f in kept)) if kept else []
             results = [r for r in insert_results if r is not None]
 
+            # Phase B-2: soft-archive outdated predecessors after the new
+            # fact is in storage. Errors are non-fatal — the new fact is
+            # already stored, the old one just won't be hidden.
+            archived = 0
+            if 'conflict_archive' in locals() and conflict_archive:
+                archived = await _archive_outdated_facts(mem, conflict_archive)
+
             log.info(
-                "Mem0 gate: facts=%d kept=%d skip(low=%d,other=%d,dup=%d) user=...%s",
-                len(facts), len(kept), skip_low, skip_other, skip_dup, str(user_id)[-4:],
+                "Mem0 gate: facts=%d kept=%d skip(low=%d,other=%d,dup=%d) "
+                "archived=%d user=...%s",
+                len(facts), len(kept), skip_low, skip_other, skip_dup,
+                archived, str(user_id)[-4:],
             )
             return {"results": results, "kept": len(kept), "skipped": {
                 "low_importance": skip_low, "other_speaker": skip_other, "near_dup": skip_dup,
@@ -355,3 +377,47 @@ async def add_memories(
     except Exception as exc:
         log.warning("Mem0 add error: %s", exc)
         return None
+
+
+async def _archive_outdated_facts(mem, archive: list[tuple[str, str]]) -> int:
+    """Soft-archive existing facts that were superseded by a new fact.
+
+    Writes ``valid_to=<now>`` and ``conflict_archived_as=<update|correction>``
+    to the existing fact's metadata. Retrieval honours valid_to to hide the
+    row from candidates (see services/mem0/search.py). The fact is never
+    physically deleted, so flipping ``MEM0_HIDE_ARCHIVED=false`` brings
+    them back without any data restore.
+
+    Returns the count of successfully archived facts. Failures are
+    logged at WARNING and skipped — the new fact stays in storage either
+    way; archival is best-effort because we already have the new truth.
+    """
+    if not archive:
+        return 0
+    import time as _time
+    now = int(_time.time())
+    success = 0
+    for existing_id, ctype in archive:
+        try:
+            existing = await asyncio.to_thread(mem.get, existing_id)
+            if not isinstance(existing, dict):
+                continue
+            text = existing.get("memory") or existing.get("text") or ""
+            if not text:
+                continue
+            partial = {"valid_to": now, "conflict_archived_as": ctype}
+            await asyncio.to_thread(
+                mem.update, memory_id=existing_id,
+                data=text, metadata=partial,
+            )
+            log.info(
+                "[CONFLICT_ARCHIVE existing_id=%s conflict_type=%s valid_to=%d]",
+                existing_id, ctype, now,
+            )
+            success += 1
+        except Exception as exc:
+            log.warning(
+                "conflict archive (%s, %s) failed (non-fatal): %s",
+                existing_id, ctype, exc,
+            )
+    return success

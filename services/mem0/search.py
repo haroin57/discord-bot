@@ -33,6 +33,27 @@ def should_use_memory_llm_mode(query: str, *, enabled: bool = True) -> bool:
     return bool(_MEMORY_LLM_INTENT_RE.search(query or ""))
 
 
+def _is_fact_valid(r: dict) -> bool:
+    """Phase B-2: hide facts that the conflict-detection layer
+    soft-archived (valid_to <= now). The flag MEM0_HIDE_ARCHIVED is the
+    one-shot rollback knob — flip false to re-surface every archived row.
+    """
+    try:
+        from config import MEM0_HIDE_ARCHIVED
+    except Exception:
+        MEM0_HIDE_ARCHIVED = True
+    if not MEM0_HIDE_ARCHIVED:
+        return True
+    md = r.get("metadata") or {}
+    vt = md.get("valid_to")
+    if not vt:
+        return True
+    try:
+        return int(vt) > int(time.time())
+    except (TypeError, ValueError):
+        return True
+
+
 async def search_memories(query: str, user_id: str, limit: int = 8) -> list[dict]:
     """Semantic search for relevant memories with relevance filtering."""
     mem = _get_mem0()
@@ -51,7 +72,8 @@ async def search_memories(query: str, user_id: str, limit: int = 8) -> list[dict
         )
         filtered = [
             r for r in results
-            if r.get("score") is None or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
+            if (r.get("score") is None or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE)
+            and _is_fact_valid(r)
         ]
         return filtered
     except Exception as exc:

@@ -467,6 +467,15 @@ MEM0_BM25_LIMIT = int(os.environ.get("MEM0_BM25_LIMIT", "20"))
 # conversational queries.
 MEM0_HYDE_ENABLED = _bool_env("MEM0_HYDE_ENABLED", True)
 
+# Phase B-2 (mem0-recall-hybrid-hyde-kg): Contradiction detection. When the
+# 2-stage dedup finds a gray-zone candidate that the LLM judge says is NOT
+# the same fact, classify whether it's an update/correction/addition. update
+# and correction cause the older row to be soft-archived (valid_to=now);
+# retrieval hides archived rows when MEM0_HIDE_ARCHIVED=true. Both flags can
+# be flipped off without code revert.
+MEM0_CONFLICT_DETECTION_ENABLED = _bool_env("MEM0_CONFLICT_DETECTION_ENABLED", True)
+MEM0_HIDE_ARCHIVED = _bool_env("MEM0_HIDE_ARCHIVED", True)
+
 # Stable namespace for kanae's own Mem0 entries. Both the bot's runtime
 # hook (bot.py) and the daily summary script (scripts/kanae_daily.py)
 # must write to the same user_id, otherwise her self-facts split into
