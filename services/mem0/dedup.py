@@ -85,6 +85,26 @@ async def llm_judge_same_fact(existing_text: str, candidate_text: str) -> bool:
         return False
 
 
+def _log_dedup_decision(
+    *, decision: str, cand: str, existing: str,
+    distance: float, dry_run: bool,
+    llm_same: bool | None = None,
+) -> None:
+    """One-line structured log so it can be grep'd later for calibration.
+
+    Phase A-3 (mem0-recall-hybrid-hyde-kg): used by `journalctl | grep
+    DEDUP_DECISION` to spot under/over-dropping over a 1-week window
+    before deciding whether to retune DEDUP_HARD_DROP_DISTANCE /
+    DEDUP_GRAY_HIGH_DISTANCE.
+    """
+    log.info(
+        "[DEDUP_DECISION decision=%s dry_run=%s distance=%.3f llm_same=%s "
+        "cand=%r existing=%r]",
+        decision, dry_run, distance, llm_same,
+        cand[:80], existing[:80],
+    )
+
+
 async def check_near_dup(
     candidate_text: str,
     candidate_category: str | None,
@@ -99,6 +119,13 @@ async def check_near_dup(
       memory id of the existing fact it matched against (caller may use
       this to reinforce the existing fact's mention_count).
     - is_dup=False → candidate should be kept; ``existing_id`` is None.
+
+    When ``dry_run=True`` the function still computes the full decision
+    (including the LLM judge call so we measure its agreement rate) but
+    always returns ``is_dup=False`` so nothing is actually dropped. The
+    reason string is prefixed with ``dry_run_would_`` so logs can be
+    grepped to identify drops that would have happened. ingest.py also
+    has its own dry-run guard for defense-in-depth.
     """
     for r in near_results:
         score = r.get("score") or 0
@@ -114,21 +141,32 @@ async def check_near_dup(
         # means the first iteration already has the smallest distance, but
         # we keep iterating just in case mem0 ever changes ordering.
         if score <= DEDUP_HARD_DROP_DISTANCE:
-            reason = f"hard_drop(distance={score:.3f})"
+            _log_dedup_decision(
+                decision="hard_drop", cand=candidate_text,
+                existing=existing_text, distance=score, dry_run=dry_run,
+            )
             log.info(
                 "dedup HARD_DROP: cand='%s' | existing='%s' | distance=%.3f",
                 candidate_text[:100], existing_text[:100], score,
             )
-            return (True, reason, existing_id)
+            if dry_run:
+                return (False, f"dry_run_would_hard_drop(distance={score:.3f})", existing_id)
+            return (True, f"hard_drop(distance={score:.3f})", existing_id)
 
         if score <= DEDUP_GRAY_HIGH_DISTANCE:
             is_same = await llm_judge_same_fact(existing_text, candidate_text)
+            _log_dedup_decision(
+                decision="gray_judged" if is_same else "gray_kept",
+                cand=candidate_text, existing=existing_text,
+                distance=score, dry_run=dry_run, llm_same=is_same,
+            )
             log.info(
                 "dedup GRAY: cand='%s' | existing='%s' | distance=%.3f | llm_same=%s",
                 candidate_text[:100], existing_text[:100], score, is_same,
             )
             if is_same:
-                reason = f"llm_judged_same(distance={score:.3f})"
-                return (True, reason, existing_id)
+                if dry_run:
+                    return (False, f"dry_run_would_llm_drop(distance={score:.3f})", existing_id)
+                return (True, f"llm_judged_same(distance={score:.3f})", existing_id)
 
     return (False, "novel", None)

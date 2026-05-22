@@ -142,6 +142,57 @@ class TestCheckNearDup:
         assert is_dup is True
         assert reason.startswith("hard_drop")
 
+    # ----- Phase A-3: dry_run logging -----
+
+    @pytest.mark.asyncio
+    async def test_dry_run_does_not_drop_on_hard_drop(self, mock_llm_judge_false):
+        """dry_run=True → hard_drop distance returns is_dup=False with prefix."""
+        result = _make_result(score=0.05, mid="existing-id")
+        is_dup, reason, existing_id = await dedup_mod.check_near_dup(
+            "candidate text", None, [result], dry_run=True,
+        )
+        assert is_dup is False
+        assert reason.startswith("dry_run_would_hard_drop")
+        # existing_id still returned for downstream reinforcement metrics
+        assert existing_id == "existing-id"
+
+    @pytest.mark.asyncio
+    async def test_dry_run_does_not_drop_on_gray_llm_same(self, mock_llm_judge_true):
+        """dry_run=True → gray-zone LLM "same" verdict returns is_dup=False."""
+        result = _make_result(score=0.25, mid="existing-id")
+        is_dup, reason, existing_id = await dedup_mod.check_near_dup(
+            "candidate text", None, [result], dry_run=True,
+        )
+        assert is_dup is False
+        assert reason.startswith("dry_run_would_llm_drop")
+        assert existing_id == "existing-id"
+
+    @pytest.mark.asyncio
+    async def test_dry_run_emits_structured_decision_log(
+        self, mock_llm_judge_false, caplog,
+    ):
+        """[DEDUP_DECISION decision=hard_drop dry_run=True ...] line emitted."""
+        import logging as _logging
+        caplog.set_level(_logging.INFO, logger="services.mem0.dedup")
+        result = _make_result(score=0.05, mid="existing-id")
+        await dedup_mod.check_near_dup(
+            "cand text", None, [result], dry_run=True,
+        )
+        joined = "\n".join(r.message for r in caplog.records)
+        assert "DEDUP_DECISION" in joined
+        assert "decision=hard_drop" in joined
+        assert "dry_run=True" in joined
+
+    @pytest.mark.asyncio
+    async def test_non_dry_run_still_drops(self, mock_llm_judge_false):
+        """dry_run=False (default) preserves the legacy hard_drop semantics."""
+        result = _make_result(score=0.05, mid="existing-id")
+        is_dup, reason, existing_id = await dedup_mod.check_near_dup(
+            "candidate text", None, [result], dry_run=False,
+        )
+        assert is_dup is True
+        assert reason.startswith("hard_drop")
+
 
 # ---------------------------------------------------------------------------
 # llm_judge_same_fact error-path tests
