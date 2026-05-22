@@ -4,7 +4,11 @@ import asyncio
 import logging
 
 from services.mem0.client import _get_mem0, _refresh_mem0_client_token
-from services.mem0.extract import extract_facts_for_kanae, extract_facts_for_self
+from services.mem0.extract import (
+    extract_facts_for_kanae,
+    extract_facts_for_self,
+    extract_full_signals,
+)
 from services.mem0.search import search_memories
 from services.oauth_manager import ensure_valid_token
 
@@ -63,6 +67,7 @@ async def add_memories(
         MEM0_CLIENT_DEDUP_ENABLED, MEM0_CLIENT_DEDUP_THRESHOLD,
         MEM0_DEDUP_TWO_STAGE, MEM0_DEDUP_SEARCH_LIMIT, MEM0_DEDUP_DRY_RUN,
         MEM0_CONFLICT_DETECTION_ENABLED,
+        MEM0_RELATION_EXTRACT_ENABLED,
     )
 
     try:
@@ -101,6 +106,9 @@ async def add_memories(
                 # Haiku call. We trust the shape because the extractor and
                 # the caller share a module-internal contract.
                 facts = pre_extracted_facts
+                # Pre-extracted path doesn't carry relations (older callers
+                # predate Phase C-2). Treat as empty.
+                relations_payload = []
             elif subject == "kanae":
                 # senpai_text=context, kanae_text=subject of extraction
                 facts = await extract_facts_for_kanae(
@@ -109,11 +117,20 @@ async def add_memories(
                     context_hint=context_hint,
                     user_id=str(user_id) if user_id else None,
                 )
+                # kanae path does not extract entity relations (Phase C-2
+                # is scoped to senpai facts for now).
+                relations_payload: list[dict] = []
             else:
-                facts = await extract_facts_for_self(
+                # Phase C-2: a single Haiku call extracts facts AND entity-entity
+                # relations. The facts list is the same shape extract_facts_for_self
+                # used to return; relations are handed off to the graph layer in
+                # _insert_one below.
+                _signals = await extract_full_signals(
                     user_text, assistant_text, context_hint,
                     user_id=str(user_id) if user_id else None,
                 )
+                facts = _signals.get("facts", [])
+                relations_payload = _signals.get("relations") or []
             # Diagnostic: show every extracted fact text. Helps trace why a
             # turn produced unexpected dedup hits (candidate vs existing).
             if facts:
@@ -328,6 +345,51 @@ async def add_memories(
             archived = 0
             if 'conflict_archive' in locals() and conflict_archive:
                 archived = await _archive_outdated_facts(mem, conflict_archive)
+
+            # Phase C-2: ingest entity-entity relations into the graph
+            # layer. Resolves src/dst canonical names via graph.find_entity
+            # (which knows about aliases & appellations) — only inserts a
+            # relation when both endpoints already exist as entities. We
+            # don't auto-create endpoints from relations to avoid letting
+            # a hallucinated edge spawn ghost entities.
+            relations_added = 0
+            relations_to_add = (
+                relations_payload if 'relations_payload' in locals() else []
+            )
+            if (
+                MEM0_RELATION_EXTRACT_ENABLED
+                and relations_to_add
+                and subject != "kanae"
+            ):
+                try:
+                    from services.mem0 import graph
+                    for rel in relations_to_add:
+                        src_name = rel.get("src")
+                        rel_type = rel.get("rel_type")
+                        dst_name = rel.get("dst")
+                        if not (src_name and rel_type and dst_name):
+                            continue
+                        src_ent = await asyncio.to_thread(
+                            graph.find_entity, src_name, str(user_id), fuzzy=False,
+                        )
+                        dst_ent = await asyncio.to_thread(
+                            graph.find_entity, dst_name, str(user_id), fuzzy=False,
+                        )
+                        if not (src_ent and dst_ent):
+                            continue
+                        rid = await asyncio.to_thread(
+                            graph.add_relation,
+                            src_ent.id, rel_type, dst_ent.id, str(user_id),
+                        )
+                        if rid:
+                            relations_added += 1
+                    if relations_added:
+                        log.info(
+                            "[REL_ADDED count=%d user=...%s]",
+                            relations_added, str(user_id)[-4:],
+                        )
+                except Exception as exc:
+                    log.warning("relation ingest failed (non-fatal): %s", exc)
 
             log.info(
                 "Mem0 gate: facts=%d kept=%d skip(low=%d,other=%d,dup=%d) "

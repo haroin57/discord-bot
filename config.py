@@ -476,6 +476,13 @@ MEM0_HYDE_ENABLED = _bool_env("MEM0_HYDE_ENABLED", True)
 MEM0_CONFLICT_DETECTION_ENABLED = _bool_env("MEM0_CONFLICT_DETECTION_ENABLED", True)
 MEM0_HIDE_ARCHIVED = _bool_env("MEM0_HIDE_ARCHIVED", True)
 
+# Phase C-2 (mem0-recall-hybrid-hyde-kg): entity-entity relation extraction.
+# Sonnet's extract step now emits a relations[] list alongside facts[];
+# ingest persists those relations into the sqlite graph layer. Flip to
+# False to silence the new relations[] processing without disturbing the
+# fact extraction path.
+MEM0_RELATION_EXTRACT_ENABLED = _bool_env("MEM0_RELATION_EXTRACT_ENABLED", True)
+
 # Stable namespace for kanae's own Mem0 entries. Both the bot's runtime
 # hook (bot.py) and the daily summary script (scripts/kanae_daily.py)
 # must write to the same user_id, otherwise her self-facts split into
