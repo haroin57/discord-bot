@@ -342,6 +342,15 @@ class TestSearchMemoriesSmart:
             AsyncMock(return_value=""),
         )
 
+    @pytest.fixture(autouse=True)
+    def _stub_llm_keywords(self, monkeypatch):
+        """LLM keyword extraction also talks to Anthropic; stub to '' by
+        default so smart-pipeline tests stay deterministic."""
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._extract_keywords_via_llm",
+            AsyncMock(return_value=""),
+        )
+
     @pytest.mark.asyncio
     async def test_full_pipeline(self, monkeypatch):
         variants = ["kw1", "kw2"]
@@ -542,6 +551,13 @@ class TestSmartSearchHydeIntegration:
             AsyncMock(return_value=[]),
         )
 
+    @pytest.fixture(autouse=True)
+    def _stub_llm_keywords(self, monkeypatch):
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._extract_keywords_via_llm",
+            AsyncMock(return_value=""),
+        )
+
     @pytest.mark.asyncio
     async def test_hyde_string_passed_to_multi_search(self, monkeypatch):
         monkeypatch.setattr(
@@ -577,6 +593,74 @@ class TestSmartSearchHydeIntegration:
         await search_memories_smart("先輩はいぶきが好き?", "u", rewrite=False)
         rewrite_mock.assert_not_called()
         hyde_mock.assert_not_called()
+
+
+class TestLlmKeywordExtraction:
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_short_query(self):
+        from services.mem0.search import _extract_keywords_via_llm
+        assert await _extract_keywords_via_llm("") == ""
+        assert await _extract_keywords_via_llm("short") == ""
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_client_none(self, monkeypatch):
+        async def _no_client():
+            return None
+        monkeypatch.setattr(
+            "services.mem0.client.get_anthropic_client", _no_client,
+        )
+        from services.mem0.search import _extract_keywords_via_llm
+        assert await _extract_keywords_via_llm("先輩は砺波いぶきが好きですか？") == ""
+
+    @pytest.mark.asyncio
+    async def test_extracts_keywords_and_aliases(self, monkeypatch):
+        fake_client = AsyncMock()
+        fake_client.messages.create = AsyncMock(
+            return_value=_make_anthropic_resp(
+                '{"keywords":["先輩","砺波いぶき","髪色"],'
+                '"aliases":["haroin"]}'
+            ),
+        )
+        monkeypatch.setattr(
+            "services.mem0.client.get_anthropic_client",
+            AsyncMock(return_value=fake_client),
+        )
+        from services.mem0.search import _extract_keywords_via_llm
+        result = await _extract_keywords_via_llm("先輩はいぶきの髪色覚えてる？")
+        parts = result.split()
+        assert "砺波いぶき" in parts
+        assert "haroin" in parts
+
+    @pytest.mark.asyncio
+    async def test_dedupes_keyword_and_alias_overlap(self, monkeypatch):
+        fake_client = AsyncMock()
+        fake_client.messages.create = AsyncMock(
+            return_value=_make_anthropic_resp(
+                '{"keywords":["砺波いぶき"],"aliases":["砺波いぶき","いぶき"]}'
+            ),
+        )
+        monkeypatch.setattr(
+            "services.mem0.client.get_anthropic_client",
+            AsyncMock(return_value=fake_client),
+        )
+        from services.mem0.search import _extract_keywords_via_llm
+        result = await _extract_keywords_via_llm("砺波いぶきの話覚えてる？")
+        parts = result.split()
+        assert parts.count("砺波いぶき") == 1
+        assert "いぶき" in parts
+
+    @pytest.mark.asyncio
+    async def test_fail_open_on_invalid_json(self, monkeypatch):
+        fake_client = AsyncMock()
+        fake_client.messages.create = AsyncMock(
+            return_value=_make_anthropic_resp("not json"),
+        )
+        monkeypatch.setattr(
+            "services.mem0.client.get_anthropic_client",
+            AsyncMock(return_value=fake_client),
+        )
+        from services.mem0.search import _extract_keywords_via_llm
+        assert await _extract_keywords_via_llm("先輩はいぶきが好きですか？") == ""
 
 
 class TestEpisodeBundle:

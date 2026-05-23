@@ -233,6 +233,73 @@ _HYDE_PROMPT = """ユーザーの質問に対して、Mem0 (長期記憶) に保
 {{"hypothetical":"<生成された事実文>"}}"""
 
 
+# Phase A-1 follow-up: Haiku-based content-word extraction.
+# Janome default-dictionary splits "砺波いぶき" / "上伊那ぼたん" into noisy
+# fragments because new proper nouns aren't in the bundled lexicon. Haiku
+# sees the full surrounding context and keeps multi-character compounds
+# intact — at the cost of one extra LLM round-trip per smart search.
+# Used in parallel with Janome via _expand_query_via_morpho; results are
+# unioned into the smart_search query list.
+_KEYWORD_EXTRACT_PROMPT = """ユーザーの質問から、Mem0 検索に使う「内容語キーワード」を抽出してください。
+
+ユーザー質問: {query}
+
+== ルール ==
+- 名詞・固有名詞・動詞語幹・形容詞を抽出 (助詞・助動詞・接続詞・記号は除外)
+- 固有名詞は分割せず原文の表記をそのまま (「砺波いぶき」「上伊那ぼたん」「TAKU INOUE」を1単位として保持)
+- 同義語・別表記があれば aliases として補う (例: 「クラナド」→ aliases:["CLANNAD"])
+- キーワード 0〜8 個
+
+以下のJSONのみ返してください(説明・コードフェンス不要):
+{{"keywords":["先輩","砺波いぶき","髪色"],"aliases":["haroin"]}}"""
+
+
+async def _extract_keywords_via_llm(query: str) -> str:
+    """Haiku-based content-word extraction. Returns whitespace-joined
+    keywords (+ aliases) or empty string on any failure."""
+    q = (query or "").strip()
+    if len(q) < 8:
+        return ""
+    try:
+        from services.mem0.client import get_anthropic_client
+        client = await get_anthropic_client()
+        if client is None:
+            return ""
+        safe_query = q[:500].replace("{", "{{").replace("}", "}}")
+        from services.mem0.cli_compat import cli_messages_create, extract_text
+        resp = await cli_messages_create(
+            client,
+            model=os.environ.get("MEM0_KEYWORD_MODEL", "claude-haiku-4-5-20251001"),
+            max_tokens=int(os.environ.get("MEM0_KEYWORD_MAX_TOKENS", "300")),
+            user_message=_KEYWORD_EXTRACT_PROMPT.format(query=safe_query),
+            task_prompt=(
+                "You extract content-word keywords from a user search "
+                "query. Return JSON only."
+            ),
+        )
+        text = extract_text(resp).strip()
+        if text.startswith("```"):
+            text = text.split("```", 2)[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.rsplit("```", 1)[0].strip()
+        import json as _json
+        data = _json.loads(text)
+        kws = [str(k).strip() for k in data.get("keywords", []) if str(k).strip()]
+        aliases = [str(a).strip() for a in data.get("aliases", []) if str(a).strip()]
+        # Stable de-dupe, source order, keyword + alias union
+        seen: set[str] = set()
+        out: list[str] = []
+        for k in kws + aliases:
+            if k not in seen:
+                seen.add(k)
+                out.append(k)
+        return " ".join(out[:10])
+    except Exception as exc:
+        log.warning("keyword_extract_via_llm failed (non-fatal): %s", exc)
+        return ""
+
+
 async def _generate_hypothetical_fact(query: str) -> str:
     """HyDE-style hypothetical answer (Phase B-1).
 
@@ -555,20 +622,32 @@ async def search_memories_smart(
         log.info("morpho_expand: %r → %r", (query or "")[:60], morpho_variant)
         queries.append(morpho_variant)
     if rewrite:
-        # Phase B-1: run rewrite + HyDE in parallel. HyDE generates a single
-        # fact-shaped sentence ("先輩は砺波いぶきが好き") that paraphrases the
-        # question, so embedding lands near the actual stored fact. The
-        # rewrite path yields canonical keyword variants. Both feed into
-        # search_memories_multi which dedupes and merges.
+        # Phase B-1 + A-1 follow-up: run rewrite + HyDE + LLM keyword
+        # extraction in parallel.
+        #   - rewrite: canonical-label variants (toeic-prep / rust-async)
+        #   - HyDE: a fact-shaped paraphrase ("先輩は砺波いぶきが好き")
+        #   - llm_keywords: content-word extraction that respects new
+        #     proper nouns Janome doesn't know about ("砺波いぶき" intact)
+        # All three feed into the multi-query merge; the layers below
+        # dedupe and rerank so any redundancy is harmless.
         variants_task = _rewrite_query(query)
         hyde_task = _generate_hypothetical_fact(query)
-        variants, hyde = await asyncio.gather(variants_task, hyde_task)
+        llm_kw_task = _extract_keywords_via_llm(query)
+        variants, hyde, llm_keywords = await asyncio.gather(
+            variants_task, hyde_task, llm_kw_task,
+        )
         for v in variants:
             if v and v not in queries:
                 queries.append(v)
         if hyde and hyde not in queries:
             log.info("hyde: %r → %r", (query or "")[:60], hyde[:80])
             queries.append(hyde)
+        if llm_keywords and llm_keywords not in queries:
+            log.info(
+                "llm_keywords: %r → %r",
+                (query or "")[:60], llm_keywords[:120],
+            )
+            queries.append(llm_keywords)
     # Phase A-1: hybrid retrieval (vector + BM25 RRF fusion). Falls back to
     # vector-only when MEM0_HYBRID_ENABLED=false. Same return shape as
     # search_memories_multi, so the downstream rerank / graph_expand keep
