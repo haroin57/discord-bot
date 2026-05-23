@@ -466,6 +466,23 @@ async def get_episode_facts(
     return filtered[:limit]
 
 
+def _expand_query_via_morpho(query: str) -> str:
+    """Phase A-1 follow-up: extract content words from the query via Janome
+    and join them with whitespace so the resulting variant can be embedded
+    as a "content-word-only" form. Empty string when Janome is unavailable
+    or finds nothing.
+
+    Returned variant is consumed by smart_search the same way LLM-rewrite
+    variants are — appended to the queries list, then deduped on insert.
+    """
+    try:
+        from services.mem0 import morpho
+        return morpho.extract_query_keywords(query)
+    except Exception as exc:
+        log.warning("morpho query expansion failed (non-fatal): %s", exc)
+        return ""
+
+
 async def _expand_query_via_graph(query: str, user_id: str) -> list[str]:
     """Translate a query into its known surface-form variants via the entity
     graph. Returns ``[]`` when nothing matches exactly.
@@ -528,6 +545,15 @@ async def search_memories_smart(
         for a in alias_variants:
             if a not in queries:
                 queries.append(a)
+    # Phase A-1 follow-up: morphological content-word variant. ~ms-level
+    # cost, no LLM. Helps vector embedding too: "上伊那ぼたんで誰が一番
+    # 好き？" → "上伊那 ぼたん 一番 好き" weights the proper nouns rather
+    # than letting stop-particles (の は で が) drag the vector toward
+    # the question-form centroid.
+    morpho_variant = _expand_query_via_morpho(query)
+    if morpho_variant and morpho_variant not in queries:
+        log.info("morpho_expand: %r → %r", (query or "")[:60], morpho_variant)
+        queries.append(morpho_variant)
     if rewrite:
         # Phase B-1: run rewrite + HyDE in parallel. HyDE generates a single
         # fact-shaped sentence ("先輩は砺波いぶきが好き") that paraphrases the

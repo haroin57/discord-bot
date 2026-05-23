@@ -82,12 +82,14 @@ class TestIndexAndSearch:
         hits = bm25_index.search_bm25("deletable", "userA", limit=10)
         assert not any(h["id"] == "f1" for h in hits)
 
-    def test_trigram_handles_japanese(self, fresh_bm25_db):
+    def test_morpho_handles_japanese(self, fresh_bm25_db):
         from services.mem0 import bm25_index
 
         bm25_index.index_fact("f1", "先輩は砺波いぶきが好き", "userA")
         bm25_index.index_fact("f2", "TypeScript の話を昨日した", "userA")
-        # Substring "砺波いぶき" should hit f1, not f2.
+        # Morpho splits "砺波いぶき" into two content tokens with the
+        # default Janome dictionary; we still want a hit when querying
+        # for the canonical compound name (one of the tokens matches).
         hits = bm25_index.search_bm25("砺波いぶき", "userA", limit=10)
         ids = [h["id"] for h in hits]
         assert "f1" in ids
@@ -106,6 +108,37 @@ class TestIndexAndSearch:
         assert bm25_index.index_fact("", "text", "userA") is False
         assert bm25_index.index_fact("f1", "", "userA") is False
         assert bm25_index.index_fact("f1", "text", "") is False
+
+    def test_natural_language_query_finds_proper_noun(self, fresh_bm25_db):
+        """Regression for the 2026-05-23 incident: long natural-language
+        queries used to phrase-match the whole sentence and return 0 hits.
+        Morpho tokenization splits the question into content words so the
+        proper noun inside it still matches."""
+        from services.mem0 import bm25_index
+        bm25_index.index_fact("f2", "好きな食べ物はラーメン", "userA")
+        bm25_index.index_fact("f3", "上伊那ぼたんを3巻まで読んだ", "userA")
+        hits = bm25_index.search_bm25(
+            "上伊那ぼたんのキャラクターで誰が一番好き？", "userA", limit=10,
+        )
+        assert any(h["id"] == "f3" for h in hits)
+
+    def test_query_with_fts5_special_chars_does_not_raise(self, fresh_bm25_db):
+        """Parens, asterisks, colons used to raise OperationalError."""
+        from services.mem0 import bm25_index
+        bm25_index.index_fact("f1", "Rust is great", "userA")
+        # Should not raise; result may be empty or contain f1.
+        hits = bm25_index.search_bm25("Rust (great): *", "userA", limit=5)
+        assert isinstance(hits, list)
+
+    def test_morpho_query_drops_particles(self, fresh_bm25_db):
+        """Particles ('の' 'は' 'が' 'で') and 1-char nouns should not appear
+        in the FTS5 query — only content words remain after morpho."""
+        from services.mem0 import bm25_index
+        bm25_index.index_fact("f1", "先輩は Rust が好き", "userA")
+        # Question with multiple particles. Should still find f1 via the
+        # 'Rust' / '好き' content words.
+        hits = bm25_index.search_bm25("先輩はRustのことが好き？", "userA", limit=5)
+        assert any(h["id"] == "f1" for h in hits)
 
 
 # ---------------------------------------------------------------------------

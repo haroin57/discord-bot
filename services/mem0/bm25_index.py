@@ -35,7 +35,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
     fact_id UNINDEXED,
     user_id UNINDEXED,
     text,
-    tokenize = 'trigram'
+    tokenize = 'unicode61 remove_diacritics 1'
 );
 """
 
@@ -77,9 +77,24 @@ def _conn():
 
 
 def index_fact(fact_id: str, text: str, user_id: str) -> bool:
-    """Insert (or replace) a fact in the FTS5 index. Idempotent on fact_id."""
+    """Insert (or replace) a fact in the FTS5 index. Idempotent on fact_id.
+
+    The stored ``text`` is the morphological tokenization of the source
+    fact — whitespace-separated content-word surface forms — so the
+    underlying unicode61 tokenizer (which splits on whitespace) yields
+    one FTS5 token per Japanese content word. Particles, fillers, and
+    1-character noise are stripped by morpho.tokenize_for_index.
+    """
     if not fact_id or not text or not user_id:
         return False
+    try:
+        from services.mem0 import morpho
+        tokenized = morpho.tokenize_for_index(text)
+    except Exception as exc:
+        log.warning(
+            "bm25 morpho tokenize_for_index failed, falling back to raw: %s", exc,
+        )
+        tokenized = text
     try:
         with _conn() as c, _db_lock:
             c.execute(
@@ -87,7 +102,7 @@ def index_fact(fact_id: str, text: str, user_id: str) -> bool:
             )
             c.execute(
                 "INSERT INTO facts_fts(fact_id, user_id, text) VALUES (?, ?, ?)",
-                (fact_id, user_id, text),
+                (fact_id, user_id, tokenized),
             )
             c.commit()
             return True
@@ -121,20 +136,48 @@ def search_bm25(query: str, user_id: str, limit: int = 20) -> list[dict]:
     ignore the absolute value.
 
     Sanitization: FTS5 has a small DSL ('AND', 'OR', '"phrase"', column
-    filters). To prevent a malformed query from raising at search time, we
-    wrap the whole query in double quotes — that turns the entire input into
-    a literal phrase match for trigram tokens. It's slightly less expressive
-    than letting users opt into the DSL but matches the "throw a question at
-    it" semantics callers expect.
+    filters). Wrapping the whole query in one big "phrase" only works for
+    short proper nouns — for natural-language questions ("上伊那ぼたんの誰が
+    一番好き？") no stored fact contains the entire phrase verbatim, so
+    BM25 returns zero hits. We instead split on Japanese + ASCII
+    punctuation/whitespace, drop FTS5 special characters, and OR-join
+    the resulting sub-phrases. Each sub-phrase still uses trigram
+    substring matching, so "上伊那ぼたん" inside a longer fact text gets
+    picked up.
     """
     q = (query or "").strip()
     if not q or not user_id:
         return []
-    # Strip any embedded double-quotes; FTS5 phrase syntax breaks otherwise.
-    safe_q = q.replace('"', " ")
-    if not safe_q.strip():
+    # Phase A-1 follow-up: tokenize the query via Janome so each FTS5
+    # disjunct is a single content word ("砺波" / "いぶき" / "好き"),
+    # not a chunk of natural-language soup. Particles, symbols, and
+    # 1-char noise are stripped upstream by morpho.tokenize_keywords.
+    try:
+        from services.mem0 import morpho
+        tokens = morpho.tokenize_keywords(q)
+    except Exception as exc:
+        log.warning("bm25 morpho tokenize failed, falling back: %s", exc)
+        tokens = []
+    # Fallback when Janome is unavailable: split on whitespace +
+    # Japanese punctuation, drop FTS5 syntax chars, keep tokens >=2 chars.
+    if not tokens:
+        import re as _re
+        cleaned = _re.sub(r'["\(\)\*\^:]', " ", q)
+        sub_phrases = _re.split(r"[\s、。？！,.?!:;~〜\-—]+", cleaned)
+        tokens = [t.strip() for t in sub_phrases if len(t.strip()) >= 2]
+    if not tokens:
         return []
-    fts_query = f'"{safe_q}"'
+    # Strip FTS5 syntax inside each token in case the morpho layer let
+    # one through (e.g. embedded paren in an English token).
+    import re as _re
+    safe_tokens = [_re.sub(r'["\(\)\*\^:]', "", t) for t in tokens[:10]]
+    safe_tokens = [t for t in safe_tokens if t]
+    if not safe_tokens:
+        return []
+    # OR-join each content word as a phrase. unicode61 tokenizer splits
+    # the index entries on whitespace, so a phrase like "砺波" matches
+    # the standalone FTS5 token "砺波" in any indexed fact.
+    fts_query = " OR ".join(f'"{t}"' for t in safe_tokens)
     try:
         with _conn() as c:
             rows = c.execute(
@@ -224,19 +267,47 @@ def reindex_all(facts: Iterable[tuple[str, str, str]]) -> int:
     """Wipe-and-rebuild the FTS5 index from an iterable of (fact_id, text, user_id).
 
     Used by ``scripts/build_mem0_bm25_index.py`` after dumping every Mem0 fact
-    from ChromaDB. Returns the number of rows inserted.
+    from ChromaDB. Each fact's text is morphologically tokenized via
+    services.mem0.morpho before insertion. Returns the row count.
+
+    SQLite virtual tables can't change their ``tokenize=`` option after
+    creation — so when the schema in _SCHEMA changes (e.g. trigram →
+    unicode61) we must wipe the underlying file, not just DELETE the
+    rows. We unlink the sqlite + WAL/SHM siblings so the next _conn()
+    call recreates everything from the current _SCHEMA.
     """
+    path = _resolve_db_path()
+    with _db_lock:
+        import os as _os
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                _os.unlink(path + suffix)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.warning("bm25 reindex_all: unlink %s%s failed: %s",
+                            path, suffix, exc)
+
     count = 0
     try:
+        # The first _conn() after the unlink recreates the file under
+        # the current schema.
         with _conn() as c, _db_lock:
-            c.execute("DELETE FROM facts_fts")
+            try:
+                from services.mem0 import morpho
+                _tokenize = morpho.tokenize_for_index
+            except Exception:
+                _tokenize = lambda s: s  # noqa: E731
             for fid, text, uid in facts:
                 if not fid or not text or not uid:
                     continue
+                tokenized = _tokenize(text)
+                if not tokenized:
+                    tokenized = text  # never index an empty row
                 c.execute(
                     "INSERT INTO facts_fts(fact_id, user_id, text) "
                     "VALUES (?, ?, ?)",
-                    (fid, uid, text),
+                    (fid, uid, tokenized),
                 )
                 count += 1
             c.commit()
