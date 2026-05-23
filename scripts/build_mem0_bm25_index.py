@@ -25,13 +25,15 @@ def _configure_logging(verbose: bool) -> None:
     )
 
 
-def _iter_facts(user_id: str | None, limit: int) -> list[tuple[str, str, str]]:
+def _iter_facts(user_id_arg: str | None, limit: int) -> list[tuple[str, str, str]]:
     """Yield (fact_id, text, user_id) tuples from the Mem0 client.
 
-    We use ``mem.get_all`` paginated by user_id when one is supplied; without
-    a user_id we walk the bot's known user_ids list. The Mem0 SDK's get_all
-    requires a user_id, so a single global dump isn't possible — call
-    repeatedly with each user_id.
+    ``user_id_arg`` accepts a single id, a comma-separated list, or None.
+    With None we fall back to KANAE_BOT_USER_ID. The Mem0 SDK's get_all
+    requires a user_id, so this loops once per namespace and concatenates.
+
+    NOTE: reindex_all is a wipe-and-rebuild — pass every namespace in a
+    single invocation, otherwise the prior run gets dropped on the floor.
     """
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from services.mem0.client import _get_mem0
@@ -41,8 +43,8 @@ def _iter_facts(user_id: str | None, limit: int) -> list[tuple[str, str, str]]:
         raise RuntimeError("Mem0 client unavailable — check OAuth token and ChromaDB connectivity")
 
     user_ids: list[str] = []
-    if user_id:
-        user_ids = [str(user_id)]
+    if user_id_arg:
+        user_ids = [u.strip() for u in str(user_id_arg).split(",") if u.strip()]
     else:
         # Walk common namespaces. KANAE_BOT_USER_ID is the only stable
         # bot-side namespace; for senpai-side ids the caller must pass
@@ -56,7 +58,8 @@ def _iter_facts(user_id: str | None, limit: int) -> list[tuple[str, str, str]]:
         if not user_ids:
             raise SystemExit(
                 "No user_id supplied and KANAE_BOT_USER_ID env is empty. "
-                "Pass --user-id <discord-id> to index a specific namespace."
+                "Pass --user-id <discord-id> (or --user-id 'id1,id2') "
+                "to index specific namespaces."
             )
 
     facts: list[tuple[str, str, str]] = []
@@ -77,7 +80,13 @@ def _iter_facts(user_id: str | None, limit: int) -> list[tuple[str, str, str]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--user-id", help="Limit to one Mem0 namespace")
+    ap.add_argument(
+        "--user-id",
+        help="Mem0 namespace to index. Comma-separated for multi-namespace "
+             "(e.g. '573489206240870410,1489178684391817336'). "
+             "Single-namespace invocations OVERWRITE the global FTS5 store, "
+             "so pass every namespace you want indexed in one call.",
+    )
     ap.add_argument("--dry-run", action="store_true",
                     help="Count facts but don't write the index")
     ap.add_argument("--limit", type=int, default=10000,
