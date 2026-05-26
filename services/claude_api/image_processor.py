@@ -19,6 +19,11 @@ import re
 from config import ATTACHMENT_DIR
 from utils.image_validator import validate_image_bytes
 
+# Reuse the resize/re-encode helper from the Read-tool path so that
+# attached images go through the same 1568 px + JPEG-85 pipeline that
+# interactive Read calls already use.  Avoids duplicating Pillow logic.
+from services.claude_api.tools import _maybe_resize_image
+
 __all__ = [
     "IMAGE_MAX_BYTES",
     "IMAGE_MAX_COUNT",
@@ -99,12 +104,27 @@ def extract_attached_image_blocks(prompt: str) -> tuple[str, list[dict]]:
         if mime is None:
             log.warning("image rejected: %s (%s)", real, err)
             continue
+        # Resize / re-encode to stay under the Anthropic 5 MB base64 cap.
+        # _maybe_resize_image raises ValueError when Pillow cannot decode
+        # the image at all (intentional — see 2026-05-15 incident notes).
+        try:
+            data, mime = _maybe_resize_image(data, mime, real)
+        except ValueError as exc:
+            log.warning("image rejected: resize failed: %s (%s)", real, exc)
+            continue
+        b64 = base64.b64encode(data).decode("ascii")
+        if len(b64) > 5_242_880:
+            log.warning(
+                "image rejected: base64 still too large after resize "
+                "(%d bytes): %s", len(b64), real,
+            )
+            continue
         blocks.append({
             "type": "image",
             "source": {
                 "type": "base64",
                 "media_type": mime,
-                "data": base64.b64encode(data).decode("ascii"),
+                "data": b64,
             },
         })
 

@@ -81,6 +81,9 @@ def classify_anthropic_error(exc: BaseException) -> str:
         body_lower = body_text.lower()
         if any(p in body_lower for p in _CONTEXT_PATTERNS):
             return "context_overflow"
+        # 400 Bad Request — deterministic; retrying won't help.
+        if status == 400:
+            return "invalid_request"
         # Other 4xx / 5xx
         return "api_exit"
     return "unknown"
@@ -94,6 +97,7 @@ def _error_message(error_type: str) -> str:
         "auth": "🔑 認証エラーが発生しました。管理者に連絡してください。",
         "context_overflow": "📝 メッセージが長すぎます。短くして送り直してください。",
         "max_turns": "🔄 ターン上限に達しました。もう一度話しかけてください。",
+        "invalid_request": "⚠️ リクエストにエラーがありました。画像が大きすぎる可能性があります。",
         "api_exit": "⚠️ 処理が中断されました。もう一度試してください。",
         # Backwards-compat alias for callers still using the SDK-era key.
         "cli_exit": "⚠️ 処理が中断されました。もう一度試してください。",

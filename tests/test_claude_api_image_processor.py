@@ -103,13 +103,19 @@ class TestExtractAttachedImageBlocks:
         return p
 
     def _patch_validator(self, monkeypatch):
-        """Mock validate_image_bytes to accept any bytes as image/png."""
+        """Mock validate_image_bytes to accept any bytes as image/png,
+        and stub _maybe_resize_image so fake PNGs pass through."""
         import services.claude_api.image_processor as mod
 
         monkeypatch.setattr(
             mod,
             "validate_image_bytes",
             lambda data, max_bytes=None: ("image/png", None),
+        )
+        monkeypatch.setattr(
+            mod,
+            "_maybe_resize_image",
+            lambda data, media_type, path_for_log: (data, media_type),
         )
 
     def test_extract_no_block(self, tmp_path, monkeypatch):

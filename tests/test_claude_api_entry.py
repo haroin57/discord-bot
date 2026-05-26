@@ -85,6 +85,12 @@ class TestExtractAttachedImageBlocks:
     def test_real_block_stripped(self, monkeypatch):
         with tempfile.TemporaryDirectory() as tmp:
             monkeypatch.setattr(image_processor_mod, "ATTACHMENT_DIR", tmp)
+            # Stub _maybe_resize_image so fake PNGs pass through Pillow check.
+            monkeypatch.setattr(
+                image_processor_mod,
+                "_maybe_resize_image",
+                lambda data, media_type, path_for_log: (data, media_type),
+            )
             p = os.path.join(tmp, "img.png")
             with open(p, "wb") as fh:
                 fh.write(b"\x89PNG\r\n\x1a\n_more_data")

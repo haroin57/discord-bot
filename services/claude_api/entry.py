@@ -468,7 +468,12 @@ async def call_with_tools(
                             # max_turns: tool-loop hit the per-request turn
                             # cap — session history is still valid.
                             return _error_message(category), None, resumable
-                        if _is_transient(category) and max_attempts < TRANSIENT_MAX_ATTEMPTS:
+                        if not _is_transient(category):
+                            # Permanent errors (api_exit, invalid_request,
+                            # unknown) — retrying won't help. Return
+                            # immediately to avoid wasting API calls.
+                            return _error_message(category), None, resumable
+                        if max_attempts < TRANSIENT_MAX_ATTEMPTS:
                             max_attempts = TRANSIENT_MAX_ATTEMPTS
                         if attempt >= max_attempts - 1:
                             # Transient errors exhausted retries — keep the
