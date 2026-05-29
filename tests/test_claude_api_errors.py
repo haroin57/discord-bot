@@ -49,9 +49,46 @@ class TestClassifyAnthropicError:
         )
         assert classify_anthropic_error(exc) == "context_overflow"
 
-    def test_generic_500_is_api_exit(self):
+    def test_generic_500_is_overloaded(self):
+        # 5xx are now transient (retried once). Previously misclassified api_exit.
         exc = self._make_status_error(500, body={"error": {"message": "internal error"}})
-        assert classify_anthropic_error(exc) == "api_exit"
+        assert classify_anthropic_error(exc) == "overloaded"
+
+    def test_stream_overloaded_200(self):
+        # mid-stream overloaded_error rides an HTTP-200 connection; classify
+        # on body.error.type, not the (misleading) 200 status.
+        exc = self._make_status_error(
+            200,
+            body={"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}},
+        )
+        assert classify_anthropic_error(exc) == "overloaded"
+
+    def test_stream_rate_limit_200(self):
+        exc = self._make_status_error(200, body={"error": {"type": "rate_limit_error"}})
+        assert classify_anthropic_error(exc) == "rate_limit"
+
+    def test_invalid_request_400_type(self):
+        exc = self._make_status_error(
+            400,
+            body={"error": {"type": "invalid_request_error", "message": "bad request"}},
+        )
+        assert classify_anthropic_error(exc) == "invalid_request"
+
+    def test_context_overflow_200(self):
+        # context-overflow must win over invalid_request even on a 200 stream.
+        exc = self._make_status_error(
+            200,
+            body={"error": {"message": "input is too long for the model"}},
+        )
+        assert classify_anthropic_error(exc) == "context_overflow"
+
+    def test_api_error_type_is_transient(self):
+        exc = self._make_status_error(200, body={"error": {"type": "api_error"}})
+        assert classify_anthropic_error(exc) == "overloaded"
+
+    def test_empty_body_200_is_api_exit(self):
+        # Unclassifiable (200 + empty body) → api_exit fallback preserved.
+        assert classify_anthropic_error(self._make_status_error(200, body={})) == "api_exit"
 
     def test_unknown_exception(self):
         assert classify_anthropic_error(RuntimeError("???")) == "unknown"

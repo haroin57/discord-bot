@@ -9,11 +9,13 @@ import pytest
 
 from services.claude_api.stall import StallWatchdog
 from services.claude_api.tool_loop import (
+    MAX_CONSECUTIVE_EMPTY_TURNS,
     AgentLoopResult,
     _block_to_dict,
     _detect_write_hallucination,
     _format_tool_invocation_for_display,
     _join_final_text,
+    _normalize_history_for_api,
     run_agent_loop,
 )
 
@@ -115,6 +117,30 @@ class TestJoinFinalText:
         assert _join_final_text(final) == "ok"
 
 
+class TestEmptyContentSanitizer:
+    """_normalize_history_for_api must never emit empty content to the API."""
+
+    def test_empty_string_replaced(self):
+        out = _normalize_history_for_api([{"role": "user", "content": ""}])
+        assert out[0]["role"] == "user"
+        assert isinstance(out[0]["content"], list) and out[0]["content"]
+
+    def test_empty_list_replaced(self):
+        out = _normalize_history_for_api([{"role": "user", "content": []}])
+        assert out[0]["role"] == "user"
+        assert out[0]["content"]  # non-empty placeholder
+
+    def test_nonempty_preserved_and_count_stable(self):
+        h = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        ]
+        out = _normalize_history_for_api(h)
+        assert len(out) == 2
+        assert out[0]["content"] == "hi"
+        assert out[1]["content"] == [{"type": "text", "text": "ok"}]
+
+
 class TestRunAgentLoop:
     @pytest.mark.asyncio
     async def test_single_turn_end_turn(self, watchdog):
@@ -178,6 +204,56 @@ class TestRunAgentLoop:
         assert [h["role"] for h in history] == ["user", "assistant", "user", "assistant"]
         assert history[2]["content"][0]["type"] == "tool_result"
         assert history[2]["content"][0]["content"] == "file content"
+
+    @pytest.mark.asyncio
+    async def test_thinking_only_pause_injects_continuation(self, watchdog):
+        # Turn 0: stop_reason=tool_use but only a thinking block (zero
+        # tool_use blocks) → pause turn. Must NOT append empty content; must
+        # nudge with a continuation user message. Turn 1: normal end_turn.
+        client = _make_client(
+            ([], _final_msg([_block("thinking", thinking="hmm")], "tool_use")),
+            ([], _final_msg([_block("text", text="done")], "end_turn")),
+        )
+        history: list[dict] = []
+        result = await run_agent_loop(
+            "hi", channel_id=1, history=history,
+            system_prompt="sys", tools_for_api=[],
+            can_use_tool=_allow_all, execute_tool=AsyncMock(),
+            status_callback=_noop_status, max_turns=5,
+            stall_watchdog=watchdog, api_client=client,
+            model="claude-opus-4-8", extra_betas=[],
+        )
+        assert result.text == "done"
+        # No empty-content user message slipped into history (the 400 cause).
+        assert all(m["content"] != [] and m["content"] != "" for m in history)
+        # A continuation nudge was injected as a user message.
+        assert any(
+            m["role"] == "user"
+            and isinstance(m["content"], list)
+            and m["content"]
+            and m["content"][0].get("text") == "続けてください。"
+            for m in history
+        )
+
+    @pytest.mark.asyncio
+    async def test_thinking_only_pause_limit_cuts_off(self, watchdog):
+        # Two consecutive pause turns hit MAX_CONSECUTIVE_EMPTY_TURNS (=2)
+        # and the loop returns accumulated text instead of spinning forever.
+        assert MAX_CONSECUTIVE_EMPTY_TURNS == 2
+        client = _make_client(
+            ([], _final_msg([_block("text", text="partial"), _block("thinking", thinking="x")], "tool_use")),
+            ([], _final_msg([_block("thinking", thinking="y")], "tool_use")),
+        )
+        history: list[dict] = []
+        result = await run_agent_loop(
+            "hi", channel_id=1, history=history,
+            system_prompt="sys", tools_for_api=[],
+            can_use_tool=_allow_all, execute_tool=AsyncMock(),
+            status_callback=_noop_status, max_turns=5,
+            stall_watchdog=watchdog, api_client=client,
+            model="claude-opus-4-8", extra_betas=[],
+        )
+        assert "partial" in result.text
 
     @pytest.mark.asyncio
     async def test_denied_tool_returns_error_result(self, watchdog):

@@ -65,26 +65,40 @@ def classify_anthropic_error(exc: BaseException) -> str:
         return "overloaded"
     if isinstance(exc, anthropic.APIStatusError):
         status = getattr(exc, "status_code", None)
-        if status == 529:
-            return "overloaded"
-        # BadRequestError is a subclass; check body for context-overflow signal
         body = getattr(exc, "body", None)
+        err_type = ""
         body_text = ""
         if isinstance(body, dict):
             err = body.get("error")
             if isinstance(err, dict):
+                err_type = str(err.get("type", "")).lower()
                 body_text = str(err.get("message", ""))
             else:
                 body_text = str(err or "")
         else:
             body_text = str(body or "")
         body_lower = body_text.lower()
+        # Stream-internal error events ride the HTTP-200 connection, so the
+        # SDK raises a bare APIStatusError(status_code=200) and the true kind
+        # lives in body.error.type. Classify on error.type, not status alone:
+        # a 200 + overloaded_error previously fell through to api_exit and was
+        # never retried (the bug this fixes).
+        if status == 529 or "overloaded" in err_type or "overloaded" in body_lower:
+            return "overloaded"
+        if status == 429 or "rate_limit" in err_type:
+            return "rate_limit"
+        # context-overflow must be checked BEFORE invalid_request so a 400 with
+        # an "input too long" body stays context_overflow (existing behaviour).
         if any(p in body_lower for p in _CONTEXT_PATTERNS):
             return "context_overflow"
         # 400 Bad Request — deterministic; retrying won't help.
-        if status == 400:
+        if status == 400 or err_type == "invalid_request_error":
             return "invalid_request"
-        # Other 4xx / 5xx
+        # Generic 5xx / api_error are transient server hiccups — retry once.
+        # _is_transient bounds attempts via TRANSIENT_MAX_ATTEMPTS, so this
+        # can't spin forever.
+        if (status is not None and status >= 500) or err_type == "api_error":
+            return "overloaded"
         return "api_exit"
     return "unknown"
 
@@ -97,7 +111,7 @@ def _error_message(error_type: str) -> str:
         "auth": "🔑 認証エラーが発生しました。管理者に連絡してください。",
         "context_overflow": "📝 メッセージが長すぎます。短くして送り直してください。",
         "max_turns": "🔄 ターン上限に達しました。もう一度話しかけてください。",
-        "invalid_request": "⚠️ リクエストにエラーがありました。画像が大きすぎる可能性があります。",
+        "invalid_request": "⚠️ リクエストの形式に問題があり処理できませんでした。もう一度試しても直らない場合は管理者に連絡してください。",
         "api_exit": "⚠️ 処理が中断されました。もう一度試してください。",
         # Backwards-compat alias for callers still using the SDK-era key.
         "cli_exit": "⚠️ 処理が中断されました。もう一度試してください。",

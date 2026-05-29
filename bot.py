@@ -189,6 +189,12 @@ _emotion_daemon_started: bool = False
 # silence-tick mean-reversion just skips until the next daily re-estimate.
 _baseline_init_started: bool = False
 
+# /abort target registry: channel_id → on_message Task currently generating
+# a reply in that channel. Populated at on_message entry (after the early
+# dispatch filters) and cleared in the finally block. The /abort command
+# looks up the entry by channel_id and calls task.cancel().
+_active_message_jobs: dict[int, asyncio.Task] = {}
+
 
 def _track_task(coro, *, name: str | None = None) -> asyncio.Task:
     """Schedule a fire-and-forget coroutine and track it for GC + error logging."""
@@ -773,6 +779,24 @@ async def _send_segmented(
 # ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
+@bot.tree.command(name="abort", description="現チャンネルで進行中の応答を中断する (admin only)")
+async def abort_cmd(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("admin only", ephemeral=True)
+        return
+
+    channel_id = interaction.channel_id
+    task = _active_message_jobs.get(channel_id) if channel_id is not None else None
+    if task is None or task.done():
+        await interaction.response.send_message(
+            "中断対象なし (進行中の応答はありません)", ephemeral=True,
+        )
+        return
+
+    task.cancel()
+    await interaction.response.send_message("中断要求を送りました", ephemeral=True)
+
+
 @bot.tree.command(name="vscode-sync", description="VSCode Claude Code → Discord 同期の切替 (admin only)")
 @app_commands.describe(action="on で開始 / off で停止 / status で状態確認")
 @app_commands.choices(action=[
@@ -953,6 +977,9 @@ async def on_message(message: discord.Message):
 
     mem0_user_id = str(message.author.id)
     image_paths: list[str] = []
+    _abort_task = asyncio.current_task()
+    if _abort_task is not None:
+        _active_message_jobs[message.channel.id] = _abort_task
     try:
         # --- Parallel pre-processing ---
         async def _fetch_reply():
@@ -1594,6 +1621,12 @@ async def on_message(message: discord.Message):
         # the user would see a 2-3 minute silence while 20 manga pages
         # are read, then one mega-chunk at the very end.
         _live_sent_any = {"v": False}
+        # Track every message we post via _incremental_send so the
+        # post-stream math/table detection (bot.py:2035 block) can delete
+        # them and re-emit via _send_segmented when the response actually
+        # contains $$..$$ or a markdown table that streaming couldn't
+        # render. Insertion order is preserved.
+        _live_messages: list[discord.Message] = []
 
         async def _incremental_send(text: str) -> None:
             text = (text or "").strip()
@@ -1601,13 +1634,30 @@ async def on_message(message: discord.Message):
                 return
             try:
                 chunks = split_message(text)
+                log.info(
+                    "[rid=%s] incremental send: %d chunk(s), %d chars",
+                    get_request_id(), len(chunks), len(text),
+                )
                 for chunk in chunks:
                     if not chunk.strip():
                         continue
-                    await message.channel.send(chunk)
-                _live_sent_any["v"] = True
+                    sent = await message.channel.send(chunk)
+                    _live_messages.append(sent)
+                    # Mark "live delivered" as soon as ONE chunk lands. If a
+                    # later chunk throws, the final-block path must still see
+                    # _live_sent_any=True so it does NOT re-send the whole
+                    # response_text and duplicate chunks 1..k-1 (rid=6072977f
+                    # class of bug).
+                    _live_sent_any["v"] = True
+                    log.info(
+                        "[rid=%s] sent live chunk %d/%d len=%d",
+                        get_request_id(), len(_live_messages), len(chunks), len(chunk),
+                    )
             except Exception as exc:
-                log.warning("incremental send failed: %s", exc)
+                log.warning(
+                    "[rid=%s] incremental send failed after %d chunk(s): %s",
+                    get_request_id(), len(_live_messages), exc,
+                )
                 # Re-raise so the agent loop falls back to accumulation
                 # (caller catches and stops sending live for this turn).
                 raise
@@ -2007,11 +2057,49 @@ async def on_message(message: discord.Message):
         try:
             if _live_sent_any["v"]:
                 # Live streaming already delivered the prose chunk by
-                # chunk via ``_incremental_send``. Skip the final text
-                # reply to avoid double-posting. Attachments (images,
-                # files, rendered tables/math) cannot ride the stream
-                # path, so emit them once as a standalone message.
-                if attach_files:
+                # chunk via ``_incremental_send``. Two sub-paths:
+                #
+                # 1. Response has $$..$$ math or markdown tables that
+                #    streaming couldn't render. Delete the streamed
+                #    messages and re-emit the whole response via
+                #    _send_segmented so KaTeX/table images land at the
+                #    correct insertion points.
+                # 2. No rich content — keep the streamed prose and just
+                #    post attachments (images, files) as a follow-up.
+                _live_masked = mask_code_blocks(response_text)
+                _live_has_rich = (
+                    has_tables(response_text, _masked=_live_masked)
+                    or has_math(response_text, _masked=_live_masked)
+                )
+                if _live_has_rich:
+                    log.info(
+                        "[rid=%s] rich content detected post-stream; "
+                        "re-emitting via segmented send then removing %d streamed message(s)",
+                        get_request_id(), len(_live_messages),
+                    )
+                    # Re-emit FIRST, delete the streamed prose only after the
+                    # segmented send succeeds. If _send_segmented throws (table/
+                    # math render error, transient channel 429/5xx/Forbidden),
+                    # keep the already-streamed plain prose rather than deleting
+                    # it and leaving the channel content-less — the user loses
+                    # only the rich rendering, not the whole turn.
+                    try:
+                        await _send_segmented(message, response_text, attach_files)
+                    except Exception as _exc:
+                        log.warning(
+                            "[rid=%s] segmented re-emit failed; keeping %d "
+                            "streamed message(s): %s",
+                            get_request_id(), len(_live_messages), _exc,
+                        )
+                    else:
+                        for _m in _live_messages:
+                            try:
+                                await _m.delete()
+                            except (discord.errors.NotFound, discord.errors.HTTPException):
+                                pass
+                            except Exception as _exc:
+                                log.warning("failed to delete streamed msg: %s", _exc)
+                elif attach_files:
                     _reply_files = attach_files
                     if len(_reply_files) > 10:
                         log.warning(
@@ -2052,6 +2140,15 @@ async def on_message(message: discord.Message):
             for f in attach_files:
                 f.close()
 
+    except asyncio.CancelledError:
+        log.info(
+            "[rid=%s] on_message cancelled via /abort (channel=%s, user=%s)",
+            get_request_id(), message.channel.id, message.author.id,
+        )
+        try:
+            await message.channel.send("中断しました")
+        except Exception:
+            pass
     except Exception:
         log.exception(
             "Error processing message from user ...%s in #%s",
@@ -2059,5 +2156,7 @@ async def on_message(message: discord.Message):
         )
         await message.reply("❌ エラーが発生しました。")
     finally:
+        if _abort_task is not None and _active_message_jobs.get(message.channel.id) is _abort_task:
+            _active_message_jobs.pop(message.channel.id, None)
         sema.release()
         await asyncio.to_thread(cleanup_attachments, image_paths)

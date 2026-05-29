@@ -378,12 +378,36 @@ def _format_tool_invocation_for_display(tool_name: str, tool_input: dict) -> str
     return f"🔧 **{tool_name}**"
 
 
+# Placeholder substituted for empty message content. The Messages API
+# rejects messages with empty content (400 'must have non-empty content').
+# Empty content arises from a thinking-only pause turn (tool_results==[]) or
+# from resumed JSONL history that captured such a turn from an older run.
+_EMPTY_CONTENT_PLACEHOLDER = [{"type": "text", "text": "(続けてください)"}]
+
+# Max consecutive thinking-only "pause turns" (stop_reason==tool_use but zero
+# tool_use blocks) before the loop stops nudging and returns accumulated text.
+# Bounds the loop so a model that keeps thinking without acting can't spin.
+MAX_CONSECUTIVE_EMPTY_TURNS = 2
+
+
 def _normalize_history_for_api(history: list[dict]) -> list[dict]:
-    """Strip extra fields, leaving only {role, content} for the API."""
-    return [
-        {"role": h["role"], "content": h["content"]}
-        for h in history
-    ]
+    """Strip extra fields, leaving only {role, content} for the API.
+
+    Also guards against empty content (``""`` or ``[]``), which the Messages
+    API rejects with 400 invalid_request. Empty content is REPLACED (not
+    dropped) with a placeholder so tool_use/tool_result pairing stays intact.
+    Both the in-loop path and the JSONL resume path funnel through here, so
+    this is the single structural defense against the empty-content 400.
+    Strict ``== ""`` / ``== []`` comparison (not a falsy check) so a future
+    ``0``/``False`` content is left untouched.
+    """
+    out: list[dict] = []
+    for h in history:
+        content = h["content"]
+        if content == "" or content == []:
+            content = _EMPTY_CONTENT_PLACEHOLDER
+        out.append({"role": h["role"], "content": content})
+    return out
 
 
 _USAGE_FIELDS = (
@@ -501,6 +525,10 @@ async def run_agent_loop(
     # Per-turn fired_tools is empty on turn N+1, so the detector sees an
     # apparent claim with no backing tool call.
     fired_tools_cumulative: set[str] = set()
+    # Consecutive thinking-only pause turns (stop_reason==tool_use but zero
+    # tool_use blocks). Initialized OUTSIDE the loop so the cap accumulates;
+    # reset to 0 whenever a turn yields real tool_results.
+    consecutive_empty = 0
 
     for turn in range(max_turns):
         messages = _normalize_history_for_api(history)
@@ -737,6 +765,36 @@ async def run_agent_loop(
                 })
                 await _safe_status(status_callback, "❌ ツールエラー")
 
+        if not tool_results:
+            # Pause turn: stop_reason was tool_use but the model emitted only
+            # thinking/text and zero tool_use blocks (seen under effort=max +
+            # interleaved-thinking). Appending {"role":"user","content":[]}
+            # here was the direct cause of the empty-content 400.
+            consecutive_empty += 1
+            if consecutive_empty < MAX_CONSECUTIVE_EMPTY_TURNS:
+                log.info(
+                    "pause turn (thinking-only, no tool_use) ch=%d turn=%d "
+                    "consecutive=%d → nudging continuation",
+                    channel_id, turn + 1, consecutive_empty,
+                )
+                history.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": "続けてください。"}],
+                })
+                continue
+            log.warning(
+                "pause turn limit reached ch=%d turn=%d consecutive=%d → "
+                "returning accumulated text",
+                channel_id, turn + 1, consecutive_empty,
+            )
+            last_text = "\n\n".join(text_across_turns)
+            _log_total_usage(channel_id, usage_totals)
+            return AgentLoopResult(
+                text=last_text or "(no response)",
+                synthetic_session_id=None,
+                active_mcp_keys=active_mcp_keys,
+            )
+        consecutive_empty = 0
         history.append({"role": "user", "content": tool_results})
 
     # Reached max_turns.

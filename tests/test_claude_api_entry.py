@@ -124,6 +124,12 @@ class TestExtractAttachedImageBlocks:
         # latter is parsed.
         with tempfile.TemporaryDirectory() as tmp:
             monkeypatch.setattr(image_processor_mod, "ATTACHMENT_DIR", tmp)
+            # Stub _maybe_resize_image so fake JPEGs pass through Pillow check.
+            monkeypatch.setattr(
+                image_processor_mod,
+                "_maybe_resize_image",
+                lambda data, media_type, path_for_log: (data, media_type),
+            )
             p = os.path.join(tmp, "img.jpg")
             with open(p, "wb") as fh:
                 fh.write(b"\xff\xd8\xff\xe0_jpeg")
@@ -167,7 +173,11 @@ class TestResolveSession:
         assert 1 in sessions
         ss._clear_session_time(1)
 
-    def test_mismatch_drops_session(self, monkeypatch):
+    def test_mismatch_merges_keys(self, monkeypatch):
+        # 2026-05-16: MCP tier escalation no longer drops the session.
+        # Missing keys are merged into the stored set so old tool_use
+        # blocks in the JSONL transcript stay valid and the will_resume
+        # flag matches the actual resumable state. See entry.py:_resolve_session.
         from services.claude_api import session_store as ss
         ss._record_session_time(1)
         monkeypatch.setattr(
@@ -176,10 +186,13 @@ class TestResolveSession:
         )
         sessions = {1: SessionInfo(session_id="abc", mcp_server_keys=["brave-search"])}
         cfg, resumable = _resolve_session(sessions, 1, {"x-scraper"})
-        # Needed key not in stored → session dropped, fresh set spawned.
-        assert sessions == {}
-        assert set(cfg.keys()) == {"x-scraper"}
-        assert resumable is False
+        # Merged: stored {'brave-search'} | needed {'x-scraper'} → both advertised,
+        # session preserved, resume still valid.
+        assert 1 in sessions
+        assert sessions[1].mcp_server_keys == ["brave-search", "x-scraper"]
+        assert set(cfg.keys()) == {"brave-search", "x-scraper"}
+        assert resumable is True
+        ss._clear_session_time(1)
 
 
 # ---------------------------------------------------------------------------

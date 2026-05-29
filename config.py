@@ -62,7 +62,7 @@ HAROIN_DM_CHANNEL_ID: int | None = int(_raw_haroin_dm) if _raw_haroin_dm.isdigit
 # ---------------------------------------------------------------------------
 CWD = os.environ.get("BOT_CWD", "/home/ubuntu")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
 # Sonnet/Haiku per-turn output cap. 64k matches what claude-cli 2.1.92
 # sends in its own request body (2026-05-14 mitm capture); the previous
 # 16k floor was forcing the model to truncate long agent-loop turns
@@ -208,7 +208,7 @@ ALLOWED_ATTACHMENT_HOSTS = frozenset({
 
 # Hard cap on the final synthesised prompt length (chars) handed to Claude,
 # to bound cost and context usage attacks.
-MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "100000"))
+MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "2000000"))
 
 # Hard cap on any single user message. Oversized input is truncated.
 MAX_USER_MESSAGE_CHARS = int(os.environ.get("MAX_USER_MESSAGE_CHARS", "8000"))
@@ -371,6 +371,12 @@ MCP_SERVERS_WEB: dict = {
     "x-scraper": {
         "command": "/home/ubuntu/free-code/x-scraper/.venv/bin/python",
         "args": ["/home/ubuntu/free-code/x-scraper/mcp_server.py"],
+    },
+    # Onion-search: anonymous DuckDuckGo via Tor Browser. Lazy spawned on
+    # first tool call (~30-60s Tor bootstrap on cold start, ~500MB RSS).
+    "onion-search": {
+        "command": "/home/ubuntu/onion-search-mcp/.venv/bin/python",
+        "args": ["/home/ubuntu/onion-search-mcp/server.py"],
     },
 }
 

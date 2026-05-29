@@ -24,6 +24,7 @@ import time
 from contextlib import AsyncExitStack
 
 import anthropic
+import httpx
 
 from config import (
     ADMIN_MAX_TURNS,
@@ -88,7 +89,7 @@ from services.claude_api.tools import (
 
 log = logging.getLogger(__name__)
 
-MODEL = "claude-opus-4-7"
+MODEL = "claude-opus-4-8"
 
 # MCP servers whose tool schemas we advertise on every admin API request.
 # The process is still spawned lazily via McpPool.call_tool() on first use.
@@ -484,6 +485,34 @@ async def call_with_tools(
                         await _safe_status(
                             status_callback,
                             f"🔄 リトライ中 ({attempt + 1}/{max_attempts})",
+                        )
+                        await asyncio.sleep(backoff)
+                    except BaseExceptionGroup as eg:
+                        # SSE streaming中に httpx 層で接続が切れると
+                        # (e.g. HTTP/2 GOAWAY mid-stream), anthropic SDK は
+                        # それをラップせず、anyio TaskGroup (MCP / stdio) の
+                        # 境界で ExceptionGroup として伝播する。中身が
+                        # httpx.RequestError なら transient として retry。
+                        # それ以外の sub-exception は上位の generic catch
+                        # に re-raise する。
+                        transport_eg, rest = eg.split(httpx.RequestError)
+                        if transport_eg is None:
+                            raise
+                        exc = transport_eg.exceptions[0]
+                        log.warning(
+                            "[ch=%d] transport error attempt %d/%d: %r",
+                            channel_id, attempt + 1, TRANSIENT_MAX_ATTEMPTS, exc,
+                        )
+                        if rest is not None:
+                            # Mixed group — surface the non-transport sub-tree
+                            # too so we don't silently swallow real bugs.
+                            raise rest
+                        if attempt >= TRANSIENT_MAX_ATTEMPTS - 1:
+                            return _error_message("overloaded"), None, resumable
+                        backoff = compute_backoff(attempt)
+                        await _safe_status(
+                            status_callback,
+                            f"🔄 接続リトライ中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})",
                         )
                         await asyncio.sleep(backoff)
 

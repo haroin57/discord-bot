@@ -28,7 +28,7 @@ LOG_FILE=/home/ubuntu/discord-bot/.state/refresh_cli_identity.log
 PY_VENV=/home/ubuntu/discord-bot/.venv/bin/python
 PY_MITM=/home/ubuntu/.local/share/pipx/venvs/mitmproxy/bin/python
 MITMDUMP=/home/ubuntu/.local/bin/mitmdump
-CLAUDE_BIN=/home/ubuntu/.local/bin/claude
+CLAUDE_BIN=/usr/local/bin/claude
 CA_CERT=/home/ubuntu/.mitmproxy/mitmproxy-ca-cert.pem
 
 mkdir -p "$(dirname "$LOG_FILE")"

@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 # run daily). DO NOT edit between the marker comments; manual edits will be
 # clobbered on the next refresh run.
 # AUTO-CAPTURE-START
-CC_VERSION = "2.1.92"
+CC_VERSION = "2.1.156"
 CC_ENTRYPOINT = "sdk-cli"
 MODEL_BETAS = [
     "claude-code-20250219",
@@ -28,6 +28,7 @@ MODEL_BETAS = [
     "prompt-caching-scope-2026-01-05",
     "advanced-tool-use-2025-11-20",
     "effort-2025-11-24",
+    "extended-cache-ttl-2025-04-11",
 ]
 CLI_IDENTITY_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 # AUTO-CAPTURE-END

@@ -57,6 +57,22 @@ RESTART_BACKOFF_S = (1.0, 2.0, 5.0, 10.0)
 # fresh session on the next attempt.
 SESSION_ROTATION_THRESHOLD = 3
 
+# A turn that comes back from the CLI but whose text isn't valid JSON is
+# almost always a refusal ("I will not respond...") — and once that lands
+# in a resumed session it poisons every subsequent turn. Rotate the
+# session after this many consecutive unparseable results so the daemon
+# self-heals instead of looping on the refusal forever (the bug behind the
+# 364 dead turns observed 2026-05-29).
+PARSE_FAILURE_ROTATION_THRESHOLD = 2
+
+# Proactively rotate the session every N successful turns. The emotion
+# prompt is self-contained (it re-embeds journal / daily / mem0 context
+# each turn), so the resumed CLI transcript holds no irreplaceable state —
+# but it does accrete, and a long enough haiku transcript starts reading
+# the repeated prompts as one escalating request and refuses. Cutting a
+# fresh session well before that point keeps every turn a clean single-shot.
+SESSION_ROTATION_TURN_INTERVAL = 20
+
 
 class EmotionSessionDaemon:
     """Long-lived Claude CLI process for the emotion engine.
@@ -89,6 +105,10 @@ class EmotionSessionDaemon:
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
         self._consecutive_failures = 0
+        # Unparseable-result streak (refusals); drives self-heal rotation.
+        self._parse_failures = 0
+        # Successful turns on the current session; drives proactive rotation.
+        self._query_count = 0
         self._stderr_drain_task: asyncio.Task | None = None
         self.is_conversation_active = False
 
@@ -173,7 +193,37 @@ class EmotionSessionDaemon:
             return None
 
         self._consecutive_failures = 0
-        return self._parse_result(result_msg)
+        parsed = self._parse_result(result_msg)
+        if parsed is None:
+            # CLI produced a turn but its text wasn't valid JSON — almost
+            # always a refusal that will poison every resumed turn after it.
+            # Count it and rotate the session before it cements into a loop.
+            self._parse_failures += 1
+            if self._parse_failures >= PARSE_FAILURE_ROTATION_THRESHOLD:
+                log.warning(
+                    "daemon %s: %d consecutive unparseable results "
+                    "(likely refusal); rotating session",
+                    self.session_key, self._parse_failures,
+                )
+                reset_session(self.state_dir, self.session_key)
+                await self._terminate(timeout=2.0)
+                self._parse_failures = 0
+                self._query_count = 0
+            return None
+
+        # Healthy turn. Clear the refusal streak and count it toward the
+        # proactive rotation budget so the transcript never grows unbounded.
+        self._parse_failures = 0
+        self._query_count += 1
+        if self._query_count >= SESSION_ROTATION_TURN_INTERVAL:
+            log.info(
+                "daemon %s: rotating session after %d turns to stop "
+                "context accretion", self.session_key, self._query_count,
+            )
+            reset_session(self.state_dir, self.session_key)
+            await self._terminate(timeout=2.0)
+            self._query_count = 0
+        return parsed
 
     async def _read_until_result(self) -> dict | None:
         """Drain stream-json lines until `type:result` (one turn complete)."""
