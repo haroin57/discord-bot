@@ -89,7 +89,7 @@ from services.claude_api.tools import (
 
 log = logging.getLogger(__name__)
 
-MODEL = "claude-opus-4-8"
+MODEL = "claude-opus-4-7"
 
 # MCP servers whose tool schemas we advertise on every admin API request.
 # The process is still spawned lazily via McpPool.call_tool() on first use.

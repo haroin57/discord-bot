@@ -62,7 +62,7 @@ HAROIN_DM_CHANNEL_ID: int | None = int(_raw_haroin_dm) if _raw_haroin_dm.isdigit
 # ---------------------------------------------------------------------------
 CWD = os.environ.get("BOT_CWD", "/home/ubuntu")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
 # Sonnet/Haiku per-turn output cap. 64k matches what claude-cli 2.1.92
 # sends in its own request body (2026-05-14 mitm capture); the previous
 # 16k floor was forcing the model to truncate long agent-loop turns
