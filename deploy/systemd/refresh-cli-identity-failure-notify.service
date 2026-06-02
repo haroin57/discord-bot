@@ -1,0 +1,11 @@
+[Unit]
+Description=Notify (Discord + journal) when refresh-cli-identity.service fails
+# Incident ③ (2026-06-02): make a failed CLI-identity refresh visible instead
+# of letting the service sit in `failed` unnoticed.
+
+[Service]
+Type=oneshot
+User=ubuntu
+# Load DISCORD_TOKEN (and optional REFRESH_CLI_FAILURE_CHANNEL_ID) for the alert.
+EnvironmentFile=/home/ubuntu/discord-bot/.env
+ExecStart=/home/ubuntu/discord-bot/scripts/notify_refresh_cli_failure.sh

@@ -296,7 +296,10 @@ def _build_cached_system(system_prompt: str, messages: list[dict]) -> list[dict]
         {"type": "text", "text": attribution},
         {"type": "text", "text": CLI_IDENTITY_TEXT},
         {"type": "text", "text": CLI_DEFAULT_SYSTEM_PROMPT,
-         "cache_control": {"type": "ephemeral", "scope": "global"}},
+         # 1h TTL so the static prefix survives the 30-min session gap and is
+         # cache-read on resume. Must be >= the messages breakpoint TTL
+         # (longer-TTL-before-shorter ordering: tools→system→messages).
+         "cache_control": {"type": "ephemeral", "scope": "global", "ttl": "1h"}},
         {"type": "text", "text": system_prompt},
     ]
 
@@ -320,15 +323,18 @@ def _inject_cache_breakpoints(messages: list[dict]) -> list[dict]:
     messages = list(messages)
     msg = dict(messages[target_idx])
     content = msg["content"]
+    # 1h TTL so the prior_history prefix survives the 30-min session gap and
+    # is cache-read on resume (matches the system breakpoint's 1h TTL).
+    _bp = {"type": "ephemeral", "ttl": "1h"}
     if isinstance(content, str):
         msg["content"] = [
-            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": content, "cache_control": _bp},
         ]
     elif isinstance(content, list):
         # Clone the last block and add cache_control
         content = list(content)
         last_block = dict(content[-1])
-        last_block["cache_control"] = {"type": "ephemeral"}
+        last_block["cache_control"] = _bp
         content[-1] = last_block
         msg["content"] = content
     messages[target_idx] = msg

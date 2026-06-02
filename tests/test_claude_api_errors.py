@@ -74,6 +74,25 @@ class TestClassifyAnthropicError:
         )
         assert classify_anthropic_error(exc) == "invalid_request"
 
+    def test_413_request_too_large_is_context_overflow(self):
+        # 413 (oversized resumed history) must self-heal via the context_overflow
+        # path — drop the session, resume from a short tail — instead of the old
+        # api_exit dead-end that re-sent the same payload forever (msg2 incident).
+        exc = self._make_status_error(
+            413,
+            body={"error": {"type": "request_too_large",
+                            "message": "Request exceeds the maximum size"}},
+        )
+        assert classify_anthropic_error(exc) == "context_overflow"
+
+    def test_request_too_large_type_on_200_is_context_overflow(self):
+        # The same error can ride a 200 stream with only the body.error.type set.
+        exc = self._make_status_error(
+            200,
+            body={"error": {"type": "request_too_large", "message": "too big"}},
+        )
+        assert classify_anthropic_error(exc) == "context_overflow"
+
     def test_context_overflow_200(self):
         # context-overflow must win over invalid_request even on a 200 stream.
         exc = self._make_status_error(

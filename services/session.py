@@ -251,6 +251,7 @@ def build_compact_history_entries(
     assistant_text: str,
     *,
     previous_context_snapshot: str = "",
+    author_label: str = "",
 ) -> tuple[dict, dict]:
     """Build the user+assistant JSONL pair without re-saving the full prompt.
 
@@ -263,9 +264,16 @@ def build_compact_history_entries(
     only; the web history view ignores it.
     """
     snapshot = extract_context_snapshot(prompt_text) or previous_context_snapshot
+    user_content = _compact_text(raw_user_text or "", COMPACT_HISTORY_USER_CHARS)
+    # Tag the speaker so a resumed transcript with multiple admins (haroin /
+    # b0nchichi) keeps each past turn attributable. Without it the replay is
+    # an undifferentiated user stream and kanae mixes up who said what.
+    # author_label is the caller's already-sanitized display name.
+    if author_label:
+        user_content = f"[{author_label}] {user_content}"
     user_entry: dict = {
         "role": "user",
-        "content": _compact_text(raw_user_text or "", COMPACT_HISTORY_USER_CHARS),
+        "content": user_content,
     }
     if snapshot:
         user_entry["context_snapshot"] = _compact_text(

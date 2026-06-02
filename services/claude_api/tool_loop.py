@@ -19,6 +19,8 @@ Notes:
   yield streaming events.
 """
 
+import asyncio
+import json
 import logging
 import re
 import time
@@ -27,7 +29,12 @@ from dataclasses import dataclass
 
 import anthropic
 
-from config import CLAUDE_MAX_TOKENS
+from config import (
+    CLAUDE_MAX_TOKENS,
+    MAX_TOOL_RESULT_CHARS,
+    STREAM_FIRST_EVENT_MAX_RETRIES,
+    STREAM_FIRST_EVENT_TIMEOUT_S,
+)
 
 from services.claude_api.client import (
     CLAUDE_MAX_TOKENS_OPUS,
@@ -84,7 +91,11 @@ def _build_cached_system(system_prompt: str, messages: list[dict]) -> list[dict]
         {"type": "text", "text": attribution},
         {"type": "text", "text": CLI_IDENTITY_TEXT},
         {"type": "text", "text": CLI_DEFAULT_SYSTEM_PROMPT,
-         "cache_control": {"type": "ephemeral", "scope": "global"}},
+         # 1h TTL so the static prefix (tools + this block) survives the
+         # SESSION_TTL_S (30-min) gap and is cache-read on resume. MUST be
+         # >= the messages breakpoint TTL: Anthropic requires longer-TTL
+         # cache_control to appear BEFORE shorter ones (tools→system→messages).
+         "cache_control": {"type": "ephemeral", "scope": "global", "ttl": "1h"}},
         {"type": "text", "text": system_prompt},
     ]
 
@@ -100,14 +111,19 @@ def _inject_cache_breakpoints(messages: list[dict]) -> list[dict]:
     messages = list(messages)
     msg = dict(messages[target_idx])
     content = msg["content"]
+    # 1h TTL so the prior_history prefix (the dominant ~90K-token turn=1
+    # write) survives the 30-min SESSION_TTL_S gap and is cache-read on
+    # resume instead of rewritten. Must match the system breakpoint's 1h
+    # (longer-TTL-before-shorter ordering rule).
+    _bp = {"type": "ephemeral", "ttl": "1h"}
     if isinstance(content, str):
         msg["content"] = [
-            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": content, "cache_control": _bp},
         ]
     elif isinstance(content, list):
         content = list(content)
         last_block = dict(content[-1])
-        last_block["cache_control"] = {"type": "ephemeral"}
+        last_block["cache_control"] = _bp
         content[-1] = last_block
         msg["content"] = content
     messages[target_idx] = msg
@@ -382,12 +398,135 @@ def _format_tool_invocation_for_display(tool_name: str, tool_input: dict) -> str
 # rejects messages with empty content (400 'must have non-empty content').
 # Empty content arises from a thinking-only pause turn (tool_results==[]) or
 # from resumed JSONL history that captured such a turn from an older run.
-_EMPTY_CONTENT_PLACEHOLDER = [{"type": "text", "text": "(続けてください)"}]
+# Wording explicitly forbids narration-only resumption: the model must call
+# a tool in the next turn rather than just continuing prose.
+_EMPTY_CONTENT_PLACEHOLDER = [{
+    "type": "text",
+    "text": "(前ターンで tool_use が無かったため再開要求。必要なら今すぐツールを呼んでください。宣言だけで終わらせないこと)",
+}]
 
 # Max consecutive thinking-only "pause turns" (stop_reason==tool_use but zero
 # tool_use blocks) before the loop stops nudging and returns accumulated text.
 # Bounds the loop so a model that keeps thinking without acting can't spin.
+#
+# 2026-05-30: lowered 2 → 1 after rid=8e6df64c (a nudged turn went silent 602s
+# upstream). RESTORED to 2 on 2026-06-02: that lowering was a misdiagnosis.
+# MAX=1 means the FIRST thinking-only pause turn returns accumulated text
+# immediately WITHOUT nudging the model to call a tool — which truncated
+# legitimate continuations (rid=decc2aeb msg3: turn=1 returned 823 chars of
+# half-finished prose, abandoning the work the model was about to do). And it
+# never actually fixed the hang: the 8e6df64c-class upstream stall recurs on
+# *normal* turns (rid=c9b86f7b hung on turn-3, not a nudge turn), so crippling
+# the nudge bought nothing. The hang is now caught directly and ~5x faster by
+# the first-event timeout in the stream loop below, so the nudge is safe to
+# restore. With MAX=2 a single benign pause turn gets one nudge ("call a tool
+# now"); only a model that thinks-without-acting twice in a row is cut off.
 MAX_CONSECUTIVE_EMPTY_TURNS = 2
+
+
+def _truncate_tool_result(content):
+    """Head+tail truncate an oversized string tool result.
+
+    A single huge tool result (``journalctl`` dump, large ``Read``/``Grep``) is
+    the dominant driver of agent-loop history bloat → 413 / 7.6M-token
+    context_overflow (2026-06-01 incident ①). Cap string results at
+    ``MAX_TOOL_RESULT_CHARS``, keeping the head (usually the most relevant) and
+    a smaller tail, with an elision marker so the model knows content was
+    dropped and can re-query a narrower slice. List results (the ``Read`` tool's
+    image content blocks) are passed through untouched. ``cap<=0`` disables.
+    """
+    cap = MAX_TOOL_RESULT_CHARS
+    if cap <= 0 or not isinstance(content, str) or len(content) <= cap:
+        return content
+    head = int(cap * 0.7)
+    tail = cap - head
+    elided = len(content) - cap
+    return (
+        content[:head]
+        + f"\n\n…[{elided:,} chars elided — tool result capped at {cap:,}; "
+        "re-run with a narrower query/range to see the rest]…\n\n"
+        + content[-tail:]
+    )
+
+
+# Tool calls the model wrote as TEXT instead of as a native tool_use block.
+# Opus 4.8 intermittently emits the function-calling XML
+# (``<function_calls><invoke name=...><parameter ...>``) inline in its prose
+# rather than as a structured tool_use block — observed rid=decc2aeb
+# (2026-06-02): a brave-search / x-scraper call leaked verbatim into the Discord
+# reply, and because the API parsed zero tool_use blocks the turn looked like a
+# "thinking-only pause" and the loop stopped. The tools were advertised
+# (tools=23 included brave-search), so this is a model-format quirk, not an
+# advertising gap — minutes later the same model called the same tool natively.
+# This text is NEVER executed by the API, so it must (a) never reach the user
+# and (b) trigger a corrective nudge so the model re-issues it as real tool_use.
+_TEXT_TOOL_CALL_MARKER = re.compile(
+    r"<\s*/?\s*(?:antml:)?(?:function_calls|invoke)\b",
+    re.IGNORECASE,
+)
+_TEXT_TOOL_CALL_RE = re.compile(
+    # A whole <function_calls>…</function_calls> wrapper (across newlines)…
+    r"<\s*(?:antml:)?function_calls\b[^>]*>.*?<\s*/\s*(?:antml:)?function_calls\s*>"
+    # …or a standalone <invoke …>…</invoke> block…
+    r"|<\s*(?:antml:)?invoke\b[^>]*>.*?<\s*/\s*(?:antml:)?invoke\s*>"
+    # …or any leftover/unclosed call marker (stream truncated mid-tag).
+    r"|<\s*/?\s*(?:antml:)?(?:function_calls|invoke|parameter)\b[^>]*>?",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_text_tool_calls(text: str) -> "tuple[str, bool]":
+    """Strip text-format tool-call XML from model prose.
+
+    Returns ``(cleaned_text, had_text_tool_call)``. ``cleaned_text`` is safe to
+    show the user and to accumulate; ``had_text_tool_call`` tells the caller to
+    parse+execute the call (so the model's intent isn't lost).
+    """
+    if not text or not _TEXT_TOOL_CALL_MARKER.search(text):
+        return text, False
+    cleaned = _TEXT_TOOL_CALL_RE.sub("", text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, True
+
+
+# Parse the text-format tool call back into (name, input) so the loop can
+# EXECUTE it instead of just nudging-and-giving-up. Nudging alone is symptom-
+# hiding: if 4.8 re-emits the text format on the next turn (consecutive=2), the
+# loop hits MAX_CONSECUTIVE_EMPTY_TURNS and returns a truncated, tool-less reply
+# (docs/2026-06-02-msg3-tag-leak-model-revert-rootcause.md root cause 2).
+_INVOKE_RE = re.compile(
+    r"<\s*(?:antml:)?invoke\b[^>]*?\bname\s*=\s*\"([^\"]+)\"[^>]*>(.*?)"
+    r"<\s*/\s*(?:antml:)?invoke\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_PARAM_RE = re.compile(
+    r"<\s*(?:antml:)?parameter\b[^>]*?\bname\s*=\s*\"([^\"]+)\"[^>]*>(.*?)"
+    r"<\s*/\s*(?:antml:)?parameter\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _parse_text_tool_calls(text: str) -> "list[tuple[str, dict]]":
+    """Extract ``[(tool_name, tool_input), ...]`` from text-format tool calls.
+
+    Each ``<parameter>`` value is JSON-decoded when possible (so ``"12"`` →
+    ``12``, ``"true"`` → ``True``, ``["a"]`` → list) to match typed tool input
+    schemas, falling back to the raw string otherwise. Returns ``[]`` when
+    nothing parses (caller then falls back to a corrective nudge).
+    """
+    calls: "list[tuple[str, dict]]" = []
+    for m in _INVOKE_RE.finditer(text or ""):
+        name = m.group(1).strip()
+        params: dict = {}
+        for pm in _PARAM_RE.finditer(m.group(2)):
+            raw = pm.group(2).strip()
+            try:
+                params[pm.group(1).strip()] = json.loads(raw)
+            except (ValueError, TypeError):
+                params[pm.group(1).strip()] = raw
+        if name:
+            calls.append((name, params))
+    return calls
 
 
 def _normalize_history_for_api(history: list[dict]) -> list[dict]:
@@ -531,6 +670,14 @@ async def run_agent_loop(
     consecutive_empty = 0
 
     for turn in range(max_turns):
+        # Record current turn on the watchdog so a stall-cancel can tell the
+        # user how deep we got ("最後のturn=N") instead of just "timed out".
+        try:
+            stall_watchdog.set_turn(turn)
+        except AttributeError:
+            # Older watchdog stub (test mocks without set_turn) — diagnostic
+            # plumbing is best-effort, never break the loop on it.
+            pass
         messages = _normalize_history_for_api(history)
         messages = _inject_cache_breakpoints(messages)
         cached_system = _build_cached_system(system_prompt, messages)
@@ -579,52 +726,107 @@ async def run_agent_loop(
         if extra_headers:
             stream_kwargs["extra_headers"] = extra_headers
 
-        try:
-            async with api_client.beta.messages.stream(**stream_kwargs) as stream:
-                async for event in stream:
-                    stall_watchdog.heartbeat()
-                    etype = getattr(event, "type", None)
-                    if etype == "content_block_start":
-                        block = getattr(event, "content_block", None)
-                        btype = getattr(block, "type", None) if block else None
-                        if btype == "thinking":
-                            await _safe_status(status_callback, "💭 thinking…")
-                        elif btype == "text":
-                            await _safe_status(status_callback, "📝 応答を生成中")
-                        elif btype == "tool_use":
-                            name = getattr(block, "name", "?")
-                            hint = _tool_input_hint(name, getattr(block, "input", None))
-                            short_name = name.split("__", 2)[-1] if "__" in name else name
-                            label = f"🔧 {short_name}"
-                            if hint:
-                                label += f" `{hint[:60]}`"
-                            await _safe_status(status_callback, label)
-                final_msg = await stream.get_final_message()
-                _log_turn_usage(channel_id, turn, final_msg, usage_totals)
-                # Update the shared rate-limit state from the response so
-                # the next turn (and the next call from entry.py) can pace
-                # itself before sending. anthropic SDK exposes the raw
-                # response via stream.response.headers.
+        # First-event (time-to-first-token) guarded stream consumption. An
+        # upstream hang manifests as HTTP 200 + ZERO SSE events: the POST
+        # succeeds but `message_start` never arrives. Bound only the wait for
+        # the FIRST event and re-POST the turn, rather than waiting out the full
+        # inter-event idle_timeout (600s observed in rid=c9b86f7b). After the
+        # first event lands, inter-event gaps are owned by the StallWatchdog so
+        # legitimate extended-thinking pauses are not cut off.
+        first_event_attempt = 0
+        while True:
+            try:
+                async with api_client.beta.messages.stream(**stream_kwargs) as stream:
+                    stream_iter = stream.__aiter__()
+                    got_first_event = False
+                    while True:
+                        try:
+                            next_event = stream_iter.__anext__()
+                            if not got_first_event:
+                                event = await asyncio.wait_for(
+                                    next_event, STREAM_FIRST_EVENT_TIMEOUT_S
+                                )
+                            else:
+                                event = await next_event
+                        except StopAsyncIteration:
+                            break
+                        got_first_event = True
+                        stall_watchdog.heartbeat()
+                        etype = getattr(event, "type", None)
+                        if etype == "content_block_start":
+                            block = getattr(event, "content_block", None)
+                            btype = getattr(block, "type", None) if block else None
+                            if btype == "thinking":
+                                await _safe_status(status_callback, "💭 thinking…")
+                            elif btype == "text":
+                                await _safe_status(status_callback, "📝 応答を生成中")
+                            elif btype == "tool_use":
+                                name = getattr(block, "name", "?")
+                                hint = _tool_input_hint(name, getattr(block, "input", None))
+                                short_name = name.split("__", 2)[-1] if "__" in name else name
+                                label = f"🔧 {short_name}"
+                                if hint:
+                                    label += f" `{hint[:60]}`"
+                                await _safe_status(status_callback, label)
+                    final_msg = await stream.get_final_message()
+                    _log_turn_usage(channel_id, turn, final_msg, usage_totals)
+                    # Update the shared rate-limit state from the response so
+                    # the next turn (and the next call from entry.py) can pace
+                    # itself before sending. anthropic SDK exposes the raw
+                    # response via stream.response.headers.
+                    try:
+                        resp = getattr(stream, "response", None)
+                        if resp is not None and getattr(resp, "headers", None) is not None:
+                            observe_ratelimit(resp.headers)
+                    except Exception as exc:
+                        log.debug("ratelimit observe failed: %s", exc)
+                break
+            except asyncio.TimeoutError:
+                # No SSE event within the first-event window. Abandon this
+                # stream (the `async with` exit closes the dangling HTTP
+                # connection) and re-POST the same turn. Heartbeat so the
+                # StallWatchdog's idle timer doesn't also fire mid-retry.
+                first_event_attempt += 1
+                stall_watchdog.heartbeat()
+                if first_event_attempt > STREAM_FIRST_EVENT_MAX_RETRIES:
+                    log.error(
+                        "first-event timeout exhausted ch=%d turn=%d "
+                        "(%ds × %d attempts) → returning accumulated text",
+                        channel_id, turn, STREAM_FIRST_EVENT_TIMEOUT_S,
+                        first_event_attempt,
+                    )
+                    _log_total_usage(channel_id, usage_totals)
+                    accumulated = "\n\n".join(text_across_turns)
+                    return AgentLoopResult(
+                        text=accumulated or (
+                            "⏰ 応答が来ませんでした（初動タイムアウト）。"
+                            "もう一度試してください。"
+                        ),
+                        synthetic_session_id=None,
+                        active_mcp_keys=active_mcp_keys,
+                    )
+                log.warning(
+                    "first-event timeout ch=%d turn=%d after %ds → re-POST "
+                    "(retry %d/%d)",
+                    channel_id, turn, STREAM_FIRST_EVENT_TIMEOUT_S,
+                    first_event_attempt, STREAM_FIRST_EVENT_MAX_RETRIES,
+                )
+                await _safe_status(status_callback, "🔄 応答が来ないので再接続中")
+                continue
+            except anthropic.AnthropicError as exc:
+                category = classify_anthropic_error(exc)
+                log.error("agent loop API error turn=%d category=%s: %s",
+                          turn, category, exc)
+                # Also try to observe ratelimit headers from the failing
+                # response so the next pre-check can refuse outright.
                 try:
-                    resp = getattr(stream, "response", None)
+                    resp = getattr(exc, "response", None)
                     if resp is not None and getattr(resp, "headers", None) is not None:
                         observe_ratelimit(resp.headers)
-                except Exception as exc:
-                    log.debug("ratelimit observe failed: %s", exc)
-        except anthropic.AnthropicError as exc:
-            category = classify_anthropic_error(exc)
-            log.error("agent loop API error turn=%d category=%s: %s",
-                      turn, category, exc)
-            # Also try to observe ratelimit headers from the failing response
-            # so the next pre-check can refuse outright.
-            try:
-                resp = getattr(exc, "response", None)
-                if resp is not None and getattr(resp, "headers", None) is not None:
-                    observe_ratelimit(resp.headers)
-            except Exception:
-                pass
-            # Caller (entry.py) owns retry/backoff; surface the exception.
-            raise
+                except Exception:
+                    pass
+                # Caller (entry.py) owns retry/backoff; surface the exception.
+                raise
 
         # Persist the assistant turn (in-memory only; disk write is caller's job)
         assistant_blocks = [_block_to_dict(b) for b in (final_msg.content or [])]
@@ -634,7 +836,12 @@ async def run_agent_loop(
         # We do this on *every* turn (not just the final one) so a model
         # that wrote its full answer in turn N and then tool_use'd Mem0
         # in turn N+1 still surfaces the prose to the user.
-        turn_text = _join_final_text(final_msg)
+        raw_turn_text = _join_final_text(final_msg)
+        # Remove any tool call the model wrote as TEXT (function-calling XML)
+        # before it is shown live or accumulated — that text is never executed
+        # by the API and leaked to Discord in rid=decc2aeb. The RAW form is kept
+        # so the text-format call can be parsed + executed below instead of lost.
+        turn_text, had_text_tool_call = _strip_text_tool_calls(raw_turn_text)
 
         # Collect tool names that fired in this turn so the hallucination
         # detector below can compare claimed writes vs actual tool_use
@@ -743,9 +950,9 @@ async def run_agent_loop(
                 if isinstance(output, list):
                     result_content: "str | list[dict]" = output
                 elif isinstance(output, str):
-                    result_content = output
+                    result_content = _truncate_tool_result(output)
                 else:
-                    result_content = str(output)
+                    result_content = _truncate_tool_result(str(output))
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tool_id,
@@ -765,6 +972,63 @@ async def run_agent_loop(
                 })
                 await _safe_status(status_callback, "❌ ツールエラー")
 
+        # 4.8 sometimes writes the tool call as TEXT instead of a native
+        # tool_use block. Rather than nudge-and-give-up (which truncates the
+        # reply once the model repeats the format and hits the consecutive
+        # limit), parse the call out of the raw prose and EXECUTE it, feeding
+        # the result back so the turn's work is not lost. Only falls through to
+        # the nudge below when nothing parses.
+        if not tool_results and had_text_tool_call:
+            parsed_calls = _parse_text_tool_calls(raw_turn_text)
+            if parsed_calls:
+                log.warning(
+                    "executing %d text-format tool call(s) ch=%d turn=%d "
+                    "(model emitted them as text; running them so the turn "
+                    "is not lost)",
+                    len(parsed_calls), channel_id, turn + 1,
+                )
+                result_lines: list[str] = []
+                for tool_name, tool_input in parsed_calls:
+                    if tool_invocation_callback is not None:
+                        try:
+                            await tool_invocation_callback(tool_name, tool_input)
+                        except Exception as exc:
+                            log.warning(
+                                "tool_invocation_callback failed (text-call %s): %s",
+                                tool_name, exc,
+                            )
+                    allowed, reason = can_use_tool(tool_name, tool_input)
+                    if not allowed:
+                        result_lines.append(f"[{tool_name}] 拒否: {reason}")
+                        await _safe_status(status_callback, "❌ ツール拒否")
+                        continue
+                    try:
+                        t0 = time.monotonic()
+                        output = await execute_tool(tool_name, tool_input)
+                        dt = time.monotonic() - t0
+                        text_out = output if isinstance(output, str) else str(output)
+                        result_lines.append(
+                            f"[{tool_name}] 結果:\n{_truncate_tool_result(text_out)}"
+                        )
+                        await _safe_status(status_callback, f"📨 結果を受信 ({dt:.1f}s)")
+                    except Exception as exc:
+                        log.warning("text-format tool %s failed: %s", tool_name, exc)
+                        result_lines.append(f"[{tool_name}] エラー: {exc}")
+                        await _safe_status(status_callback, "❌ ツールエラー")
+                feedback = (
+                    "前ターンのツール呼び出しがテキスト形式 (<invoke>) だったため、"
+                    "こちらで代理実行しました。結果は以下です。これを使って回答を"
+                    "続けてください。追加でツールが必要なら、次は必ず正式な tool_use "
+                    "ブロックで呼んでください (テキスト形式は実行されません)。\n\n"
+                    + "\n\n".join(result_lines)
+                )
+                history.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": feedback}],
+                })
+                consecutive_empty = 0
+                continue
+
         if not tool_results:
             # Pause turn: stop_reason was tool_use but the model emitted only
             # thinking/text and zero tool_use blocks (seen under effort=max +
@@ -773,13 +1037,33 @@ async def run_agent_loop(
             consecutive_empty += 1
             if consecutive_empty < MAX_CONSECUTIVE_EMPTY_TURNS:
                 log.info(
-                    "pause turn (thinking-only, no tool_use) ch=%d turn=%d "
-                    "consecutive=%d → nudging continuation",
+                    "pause turn (%s) ch=%d turn=%d consecutive=%d → nudging",
+                    "text-format tool call" if had_text_tool_call
+                    else "thinking-only, no tool_use",
                     channel_id, turn + 1, consecutive_empty,
                 )
+                # MAX_CONSECUTIVE_EMPTY_TURNS=2 (restored 2026-06-02): one nudge
+                # is allowed before giving up. Two distinct causes land here —
+                # the model thought without acting, or it wrote a tool call as
+                # text (stripped from turn_text above) — so the nudge is
+                # tailored. Both forbid narration-only continuation: the prior
+                # "続けてください。" let the model keep thinking (rid=8e6df64c).
+                if had_text_tool_call:
+                    nudge = (
+                        "前ターンでツール呼び出しを <function_calls> / <invoke> の"
+                        "プレーンテキスト形式で書きましたが、その形式は実行されません。"
+                        "同じ呼び出しを正式な tool_use ブロックとして今すぐ実行してください。"
+                        "説明や宣言だけで終わらせないこと。"
+                    )
+                else:
+                    nudge = (
+                        "前ターンは思考のみで tool_use ブロックがありませんでした。"
+                        "説明や考察ではなく、必要なツール (Read / Grep / Bash / Edit 等) を"
+                        "次のターンで必ず呼んでください。宣言だけで終わらせるのは禁止です。"
+                    )
                 history.append({
                     "role": "user",
-                    "content": [{"type": "text", "text": "続けてください。"}],
+                    "content": [{"type": "text", "text": nudge}],
                 })
                 continue
             log.warning(

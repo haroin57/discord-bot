@@ -377,12 +377,39 @@ class EmotionSessionDaemon:
             "--model", self.model,
         ]
         cmd += ["--resume", session_id] if resume else ["--session-id", session_id]
+        # Credential isolation (2026-06-01 incident ②): this CLI shares the
+        # bot's process env, so without an override it reads/writes the SAME
+        # ~/.claude/.credentials.json as the bot's direct-API OAuth manager.
+        # The CLI rotates that file on its own schedule, invalidating the
+        # refresh token the bot holds in memory → `invalid_grant` (18:52 rotate
+        # → 18:53 invalid_grant). Point the emotion CLI at its OWN config dir so
+        # the two credential chains can never collide.
+        #
+        # Activation is gated on that dir already holding credentials: it needs
+        # a one-time `CLAUDE_CONFIG_DIR=<dir> claude login` (see
+        # docs/2026-06-01-claude-api-stall-incident.md). Until then we keep the
+        # shared dir and warn loudly rather than silently breaking the (non-
+        # critical) emotion engine on deploy — the isolation switches on by
+        # itself the moment that login is done.
+        env = dict(os.environ)
+        emotion_cfg_dir = os.environ.get(
+            "EMOTION_CLAUDE_CONFIG_DIR", "/home/ubuntu/.claude-emotion"
+        )
+        if os.path.exists(os.path.join(emotion_cfg_dir, ".credentials.json")):
+            env["CLAUDE_CONFIG_DIR"] = emotion_cfg_dir
+        else:
+            log.warning(
+                "emotion CLI: %s has no .credentials.json — falling back to the "
+                "SHARED ~/.claude credential. OAuth self-poisoning risk persists "
+                "until you run: CLAUDE_CONFIG_DIR=%s claude login",
+                emotion_cfg_dir, emotion_cfg_dir,
+            )
         return await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=dict(os.environ),
+            env=env,
             cwd=self.cwd,
         )
 

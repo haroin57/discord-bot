@@ -54,6 +54,20 @@ USER_AGENT = f"claude-cli/{CC_VERSION} (external, {CC_ENTRYPOINT})"
 #   advanced-tool-use beta. Mirroring it keeps overage-cohort routing
 #   working under sustained load.
 THINKING_CONFIG = {"type": "adaptive"}
+
+
+def supports_adaptive_thinking(model: str) -> bool:
+    """Whether ``thinking={"type":"adaptive"}`` is accepted by ``model``.
+
+    Adaptive thinking is an Opus/Sonnet-4 feature. Haiku 4.5 rejects it with
+    HTTP 400 ``adaptive thinking is not supported on this model`` — which was
+    silently 400-ing every Mem0 helper (hyde / keyword-extract / rewrite /
+    rerank / dedup / conflict-classify all run on Haiku), so query expansion
+    fell open to lexical/vector only. Gate the ``thinking`` kwarg on this.
+    """
+    return "haiku" not in (model or "").lower()
+
+
 OUTPUT_CONFIG = {"effort": "max"}
 CONTEXT_MANAGEMENT_CONFIG = {
     "edits": [

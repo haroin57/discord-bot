@@ -47,10 +47,27 @@ class StallWatchdog:
         self._task: asyncio.Task | None = None
         self._parent: asyncio.Task | None = None
         self._stream_idle = False
+        # Diagnostics surfaced to entry.py's CancelledError handler so the
+        # user-visible status_msg can be edited into a structured
+        # "⏰ タイムアウトしました — rid=... idle=... 最後のturn=..." line
+        # instead of being deleted and replaced with a context-free notice.
+        self.idle_seconds: float = 0.0
+        self.last_turn: int = -1
+        self.cancel_reason: str = ""
 
     def heartbeat(self) -> None:
         self._last = time.monotonic()
         self._warned = False
+
+    def set_turn(self, turn: int) -> None:
+        """Record the agent-loop turn we are currently executing.
+
+        Called by tool_loop at the top of each ``for turn in range(...)``
+        iteration. Surfaces as ``last_turn`` on cancel so the user-facing
+        diagnostic can say "最後のturn=N" (the deepest turn we entered).
+        """
+        if turn > self.last_turn:
+            self.last_turn = turn
 
     @property
     def stream_idle(self) -> bool:
@@ -79,6 +96,8 @@ class StallWatchdog:
             # in this PR; wired for keen-strolling-thunder.md).
             if self.cancel_event is not None and self.cancel_event.is_set():
                 log.info("[ch=%d] cancel_event set, cancelling", self.channel_id)
+                self.idle_seconds = idle
+                self.cancel_reason = "user_cancel"
                 self._stream_idle = True
                 if self._parent is not None:
                     self._parent.cancel("user cancel")
@@ -93,18 +112,28 @@ class StallWatchdog:
                     self.status_callback,
                     f"⏰ ストリームが {int(idle)} 秒応答なし、中断します",
                 )
+                self.idle_seconds = idle
+                self.cancel_reason = "stream_idle"
                 self._stream_idle = True
                 if self._parent is not None:
                     self._parent.cancel("stream idle")
                 return
 
-            if idle > self.stall_threshold_s and not self._warned:
-                log.warning(
-                    "[ch=%d] stream stall: no message for %.0fs",
-                    self.channel_id, idle,
-                )
+            if idle > self.stall_threshold_s:
+                # Log once on first stall to avoid spam; reset on heartbeat().
+                # User-facing status edit re-fires every poll so the displayed
+                # idle seconds advance instead of latching at the first value
+                # (was the rid=8e6df64c UX bug: user saw "31秒" frozen for
+                # 571s while real idle climbed to 602s).
+                # bot.py _update_status() rate-limits to STATUS_INTERVAL_S=2.0s
+                # with latest-wins, so a 10s poll cadence is safely throttled.
+                if not self._warned:
+                    log.warning(
+                        "[ch=%d] stream stall: no message for %.0fs",
+                        self.channel_id, idle,
+                    )
+                    self._warned = True
                 await _safe_status(
                     self.status_callback,
                     f"⏳ 応答が遅延しています ({int(idle)}秒)",
                 )
-                self._warned = True

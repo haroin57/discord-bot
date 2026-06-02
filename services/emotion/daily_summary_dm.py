@@ -25,14 +25,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from config import HAROIN_USER_ID
 from services.emotion.daily import load_daily
 
 log = logging.getLogger(__name__)
 
 JST = timezone(timedelta(hours=9))
-
-# haroin (先輩) — recipient of the hourly recap DM.
-HAROIN_USER_ID = 573489206240870410
 
 # Loop interval. 1h matches the requested cadence; the entry window is
 # also 1h so consecutive recaps don't overlap.

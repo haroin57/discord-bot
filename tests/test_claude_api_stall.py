@@ -43,20 +43,38 @@ async def test_stall_threshold_invokes_callback():
 
 
 @pytest.mark.asyncio
-async def test_stall_only_warns_once_per_idle_period():
+async def test_stall_logs_once_but_status_advances_each_poll(caplog):
+    # 2026-05-30 FIX A: the watchdog now re-emits the user-facing status
+    # edit on EVERY poll while stalled so the displayed idle seconds advance
+    # (was the rid=8e6df64c UX bug: "31秒" frozen for ~571s while real idle
+    # climbed to 602s). The log.warning still fires only once per stall
+    # episode to avoid spam.
     calls: list[str] = []
 
     async def cb(msg):
         calls.append(msg)
 
-    async with StallWatchdog(
-        channel_id=1, status_callback=cb,
-        stall_threshold_s=0.05, idle_timeout_s=10.0, poll_interval_s=0.02,
-    ):
-        await asyncio.sleep(0.3)
-    # Same idle period — should warn once, not many times.
-    warn_count = sum(1 for c in calls if "⏳" in c)
-    assert warn_count == 1
+    import logging
+    with caplog.at_level(logging.WARNING, logger="services.claude_api.stall"):
+        async with StallWatchdog(
+            channel_id=1, status_callback=cb,
+            stall_threshold_s=0.05, idle_timeout_s=10.0, poll_interval_s=0.02,
+        ):
+            await asyncio.sleep(0.3)
+    # status_callback should fire multiple times (one per poll while stalled).
+    warn_callbacks = sum(1 for c in calls if "⏳" in c)
+    assert warn_callbacks > 1, (
+        f"expected multiple status edits while stalled, got {warn_callbacks}"
+    )
+    # But log.warning("stream stall: ...") should appear only ONCE per
+    # stall period (heartbeat() resets _warned for the next stall episode).
+    stall_log_lines = [
+        r for r in caplog.records
+        if "stream stall: no message" in r.getMessage()
+    ]
+    assert len(stall_log_lines) == 1, (
+        f"expected exactly 1 'stream stall' log line, got {len(stall_log_lines)}"
+    )
 
 
 @pytest.mark.asyncio

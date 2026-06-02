@@ -26,10 +26,13 @@ from contextlib import AsyncExitStack
 import anthropic
 import httpx
 
+from services.correlation import get_request_id
+
 from config import (
     ADMIN_MAX_TURNS,
     ATTACHMENT_DIR,
     CLAUDE_MAX_PARALLEL,
+    CLAUDE_MODEL,
     CWD,
     RESTRICTED_CLAUDE_MAX_PARALLEL,
     RESTRICTED_SYSTEM_PROMPT,
@@ -89,7 +92,9 @@ from services.claude_api.tools import (
 
 log = logging.getLogger(__name__)
 
-MODEL = "claude-opus-4-7"
+# Single source of truth: config.CLAUDE_MODEL (default 4-7, .env-overridable).
+# This is the constant the current direct-API path actually reads.
+MODEL = CLAUDE_MODEL
 
 # MCP servers whose tool schemas we advertise on every admin API request.
 # The process is still spawned lazily via McpPool.call_tool() on first use.
@@ -202,6 +207,7 @@ async def call_with_tools(
     raw_user_text: str = "",
     is_thread: bool = False,
     has_image_attachment: bool = False,
+    author_label: str = "",
 ) -> tuple[str, SessionInfo | None, bool]:
     """Direct-API replacement for services/claude_sdk.py:call_with_tools.
 
@@ -426,8 +432,38 @@ async def call_with_tools(
                         break
                     except asyncio.CancelledError:
                         # Stall watchdog fired or shutdown — surface as timeout.
-                        log.warning("[ch=%d] cancelled during agent loop", channel_id)
-                        return f"⏰ タイムアウトしました", None, False
+                        # Build a diagnostic tail (rid / idle seconds / deepest
+                        # turn / reason) so bot.py can edit it into the
+                        # existing status_msg instead of deleting that message
+                        # and losing the context anchor. The leading
+                        # "⏰ タイムアウトしました" is preserved verbatim so any
+                        # caller / test that just checks the phrase still works.
+                        # The em-dash " — " (U+2014) is the sentinel bot.py
+                        # uses to distinguish the structured form from a
+                        # legacy plain timeout.
+                        _idle_s = int(getattr(watchdog, "idle_seconds", 0) or 0)
+                        _last_turn = getattr(watchdog, "last_turn", -1)
+                        _reason = getattr(watchdog, "cancel_reason", "") or "cancel"
+                        try:
+                            _rid = get_request_id() or "-"
+                        except Exception:
+                            _rid = "-"
+                        _rid_short = _rid[:8] if _rid and _rid != "-" else "-"
+                        _turn_label = (
+                            f"最後のturn={_last_turn + 1}" if _last_turn >= 0
+                            else "最後のturn=未開始"
+                        )
+                        log.warning(
+                            "[ch=%d rid=%s] cancelled during agent loop "
+                            "reason=%s idle=%ss last_turn=%d",
+                            channel_id, _rid, _reason, _idle_s, _last_turn,
+                        )
+                        return (
+                            f"⏰ タイムアウトしました — rid={_rid_short} "
+                            f"idle={_idle_s}秒 {_turn_label} reason={_reason}",
+                            None,
+                            False,
+                        )
                     except anthropic.AnthropicError as exc:
                         category = classify_anthropic_error(exc)
                         log.error(
@@ -546,6 +582,7 @@ async def call_with_tools(
                     prompt_text=prompt_text,
                     assistant_text=response_text,
                     previous_context_snapshot=latest_context_snapshot,
+                    author_label=author_label,
                 )
                 await asyncio.to_thread(append_jsonl, channel_id, user_entry)
                 await asyncio.to_thread(append_jsonl, channel_id, assistant_entry)

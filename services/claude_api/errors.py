@@ -87,6 +87,21 @@ def classify_anthropic_error(exc: BaseException) -> str:
             return "overloaded"
         if status == 429 or "rate_limit" in err_type:
             return "rate_limit"
+        # 413 request_too_large: the payload (huge resumed history) exceeds the
+        # request size limit. The body — "Request exceeds the maximum size" /
+        # "request_too_large" — matches NONE of _CONTEXT_PATTERNS, so before
+        # 2026-06-01 this fell through to api_exit → non-transient → entry.py
+        # returned immediately WITHOUT dropping the session, so the next message
+        # re-sent the same oversized history and 413'd again (msg2 incident).
+        # Route it to context_overflow so entry.py's handler drops the session
+        # and the next turn resumes from a short JSONL tail (self-heal).
+        if (
+            status == 413
+            or "request_too_large" in err_type
+            or "exceeds the maximum size" in body_lower
+            or "request too large" in body_lower
+        ):
+            return "context_overflow"
         # context-overflow must be checked BEFORE invalid_request so a 400 with
         # an "input too long" body stays context_overflow (existing behaviour).
         if any(p in body_lower for p in _CONTEXT_PATTERNS):

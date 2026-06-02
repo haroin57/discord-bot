@@ -16,9 +16,9 @@ _JST = timezone(timedelta(hours=9))
 
 # Soft cap to keep the block from ballooning the prompt. The top-k call
 # already limits item count, but each item rendered with affect annotations
-# can still reach ~80 chars; 5 items is a safe ceiling under the 200-char
-# budget the plan allocates to interests.
-_DEFAULT_TOP_K = 5
+# can still reach ~80 chars; 3 items keeps the per-turn block small while
+# still surfacing the most salient interests (top-k by decayed salience).
+_DEFAULT_TOP_K = 3
 
 _NOTE = (
     "あなたが最近関心を持っているトピック。応答で自然に滲ませても良いが、"

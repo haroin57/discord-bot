@@ -58,10 +58,37 @@ _raw_haroin_dm = os.environ.get("HAROIN_DM_CHANNEL_ID", "").strip()
 HAROIN_DM_CHANNEL_ID: int | None = int(_raw_haroin_dm) if _raw_haroin_dm.isdigit() else None
 
 # ---------------------------------------------------------------------------
+# Per-admin identity labels (sender disambiguation)
+# ---------------------------------------------------------------------------
+# The bot was mixing up haroin (先輩) and his father b0nchichi because the
+# prompt header carried only a boolean admin flag — the model had to guess
+# "who is this" from the display name. We pin user_id → role so kanae can
+# validate the sender by ID and pick 呼称/口調 deterministically. IDs are
+# stable; hard-coded here (mirrored in ~/.claude/CLAUDE.md).
+HAROIN_USER_ID = 573489206240870410
+B0NCHICHI_USER_ID = 1037285234200297522
+USER_ROLE_LABELS: dict[int, str] = {
+    HAROIN_USER_ID: "haroin（先輩本人。後輩口調で接する唯一の相手）",
+    B0NCHICHI_USER_ID: "b0nchichi（haroin の父親。丁寧語で接し『先輩』とは呼ばない）",
+}
+
+
+def role_label_for(user_id: int) -> str:
+    """Prompt-facing role label for a known admin user_id (else '')."""
+    return USER_ROLE_LABELS.get(user_id, "")
+
+# ---------------------------------------------------------------------------
 # Claude
 # ---------------------------------------------------------------------------
 CWD = os.environ.get("BOT_CWD", "/home/ubuntu")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
+# Single source of truth for the model. entry.py / claude_sdk.py import THIS
+# (was: three independent hardcoded `MODEL = ...` constants that drifted —
+# the b762baf 4-7 revert was silently undone because a later patch rolled all
+# three back to 4-8, see docs/2026-06-02-msg3-tag-leak-model-revert-rootcause.md).
+# Override per-deploy via `.env` CLAUDE_MODEL. 4-7 is the stable default; 4-8
+# intermittently emits tool calls as text (<function_calls>/<invoke>) — the
+# tool_loop now parses+executes those, but 4-7 avoids the quirk entirely.
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
 # Sonnet/Haiku per-turn output cap. 64k matches what claude-cli 2.1.92
 # sends in its own request body (2026-05-14 mitm capture); the previous
@@ -181,6 +208,33 @@ CLAUDE_MAX_BACKOFF_S = int(os.environ.get("CLAUDE_MAX_BACKOFF_S", "60"))
 # headroom without unbounded waits.
 STREAM_STALL_THRESHOLD_S = int(os.environ.get("STREAM_STALL_THRESHOLD_S", "30"))
 STREAM_IDLE_TIMEOUT_S = int(os.environ.get("STREAM_IDLE_TIMEOUT_S", "300"))
+
+# First-event (time-to-first-token) timeout — distinct from the inter-event
+# idle above. An upstream hang manifests as HTTP 200 + ZERO SSE events: the
+# POST succeeds but `message_start` never arrives (observed 2026-06-01 rid=
+# c9b86f7b: turn-3 POST at 18:29:42, then 601s of total silence until the idle
+# watchdog cancelled at the full 600s). `message_start` normally lands in ~1-2s
+# even under extended thinking (the 90s+ silence the comment above describes is
+# BETWEEN events, after the first one), so a short first-event bound is safe and
+# catches the hang ~5x faster. On timeout we abandon the stream and re-POST the
+# same turn up to STREAM_FIRST_EVENT_MAX_RETRIES times; if still silent the loop
+# returns a clean timeout instead of letting entry.py retry the whole request
+# (which would stack 4×timeout into a worse hang).
+STREAM_FIRST_EVENT_TIMEOUT_S = int(os.environ.get("STREAM_FIRST_EVENT_TIMEOUT_S", "120"))
+STREAM_FIRST_EVENT_MAX_RETRIES = int(os.environ.get("STREAM_FIRST_EVENT_MAX_RETRIES", "1"))
+
+# Per-tool-result size cap (context_overflow prevention, 2026-06-01 incident ①).
+# A single oversized tool result (huge `journalctl`/`Read`/`Grep` dump) fed back
+# into the agent loop is the dominant driver of history bloat → 413 / 7.6M-token
+# context_overflow. Results longer than this are head+tail truncated with an
+# elision marker before being packaged as a tool_result block. 0 disables.
+#
+# Default 200000 chars (~50k tokens): generous enough for haroin's debug-heavy
+# workflow (large Reads / log dumps) while still capping a single pathological
+# dump (e.g. a 9.9MB bot.log Read) at ~1/20th of the 1M window. The real guard
+# against *accumulated* bloat is the context_overflow self-heal (413 now routes
+# there too); this cap only stops one result from blowing the window outright.
+MAX_TOOL_RESULT_CHARS = int(os.environ.get("MAX_TOOL_RESULT_CHARS", "200000"))
 
 # OAuth (free-code: checkAndRefreshOAuthTokenIfNeeded)
 TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000
@@ -451,7 +505,11 @@ MEM0_GATE_ENABLED = _bool_env("MEM0_GATE_ENABLED", True)                   # P2:
 MEM0_GATE_MIN_IMPORTANCE = int(os.environ.get("MEM0_GATE_MIN_IMPORTANCE", "2"))
 MEM0_GATE_MODEL = os.environ.get("MEM0_GATE_MODEL", "claude-haiku-4-5-20251001")
 MEM0_CLIENT_DEDUP_ENABLED = _bool_env("MEM0_CLIENT_DEDUP_ENABLED", True)   # P2.5
-MEM0_CLIENT_DEDUP_THRESHOLD = float(os.environ.get("MEM0_CLIENT_DEDUP_THRESHOLD", "0.85"))
+# score is *distance* (small = similar); the legacy single-threshold path
+# drops when distance < threshold, so 0.85 over-drops. 0.20 is the correct
+# default per the warning in ingest.py. (Bypassed entirely when
+# MEM0_DEDUP_TWO_STAGE=True, the default — defensive only.)
+MEM0_CLIENT_DEDUP_THRESHOLD = float(os.environ.get("MEM0_CLIENT_DEDUP_THRESHOLD", "0.20"))
 MEM0_DEDUP_TWO_STAGE = _bool_env("MEM0_DEDUP_TWO_STAGE", True)            # P4: 2段階dedup (LLM判定)
 MEM0_DEDUP_SEARCH_LIMIT = int(os.environ.get("MEM0_DEDUP_SEARCH_LIMIT", "5"))
 MEM0_DEDUP_DRY_RUN = _bool_env("MEM0_DEDUP_DRY_RUN", False)               # P4: dry-run (dropせずログのみ)

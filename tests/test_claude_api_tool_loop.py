@@ -1,5 +1,6 @@
 """Tests for services.claude_api.tool_loop.run_agent_loop."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -12,16 +13,73 @@ from services.claude_api.tool_loop import (
     MAX_CONSECUTIVE_EMPTY_TURNS,
     AgentLoopResult,
     _block_to_dict,
+    _build_cached_system,
     _detect_write_hallucination,
     _format_tool_invocation_for_display,
+    _inject_cache_breakpoints,
     _join_final_text,
     _normalize_history_for_api,
+    _parse_text_tool_calls,
+    _strip_text_tool_calls,
+    _truncate_tool_result,
     run_agent_loop,
 )
 
 
 def _block(type_, **kwargs):
     return SimpleNamespace(type=type_, **kwargs)
+
+
+class TestCacheBreakpoints:
+    """1h cache TTL so the prior_history prefix survives the 30-min session
+    gap and is cache-read on resume (the dominant turn=1 write)."""
+
+    def test_system_block_has_1h_ttl(self):
+        sysblocks = _build_cached_system("persona", [{"role": "user", "content": "hi"}])
+        cc = sysblocks[2].get("cache_control")
+        assert cc is not None
+        assert cc.get("ttl") == "1h"
+
+    def test_message_breakpoint_has_1h_ttl(self):
+        msgs = [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "u3 current"},
+        ]
+        out = _inject_cache_breakpoints(msgs)
+        # breakpoint goes on the second-to-last user message (u2, index 2).
+        bp = out[2]["content"]
+        block = bp[-1] if isinstance(bp, list) else None
+        assert block is not None and block.get("cache_control", {}).get("ttl") == "1h"
+
+    def test_ttl_ordering_invariant(self):
+        # Anthropic requires longer-TTL cache_control BEFORE shorter ones
+        # (tools→system→messages). We only ever emit 1h, so no 5m may precede.
+        msgs = [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "u3"},
+        ]
+        sysblocks = _build_cached_system("persona", msgs)
+        out = _inject_cache_breakpoints(msgs)
+        ttls = []
+        for b in sysblocks:
+            cc = b.get("cache_control")
+            if cc:
+                ttls.append(cc.get("ttl", "5m"))
+        for m in out:
+            c = m["content"]
+            if isinstance(c, list):
+                for blk in c:
+                    cc = isinstance(blk, dict) and blk.get("cache_control")
+                    if cc:
+                        ttls.append(cc.get("ttl", "5m"))
+        # No 5-minute breakpoint may appear before any 1-hour one.
+        assert all(t == "1h" for t in ttls), ttls
 
 
 def _final_msg(blocks, stop_reason):
@@ -141,6 +199,116 @@ class TestEmptyContentSanitizer:
         assert out[1]["content"] == [{"type": "text", "text": "ok"}]
 
 
+class TestStripTextToolCalls:
+    """Tool calls the model wrote as TEXT (function-calling XML) must be
+    stripped before they reach the user (msg3 root cause, rid=decc2aeb)."""
+
+    def test_bare_invoke_block_stripped(self):
+        text = (
+            "裏取りします。\n"
+            '<invoke name="mcp__brave-search__brave_web_search">\n'
+            '<parameter name="query">Andrew Left</parameter>\n</invoke>'
+        )
+        cleaned, had = _strip_text_tool_calls(text)
+        assert had is True
+        assert "<invoke" not in cleaned and "parameter" not in cleaned
+        assert cleaned == "裏取りします。"
+
+    def test_function_calls_wrapper_stripped(self):
+        text = (
+            "ok\n<function_calls>\n<invoke name=\"x\">\n"
+            "<parameter name=\"q\">v</parameter>\n</invoke>\n</function_calls>"
+        )
+        cleaned, had = _strip_text_tool_calls(text)
+        assert had is True
+        assert "function_calls" not in cleaned and cleaned.strip() == "ok"
+
+    def test_namespaced_prefix_stripped(self):
+        # Build the "antml:"-style namespace without writing the literal token.
+        ns = "a" + "ntml:"
+        text = (
+            "keep\n"
+            f'<{ns}function_calls><{ns}invoke name="t">'
+            f"</{ns}invoke></{ns}function_calls>"
+        )
+        cleaned, had = _strip_text_tool_calls(text)
+        assert had is True
+        assert "function_calls" not in cleaned and cleaned.strip() == "keep"
+
+    def test_no_markers_unchanged(self):
+        text = "ただの文章です。a < b の比較や <url> も触らない。"
+        cleaned, had = _strip_text_tool_calls(text)
+        assert had is False
+        assert cleaned == text
+
+    def test_unclosed_marker_stripped(self):
+        # Stream truncated mid-tag: an unclosed <invoke …> still gets removed.
+        text = 'やります。\n<invoke name="Read">'
+        cleaned, had = _strip_text_tool_calls(text)
+        assert had is True
+        assert "invoke" not in cleaned and cleaned.strip() == "やります。"
+
+
+class TestParseTextToolCalls:
+    """Text-format tool calls are parsed back into (name, input) so the loop
+    can EXECUTE them instead of nudge-and-give-up (root cause 2)."""
+
+    def test_single_call_string_param(self):
+        text = (
+            '<invoke name="mcp__brave-search__brave_web_search">'
+            '<parameter name="query">Andrew Left</parameter></invoke>'
+        )
+        calls = _parse_text_tool_calls(text)
+        assert calls == [("mcp__brave-search__brave_web_search", {"query": "Andrew Left"})]
+
+    def test_multiple_calls(self):
+        text = (
+            '<invoke name="A"><parameter name="x">1one</parameter></invoke>'
+            '<invoke name="B"><parameter name="y">two</parameter></invoke>'
+        )
+        calls = _parse_text_tool_calls(text)
+        assert [c[0] for c in calls] == ["A", "B"]
+        assert calls[1][1] == {"y": "two"}
+
+    def test_json_typed_param_decoded(self):
+        text = (
+            '<invoke name="t"><parameter name="q">hi</parameter>'
+            '<parameter name="count">12</parameter></invoke>'
+        )
+        _, inp = _parse_text_tool_calls(text)[0]
+        assert inp["q"] == "hi"
+        assert inp["count"] == 12  # JSON-decoded to int, not "12"
+
+    def test_unclosed_invoke_not_parsed(self):
+        # No closing </invoke> → cannot execute → caller falls back to a nudge.
+        assert _parse_text_tool_calls('<invoke name="Read">') == []
+
+    def test_no_markers_empty(self):
+        assert _parse_text_tool_calls("ただの文章") == []
+
+
+class TestTruncateToolResult:
+    """Oversized tool results are head+tail capped to bound history growth
+    (context_overflow prevention ①)."""
+
+    def test_short_passthrough(self):
+        assert _truncate_tool_result("small") == "small"
+
+    def test_list_passthrough(self):
+        blocks = [{"type": "text", "text": "x"}]
+        assert _truncate_tool_result(blocks) is blocks
+
+    def test_oversized_head_tail_truncated(self):
+        import services.claude_api.tool_loop as tl
+        cap = tl.MAX_TOOL_RESULT_CHARS
+        big = ("H" * (cap + 20000)) + ("T" * 5000)
+        out = _truncate_tool_result(big)
+        assert len(out) < len(big)
+        assert out.startswith("H")
+        assert out.endswith("T")
+        assert "elided" in out
+
+
 class TestRunAgentLoop:
     @pytest.mark.asyncio
     async def test_single_turn_end_turn(self, watchdog):
@@ -206,13 +374,15 @@ class TestRunAgentLoop:
         assert history[2]["content"][0]["content"] == "file content"
 
     @pytest.mark.asyncio
-    async def test_thinking_only_pause_injects_continuation(self, watchdog):
-        # Turn 0: stop_reason=tool_use but only a thinking block (zero
-        # tool_use blocks) → pause turn. Must NOT append empty content; must
-        # nudge with a continuation user message. Turn 1: normal end_turn.
+    async def test_thinking_only_pause_terminates_without_empty_content(self, watchdog):
+        # Under MAX_CONSECUTIVE_EMPTY_TURNS=2 the first thinking-only pause turn
+        # nudges (one corrective POST); the SECOND consecutive pause hits the
+        # limit and returns accumulated text. Critical invariants:
+        #   1. No empty-content user message slipped into history (the 400 cause).
+        #   2. The nudge IS appended, and it is a non-empty text block.
         client = _make_client(
             ([], _final_msg([_block("thinking", thinking="hmm")], "tool_use")),
-            ([], _final_msg([_block("text", text="done")], "end_turn")),
+            ([], _final_msg([_block("thinking", thinking="still")], "tool_use")),
         )
         history: list[dict] = []
         result = await run_agent_loop(
@@ -223,25 +393,34 @@ class TestRunAgentLoop:
             stall_watchdog=watchdog, api_client=client,
             model="claude-opus-4-8", extra_betas=[],
         )
-        assert result.text == "done"
-        # No empty-content user message slipped into history (the 400 cause).
+        # No prior text turns → accumulated empty → (no response) fallback.
+        assert result.text == "(no response)"
+        # 400 guard: never append "" or [] content.
         assert all(m["content"] != [] and m["content"] != "" for m in history)
-        # A continuation nudge was injected as a user message.
-        assert any(
-            m["role"] == "user"
+        # Exactly one nudge user message was appended (MAX=2 allows one nudge).
+        nudges = [
+            m for m in history
+            if m["role"] == "user"
             and isinstance(m["content"], list)
             and m["content"]
-            and m["content"][0].get("text") == "続けてください。"
-            for m in history
-        )
+            and isinstance(m["content"][0], dict)
+            and "前ターンは思考のみで" in m["content"][0].get("text", "")
+        ]
+        assert len(nudges) == 1
 
     @pytest.mark.asyncio
-    async def test_thinking_only_pause_limit_cuts_off(self, watchdog):
-        # Two consecutive pause turns hit MAX_CONSECUTIVE_EMPTY_TURNS (=2)
-        # and the loop returns accumulated text instead of spinning forever.
+    async def test_thinking_only_pause_nudges_then_returns_accumulated_text(self, watchdog):
+        # Turn 0: prose "partial" + thinking + stop_reason=tool_use, no tool_use
+        #         blocks → pause (consecutive=1) → nudge, a second POST fires.
+        # Turn 1: pause again (consecutive=2 == MAX) → limit reached → return
+        #         accumulated text ("partial"). This restores the nudge that
+        #         MAX=1 had killed (msg3 premature-stop regression, 2026-06-02).
         assert MAX_CONSECUTIVE_EMPTY_TURNS == 2
         client = _make_client(
-            ([], _final_msg([_block("text", text="partial"), _block("thinking", thinking="x")], "tool_use")),
+            ([], _final_msg(
+                [_block("text", text="partial"), _block("thinking", thinking="x")],
+                "tool_use",
+            )),
             ([], _final_msg([_block("thinking", thinking="y")], "tool_use")),
         )
         history: list[dict] = []
@@ -254,6 +433,110 @@ class TestRunAgentLoop:
             model="claude-opus-4-8", extra_betas=[],
         )
         assert "partial" in result.text
+        # The nudge was appended after the first pause turn.
+        assert any(
+            m["role"] == "user" and isinstance(m["content"], list)
+            and m["content"] and isinstance(m["content"][0], dict)
+            and "前ターンは思考のみで" in m["content"][0].get("text", "")
+            for m in history
+        )
+
+    @pytest.mark.asyncio
+    async def test_first_event_timeout_retries_then_returns(self, watchdog, monkeypatch):
+        # An upstream hang = HTTP 200 + no SSE events. The first-event timeout
+        # abandons the stream and re-POSTs once; if still silent it returns a
+        # clean timeout instead of waiting out the full idle_timeout (msg1).
+        import services.claude_api.tool_loop as tl
+        monkeypatch.setattr(tl, "STREAM_FIRST_EVENT_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(tl, "STREAM_FIRST_EVENT_MAX_RETRIES", 1)
+
+        class _HangStream:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.sleep(5)  # never delivers a first event
+                raise StopAsyncIteration
+
+            async def get_final_message(self):
+                raise AssertionError("must not reach final message on a hang")
+
+        attempts = {"n": 0}
+        client = MagicMock()
+
+        def stream_factory(**_k):
+            attempts["n"] += 1
+            return _HangStream()
+
+        client.beta.messages.stream = stream_factory
+        result = await run_agent_loop(
+            "hi", channel_id=1, history=[],
+            system_prompt="sys", tools_for_api=[],
+            can_use_tool=_allow_all, execute_tool=AsyncMock(),
+            status_callback=_noop_status, max_turns=5,
+            stall_watchdog=watchdog, api_client=client,
+            model="claude-opus-4-8", extra_betas=[],
+        )
+        # initial POST + 1 retry = 2, then a clean first-event-timeout message.
+        assert attempts["n"] == 2
+        assert "初動タイムアウト" in result.text
+
+    @pytest.mark.asyncio
+    async def test_text_format_tool_call_stripped_and_executed(self, watchdog):
+        # Opus 4.8 sometimes writes a tool call as TEXT (function-calling XML)
+        # instead of a native tool_use block (rid=decc2aeb msg3). The XML must
+        # never reach the user, AND the call must be PARSED + EXECUTED (not just
+        # nudged) so the model's intent isn't lost. Turn 0 leaks an <invoke>;
+        # the loop runs it, feeds the result back; turn 1 ends cleanly.
+        leak = (
+            "了解です、裏取りします。\n"
+            '<function_calls>\n<invoke name="mcp__brave-search__brave_web_search">\n'
+            '<parameter name="query">Andrew Left verdict</parameter>\n'
+            "</invoke>\n</function_calls>"
+        )
+        sent: list[str] = []
+
+        async def _capture(text):
+            sent.append(text)
+
+        execute = AsyncMock(return_value="検索結果データ")
+        client = _make_client(
+            ([], _final_msg([_block("text", text=leak)], "tool_use")),
+            ([], _final_msg([_block("text", text="done")], "end_turn")),
+        )
+        history: list[dict] = []
+        result = await run_agent_loop(
+            "search", channel_id=1, history=history,
+            system_prompt="sys", tools_for_api=[],
+            can_use_tool=_allow_all, execute_tool=execute,
+            status_callback=_noop_status,
+            incremental_text_callback=_capture,
+            max_turns=5, stall_watchdog=watchdog, api_client=client,
+            model="claude-opus-4-8", extra_betas=[],
+        )
+        joined = "\n".join(sent)
+        # Leaked XML never reached the user; the prose before it did.
+        assert "<invoke" not in joined and "function_calls" not in joined
+        assert "了解です" in joined
+        assert "done" in result.text
+        # The text-format call was actually executed with the parsed input.
+        execute.assert_awaited_once_with(
+            "mcp__brave-search__brave_web_search", {"query": "Andrew Left verdict"}
+        )
+        # The result was fed back to the model (proxy-execution feedback).
+        assert any(
+            m["role"] == "user" and isinstance(m["content"], list)
+            and m["content"] and isinstance(m["content"][0], dict)
+            and "代理実行" in m["content"][0].get("text", "")
+            and "検索結果データ" in m["content"][0].get("text", "")
+            for m in history
+        )
 
     @pytest.mark.asyncio
     async def test_denied_tool_returns_error_result(self, watchdog):

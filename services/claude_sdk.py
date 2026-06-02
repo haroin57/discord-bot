@@ -38,6 +38,7 @@ from config import (
     CLAUDE_MAX_ATTEMPTS,
     CLAUDE_MAX_BACKOFF_S,
     CLAUDE_MAX_PARALLEL,
+    CLAUDE_MODEL,
     CLAUDE_TIMEOUT,
     CLAUDE_TRANSIENT_MAX_ATTEMPTS,
     CWD,
@@ -81,7 +82,8 @@ _RESTRICTED_DENY_LIST = [
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
-MODEL = "claude-opus-4-7"
+# Single source of truth: config.CLAUDE_MODEL (default 4-7, .env-overridable).
+MODEL = CLAUDE_MODEL
 
 # ---------------------------------------------------------------------------
 # Timeout / turns
@@ -365,6 +367,7 @@ async def call_with_tools(
     raw_user_text: str = "",
     is_thread: bool = False,
     has_image_attachment: bool = False,
+    author_label: str = "",
 ) -> tuple[str, "SessionInfo | None", bool]:
     """Call Claude via SDK. Model decides tool usage (free-code QueryEngine pattern)."""
     # H-3: pick the correct concurrency slot so non-admins can't starve
