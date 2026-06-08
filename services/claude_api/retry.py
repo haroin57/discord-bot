@@ -6,6 +6,7 @@ security/phase2-unification (SRE4) replaces it with true LRU — we keep parity
 with master here and will sync when that branch is merged.
 """
 
+import random
 import time
 
 from config import (
@@ -48,6 +49,20 @@ def check_and_record_retry_budget(channel_id: int) -> bool:
     return True
 
 
-def compute_backoff(attempt: int) -> float:
-    """Exponential backoff: BASE * 2**attempt, capped at MAX_BACKOFF_S."""
-    return min(BASE_BACKOFF_S * (2 ** attempt), MAX_BACKOFF_S)
+def compute_backoff(attempt: int, *, jitter: bool = True) -> float:
+    """Exponential backoff: BASE * 2**attempt, capped at MAX_BACKOFF_S.
+
+    With ``jitter=True`` (default) an *equal jitter* scheme is applied:
+    half the capped delay is fixed and half is uniformly random in
+    ``[0, capped/2]``. This breaks up synchronized retries so repeated
+    overloaded/rate-limit failures don't all re-enter at the same instant
+    (thundering herd) and keep colliding with the server's recovery window.
+
+    ``jitter=False`` returns the deterministic capped delay — used by tests
+    asserting exact values and by any caller that needs reproducibility.
+    """
+    capped = min(BASE_BACKOFF_S * (2 ** attempt), MAX_BACKOFF_S)
+    if not jitter:
+        return capped
+    half = capped / 2
+    return half + random.uniform(0, half)

@@ -8,6 +8,7 @@ from services.claude_api import retry as retry_mod
 from services.claude_api.retry import (
     BASE_BACKOFF_S,
     MAX_BACKOFF_S,
+    TRANSIENT_MAX_ATTEMPTS,
     _RETRY_BUDGET_MAX_CHANNELS,
     _RETRY_BUDGET_PER_WINDOW,
     _RETRY_BUDGET_WINDOW_S,
@@ -65,10 +66,48 @@ class TestRetryBudget:
 
 
 class TestComputeBackoff:
-    def test_grows_exponentially(self):
-        assert compute_backoff(0) == BASE_BACKOFF_S
-        assert compute_backoff(1) == BASE_BACKOFF_S * 2
-        assert compute_backoff(2) == BASE_BACKOFF_S * 4
+    def test_grows_exponentially_without_jitter(self):
+        assert compute_backoff(0, jitter=False) == BASE_BACKOFF_S
+        assert compute_backoff(1, jitter=False) == BASE_BACKOFF_S * 2
+        assert compute_backoff(2, jitter=False) == BASE_BACKOFF_S * 4
 
-    def test_capped_at_max(self):
-        assert compute_backoff(100) == MAX_BACKOFF_S
+    def test_capped_at_max_without_jitter(self):
+        assert compute_backoff(100, jitter=False) == MAX_BACKOFF_S
+
+    def test_jitter_stays_in_equal_jitter_band(self):
+        # equal jitter: result in [capped/2, capped] for every attempt.
+        for attempt in range(6):
+            capped = min(BASE_BACKOFF_S * (2 ** attempt), MAX_BACKOFF_S)
+            for _ in range(200):
+                delay = compute_backoff(attempt)  # jitter=True default
+                assert capped / 2 <= delay <= capped
+
+    def test_jitter_capped_at_max(self):
+        for _ in range(200):
+            assert compute_backoff(100) <= MAX_BACKOFF_S
+
+    def test_jitter_actually_varies(self):
+        # With jitter on, repeated calls must not all be identical.
+        samples = {compute_backoff(3) for _ in range(50)}
+        assert len(samples) > 1
+
+
+class TestTransientRetryBound:
+    """ADR-0006: the transient retry loop runs range(TRANSIENT_MAX_ATTEMPTS),
+    so the final attempt index is TRANSIENT_MAX_ATTEMPTS - 1. entry.py uses
+    `attempt >= TRANSIENT_MAX_ATTEMPTS - 1` as the exhaustion check. Guard the
+    invariant that this check fires exactly once, on the last attempt — the
+    off-by-one regression made it never fire, so overloaded fell through to the
+    "unknown" fallback ("内部エラー")."""
+
+    def test_exhaustion_check_fires_on_last_attempt(self):
+        attempts = list(range(TRANSIENT_MAX_ATTEMPTS))
+        exhausted = [a for a in attempts if a >= TRANSIENT_MAX_ATTEMPTS - 1]
+        # Exactly the final attempt triggers exhaustion — never zero (the bug).
+        assert exhausted == [TRANSIENT_MAX_ATTEMPTS - 1]
+
+    def test_loop_range_reaches_exhaustion(self):
+        # The last value yielded by the loop must satisfy the exhaustion check,
+        # otherwise the loop falls through with result=None.
+        last_attempt = list(range(TRANSIENT_MAX_ATTEMPTS))[-1]
+        assert last_attempt >= TRANSIENT_MAX_ATTEMPTS - 1

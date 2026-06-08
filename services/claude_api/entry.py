@@ -68,7 +68,6 @@ from services.claude_api.restricted import (
     make_can_use_tool,
 )
 from services.claude_api.retry import (
-    DEFAULT_MAX_ATTEMPTS,
     TRANSIENT_MAX_ATTEMPTS,
     check_and_record_retry_budget,
     compute_backoff,
@@ -345,8 +344,11 @@ async def call_with_tools(
             # 7. API client
             api_client = await _make_api_client(restricted)
 
-            # 8. Retry loop around run_agent_loop
-            max_attempts = DEFAULT_MAX_ATTEMPTS
+            # 8. Retry loop around run_agent_loop. The loop range
+            # (TRANSIENT_MAX_ATTEMPTS) is the single source of truth for the
+            # attempt count — there is no separate max_attempts to keep in
+            # sync (ADR-0006 removed the off-by-one that masked overloaded
+            # failures as "unknown").
             response_text: str | None = None
             result: AgentLoopResult | None = None
             for attempt in range(TRANSIENT_MAX_ATTEMPTS):
@@ -459,7 +461,7 @@ async def call_with_tools(
                             )
                             await _safe_status(
                                 status_callback,
-                                f"🔄 認証リトライ中 ({attempt + 1}/{max_attempts})",
+                                f"🔄 認証リトライ中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})",
                             )
                             continue
                         if category in ("auth", "max_turns"):
@@ -474,9 +476,15 @@ async def call_with_tools(
                             # unknown) — retrying won't help. Return
                             # immediately to avoid wasting API calls.
                             return _error_message(category), None, resumable
-                        if max_attempts < TRANSIENT_MAX_ATTEMPTS:
-                            max_attempts = TRANSIENT_MAX_ATTEMPTS
-                        if attempt >= max_attempts - 1:
+                        # Transient (overloaded / rate_limit): the loop runs
+                        # `range(TRANSIENT_MAX_ATTEMPTS)`, so the final attempt
+                        # is `TRANSIENT_MAX_ATTEMPTS - 1`. We MUST return the
+                        # correctly-classified error here on that attempt —
+                        # otherwise the loop falls through with result=None and
+                        # the function tail returns the "unknown" fallback
+                        # ("内部エラー"), masking an overloaded as a generic
+                        # failure (ADR-0006).
+                        if attempt >= TRANSIENT_MAX_ATTEMPTS - 1:
                             # Transient errors exhausted retries — keep the
                             # session alive so the next user message can
                             # resume without losing context.
@@ -484,7 +492,7 @@ async def call_with_tools(
                         backoff = compute_backoff(attempt)
                         await _safe_status(
                             status_callback,
-                            f"🔄 リトライ中 ({attempt + 1}/{max_attempts})",
+                            f"🔄 リトライ中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})",
                         )
                         await asyncio.sleep(backoff)
                     except BaseExceptionGroup as eg:

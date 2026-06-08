@@ -122,6 +122,17 @@ class TestErrorMessage:
     def test_unknown_fallback(self):
         assert "❌" in _error_message("brand_new_category")
 
+    def test_overloaded_is_not_the_unknown_fallback(self):
+        # ADR-0006: an overloaded retry-exhaustion must surface the overloaded
+        # message, never the generic "内部エラー" fallback. If these ever
+        # collapse to the same string, the user can no longer tell a transient
+        # server overload from a real internal error.
+        overloaded = _error_message("overloaded")
+        fallback = _error_message("brand_new_category")
+        assert overloaded != fallback
+        assert "内部エラー" not in overloaded
+        assert "混雑" in overloaded
+
 
 class TestIsTransient:
     @pytest.mark.parametrize("t,expected", [

@@ -65,6 +65,18 @@ CLAUDE_MAX_TOKENS_OPUS = 64000
 _session_id = str(uuid.uuid4())
 
 
+def supports_adaptive_thinking(model: str) -> bool:
+    """Whether ``model`` accepts ``thinking.type=adaptive``.
+
+    Haiku returns HTTP 400 when adaptive thinking is requested, which was
+    silently failing-open every Mem0 helper (query-expansion / dedup /
+    rerank — all default to Haiku) and falling through to their except
+    branches. Exclude Haiku (and any future small model carrying "haiku"
+    in its id); Opus / Sonnet support adaptive thinking.
+    """
+    return "haiku" not in (model or "").lower()
+
+
 def _load_cli_default_system_prompt() -> str:
     """The CLI's default agent system prompt (system[2] in mitm capture).
 

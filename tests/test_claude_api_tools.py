@@ -23,6 +23,17 @@ def tmpdir_ctx():
         yield ToolContext(cwd=tmp, restricted=False, channel_id=1)
 
 
+@pytest.fixture
+def tmpdir_ctx_restricted():
+    # restricted=True is what every non-admin caller gets in production
+    # (entry.py derives `restricted` from is_admin). The cwd jail is a
+    # restricted-mode guard, so cwd-escape rejection must be tested here,
+    # not via the admin (restricted=False) fixture which drops the jail by
+    # design (e.g. an admin reading ~/manga).
+    with tempfile.TemporaryDirectory() as tmp:
+        yield ToolContext(cwd=tmp, restricted=True, channel_id=1)
+
+
 class TestResolveUnder:
     def test_relative_ok(self, tmpdir_ctx):
         out = _resolve_under(tmpdir_ctx.cwd, "a/b.txt")
@@ -79,15 +90,16 @@ class TestRead:
         assert "[truncated" in out
 
     @pytest.mark.asyncio
-    async def test_read_rejects_escape_via_symlink(self, tmpdir_ctx):
+    async def test_read_rejects_escape_via_symlink(self, tmpdir_ctx_restricted):
         # A symlink whose realpath escapes cwd is rejected at the path
         # gate (before the file is opened). O_NOFOLLOW alone wouldn't be
         # enough — it only protects the final path component.
-        link = os.path.join(tmpdir_ctx.cwd, "escape")
+        # Uses the restricted (non-admin) context, where the cwd jail applies.
+        link = os.path.join(tmpdir_ctx_restricted.cwd, "escape")
         os.symlink("/etc", link)
         with pytest.raises(ValueError, match="escapes"):
             await execute_builtin_tool(
-                "Read", {"file_path": "escape/passwd"}, tmpdir_ctx,
+                "Read", {"file_path": "escape/passwd"}, tmpdir_ctx_restricted,
             )
 
 
@@ -102,10 +114,12 @@ class TestWrite:
             assert fh.read() == "abc"
 
     @pytest.mark.asyncio
-    async def test_write_outside_cwd_rejected(self, tmpdir_ctx):
+    async def test_write_outside_cwd_rejected(self, tmpdir_ctx_restricted):
+        # Restricted (non-admin) context: writes outside the cwd jail are rejected.
         with pytest.raises(ValueError):
             await execute_builtin_tool(
-                "Write", {"file_path": "/tmp/evil.txt", "content": "x"}, tmpdir_ctx,
+                "Write", {"file_path": "/tmp/evil.txt", "content": "x"},
+                tmpdir_ctx_restricted,
             )
 
     @pytest.mark.asyncio

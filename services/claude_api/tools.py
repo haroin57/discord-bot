@@ -6,9 +6,14 @@ in services/claude_api/mcp_client.py; tool_loop.py merges both sets and
 routes calls to the right backend.
 
 Restricted mode rejects every tool here at the policy gate
-(services/claude_api/restricted.py), but the implementations still respect
-the same defenses (cwd jail, O_NOFOLLOW, output caps, env allowlist) so a
-gate regression cannot escalate.
+(services/claude_api/restricted.py). The implementations carry their own
+defenses as a second layer: O_NOFOLLOW, output caps, and the env allowlist
+apply UNCONDITIONALLY. The cwd jail, however, is tied to ToolContext.restricted
+— it is enforced for restricted (non-admin) callers and intentionally dropped
+for admins (restricted=False), who are trusted with full-filesystem access
+(e.g. reading ~/manga). Because both the policy gate and the cwd jail key off
+the same `restricted` flag, the cwd jail is NOT an independent backstop against
+a mis-set flag; the always-on defenses above are.
 
 Ports / inspiration:
 - Read   → free-code/src/tools/FileReadTool/FileReadTool.tsx
