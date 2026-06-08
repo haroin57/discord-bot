@@ -117,6 +117,17 @@ class TestIndexAndSearch:
         assert history_index.search_history("新しい行", 1)
         assert history_index.stats()["rows"] == 3
 
+    def test_reindex_all_with_author_5tuple(self, fresh_history_db):
+        from services.mem0 import history_index
+        lines = [
+            (3, "t1", "channel", "新玉ねぎの話", "b0nchichi"),
+            (3, "t2", "user", "了解", "haroin"),
+        ]
+        count = history_index.reindex_all(lines)
+        assert count == 2
+        hits = history_index.search_history("新玉ねぎ", 3)
+        assert hits and hits[0]["author"] == "b0nchichi"
+
 
 class TestFormatHistoryForPrompt:
     def test_empty_returns_empty_string(self):
