@@ -999,6 +999,37 @@ class TestOnMessage:
             spy.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_nonmention_message_indexed_as_channel(self, monkeypatch):
+        """A guild message that doesn't address the bot is persisted+indexed
+        as role="channel" (for later history_search), and gets no reply."""
+        import bot
+        monkeypatch.setattr("bot.MEM0_HISTORY_SEARCH_ENABLED", True)
+
+        captured = {}
+
+        def fake_append(channel_id, entry):
+            captured["channel_id"] = channel_id
+            captured["entry"] = entry
+
+        # Non-mention message: no keyword, no mention.
+        msg = _make_message(content="東洋水産の決算きた", author_id=55555)
+        msg.author.display_name = "b0nchichi"
+
+        with patch("services.session.append_jsonl", side_effect=fake_append), \
+             patch("bot.call_with_tools", new_callable=AsyncMock) as mock_cwt:
+            await self._dispatch(msg)
+            # Let the fire-and-forget _track_task run.
+            await asyncio.sleep(0.05)
+
+        # No reply / no agent call for a non-mention message.
+        mock_cwt.assert_not_called()
+        msg.reply.assert_not_called()
+        # It was persisted as a channel row with the author.
+        assert captured.get("entry", {}).get("role") == "channel"
+        assert captured["entry"]["content"] == "東洋水産の決算きた"
+        assert captured["entry"]["author"] == "b0nchichi"
+
+    @pytest.mark.asyncio
     async def test_history_search_skipped_for_nonadmin(self, monkeypatch):
         """Non-admin caller → history search never runs (privacy: JSONL has no author id)."""
         import bot
