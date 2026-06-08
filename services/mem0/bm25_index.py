@@ -8,10 +8,14 @@ characters in embedding space).
 
 The store is a sqlite FTS5 virtual table at ``STATE_DIR/mem0_bm25.sqlite`` —
 kept in a separate file from the entity graph so the two indices can be
-rebuilt or wiped independently. The tokenizer is ``trigram`` because the
-``unicode61`` default has no CJK word segmentation and ``porter`` is
-English-only; trigram works uniformly across Japanese and Latin script at the
-cost of ~3x storage which is negligible at our scale (~1500 facts).
+rebuilt or wiped independently. The tokenizer is ``unicode61`` (NOT trigram):
+it has no CJK word segmentation and does not substring-match, so ``index_fact``
+pre-tokenizes each fact through ``services.mem0.morpho`` and stores the
+whitespace-joined content words in the indexed ``text`` column — unicode61's
+whitespace split then yields one FTS5 token per Japanese content word. The
+original sentence is kept verbatim in the UNINDEXED ``orig_text`` column and is
+what ``search_bm25`` returns as ``memory``; the indexed ``text`` column is for
+matching only and must never be surfaced to a consumer/LLM.
 
 The module is synchronous; callers wrap with ``asyncio.to_thread`` from event
 loops. A single ``_db_lock`` serializes writes; FTS5 reads are concurrent-safe
@@ -34,6 +38,7 @@ _SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
     fact_id UNINDEXED,
     user_id UNINDEXED,
+    orig_text UNINDEXED,
     text,
     tokenize = 'unicode61 remove_diacritics 1'
 );
@@ -79,11 +84,16 @@ def _conn():
 def index_fact(fact_id: str, text: str, user_id: str) -> bool:
     """Insert (or replace) a fact in the FTS5 index. Idempotent on fact_id.
 
-    The stored ``text`` is the morphological tokenization of the source
-    fact — whitespace-separated content-word surface forms — so the
+    The indexed ``text`` column is the morphological tokenization of the
+    source fact — whitespace-separated content-word surface forms — so the
     underlying unicode61 tokenizer (which splits on whitespace) yields
     one FTS5 token per Japanese content word. Particles, fillers, and
     1-character noise are stripped by morpho.tokenize_for_index.
+
+    The raw ``text`` argument is ALSO stored verbatim in the UNINDEXED
+    ``orig_text`` column and is what ``search_bm25`` returns as ``memory``.
+    Callers MUST pass the original fact sentence here, never a pre-tokenized
+    string — otherwise ``orig_text`` would hold tokenized garbage too.
     """
     if not fact_id or not text or not user_id:
         return False
@@ -101,8 +111,9 @@ def index_fact(fact_id: str, text: str, user_id: str) -> bool:
                 "DELETE FROM facts_fts WHERE fact_id = ?", (fact_id,),
             )
             c.execute(
-                "INSERT INTO facts_fts(fact_id, user_id, text) VALUES (?, ?, ?)",
-                (fact_id, user_id, tokenized),
+                "INSERT INTO facts_fts(fact_id, user_id, orig_text, text) "
+                "VALUES (?, ?, ?, ?)",
+                (fact_id, user_id, text, tokenized),
             )
             c.commit()
             return True
@@ -141,9 +152,10 @@ def search_bm25(query: str, user_id: str, limit: int = 20) -> list[dict]:
     一番好き？") no stored fact contains the entire phrase verbatim, so
     BM25 returns zero hits. We instead split on Japanese + ASCII
     punctuation/whitespace, drop FTS5 special characters, and OR-join
-    the resulting sub-phrases. Each sub-phrase still uses trigram
-    substring matching, so "上伊那ぼたん" inside a longer fact text gets
-    picked up.
+    the resulting sub-phrases. Matching is exact-token (unicode61), not
+    substring: morpho splits both the stored fact and the query into the
+    same content words, so "上伊那ぼたん" → "上伊那" / "ぼたん" matches the
+    standalone tokens indexed from a longer fact.
     """
     q = (query or "").strip()
     if not q or not user_id:
@@ -181,7 +193,7 @@ def search_bm25(query: str, user_id: str, limit: int = 20) -> list[dict]:
     try:
         with _conn() as c:
             rows = c.execute(
-                "SELECT fact_id, text, bm25(facts_fts) AS score "
+                "SELECT fact_id, orig_text, bm25(facts_fts) AS score "
                 "FROM facts_fts "
                 "WHERE facts_fts MATCH ? AND user_id = ? "
                 "ORDER BY bm25(facts_fts) "
@@ -199,7 +211,10 @@ def search_bm25(query: str, user_id: str, limit: int = 20) -> list[dict]:
     for i, r in enumerate(rows):
         out.append({
             "id": r["fact_id"],
-            "memory": r["text"],
+            # Return the original sentence (orig_text), never the tokenized
+            # `text` column — the latter is for FTS5 matching only and would
+            # surface as keyword-soup to the prompt and the LLM reranker.
+            "memory": r["orig_text"],
             "rank": i + 1,
             "bm25_score": float(r["score"]),
         })
@@ -252,6 +267,13 @@ def rrf_merge(
             if existing.get("score") in (None, 0.8) and item.get("score") is not None:
                 existing["score"] = item["score"]
 
+    # INVARIANT: `memory` must be the richest representation per id — the
+    # ChromaDB full sentence, never the FTS5 tokenized form. vector_hits are
+    # bumped BEFORE bm25_hits and the existing-id branch in _bump never
+    # overwrites `memory`, so a fact that also hit via vector keeps its full
+    # text. search_bm25 now returns orig_text (the raw sentence) as memory,
+    # so a BM25-only id is safe too. Do NOT re-point search_bm25 at the
+    # tokenized `text` column or this invariant breaks silently.
     for i, item in enumerate(vector_hits or []):
         _bump(item, i + 1)
     for item in bm25_hits or []:
@@ -305,9 +327,9 @@ def reindex_all(facts: Iterable[tuple[str, str, str]]) -> int:
                 if not tokenized:
                     tokenized = text  # never index an empty row
                 c.execute(
-                    "INSERT INTO facts_fts(fact_id, user_id, text) "
-                    "VALUES (?, ?, ?)",
-                    (fid, uid, tokenized),
+                    "INSERT INTO facts_fts(fact_id, user_id, orig_text, text) "
+                    "VALUES (?, ?, ?, ?)",
+                    (fid, uid, text, tokenized),
                 )
                 count += 1
             c.commit()

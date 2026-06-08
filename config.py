@@ -465,6 +465,13 @@ MEM0_HYBRID_ENABLED = _bool_env("MEM0_HYBRID_ENABLED", True)
 MEM0_BM25_RRF_K = int(os.environ.get("MEM0_BM25_RRF_K", "60"))
 MEM0_BM25_LIMIT = int(os.environ.get("MEM0_BM25_LIMIT", "20"))
 
+# Per-turn literal-keyword recall over the raw per-channel JSONL transcript
+# (services/mem0/history_index.py). Rescues exact terms (proper nouns mentioned
+# once) that curation dropped from Mem0 facts. Admin-only at the call site
+# because the JSONL has no author id. See ADR-0004.
+MEM0_HISTORY_SEARCH_ENABLED = _bool_env("MEM0_HISTORY_SEARCH_ENABLED", True)
+MEM0_HISTORY_SEARCH_LIMIT = int(os.environ.get("MEM0_HISTORY_SEARCH_LIMIT", "5"))
+
 # Phase B-1 (mem0-recall-hybrid-hyde-kg): HyDE rewrite. When True, smart_search
 # also asks Haiku to generate a hypothetical fact answering the user's
 # question, then searches with that string in parallel with keyword variants.
@@ -504,27 +511,6 @@ MEM0_EPISODE_BUNDLE_LIMIT = int(os.environ.get("MEM0_EPISODE_BUNDLE_LIMIT", "5")
 # matches the historical behavior; the daily script has no bot client
 # so it cannot fall back and will skip the Mem0 push when this is empty.
 KANAE_BOT_USER_ID = os.environ.get("KANAE_BOT_USER_ID", "")
-
-# Kanae self-model (interests/episodes layer; see plans/kanae-self-model.md).
-# Phase 1 — interest tracker only. When False, the entire kanae_self
-# subsystem is bypassed: no signal extraction beyond facts, no state file
-# write, no prompt block injection. Phase 2/3 add their own flags.
-KANAE_SELF_INTEREST_ENABLED = _bool_env("KANAE_SELF_INTEREST_ENABLED", True)
-# Phase 2 — episode ring buffer + interest-driven mem0 query rewrite +
-# Mem0 metadata enrichment (persona/episode_id/interest_tags). Independent
-# from INTEREST_ENABLED so episode recording can be paused without
-# losing the interest layer if the latter is healthy.
-KANAE_SELF_EPISODE_ENABLED = _bool_env("KANAE_SELF_EPISODE_ENABLED", True)
-# Phase 3 — fold <kanae_state>/<kanae_interests>/<kanae_episodes>/
-# <kanae_self_memory> into a single <kanae_self> block. Off → legacy
-# four-block layout. Kept as a flag so a bad render can be reverted
-# instantly without re-deploying.
-KANAE_SELF_UNIFIED_BLOCK = _bool_env("KANAE_SELF_UNIFIED_BLOCK", True)
-
-# Hourly summary DM to haroin (services/emotion/daily_summary_dm.py).
-# Costs ~1500 tokens/hour (~36k/day) of Haiku. Default off — flip to
-# true via env when the budget is comfortable again.
-ENABLE_HOURLY_SUMMARY_DM = _bool_env("ENABLE_HOURLY_SUMMARY_DM", False)
 
 _github_token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
 if _github_token:

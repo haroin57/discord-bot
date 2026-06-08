@@ -12,7 +12,6 @@ from utils.cache import TTLLRUCache
 from config import (
     ADMIN_USER_IDS,
     ALLOWED_ATTACHMENT_HOSTS,
-    BOT_KEYWORDS,
     BOT_ROLE_IDS,
     CROSS_THREAD_CONTEXT_MESSAGES,
     MAX_CROSS_THREAD_CHARS,
@@ -44,25 +43,26 @@ def _cache_set(key: tuple[int, int], text: str) -> None:
 # ---------------------------------------------------------------------------
 # Mention stripping (pre-compiled regex cache)
 # ---------------------------------------------------------------------------
+# NOTE: BOT_KEYWORDS ("かなえ" 等) は意図的に strip しない。キーワード除去は
+# 本文途中の「かなえ」(例:「かなえちゃんによると」)にマッチして後続を食い、
+# 本文を破壊する事故源だった (2026-06-08, ADR-0003)。呼びかけキーワードは
+# prompt 本文に残し、Claude 側に自然な文脈として渡す。strip するのは機械的な
+# メンショントークン (<@id> / <@&role>) のみ。
 _mention_re_cache: re.Pattern | None = None
-_keyword_re_cache: list[re.Pattern] = []
 
 
 def build_mention_regex(user_id: int) -> None:
-    """Pre-compile mention/keyword regex patterns. Called once after on_ready."""
-    global _mention_re_cache, _keyword_re_cache
+    """Pre-compile the bot's mention/role-mention regex. Called once after on_ready."""
+    global _mention_re_cache
     parts = [rf"<@!?{user_id}>"]
     for role_id in BOT_ROLE_IDS:
         parts.append(rf"<@&{role_id}>")
     _mention_re_cache = re.compile(r"(?:" + "|".join(parts) + r")\s*")
-    _keyword_re_cache = [re.compile(rf"(?i){re.escape(kw)}[,、]?\s*") for kw in BOT_KEYWORDS]
 
 
 def strip_mention(content: str, user_id: int) -> str:
-    """Remove the bot's direct mentions, role mentions, and keywords."""
+    """Remove the bot's direct mentions and role mentions. Keywords are preserved."""
     text = _mention_re_cache.sub("", content) if _mention_re_cache else content
-    for pat in _keyword_re_cache:
-        text = pat.sub("", text, count=1)
     return text.strip()
 
 
@@ -247,7 +247,7 @@ async def fetch_thread_context(
     return result
 
 
-CHANNEL_CONTEXT_LIMIT = LAYER1_COUNT + LAYER2_COUNT  # 15
+CHANNEL_CONTEXT_LIMIT = LAYER1_COUNT + LAYER2_COUNT  # 40
 
 
 async def fetch_channel_context(

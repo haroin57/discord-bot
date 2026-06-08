@@ -391,6 +391,31 @@ async def _rewrite_query(query: str) -> list[str]:
         return []
 
 
+def _apply_reinforcement_boost(memories: list[dict]) -> None:
+    """Hebbian-style pre-boost, applied in-place and re-sorted by score.
+
+    ``score`` is *distance* (small = relevant), so a well-reinforced fact
+    (high ``mention_count`` / recent ``last_reinforced_at``) gets its distance
+    SHRUNK and moves up in ranking. Bounded subtraction prevents negatives.
+
+    Used by BOTH the LLM-rerank path and the plain path so per-user
+    recency/engagement ordering applies on every turn, not only on the
+    recall-intent (rerank=True) path. Non-fatal on any error.
+    """
+    if not memories:
+        return
+    try:
+        from services.mem0.reinforce import reinforcement_boost
+        for m in memories:
+            boost = reinforcement_boost(m.get("metadata"))
+            if boost:
+                current = m.get("score") if m.get("score") is not None else 1.0
+                m["score"] = max(0.0, current - boost)
+        memories.sort(key=lambda x: x.get("score") if x.get("score") is not None else 99)
+    except Exception as exc:
+        log.warning("reinforcement_boost failed (non-fatal): %s", exc)
+
+
 async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> list[dict]:
     """LLM-based re-ranking of Mem0 candidates by relevance to the original query.
 
@@ -404,20 +429,7 @@ async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> 
     if not memories:
         return []
 
-    # Apply reinforcement boost in-place before the LLM rerank. score is
-    # *distance* (small = relevant), so a boosted fact gets its distance
-    # SHRUNK — a well-reinforced fact effectively moves closer to the query
-    # in ranking space. Bounded subtraction prevents negative distances.
-    try:
-        from services.mem0.reinforce import reinforcement_boost
-        for m in memories:
-            boost = reinforcement_boost(m.get("metadata"))
-            if boost:
-                current = m.get("score") if m.get("score") is not None else 1.0
-                m["score"] = max(0.0, current - boost)
-        memories.sort(key=lambda x: x.get("score") if x.get("score") is not None else 99)
-    except Exception as exc:
-        log.warning("rerank: reinforcement_boost failed (non-fatal): %s", exc)
+    _apply_reinforcement_boost(memories)
 
     if len(memories) <= top_k:
         return memories
@@ -723,6 +735,11 @@ async def search_memories_smart(
         )
         return reranked
 
+    # Per-user recency/engagement ordering on the plain path too (no LLM).
+    # Re-sorts candidates by boosted distance so well-reinforced facts win
+    # the candidates[:limit] cut below — previously this only ran on the
+    # rerank=True (recall-intent) path, so normal turns had no per-user bias.
+    _apply_reinforcement_boost(candidates)
     from services.mem0.client import MEM0_RELEVANCE_MAX_DISTANCE
     filtered = [
         r for r in candidates[:limit]

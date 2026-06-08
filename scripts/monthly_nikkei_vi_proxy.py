@@ -22,11 +22,12 @@ from matplotlib.collections import LineCollection
 import japanize_matplotlib  # noqa: F401
 
 
-def fetch_data(years_back: int = 1, extra_days: int = 35):
+def fetch_data(months_back: int = 6, extra_days: int = 35):
     """日経平均とVIXを取得。HV22計算のため1ヶ月余分に取得。"""
     end = datetime.now()
-    start_extended = end - timedelta(days=365 * years_back + extra_days)
-    start_display = end - timedelta(days=365 * years_back)
+    window_days = int(30.44 * months_back)
+    start_extended = end - timedelta(days=window_days + extra_days)
+    start_display = end - timedelta(days=window_days)
 
     nikkei = yf.download('^N225', start=start_extended, end=end, progress=False, auto_adjust=False)
     vix = yf.download('^VIX', start=start_extended, end=end, progress=False, auto_adjust=False)
@@ -127,7 +128,7 @@ def render(df: pd.DataFrame, output_path: Path, corr_hv_vix: float):
     ax2.grid(True, alpha=0.3)
     fig.autofmt_xdate(rotation=45)
 
-    fig.suptitle(f'日経平均 × 日経VI 1年間散布図 ({datetime.now().strftime("%Y-%m")} 月次版)',
+    fig.suptitle(f'日経平均 × 日経VI 半年間 ({datetime.now().strftime("%Y-%m")} 月次版)',
                  fontsize=14, fontweight='bold', y=1.00)
     fig.text(0.02, -0.02,
              '※ 日経VI 実値は無料API未提供のため、HV22 + VRP補正 3% を proxy として使用。'
@@ -146,7 +147,7 @@ def main():
     output_path = output_dir / f'nikkei_vi_scatter_{yyyymm}.png'
 
     print('Fetching Nikkei 225 and VIX...')
-    nikkei_close, vix_close, start_display = fetch_data(years_back=1, extra_days=35)
+    nikkei_close, vix_close, start_display = fetch_data(months_back=6, extra_days=35)
     vi_proxy, hv22 = compute_vi_proxy(nikkei_close)
 
     df = pd.DataFrame({

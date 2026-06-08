@@ -181,6 +181,14 @@ _EXTRACT_PROMPT = """以下の会話ターンから、長期記憶として保�
 - importance < 2 は出力しない (ただし固有名詞 + 嗜好/行動/知識 はデフォルトで importance=2 以上で出すこと)
 - 1 fact は日本語 120字以内
 - category は personal/project/tech/science/hobby/invest/ops/meta のいずれか
+  - personal: 個人・関係性・健康・進路・家族
+  - project: 具体的開発プロジェクト(ashitabo/kanae-bot/free-code/happy-stack/chatqa等の固有名詞)
+  - tech: 技術関心・学習(言語/コンパイラ/Async/LLMアーキ/逆解析)
+  - science: 物理/数学/思想/哲学(コード書かない世界観)
+  - hobby: 趣味・音楽・読書・アニメ・酒・グルメ
+  - invest: 投資・株・暗号資産・経済テーマ
+  - ops: 運用・Git安全・設定・VPS・dev環境
+  - meta: LLM対話メタ・好み・スタイル・断片ログ
 
 == entities フィールド ==
 

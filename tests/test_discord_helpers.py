@@ -85,12 +85,32 @@ class TestStripMention:
         result = strip_mention("<@&789> hello", 123456)
         assert result == "hello"
 
-    def test_strips_keyword(self):
+    def test_keyword_callout_preserved(self):
+        # ADR-0003: キーワード呼びかけは strip しない。本文に残して Claude に渡す。
         BOT_ROLE_IDS.clear()
         build_mention_regex(123456)
         result = strip_mention("かなえ、元気？", 123456)
-        assert "かなえ" not in result
-        assert "元気" in result
+        assert result == "かなえ、元気？"
+
+    def test_keyword_in_compound_word_preserved(self):
+        # 事故再現ケース: 本文途中の「かなえ」が後続を食わないこと。
+        BOT_ROLE_IDS.clear()
+        build_mention_regex(123456)
+        result = strip_mention("かなえちゃんによると新玉ねぎは", 123456)
+        assert result == "かなえちゃんによると新玉ねぎは"
+
+    def test_keyword_with_particle_preserved(self):
+        BOT_ROLE_IDS.clear()
+        build_mention_regex(123456)
+        result = strip_mention("かなえによると", 123456)
+        assert result == "かなえによると"
+
+    def test_mention_stripped_keyword_preserved(self):
+        # メンショントークンは除去、本文中のキーワードは保持。
+        BOT_ROLE_IDS.clear()
+        build_mention_regex(123456)
+        result = strip_mention("<@123456> かなえの音楽", 123456)
+        assert result == "かなえの音楽"
 
     def test_preserves_other_text(self):
         BOT_ROLE_IDS.clear()
@@ -205,11 +225,11 @@ class TestContextConstants:
 
     def test_layer1_count(self):
         from utils.discord_helpers import LAYER1_COUNT
-        assert LAYER1_COUNT == 15
+        assert LAYER1_COUNT == 25
 
     def test_layer2_count(self):
         from utils.discord_helpers import LAYER2_COUNT
-        assert LAYER2_COUNT == 10
+        assert LAYER2_COUNT == 15
 
     def test_max_context_chars(self):
         from utils.discord_helpers import MAX_CONTEXT_CHARS
@@ -227,17 +247,17 @@ class TestBuildLayeredLines:
         from utils.discord_helpers import _build_layered_lines, LAYER1_COUNT
         messages = [(f"user{i}", f"message {i}") for i in range(5)]
         lines, _ = _build_layered_lines(messages)
-        # All 5 should be full text (within LAYER1_COUNT=15)
+        # All 5 should be full text (within LAYER1_COUNT=25)
         assert len(lines) == 5
         assert all("message" in line for line in lines)
 
     def test_layer2_summarized_when_many_messages(self):
         from utils.discord_helpers import _build_layered_lines, LAYER1_COUNT, LAYER2_COUNT
-        total = LAYER1_COUNT + LAYER2_COUNT  # 25
+        total = LAYER1_COUNT + LAYER2_COUNT  # 40
         messages = [(f"user{i}", f"{'x' * 300} msg{i}") for i in range(total)]
         lines, _ = _build_layered_lines(messages)
-        # Layer 2 messages (first 10) should be summarized (shorter)
-        # Layer 1 messages (last 15) should be full
+        # Layer 2 messages (first 15) should be summarized (shorter)
+        # Layer 1 messages (last 25) should be full
         assert len(lines) >= LAYER1_COUNT  # at least layer1 lines present
 
 

@@ -1038,3 +1038,32 @@ def test_rerank_brace_injection_in_candidate():
 
     result = asyncio.run(run())
     assert isinstance(result, list)
+
+
+class TestApplyReinforcementBoost:
+    """Per-user recency/engagement ordering, now applied on the plain path too
+    (not just the rerank=True recall-intent path)."""
+
+    def test_high_mention_count_sorts_ahead(self):
+        from services.mem0.search import _apply_reinforcement_boost
+        mems = [
+            {"id": "cold", "score": 0.50, "metadata": {"mention_count": 1}},
+            {"id": "hot", "score": 0.50, "metadata": {"mention_count": 50}},
+        ]
+        _apply_reinforcement_boost(mems)
+        # the frequently-reinforced fact gets its distance shrunk → sorts first
+        assert mems[0]["id"] == "hot"
+        assert mems[0]["score"] < 0.50
+
+    def test_no_metadata_is_noop_and_safe(self):
+        from services.mem0.search import _apply_reinforcement_boost
+        mems = [{"id": "a", "score": 0.3}, {"id": "b", "score": 0.1}]
+        _apply_reinforcement_boost(mems)  # must not raise
+        # sorted ascending by distance regardless
+        assert [m["id"] for m in mems] == ["b", "a"]
+
+    def test_empty_list_safe(self):
+        from services.mem0.search import _apply_reinforcement_boost
+        empty = []
+        _apply_reinforcement_boost(empty)
+        assert empty == []

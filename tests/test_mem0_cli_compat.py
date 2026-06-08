@@ -138,6 +138,37 @@ class TestCliMessagesCreate:
         assert "anthropic-beta" in extra
         assert "x-app" in extra
 
+    @pytest.mark.asyncio
+    async def test_no_adaptive_thinking_for_haiku(self):
+        """Haiku rejects adaptive thinking with HTTP 400 — the kwarg must be
+        omitted for Haiku models (regression: 22 live 400s/day before fix)."""
+        mock_create = AsyncMock(return_value=MagicMock())
+        mock_client = MagicMock()
+        mock_client.messages.create = mock_create
+        await compat_mod.cli_messages_create(
+            mock_client,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            user_message="hi",
+            task_prompt="task",
+        )
+        assert "thinking" not in mock_create.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_adaptive_thinking_kept_for_opus(self):
+        """Opus supports adaptive thinking, so the kwarg is still sent."""
+        mock_create = AsyncMock(return_value=MagicMock())
+        mock_client = MagicMock()
+        mock_client.messages.create = mock_create
+        await compat_mod.cli_messages_create(
+            mock_client,
+            model="claude-opus-4-8",
+            max_tokens=256,
+            user_message="hi",
+            task_prompt="task",
+        )
+        assert mock_create.call_args.kwargs.get("thinking") == {"type": "adaptive"}
+
 
 # ---------------------------------------------------------------------------
 # extract_text tests

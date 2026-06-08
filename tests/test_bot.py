@@ -768,10 +768,15 @@ class TestOnMessage:
             # Implementation wraps reply context in <replied_to_message> XML tag
             assert "replied_to_message" in captured_prompt
             assert "ReplyAuthor" in captured_prompt
-            # Non-self reply remains inside <untrusted_user_input>
-            wrapper_open = captured_prompt.index("<untrusted_user_input>")
+            # An external (untrusted) reply must sit OUTSIDE the admin caller's
+            # <trusted_user_input> wrapper — its untrusted text must never land
+            # inside a first-party trusted block.
+            # Match the real wrapper opening (the admin header text also
+            # mentions the literal "<trusted_user_input>", so anchor on the
+            # newline that only the actual wrapper has).
+            wrapper_open = captured_prompt.index("<trusted_user_input>\n")
             tag_pos = captured_prompt.index("<replied_to_message")
-            assert tag_pos > wrapper_open
+            assert tag_pos < wrapper_open
 
     @pytest.mark.asyncio
     async def test_admin_reply_to_bot_uses_trusted_tag_outside_wrapper(self, monkeypatch):
@@ -818,7 +823,10 @@ class TestOnMessage:
             assert "私の過去発言" in captured_prompt
             assert "<replied_to_message" not in captured_prompt
             tag_pos = captured_prompt.index("<replied_to_trusted_message")
-            wrapper_open = captured_prompt.index("<untrusted_user_input>")
+            # Match the real wrapper opening (the admin header text also
+            # mentions the literal "<trusted_user_input>", so anchor on the
+            # newline that only the actual wrapper has).
+            wrapper_open = captured_prompt.index("<trusted_user_input>\n")
             assert tag_pos < wrapper_open
 
     @pytest.mark.asyncio
@@ -866,7 +874,10 @@ class TestOnMessage:
             assert "b0nchichi" in captured_prompt
             assert "お父さんからのコメント" in captured_prompt
             tag_pos = captured_prompt.index("<replied_to_trusted_message")
-            wrapper_open = captured_prompt.index("<untrusted_user_input>")
+            # Match the real wrapper opening (the admin header text also
+            # mentions the literal "<trusted_user_input>", so anchor on the
+            # newline that only the actual wrapper has).
+            wrapper_open = captured_prompt.index("<trusted_user_input>\n")
             assert tag_pos < wrapper_open
 
     @pytest.mark.asyncio
@@ -908,13 +919,113 @@ class TestOnMessage:
             await self._dispatch(msg)
 
             assert captured_prompt is not None
-            # External author stays inside untrusted wrapper with the
-            # non-trusted tag.
+            # External author keeps the non-trusted tag AND sits OUTSIDE the
+            # admin caller's trusted wrapper — untrusted reply text must never
+            # be embedded inside <trusted_user_input>.
             assert "<replied_to_message" in captured_prompt
             assert "<replied_to_trusted_message" not in captured_prompt
             tag_pos = captured_prompt.index("<replied_to_message")
-            wrapper_open = captured_prompt.index("<untrusted_user_input>")
-            assert tag_pos > wrapper_open
+            # Match the real wrapper opening (the admin header text also
+            # mentions the literal "<trusted_user_input>", so anchor on the
+            # newline that only the actual wrapper has).
+            wrapper_open = captured_prompt.index("<trusted_user_input>\n")
+            assert tag_pos < wrapper_open
+
+    @pytest.mark.asyncio
+    async def test_history_search_injected_for_admin(self, monkeypatch):
+        """admin + long query → <history_search> block injected with the hit."""
+        import bot
+        from services.mem0 import history_index
+
+        long_text = "東洋水産の株について前に話したのを覚えてる？教えて"
+        monkeypatch.setattr("bot.MEM0_HISTORY_SEARCH_ENABLED", True)
+        monkeypatch.setattr(
+            history_index, "search_history",
+            MagicMock(return_value=[
+                {"role": "user", "memory": "東洋水産の株を買った", "ts": "t", "rank": 1},
+            ]),
+        )
+
+        msg = _make_message(content=f"かなえ {long_text}", author_id=12345)
+        captured_prompt = None
+
+        async def capture_call(prompt, *args, **kwargs):
+            nonlocal captured_prompt
+            captured_prompt = prompt
+            return ("ok", None, False)
+
+        with patch("bot.strip_mention", return_value=long_text), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value=long_text), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.search_memories_smart", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+
+            assert captured_prompt is not None
+            assert "<history_search" in captured_prompt
+            assert "東洋水産の株を買った" in captured_prompt
+
+    @pytest.mark.asyncio
+    async def test_history_search_skipped_when_flag_off(self, monkeypatch):
+        """MEM0_HISTORY_SEARCH_ENABLED=False → search_history never called."""
+        import bot
+        from services.mem0 import history_index
+
+        long_text = "東洋水産の株について前に話したのを覚えてる？教えて"
+        monkeypatch.setattr("bot.MEM0_HISTORY_SEARCH_ENABLED", False)
+        spy = MagicMock(return_value=[])
+        monkeypatch.setattr(history_index, "search_history", spy)
+
+        msg = _make_message(content=f"かなえ {long_text}", author_id=12345)
+
+        with patch("bot.strip_mention", return_value=long_text), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value=long_text), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.search_memories_smart", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+            spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_history_search_skipped_for_nonadmin(self, monkeypatch):
+        """Non-admin caller → history search never runs (privacy: JSONL has no author id)."""
+        import bot
+        from services.mem0 import history_index
+
+        long_text = "東洋水産の株について前に話したのを覚えてる？教えて"
+        # Make 12345 a non-admin while keeping the guild mention gate satisfied.
+        monkeypatch.setattr("bot.ADMIN_USER_IDS", {99999})
+        monkeypatch.setattr("bot.MEM0_HISTORY_SEARCH_ENABLED", True)
+        spy = MagicMock(return_value=[])
+        monkeypatch.setattr(history_index, "search_history", spy)
+
+        msg = _make_message(content=f"かなえ {long_text}", author_id=12345)
+
+        with patch("bot.strip_mention", return_value=long_text), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value=long_text), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.search_memories_smart", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+            spy.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_response_images_attached(self, monkeypatch):
@@ -1308,12 +1419,9 @@ async def test_tree_sync_only_runs_once():
     import bot
 
     bot._tree_synced = False
-    # Pre-set every guard flag so on_ready short-circuits all the background
-    # task spawns (emotion daemon, silence tick, hourly summary etc.).
-    # Otherwise their long-running loops leak into subsequent tests and the
-    # whole test_bot.py suite hangs.
+    # Pre-set the cleanup guard so on_ready short-circuits its background
+    # task spawns. Otherwise long-running loops leak into subsequent tests.
     bot._cleanup_scheduled = True
-    bot._emotion_daemon_started = True
 
     mock_tree_sync = AsyncMock(return_value=[MagicMock(), MagicMock()])
     mock_tree = MagicMock()
@@ -1336,7 +1444,6 @@ async def test_tree_sync_only_runs_once():
     # Reset for other tests
     bot._tree_synced = False
     bot._cleanup_scheduled = False
-    bot._emotion_daemon_started = False
 
 
 def test_attachments_capped_at_10():

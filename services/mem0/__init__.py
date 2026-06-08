@@ -16,7 +16,10 @@ from services.mem0.client import (
     get_all_memories,
 )
 from services.mem0.extract import extract_facts_for_self
-from services.mem0.format import format_memories_for_prompt
+from services.mem0.format import (
+    format_history_for_prompt,
+    format_memories_for_prompt,
+)
 from services.mem0.ingest import add_memories
 from services.mem0.search import (
     search_memories,
@@ -31,6 +34,7 @@ __all__ = [
     "add_memories",
     "delete_memory",
     "extract_facts_for_self",
+    "format_history_for_prompt",
     "format_memories_for_prompt",
     "get_all_memories",
     "search_memories",

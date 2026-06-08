@@ -1,0 +1,439 @@
+2026-06-08 10:45:19,968 INFO SDK attempt 1/5 (timeout=90s, resume=True)
+2026-06-08 10:45:19,969 WARNING Session resume timed out for ch=90001, retrying fresh
+2026-06-08 10:45:19,969 INFO SDK attempt 2/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:19,970 INFO [ch=90001] ✅ done: turns=1 tools=0 elapsed=0.0s api=0.5s cost=$0.0100 tokens_in=10 tokens_out=5 error=False
+2026-06-08 10:45:19,970 INFO Response via claude-opus-4-7 (restricted=False) len=8
+2026-06-08 10:45:19,974 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:19,976 INFO SDK attempt 1/1 (timeout=1800s, resume=False)
+2026-06-08 10:45:19,976 ERROR SDK error (attempt 1, type=cli_exit): exit code 1 failed
+Traceback (most recent call last):
+  File "/home/ubuntu/discord-bot/services/claude_sdk.py", line 581, in call_with_tools
+    async for msg in query(prompt=prompt, options=options):
+    ...<87 lines>...
+            )
+  File "/home/ubuntu/discord-bot/tests/test_claude_sdk.py", line 835, in cli_exit_error
+    raise RuntimeError("exit code 1 failed")
+RuntimeError: exit code 1 failed
+2026-06-08 10:45:19,985 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:19,987 INFO [ch=100001] ✅ done: turns=1 tools=0 elapsed=0.0s api=0.5s cost=$0.0100 tokens_in=10 tokens_out=5 error=False
+2026-06-08 10:45:19,987 INFO Response via claude-opus-4-7 (restricted=False) len=2
+2026-06-08 10:45:19,990 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:19,993 INFO [ch=100002] ✅ done: turns=1 tools=0 elapsed=0.0s api=0.5s cost=$0.0100 tokens_in=10 tokens_out=5 error=False
+2026-06-08 10:45:19,993 INFO Response via claude-opus-4-7 (restricted=False) len=2
+2026-06-08 10:45:19,996 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:19,996 INFO [ch=100003] 📡 system: subtype=init
+2026-06-08 10:45:19,997 INFO [ch=100003] ✅ done: turns=1 tools=0 elapsed=0.0s api=0.5s cost=$0.0100 tokens_in=10 tokens_out=5 error=False
+2026-06-08 10:45:19,997 INFO Response via claude-opus-4-7 (restricted=False) len=2
+2026-06-08 10:45:20,001 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,004 INFO [ch=100004] ✅ done: turns=1 tools=0 elapsed=0.0s api=0.5s cost=$0.0100 tokens_in=10 tokens_out=5 error=False
+2026-06-08 10:45:20,004 INFO Response via claude-opus-4-7 (restricted=False) len=2
+2026-06-08 10:45:20,022 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,023 INFO Saved stderr to /tmp/pytest-of-ubuntu/pytest-18/test_stderr_saved_to_disk_on_e0/stderr_ch11001.log
+2026-06-08 10:45:20,023 ERROR SDK error (attempt 1, type=auth): authentication failed 401
+stderr tail:
+some stderr content with error details
+2026-06-08 10:45:20,026 INFO Resuming session stale-sess for ch=95001 (mcp=set())
+2026-06-08 10:45:20,026 INFO SDK attempt 1/5 (timeout=90s, resume=True)
+2026-06-08 10:45:20,026 ERROR SDK error (attempt 1, type=cli_exit): exit code 1 session mismatch
+Traceback (most recent call last):
+  File "/home/ubuntu/discord-bot/services/claude_sdk.py", line 581, in call_with_tools
+    async for msg in query(prompt=prompt, options=options):
+    ...<87 lines>...
+            )
+  File "/home/ubuntu/discord-bot/tests/test_claude_sdk.py", line 1092, in cli_exit_then_ok
+    raise RuntimeError("exit code 1 session mismatch")
+RuntimeError: exit code 1 session mismatch
+2026-06-08 10:45:20,029 WARNING Session resume failed (cli_exit) for ch=95001, retrying fresh
+2026-06-08 10:45:20,029 INFO SDK attempt 2/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,030 INFO [ch=95001] ✅ done: turns=1 tools=0 elapsed=0.0s api=0.5s cost=$0.0100 tokens_in=10 tokens_out=5 error=False
+2026-06-08 10:45:20,031 INFO Response via claude-opus-4-7 (restricted=False) len=14
+2026-06-08 10:45:20,035 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,035 ERROR SDK error (attempt 1, type=overloaded): overloaded 529
+Traceback (most recent call last):
+  File "/home/ubuntu/discord-bot/services/claude_sdk.py", line 581, in call_with_tools
+    async for msg in query(prompt=prompt, options=options):
+    ...<87 lines>...
+            )
+  File "/home/ubuntu/discord-bot/tests/test_claude_sdk.py", line 1113, in flaky_query
+    raise RuntimeError("overloaded 529")
+RuntimeError: overloaded 529
+2026-06-08 10:45:20,038 INFO Retrying in 0s (type=overloaded, attempt 1/5)
+2026-06-08 10:45:20,038 INFO SDK attempt 2/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,039 INFO [ch=95002] ✅ done: turns=1 tools=0 elapsed=0.0s api=0.5s cost=$0.0100 tokens_in=10 tokens_out=5 error=False
+2026-06-08 10:45:20,040 INFO Response via claude-opus-4-7 (restricted=False) len=14
+2026-06-08 10:45:20,054 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,056 INFO [ch=110001] ✅ done: turns=1 tools=0 elapsed=0.0s api=0.5s cost=$0.0100 tokens_in=10 tokens_out=5 error=False
+2026-06-08 10:45:20,056 INFO Response via claude-opus-4-7 (restricted=False) len=2
+2026-06-08 10:45:20,059 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,062 INFO [ch=110002] ✅ done: turns=1 tools=1 elapsed=0.0s api=0.5s cost=$0.0100 tokens_in=10 tokens_out=5 error=False
+2026-06-08 10:45:20,062 INFO Response via claude-opus-4-7 (restricted=False) len=2
+2026-06-08 10:45:20,065 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,066 INFO [ch=110003] ✅ done: turns=1 tools=0 elapsed=0.0s api=0.5s cost=$0.0100 tokens_in=10 tokens_out=5 error=False
+2026-06-08 10:45:20,066 ERROR SDK error (attempt 1, type=cli_exit): exit code 1
+Traceback (most recent call last):
+  File "/home/ubuntu/discord-bot/services/claude_sdk.py", line 581, in call_with_tools
+    async for msg in query(prompt=prompt, options=options):
+    ...<87 lines>...
+            )
+  File "/home/ubuntu/discord-bot/tests/test_claude_sdk.py", line 1279, in result_then_exit
+    raise RuntimeError("exit code 1")
+RuntimeError: exit code 1
+2026-06-08 10:45:20,070 INFO CLI exited with partial response, returning it
+2026-06-08 10:45:20,070 INFO Response via claude-opus-4-7 (restricted=False) len=12
+2026-06-08 10:45:20,073 INFO Resuming session broken-sess for ch=110004 (mcp=set())
+2026-06-08 10:45:20,074 INFO SDK attempt 1/1 (timeout=90s, resume=True)
+2026-06-08 10:45:20,074 ERROR SDK error (attempt 1, type=unknown): something weird happened in sdk
+Traceback (most recent call last):
+  File "/home/ubuntu/discord-bot/services/claude_sdk.py", line 581, in call_with_tools
+    async for msg in query(prompt=prompt, options=options):
+    ...<87 lines>...
+            )
+  File "/home/ubuntu/discord-bot/tests/test_claude_sdk.py", line 1306, in unknown_error
+    raise RuntimeError("something weird happened in sdk")
+RuntimeError: something weird happened in sdk
+2026-06-08 10:45:20,079 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,080 ERROR SDK error (attempt 1, type=overloaded): overloaded 529
+Traceback (most recent call last):
+  File "/home/ubuntu/discord-bot/services/claude_sdk.py", line 581, in call_with_tools
+    async for msg in query(prompt=prompt, options=options):
+    ...<87 lines>...
+            )
+  File "/home/ubuntu/discord-bot/tests/test_claude_sdk.py", line 1337, in flaky_query
+    raise RuntimeError("overloaded 529")
+RuntimeError: overloaded 529
+2026-06-08 10:45:20,083 INFO Retrying in 0s (type=overloaded, attempt 1/5)
+2026-06-08 10:45:20,083 INFO SDK attempt 2/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,084 INFO [ch=999998] ✅ done: turns=1 tools=0 elapsed=0.0s api=0.5s cost=$0.0100 tokens_in=10 tokens_out=5 error=False
+2026-06-08 10:45:20,084 INFO Response via claude-opus-4-7 (restricted=False) len=2
+2026-06-08 10:45:20,091 WARNING ch=42 restricted call has image attachment; images won't be processed by Read tool in restricted mode (H3)
+2026-06-08 10:45:20,091 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,092 INFO [ch=42] ✅ done: turns=1 tools=0 elapsed=0.0s api=0.1s cost=n/a tokens_in=10 tokens_out=5 error=False
+2026-06-08 10:45:20,092 INFO Response via claude-opus-4-7 (restricted=True) len=2
+2026-06-08 10:45:20,095 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,096 INFO [ch=99] ✅ done: turns=1 tools=0 elapsed=0.0s api=0.1s cost=n/a tokens_in=10 tokens_out=5 error=False
+2026-06-08 10:45:20,096 INFO Response via claude-opus-4-7 (restricted=False) len=2
+2026-06-08 10:45:20,099 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,099 ERROR SDK error (attempt 1, type=overloaded): overloaded server 529
+Traceback (most recent call last):
+  File "/home/ubuntu/discord-bot/services/claude_sdk.py", line 581, in call_with_tools
+    async for msg in query(prompt=prompt, options=options):
+    ...<87 lines>...
+            )
+  File "/home/ubuntu/discord-bot/tests/test_claude_sdk.py", line 1484, in transient_query
+    raise RuntimeError("overloaded server 529")
+RuntimeError: overloaded server 529
+2026-06-08 10:45:20,102 INFO Retrying in 3s (type=overloaded, attempt 1/5)
+2026-06-08 10:45:20,102 WARNING Retry budget exhausted for ch=77777, giving up
+2026-06-08 10:45:20,105 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,105 WARNING Killed 1 orphan claude CLI process(es) on CancelledError
+2026-06-08 10:45:20,108 INFO SDK attempt 1/5 (timeout=1800s, resume=False)
+2026-06-08 10:45:20,110 INFO [ch=200002] ✅ done: turns=1 tools=1 elapsed=0.0s api=0.5s cost=$0.0100 tokens_in=10 tokens_out=5 error=False
+2026-06-08 10:45:20,111 INFO Response via claude-opus-4-7 (restricted=False) len=4
+2026-06-08 10:45:20,351 INFO test event
+2026-06-08 10:45:20,387 INFO Resolved message link: guild=111 ch=222 msg=333
+2026-06-08 10:45:20,394 INFO Resolved message link: guild=1 ch=2 msg=3
+2026-06-08 10:45:20,397 INFO Resolved message link: guild=1 ch=2 msg=3
+2026-06-08 10:45:20,397 INFO Resolved message link: guild=4 ch=5 msg=6
+2026-06-08 10:45:20,401 INFO Resolved message link: guild=1 ch=2 msg=3
+2026-06-08 10:45:20,405 INFO Downloaded attachment: test.png -> /tmp/pytest-of-ubuntu/pytest-18/test_successful_download1/attachments/42.png
+2026-06-08 10:45:20,413 WARNING Failed to download attachment test.png: connection error
+2026-06-08 10:45:20,416 WARNING Skipping oversized attachment test.png (20971520 bytes)
+2026-06-08 10:45:20,421 INFO Downloaded attachment: noext -> /tmp/pytest-of-ubuntu/pytest-18/test_no_extension_defaults_to_0/attachments/42.png
+2026-06-08 10:45:20,430 WARNING Rate limited (attempt 1/3), retrying in 0s
+2026-06-08 10:45:20,444 WARNING Rate limited (attempt 1/2), retrying in 0s
+2026-06-08 10:45:20,446 ERROR Direct API error: rate limited
+Traceback (most recent call last):
+  File "/home/ubuntu/discord-bot/services/claude_api/__init__.py", line 430, in call_direct
+    await asyncio.to_thread(_stream_once, api_client, messages, SYSTEM_PROMPT, response_chunks)
+  File "/home/ubuntu/discord-bot/tests/test_coverage_improvements.py", line 584, in fake_to_thread
+    raise anthropic.RateLimitError(
+    ...<3 lines>...
+    )
+anthropic.RateLimitError: rate limited
+2026-06-08 10:45:20,453 WARNING Stream stall: 100.0s gap
+2026-06-08 10:45:20,491 ERROR Direct API error: API down
+Traceback (most recent call last):
+  File "/home/ubuntu/discord-bot/services/claude_api/__init__.py", line 423, in call_direct
+    api_client = get_client()
+  File "/usr/lib/python3.13/unittest/mock.py", line 1169, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/unittest/mock.py", line 1173, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/unittest/mock.py", line 1228, in _execute_mock_call
+    raise effect
+Exception: API down
+2026-06-08 10:45:20,550 WARNING [ch=1] history load failed: invalid channel_id range: 1
+2026-06-08 10:45:20,551 INFO OAuth loaded — token valid, expires_at=1780884003027, subscription=max
+2026-06-08 10:45:20,873 INFO session prime: https://api.anthropic.com/api/oauth/profile → HTTP 200
+2026-06-08 10:45:21,286 INFO session prime: https://api.anthropic.com/api/oauth/claude_cli/roles → HTTP 200
+2026-06-08 10:45:21,300 INFO [PROMPT_BREAKDOWN ch=1] api_payload: prior_turns=0 prior_chars=0 user_chars=5 user_blocks=1 system_chars=13104 tools=23 resumable=False attempt=1
+2026-06-08 10:45:23,023 INFO HTTP Request: POST https://api.anthropic.com/v1/messages?beta=true "HTTP/2 200 OK"
+2026-06-08 10:45:29,229 INFO claude_api_usage channel=1 turn=1 input_tokens=10653 cache_read_input_tokens=0 cache_creation_input_tokens=15859 output_tokens=361 stop_reason=end_turn
+2026-06-08 10:45:29,229 INFO rate-limit observed: status=allowed claim=five_hour 5h_util=0.21 7d_util=0.18 fallback=0.50 reset_5h=1780898400 reset_7d=1781164800
+2026-06-08 10:45:29,230 WARNING [ch=1] history append failed: invalid channel_id range: 1
+2026-06-08 10:45:29,265 WARNING [ch=1] history load failed: invalid channel_id range: 1
+2026-06-08 10:45:29,265 INFO OAuth loaded — token valid, expires_at=1780884003027, subscription=max
+2026-06-08 10:45:29,276 INFO [PROMPT_BREAKDOWN ch=1] api_payload: prior_turns=0 prior_chars=0 user_chars=5 user_blocks=1 system_chars=13104 tools=23 resumable=False attempt=1
+2026-06-08 10:45:29,276 INFO pacing: sleeping 2.0s (status=allowed fallback=0.50)
+2026-06-08 10:45:33,055 INFO HTTP Request: POST https://api.anthropic.com/v1/messages?beta=true "HTTP/2 200 OK"
+2026-06-08 10:45:40,822 INFO claude_api_usage channel=1 turn=1 input_tokens=6 cache_read_input_tokens=15859 cache_creation_input_tokens=10647 output_tokens=412 stop_reason=end_turn
+2026-06-08 10:45:40,822 INFO rate-limit observed: status=allowed claim=five_hour 5h_util=0.21 7d_util=0.18 fallback=0.50 reset_5h=1780898400 reset_7d=1781164800
+2026-06-08 10:45:40,823 WARNING [ch=1] history append failed: invalid channel_id range: 1
+2026-06-08 10:45:40,863 WARNING [ch=1] history load failed: invalid channel_id range: 1
+2026-06-08 10:45:40,864 INFO OAuth loaded — token valid, expires_at=1780884003027, subscription=max
+2026-06-08 10:45:40,874 INFO [PROMPT_BREAKDOWN ch=1] api_payload: prior_turns=0 prior_chars=0 user_chars=5 user_blocks=1 system_chars=13104 tools=23 resumable=False attempt=1
+2026-06-08 10:45:40,875 INFO pacing: sleeping 0.4s (status=allowed fallback=0.50)
+2026-06-08 10:45:42,998 INFO HTTP Request: POST https://api.anthropic.com/v1/messages?beta=true "HTTP/2 200 OK"
+2026-06-08 10:45:53,109 INFO claude_api_usage channel=1 turn=1 input_tokens=6 cache_read_input_tokens=15859 cache_creation_input_tokens=10647 output_tokens=638 stop_reason=end_turn
+2026-06-08 10:45:53,109 INFO rate-limit observed: status=allowed claim=five_hour 5h_util=0.21 7d_util=0.18 fallback=0.50 reset_5h=1780898400 reset_7d=1781164800
+2026-06-08 10:45:53,110 WARNING [ch=1] history append failed: invalid channel_id range: 1
+2026-06-08 10:45:53,144 WARNING [ch=1] history load failed: invalid channel_id range: 1
+2026-06-08 10:45:53,145 INFO OAuth loaded — token valid, expires_at=1780884003027, subscription=max
+2026-06-08 10:45:53,159 INFO [PROMPT_BREAKDOWN ch=1] api_payload: prior_turns=0 prior_chars=0 user_chars=5 user_blocks=1 system_chars=13104 tools=23 resumable=False attempt=1
+2026-06-08 10:45:54,573 INFO HTTP Request: POST https://api.anthropic.com/v1/messages?beta=true "HTTP/2 200 OK"
+2026-06-08 10:45:58,280 INFO claude_api_usage channel=1 turn=1 input_tokens=6 cache_read_input_tokens=15859 cache_creation_input_tokens=10647 output_tokens=216 stop_reason=end_turn
+2026-06-08 10:45:58,280 INFO rate-limit observed: status=allowed claim=five_hour 5h_util=0.21 7d_util=0.18 fallback=0.50 reset_5h=1780898400 reset_7d=1781164800
+2026-06-08 10:45:58,281 WARNING [ch=1] history append failed: invalid channel_id range: 1
+2026-06-08 10:45:58,317 WARNING [ch=1] history load failed: invalid channel_id range: 1
+2026-06-08 10:45:58,318 INFO OAuth loaded — token valid, expires_at=1780884003027, subscription=max
+2026-06-08 10:45:58,328 INFO [PROMPT_BREAKDOWN ch=1] api_payload: prior_turns=0 prior_chars=0 user_chars=5 user_blocks=1 system_chars=13104 tools=23 resumable=False attempt=1
+2026-06-08 10:45:58,328 INFO pacing: sleeping 4.8s (status=allowed fallback=0.50)
+2026-06-08 10:46:04,485 INFO HTTP Request: POST https://api.anthropic.com/v1/messages?beta=true "HTTP/2 200 OK"
+2026-06-08 10:46:14,115 INFO claude_api_usage channel=1 turn=1 input_tokens=6 cache_read_input_tokens=15859 cache_creation_input_tokens=10647 output_tokens=561 stop_reason=end_turn
+2026-06-08 10:46:14,115 INFO rate-limit observed: status=allowed claim=five_hour 5h_util=0.22 7d_util=0.18 fallback=0.50 reset_5h=1780898400 reset_7d=1781164800
+2026-06-08 10:46:14,116 WARNING [ch=1] history append failed: invalid channel_id range: 1
+2026-06-08 10:46:14,153 WARNING [ch=1] history load failed: invalid channel_id range: 1
+2026-06-08 10:46:14,153 INFO OAuth loaded — token valid, expires_at=1780884003027, subscription=max
+2026-06-08 10:46:14,165 INFO [PROMPT_BREAKDOWN ch=1] api_payload: prior_turns=0 prior_chars=0 user_chars=5 user_blocks=1 system_chars=13104 tools=23 resumable=False attempt=1
+2026-06-08 10:46:15,588 INFO HTTP Request: POST https://api.anthropic.com/v1/messages?beta=true "HTTP/2 200 OK"
+2026-06-08 10:46:20,735 INFO claude_api_usage channel=1 turn=1 input_tokens=6 cache_read_input_tokens=15859 cache_creation_input_tokens=10647 output_tokens=308 stop_reason=end_turn
+2026-06-08 10:46:20,735 INFO rate-limit observed: status=allowed claim=five_hour 5h_util=0.22 7d_util=0.18 fallback=0.50 reset_5h=1780898400 reset_7d=1781164800
+2026-06-08 10:46:20,737 WARNING [ch=1] history append failed: invalid channel_id range: 1
+2026-06-08 10:46:20,770 WARNING [ch=1] history load failed: invalid channel_id range: 1
+2026-06-08 10:46:20,771 INFO OAuth loaded — token valid, expires_at=1780884003027, subscription=max
+2026-06-08 10:46:20,782 INFO [PROMPT_BREAKDOWN ch=1] api_payload: prior_turns=0 prior_chars=0 user_chars=5 user_blocks=1 system_chars=13104 tools=23 resumable=False attempt=1
+2026-06-08 10:46:20,782 INFO pacing: sleeping 3.4s (status=allowed fallback=0.50)
+2026-06-08 10:46:25,387 INFO HTTP Request: POST https://api.anthropic.com/v1/messages?beta=true "HTTP/2 200 OK"
+2026-06-08 10:46:32,130 INFO claude_api_usage channel=1 turn=1 input_tokens=6 cache_read_input_tokens=15859 cache_creation_input_tokens=10647 output_tokens=394 stop_reason=end_turn
+2026-06-08 10:46:32,130 INFO rate-limit observed: status=allowed claim=five_hour 5h_util=0.22 7d_util=0.18 fallback=0.50 reset_5h=1780898400 reset_7d=1781164800
+2026-06-08 10:46:32,131 WARNING [ch=1] history append failed: invalid channel_id range: 1
+2026-06-08 10:46:32,165 WARNING [ch=1] history load failed: invalid channel_id range: 1
+2026-06-08 10:46:32,165 INFO OAuth loaded — token valid, expires_at=1780884003027, subscription=max
+2026-06-08 10:46:32,176 INFO [PROMPT_BREAKDOWN ch=1] api_payload: prior_turns=0 prior_chars=0 user_chars=5 user_blocks=1 system_chars=13104 tools=23 resumable=False attempt=1
+2026-06-08 10:46:32,176 INFO pacing: sleeping 2.0s (status=allowed fallback=0.50)
+2026-06-08 10:46:35,487 INFO HTTP Request: POST https://api.anthropic.com/v1/messages?beta=true "HTTP/2 200 OK"
+2026-06-08 10:46:40,854 INFO claude_api_usage channel=1 turn=1 input_tokens=6 cache_read_input_tokens=15859 cache_creation_input_tokens=10647 output_tokens=208 stop_reason=end_turn
+2026-06-08 10:46:40,854 INFO rate-limit observed: status=allowed claim=five_hour 5h_util=0.23 7d_util=0.18 fallback=0.50 reset_5h=1780898400 reset_7d=1781164800
+2026-06-08 10:46:40,855 WARNING [ch=1] history append failed: invalid channel_id range: 1
+2026-06-08 10:46:40,888 WARNING [ch=42] history load failed: invalid channel_id range: 42
+2026-06-08 10:46:40,889 INFO OAuth loaded — token valid, expires_at=1780884003027, subscription=max
+2026-06-08 10:46:40,899 INFO [PROMPT_BREAKDOWN ch=42] api_payload: prior_turns=0 prior_chars=0 user_chars=5 user_blocks=1 system_chars=13104 tools=23 resumable=False attempt=1
+2026-06-08 10:46:40,900 INFO pacing: sleeping 3.3s (status=allowed fallback=0.50)
+2026-06-08 10:46:45,771 INFO HTTP Request: POST https://api.anthropic.com/v1/messages?beta=true "HTTP/2 200 OK"
+2026-06-08 10:46:50,551 INFO claude_api_usage channel=42 turn=1 input_tokens=6 cache_read_input_tokens=15859 cache_creation_input_tokens=10647 output_tokens=258 stop_reason=end_turn
+2026-06-08 10:46:50,551 INFO rate-limit observed: status=allowed claim=five_hour 5h_util=0.23 7d_util=0.18 fallback=0.50 reset_5h=1780898400 reset_7d=1781164800
+2026-06-08 10:46:50,553 WARNING [ch=42] history append failed: invalid channel_id range: 42
+2026-06-08 10:46:50,596 WARNING [ch=77] history load failed: invalid channel_id range: 77
+2026-06-08 10:46:50,597 INFO OAuth loaded — token valid, expires_at=1780884003027, subscription=max
+2026-06-08 10:46:50,608 INFO [PROMPT_BREAKDOWN ch=77] api_payload: prior_turns=0 prior_chars=0 user_chars=5 user_blocks=1 system_chars=13104 tools=23 resumable=False attempt=1
+2026-06-08 10:46:50,608 INFO pacing: sleeping 3.6s (status=allowed fallback=0.50)
+2026-06-08 10:46:55,877 INFO HTTP Request: POST https://api.anthropic.com/v1/messages?beta=true "HTTP/2 200 OK"
+2026-06-08 10:46:59,076 INFO claude_api_usage channel=77 turn=1 input_tokens=6 cache_read_input_tokens=15859 cache_creation_input_tokens=10647 output_tokens=170 stop_reason=end_turn
+2026-06-08 10:46:59,076 INFO rate-limit observed: status=allowed claim=five_hour 5h_util=0.23 7d_util=0.18 fallback=0.50 reset_5h=1780898400 reset_7d=1781164800
+2026-06-08 10:46:59,077 WARNING [ch=77] history append failed: invalid channel_id range: 77
+2026-06-08 10:46:59,148 INFO Resolved message link: guild=111 ch=222 msg=333
+2026-06-08 10:46:59,152 WARNING Failed to resolve message link https://discord.com/channels/111/222/333: Not found
+2026-06-08 10:46:59,233 INFO Resolved message link: guild=1 ch=222 msg=333
+2026-06-08 10:46:59,237 WARNING Rejecting message-link resolution: user=55 lacks read access to channel=222
+2026-06-08 10:46:59,240 WARNING Message link guild mismatch: url=1 fetched=999
+2026-06-08 10:46:59,247 INFO Cross-thread context fetched: thread=my-thread msgs=1
+2026-06-08 10:46:59,247 INFO Resolved message link: guild=1 ch=222 msg=333
+2026-06-08 10:46:59,251 INFO Resolved message link: guild=1 ch=2 msg=3
+2026-06-08 10:46:59,264 WARNING Rejecting channel-mention context: user=42 lacks access to thread=300
+2026-06-08 10:46:59,268 INFO Channel-mention context fetched: thread=public-thread msgs=1
+2026-06-08 10:46:59,271 WARNING Failed to fetch channel-mention context for 500: object MagicMock can't be used in 'await' expression
+2026-06-08 10:46:59,277 INFO Resolved message link: guild=1 ch=222 msg=333
+2026-06-08 10:46:59,281 WARNING Rejecting linked attachment from non-allowlisted host: https://evil.com/data.txt
+2026-06-08 10:46:59,281 INFO Resolved message link: guild=1 ch=222 msg=333
+2026-06-08 10:46:59,286 INFO Resolved message link: guild=1 ch=222 msg=333
+2026-06-08 10:46:59,290 INFO Resolved message link: guild=1 ch=222 msg=333
+2026-06-08 10:46:59,294 INFO Resolved message link: guild=1 ch=222 msg=333
+2026-06-08 10:46:59,297 WARNING Failed to resolve message link https://discord.com/channels/1/222/333: network error
+2026-06-08 10:46:59,306 WARNING Message link guild mismatch: url=1 fetched=1
+2026-06-08 10:46:59,316 INFO Mem0: injected 0 memories for user ...2002
+2026-06-08 10:46:59,316 INFO [PROMPT_BREAKDOWN rid=6be74c83 path=full total_pre_cap=389 will_resume=False actually_admin=False] trusted_header=185 mem0_user=120 untrusted_wrapper_overhead=47 user_text=34 mem0_user_count=0
+2026-06-08 10:46:59,316 INFO [rid=6be74c83] processing user=2002 channel=5555 admin=False len=389
+2026-06-08 10:46:59,317 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:46:59,331 INFO Mem0: injected 0 memories for user ...2002
+2026-06-08 10:46:59,331 INFO [PROMPT_BREAKDOWN rid=fccf8217 path=full total_pre_cap=410 will_resume=False actually_admin=False] trusted_header=185 mem0_user=120 user_text=55 untrusted_wrapper_overhead=47 mem0_user_count=0
+2026-06-08 10:46:59,332 INFO [rid=fccf8217] processing user=2002 channel=5555 admin=False len=410
+2026-06-08 10:46:59,332 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:46:59,345 INFO Mem0: injected 0 memories for user ...2002
+2026-06-08 10:46:59,346 INFO [PROMPT_BREAKDOWN rid=a398fa03 path=full total_pre_cap=402 will_resume=False actually_admin=False] trusted_header=185 mem0_user=120 user_text=47 untrusted_wrapper_overhead=47 mem0_user_count=0
+2026-06-08 10:46:59,346 INFO [rid=a398fa03] processing user=2002 channel=5555 admin=False len=402
+2026-06-08 10:46:59,346 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:46:59,363 INFO Mem0: injected 0 memories for user ...2002
+2026-06-08 10:46:59,363 INFO [PROMPT_BREAKDOWN rid=7869300b path=full total_pre_cap=410 will_resume=False actually_admin=False] trusted_header=185 mem0_user=120 user_text=55 untrusted_wrapper_overhead=47 mem0_user_count=0
+2026-06-08 10:46:59,363 INFO [rid=7869300b] processing user=2002 channel=5555 admin=False len=410
+2026-06-08 10:46:59,363 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:46:59,377 INFO Mem0: injected 0 memories for user ...2002
+2026-06-08 10:46:59,377 INFO [PROMPT_BREAKDOWN rid=e468f937 path=full total_pre_cap=406 will_resume=False actually_admin=False] trusted_header=185 mem0_user=120 user_text=51 untrusted_wrapper_overhead=47 mem0_user_count=0
+2026-06-08 10:46:59,378 INFO [rid=e468f937] processing user=2002 channel=5555 admin=False len=406
+2026-06-08 10:46:59,378 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:46:59,393 INFO [PROMPT_BREAKDOWN rid=0aacdce4 path=full total_pre_cap=253 will_resume=False actually_admin=False] trusted_header=185 untrusted_wrapper_overhead=47 user_text=20
+2026-06-08 10:46:59,393 INFO [rid=0aacdce4] processing user=2002 channel=5555 admin=False len=253
+2026-06-08 10:46:59,394 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:46:59,409 INFO [PROMPT_BREAKDOWN rid=15191052 path=full total_pre_cap=239 will_resume=False actually_admin=False] trusted_header=185 untrusted_wrapper_overhead=47 user_text=6
+2026-06-08 10:46:59,409 INFO [rid=15191052] processing user=2002 channel=5555 admin=False len=239
+2026-06-08 10:46:59,410 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:46:59,425 INFO Mem0: injected 0 memories for user ...1001
+2026-06-08 10:46:59,426 INFO kanae_self unified block injected: chars=866 facts=0 interests=3 episodes=10
+2026-06-08 10:46:59,426 INFO [PROMPT_BREAKDOWN rid=b7e6c59f path=full total_pre_cap=1243 will_resume=False actually_admin=True] kanae_self_unified=866 trusted_header=175 mem0_user=120 untrusted_wrapper_overhead=43 user_text=34 kanae_self_episodes_count=10 kanae_self_interests_count=3 mem0_user_count=0 kanae_self_facts_count=0
+2026-06-08 10:46:59,426 INFO [rid=b7e6c59f] processing user=1001 channel=5555 admin=True len=1243
+2026-06-08 10:46:59,426 INFO Routing to SDK/CLI (restricted=False, is_thread=False)
+2026-06-08 10:46:59,529 INFO emotion feedback: daemon not registered, skipping turn
+2026-06-08 10:46:59,543 INFO [PROMPT_BREAKDOWN rid=1a3b83c8 path=full total_pre_cap=239 will_resume=False actually_admin=False] trusted_header=185 untrusted_wrapper_overhead=47 user_text=6
+2026-06-08 10:46:59,543 INFO [rid=1a3b83c8] processing user=2002 channel=5555 admin=False len=239
+2026-06-08 10:46:59,543 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:46:59,599 INFO kanae_self unified block injected: chars=794 facts=0 interests=3 episodes=10
+2026-06-08 10:46:59,599 INFO [PROMPT_BREAKDOWN rid=ddda8bfa path=full total_pre_cap=1021 will_resume=False actually_admin=True] kanae_self_unified=794 trusted_header=175 untrusted_wrapper_overhead=43 kanae_self_episodes_count=10 user_text=6 kanae_self_interests_count=3 kanae_self_facts_count=0
+2026-06-08 10:46:59,599 INFO [rid=ddda8bfa] processing user=1001 channel=5555 admin=True len=1021
+2026-06-08 10:46:59,599 INFO Routing to SDK/CLI (restricted=False, is_thread=False)
+2026-06-08 10:46:59,609 INFO emotion feedback: daemon not registered, skipping turn
+2026-06-08 10:46:59,662 INFO [PROMPT_BREAKDOWN rid=45c7f78e path=full total_pre_cap=251 will_resume=False actually_admin=False] trusted_header=185 untrusted_wrapper_overhead=47 user_text=18
+2026-06-08 10:46:59,663 INFO [rid=45c7f78e] processing user=2002 channel=5555 admin=False len=251
+2026-06-08 10:46:59,663 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:46:59,736 INFO kanae_self unified block injected: chars=794 facts=0 interests=3 episodes=10
+2026-06-08 10:46:59,736 INFO [PROMPT_BREAKDOWN rid=90f9d0f5 path=full total_pre_cap=1032 will_resume=False actually_admin=True] kanae_self_unified=794 trusted_header=175 untrusted_wrapper_overhead=43 user_text=17 kanae_self_episodes_count=10 kanae_self_interests_count=3 kanae_self_facts_count=0
+2026-06-08 10:46:59,736 INFO [rid=90f9d0f5] processing user=1001 channel=5555 admin=True len=1032
+2026-06-08 10:46:59,736 INFO Routing to SDK/CLI (restricted=False, is_thread=False)
+2026-06-08 10:46:59,742 INFO Mem0 batch ingest: uid=1001 turns=10 chars=391
+2026-06-08 10:46:59,745 INFO emotion feedback: daemon not registered, skipping turn
+2026-06-08 10:46:59,814 WARNING Rejecting message-link resolution: user=444 lacks read access to channel=9999
+2026-06-08 10:46:59,818 INFO Resolved message link: guild=7777 ch=9999 msg=1111
+2026-06-08 10:46:59,827 WARNING Rejecting non-allow-listed attachment URL: https://evil.example/pwn.png
+2026-06-08 10:46:59,829 WARNING Rejecting path with non-image content: /tmp/pytest-of-ubuntu/pytest-18/test_extension_spoof_rejected0/id_rsa.png
+2026-06-08 10:46:59,832 WARNING Rejecting image path outside allow-list: /tmp/pytest-of-ubuntu/pytest-18/test_path_outside_allowlist_re0/ok.png
+2026-06-08 10:46:59,834 WARNING Rejecting image path outside allow-list: /tmp/pytest-of-ubuntu/pytest-18/test_symlink_escape_rejected1/inside/innocent.png
+2026-06-08 10:46:59,843 INFO [PROMPT_BREAKDOWN rid=dfde8f40 path=full total_pre_cap=248 will_resume=False actually_admin=False] trusted_header=185 untrusted_wrapper_overhead=47 user_text=15
+2026-06-08 10:46:59,843 INFO [rid=dfde8f40] processing user=2002 channel=5555 admin=False len=248
+2026-06-08 10:46:59,843 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:46:59,843 ERROR Error processing message from user ...2002 in #<MagicMock name='mock.channel' spec='TextChannel' id='128089307381248'>
+Traceback (most recent call last):
+  File "/home/ubuntu/discord-bot/bot.py", line 1714, in on_message
+    response_text, session_info, actually_resumed = await call_with_tools(
+                                                          ~~~~~~~~~~~~~~~^
+        prompt, message.channel.id, sessions,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<6 lines>...
+        has_image_attachment=bool(image_paths),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+TypeError: TestResponseImageSuppression.test_nonadmin_response_images_suppressed.<locals>.fake_call() got an unexpected keyword argument 'incremental_text_callback'
+2026-06-08 10:46:59,863 INFO [PROMPT_BREAKDOWN rid=df22a9c7 path=full total_pre_cap=240 will_resume=False actually_admin=False] trusted_header=185 untrusted_wrapper_overhead=47 user_text=7
+2026-06-08 10:46:59,863 INFO [rid=df22a9c7] processing user=2002 channel=5555 admin=False len=240
+2026-06-08 10:46:59,864 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:46:59,884 INFO kanae_self unified block injected: chars=794 facts=0 interests=3 episodes=10
+2026-06-08 10:46:59,884 INFO [PROMPT_BREAKDOWN rid=e2e9ae9f path=full total_pre_cap=1020 will_resume=False actually_admin=True] kanae_self_unified=794 trusted_header=175 untrusted_wrapper_overhead=43 kanae_self_episodes_count=10 user_text=5 kanae_self_interests_count=3 kanae_self_facts_count=0
+2026-06-08 10:46:59,885 INFO [rid=e2e9ae9f] processing user=1001 channel=5555 admin=True len=1020
+2026-06-08 10:46:59,885 INFO Routing to SDK/CLI (restricted=False, is_thread=False)
+2026-06-08 10:46:59,893 INFO emotion feedback: daemon not registered, skipping turn
+2026-06-08 10:46:59,917 INFO kanae_self unified block injected: chars=794 facts=0 interests=3 episodes=10
+2026-06-08 10:46:59,917 INFO [PROMPT_BREAKDOWN rid=6a84772d path=full total_pre_cap=1020 will_resume=False actually_admin=True] kanae_self_unified=794 trusted_header=175 untrusted_wrapper_overhead=43 kanae_self_episodes_count=10 user_text=5 kanae_self_interests_count=3 kanae_self_facts_count=0
+2026-06-08 10:46:59,917 INFO [rid=6a84772d] processing user=1001 channel=5555 admin=True len=1020
+2026-06-08 10:46:59,918 INFO Routing to SDK/CLI (restricted=False, is_thread=False)
+2026-06-08 10:46:59,929 INFO emotion feedback: daemon not registered, skipping turn
+2026-06-08 10:46:59,943 INFO [PROMPT_BREAKDOWN rid=3aa911f1 path=full total_pre_cap=238 will_resume=False actually_admin=False] trusted_header=185 untrusted_wrapper_overhead=47 user_text=5
+2026-06-08 10:46:59,943 INFO [rid=3aa911f1] processing user=2002 channel=5555 admin=False len=238
+2026-06-08 10:46:59,943 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:46:59,959 INFO [PROMPT_BREAKDOWN rid=ec9435d3 path=full total_pre_cap=238 will_resume=False actually_admin=False] trusted_header=185 untrusted_wrapper_overhead=47 user_text=5
+2026-06-08 10:46:59,959 INFO [rid=ec9435d3] processing user=2002 channel=5555 admin=False len=238
+2026-06-08 10:46:59,960 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:46:59,979 INFO kanae_self unified block injected: chars=794 facts=0 interests=3 episodes=10
+2026-06-08 10:46:59,979 INFO [PROMPT_BREAKDOWN rid=4748175e path=full total_pre_cap=1020 will_resume=False actually_admin=True] kanae_self_unified=794 trusted_header=175 untrusted_wrapper_overhead=43 kanae_self_episodes_count=10 user_text=5 kanae_self_interests_count=3 kanae_self_facts_count=0
+2026-06-08 10:46:59,979 INFO [rid=4748175e] processing user=1001 channel=5555 admin=True len=1020
+2026-06-08 10:46:59,979 INFO Routing to SDK/CLI (restricted=False, is_thread=False)
+2026-06-08 10:46:59,986 INFO emotion feedback: daemon not registered, skipping turn
+2026-06-08 10:47:00,000 INFO kanae_self unified block injected: chars=794 facts=0 interests=3 episodes=10
+2026-06-08 10:47:00,000 INFO [PROMPT_BREAKDOWN rid=cbbdbfd4 path=full total_pre_cap=1020 will_resume=False actually_admin=True] kanae_self_unified=794 trusted_header=175 untrusted_wrapper_overhead=43 kanae_self_episodes_count=10 user_text=5 kanae_self_interests_count=3 kanae_self_facts_count=0
+2026-06-08 10:47:00,000 INFO [rid=cbbdbfd4] processing user=1001 channel=5555 admin=True len=1020
+2026-06-08 10:47:00,001 INFO Routing to SDK/CLI (restricted=False, is_thread=False)
+2026-06-08 10:47:00,010 INFO emotion feedback: daemon not registered, skipping turn
+2026-06-08 10:47:00,032 INFO kanae_self unified block injected: chars=794 facts=0 interests=3 episodes=10
+2026-06-08 10:47:00,032 INFO [PROMPT_BREAKDOWN rid=326d6638 path=full total_pre_cap=1020 will_resume=False actually_admin=True] kanae_self_unified=794 trusted_header=175 untrusted_wrapper_overhead=43 kanae_self_episodes_count=10 user_text=5 kanae_self_interests_count=3 kanae_self_facts_count=0
+2026-06-08 10:47:00,033 INFO [rid=326d6638] processing user=1001 channel=5555 admin=True len=1020
+2026-06-08 10:47:00,033 INFO Routing to SDK/CLI (restricted=False, is_thread=False)
+2026-06-08 10:47:00,062 INFO emotion feedback: daemon not registered, skipping turn
+2026-06-08 10:47:00,072 INFO kanae_self unified block injected: chars=794 facts=0 interests=3 episodes=10
+2026-06-08 10:47:00,073 INFO [PROMPT_BREAKDOWN rid=f097763e path=full total_pre_cap=1020 will_resume=False actually_admin=True] kanae_self_unified=794 trusted_header=175 untrusted_wrapper_overhead=43 kanae_self_episodes_count=10 user_text=5 kanae_self_interests_count=3 kanae_self_facts_count=0
+2026-06-08 10:47:00,073 INFO [rid=f097763e] processing user=1001 channel=5555 admin=True len=1020
+2026-06-08 10:47:00,073 INFO Routing to SDK/CLI (restricted=False, is_thread=False)
+2026-06-08 10:47:00,100 INFO emotion feedback: daemon not registered, skipping turn
+2026-06-08 10:47:00,115 INFO kanae_self unified block injected: chars=794 facts=0 interests=3 episodes=10
+2026-06-08 10:47:00,115 INFO [PROMPT_BREAKDOWN rid=cab2d83d path=full total_pre_cap=1020 will_resume=False actually_admin=True] kanae_self_unified=794 trusted_header=175 untrusted_wrapper_overhead=43 kanae_self_episodes_count=10 user_text=5 kanae_self_interests_count=3 kanae_self_facts_count=0
+2026-06-08 10:47:00,115 INFO [rid=cab2d83d] processing user=1001 channel=5555 admin=True len=1020
+2026-06-08 10:47:00,116 INFO Routing to SDK/CLI (restricted=False, is_thread=False)
+2026-06-08 10:47:00,124 INFO emotion feedback: daemon not registered, skipping turn
+2026-06-08 10:47:00,146 INFO Mem0: injected 0 memories for user ...2002
+2026-06-08 10:47:00,147 INFO [PROMPT_BREAKDOWN rid=ddda3181 path=full total_pre_cap=485 will_resume=False actually_admin=False] trusted_header=185 user_text=130 mem0_user=120 untrusted_wrapper_overhead=47 mem0_user_count=0
+2026-06-08 10:47:00,147 INFO [rid=ddda3181] processing user=2002 channel=5555 admin=False len=485
+2026-06-08 10:47:00,148 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:47:00,164 INFO Mem0: injected 0 memories for user ...2002
+2026-06-08 10:47:00,164 INFO [PROMPT_BREAKDOWN rid=390b5e49 path=full total_pre_cap=9359 will_resume=False actually_admin=False] user_text=9004 trusted_header=185 mem0_user=120 untrusted_wrapper_overhead=47 mem0_user_count=0
+2026-06-08 10:47:00,164 WARNING [PROMPT_BREAKDOWN rid=390b5e49] truncated by MAX_PROMPT_CHARS: 9359 -> 530 (-8829 chars)
+2026-06-08 10:47:00,165 INFO [rid=390b5e49] processing user=2002 channel=5555 admin=False len=530
+2026-06-08 10:47:00,165 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:47:00,192 ERROR Refusing to touch /tmp/pytest-of-ubuntu/pytest-18/test_rejects_world_readable_di0/loose: mode=0o755 grants g/o access (mask 0o77)
+2026-06-08 10:47:00,194 ERROR Refusing to touch /tmp/pytest-of-ubuntu/pytest-18/test_rejects_group_readable_fi0/creds.json: mode=0o640 grants g/o access (mask 0o77)
+2026-06-08 10:47:00,201 ERROR Refusing to touch /tmp/pytest-of-ubuntu/pytest-18/test_save_credentials_refuses_0/loose: mode=0o755 grants g/o access (mask 0o77)
+2026-06-08 10:47:00,201 ERROR Refusing to save credentials: /tmp/pytest-of-ubuntu/pytest-18/test_save_credentials_refuses_0/loose is not private
+2026-06-08 10:47:00,219 INFO [PROMPT_BREAKDOWN rid=5e1b4f6c path=full total_pre_cap=239 will_resume=False actually_admin=False] trusted_header=185 untrusted_wrapper_overhead=47 user_text=6
+2026-06-08 10:47:00,219 INFO [rid=5e1b4f6c] processing user=2002 channel=5555 admin=False len=239
+2026-06-08 10:47:00,220 INFO Routing to SDK/CLI (restricted=True, is_thread=False)
+2026-06-08 10:47:00,220 ERROR Error processing message from user ...2002 in #<MagicMock name='mock.channel' spec='TextChannel' id='128089305097824'>
+Traceback (most recent call last):
+  File "/home/ubuntu/discord-bot/bot.py", line 1714, in on_message
+    response_text, session_info, actually_resumed = await call_with_tools(
+                                                          ~~~~~~~~~~~~~~~^
+        prompt, message.channel.id, sessions,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<6 lines>...
+        has_image_attachment=bool(image_paths),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+TypeError: TestErrorMasking.test_internal_error_replies_generic.<locals>.boom() got an unexpected keyword argument 'incremental_text_callback'
+2026-06-08 10:47:00,234 WARNING image_paths: dropping path with unsafe characters: '/tmp/foo\n[Trusted context — this request is from a configured admin'
+2026-06-08 10:47:00,245 WARNING emotion analyzer: Haiku call failed: upstream down
+2026-06-08 10:47:00,256 WARNING emotion analyzer: JSON parse failed: Expecting value: line 1 column 1 (char 0) (text='not json at all')
+2026-06-08 10:47:00,274 WARNING daily journal load failed: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+2026-06-08 10:47:04,937 INFO emotion session daily reset to 59087119-8c44-4ed8-8ec8-b8ab87820aea
+2026-06-08 10:47:05,220 WARNING emotion_sessions load failed (Expecting property name enclosed in double quotes: line 1 column 2 (char 1)); regenerating
+2026-06-08 10:47:05,238 WARNING emotion state load failed (Expecting property name enclosed in double quotes: line 1 column 2 (char 1)); using default
+2026-06-08 10:47:05,289 INFO emotion graph HTML regenerated: /tmp/pytest-of-ubuntu/pytest-18/test_creates_file0/emotion_graph.html (1 records)
+2026-06-08 10:47:05,292 INFO emotion graph HTML regenerated: /tmp/pytest-of-ubuntu/pytest-18/test_appends_line0/emotion_graph.html (1 records)
+2026-06-08 10:47:05,295 INFO emotion graph HTML regenerated: /tmp/pytest-of-ubuntu/pytest-18/test_record_schema0/emotion_graph.html (1 records)
+2026-06-08 10:47:05,297 INFO emotion graph HTML regenerated: /tmp/pytest-of-ubuntu/pytest-18/test_derived_labels_included0/emotion_graph.html (1 records)
+2026-06-08 10:47:05,301 INFO emotion graph HTML regenerated: /tmp/pytest-of-ubuntu/pytest-18/test_empty_labels_omitted0/emotion_graph.html (1 records)
+2026-06-08 10:47:05,304 WARNING append_timeseries failed
+Traceback (most recent call last):
+  File "/home/ubuntu/discord-bot/services/emotion/timeseries.py", line 67, in append_timeseries
+    with ts_path.open("a", encoding="utf-8") as f:
+         ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/pathlib/_local.py", line 539, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: '/tmp/pytest-of-ubuntu/pytest-18/test_failure_no_raise0/emotion_ts.jsonl'
+2026-06-08 10:47:05,309 INFO emotion graph HTML regenerated: /tmp/pytest-of-ubuntu/pytest-18/test_empty_journal_trigger0/emotion_graph.html (1 records)
+2026-06-08 10:47:05,317 INFO emotion graph HTML regenerated: /tmp/pytest-of-ubuntu/pytest-18/test_loads_records0/emotion_graph.html (1 records)
+2026-06-08 10:47:05,325 WARNING timeseries: corrupt line 2, skipping
+2026-06-08 10:47:05,351 WARNING validator: missing field arousal
+2026-06-08 10:47:05,353 WARNING validator: non-numeric valence='abc'
+2026-06-08 10:47:05,479 INFO Streaming up to 10 messages from #fake (123)
+2026-06-08 10:47:05,509 INFO Streaming up to 20 messages from #fake (123)
+2026-06-08 10:47:05,533 INFO Streaming up to 10 messages from #fake (123)
+2026-06-08 10:47:05,554 INFO Streaming up to 10 messages from #fake (123)
+2026-06-08 10:47:05,872 INFO Streaming up to 200 messages from #fake (123)

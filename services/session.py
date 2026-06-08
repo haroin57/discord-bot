@@ -212,6 +212,24 @@ def append_jsonl(channel_id: int, entry: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
 
+    # Mirror the line into the BM25 history index for per-turn literal recall.
+    # Single chokepoint: every transcript write goes through append_jsonl, so
+    # hooking here covers both the OAuth (entry.py) and API-key (__init__.py)
+    # paths uniformly. Non-fatal — a transcript must persist even if indexing
+    # fails. Caller already runs append_jsonl off the event loop via to_thread,
+    # so the synchronous index write piggybacks on that thread.
+    try:
+        role = entry.get("role")
+        content = entry.get("content")
+        if role and content:
+            from services.mem0 import history_index
+            history_index.index_line(
+                channel_id, entry.get("timestamp", ""), role, content,
+                author=entry.get("author", ""),
+            )
+    except Exception as exc:
+        log.warning("history index update failed (non-fatal): %s", exc)
+
 
 _CONTEXT_BLOCK_RE = re.compile(
     r"<(?P<tag>retrieved_memories|kanae_self_memory)(?:\s[^>]*)?>.*?</(?P=tag)>",

@@ -94,6 +94,22 @@ class TestIndexAndSearch:
         ids = [h["id"] for h in hits]
         assert "f1" in ids
         assert "f2" not in ids
+        # Regression (2026-05-29): search_bm25 must return the ORIGINAL
+        # sentence as `memory`, not the morpho-tokenized keyword string.
+        f1_hit = next(h for h in hits if h["id"] == "f1")
+        assert f1_hit["memory"] == "先輩は砺波いぶきが好き"
+
+    def test_memory_is_original_not_tokenized(self, fresh_bm25_db):
+        """search_bm25 must surface the raw fact sentence, not the FTS5
+        tokenized `text` column (the 2026-05-29 degradation bug)."""
+        from services.mem0 import bm25_index, morpho
+        sentence = "homeフォルダにマンガをまとめて管理している"
+        bm25_index.index_fact("f1", sentence, "userA")
+        hits = bm25_index.search_bm25("マンガ 管理", "userA", limit=10)
+        f1 = next(h for h in hits if h["id"] == "f1")
+        assert f1["memory"] == sentence
+        # And explicitly NOT the whitespace-joined tokenized form.
+        assert f1["memory"] != morpho.tokenize_for_index(sentence)
 
     def test_empty_query_returns_empty(self, fresh_bm25_db):
         from services.mem0 import bm25_index
@@ -209,6 +225,17 @@ class TestRrfMerge:
         # don't drop them. Currently 0.8 (matching graph_expand).
         assert merged[0].get("score") == 0.8
 
+    def test_memory_prefers_full_text_for_shared_id(self):
+        """When a fact hits via BOTH vector (full sentence) and bm25, the
+        fused `memory` must stay the full sentence — never overwritten by a
+        bm25 item. Locks the rrf_merge half of the 2026-05-29 invariant."""
+        from services.mem0.bm25_index import rrf_merge
+
+        vector = [{"id": "f1", "score": 0.1, "memory": "先輩は砺波いぶきが好き"}]
+        bm25 = [{"id": "f1", "rank": 1, "memory": "先輩 砺波 いぶき 好き"}]
+        merged = rrf_merge(vector, bm25, k=60, limit=10)
+        assert merged[0]["memory"] == "先輩は砺波いぶきが好き"
+
 
 # ---------------------------------------------------------------------------
 # search_memories_hybrid
@@ -299,6 +326,16 @@ class TestReindex:
         assert hits == []
         hits = bm25_index.search_bm25("first", "u", limit=10)
         assert [h["id"] for h in hits] == ["f1"]
+
+    def test_reindex_all_memory_is_original(self, fresh_bm25_db):
+        """reindex_all must store the raw sentence as orig_text so search
+        returns it as `memory` (regression lock for the 2026-05-29 bug)."""
+        from services.mem0 import bm25_index
+        sentence = "上伊那ぼたんを3巻まで読んだ"
+        bm25_index.reindex_all([("f1", sentence, "u")])
+        hits = bm25_index.search_bm25("上伊那ぼたん", "u", limit=10)
+        f1 = next(h for h in hits if h["id"] == "f1")
+        assert f1["memory"] == sentence
 
     def test_reindex_all_skips_empty_rows(self, fresh_bm25_db):
         from services.mem0 import bm25_index
