@@ -71,7 +71,7 @@ PING_OUT=$(env -i \
     HTTPS_PROXY="http://127.0.0.1:$PORT" \
     HTTP_PROXY="http://127.0.0.1:$PORT" \
     NODE_EXTRA_CA_CERTS="$CA_CERT" \
-    "$CLAUDE_BIN" -p "1+1=" --model claude-opus-4-6 2>&1 || true)
+    "$CLAUDE_BIN" -p "1+1=" --model claude-fable-5 2>&1 || true)
 log "CLI output (truncated): $(echo "$PING_OUT" | head -c 200)"
 
 # 3. stop mitmdump

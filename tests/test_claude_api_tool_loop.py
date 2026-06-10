@@ -12,9 +12,12 @@ from services.claude_api.tool_loop import (
     MAX_CONSECUTIVE_EMPTY_TURNS,
     AgentLoopResult,
     _block_to_dict,
+    _build_cached_system,
     _detect_write_hallucination,
     _format_tool_invocation_for_display,
+    _inject_cache_breakpoints,
     _join_final_text,
+    _log_turn_usage,
     _normalize_history_for_api,
     run_agent_loop,
 )
@@ -469,17 +472,18 @@ class TestTodoWriteDisplay:
         assert "[x] c" in out
 
 
-class TestEffortMax:
-    """Pin the effort dial at "max" (top of low<medium<high<xhigh<max).
+class TestEffortXhigh:
+    """Pin the effort dial at "xhigh" (low<medium<high<xhigh<max).
 
     The CLI capture shows "high" because that's claude-cli's default, but
-    the dial actually goes higher and the bot opts in deliberately. These
-    tests fail loudly if anyone silently downgrades the bot's request.
+    the bot deliberately steps up one notch to "xhigh" for extra thinking
+    budget (an intentional divergence from the CLI request — haroin
+    preference). These tests fail loudly if anyone silently changes it.
     """
 
-    def test_output_config_constant_is_max(self):
+    def test_output_config_constant_is_xhigh(self):
         from services.claude_api.client import OUTPUT_CONFIG
-        assert OUTPUT_CONFIG == {"effort": "max"}
+        assert OUTPUT_CONFIG == {"effort": "xhigh"}
 
     def test_effort_beta_still_in_betas(self):
         # output_config.effort is only honored under the effort-2025-11-24
@@ -488,10 +492,12 @@ class TestEffortMax:
         assert "effort-2025-11-24" in MODEL_BETAS
 
     @pytest.mark.asyncio
-    async def test_effort_max_reaches_stream_kwargs(self, watchdog):
+    async def test_effort_xhigh_reaches_stream_kwargs(self, watchdog):
         # Capture the kwargs that run_agent_loop hands to the SDK's stream
-        # factory. The extra_body branch is where output_config rides into
-        # the /v1/messages request body.
+        # factory. Per ADR-0009, output_config is a DIRECT kwarg (not nested in
+        # extra_body) — the beta streaming path silently drops it from
+        # extra_body, so effort never reaches the wire there. extra_body still
+        # carries context_management.
         captured_kwargs: dict = {}
 
         def stream_factory(**kwargs):
@@ -515,5 +521,131 @@ class TestEffortMax:
             model="claude-opus-4-7",
             extra_betas=[],
         )
-        extra_body = captured_kwargs.get("extra_body") or {}
-        assert extra_body.get("output_config") == {"effort": "max"}
+        assert captured_kwargs.get("output_config") == {"effort": "xhigh"}
+
+
+class TestRefusalLogging:
+    """ADR-0008: on stop_reason=refusal, _log_turn_usage must surface
+    stop_details (category + explanation) so refusals are diagnosable."""
+
+    def _usage(self):
+        return SimpleNamespace(
+            input_tokens=10, cache_read_input_tokens=0,
+            cache_creation_input_tokens=100, output_tokens=2,
+        )
+
+    def test_refusal_logs_stop_details(self, caplog):
+        caplog.set_level("WARNING")
+        final = SimpleNamespace(
+            usage=self._usage(),
+            stop_reason="refusal",
+            stop_details=SimpleNamespace(category="cyber", explanation="nope"),
+        )
+        _log_turn_usage(123, 0, final, {f: 0 for f in (
+            "input_tokens", "cache_read_input_tokens",
+            "cache_creation_input_tokens", "output_tokens", "turns")})
+        rec = [r.message for r in caplog.records if "claude_api_refusal" in r.message]
+        assert rec, "refusal log not emitted"
+        assert "category=cyber" in rec[0]
+        assert "nope" in rec[0]
+
+    def test_non_refusal_does_not_log_refusal(self, caplog):
+        caplog.set_level("WARNING")
+        final = SimpleNamespace(
+            usage=self._usage(), stop_reason="end_turn", stop_details=None,
+        )
+        _log_turn_usage(123, 0, final, {f: 0 for f in (
+            "input_tokens", "cache_read_input_tokens",
+            "cache_creation_input_tokens", "output_tokens", "turns")})
+        assert not any("claude_api_refusal" in r.message for r in caplog.records)
+
+    def test_refusal_with_missing_stop_details_is_safe(self, caplog):
+        # Older SDK / mock without stop_details — must not crash, logs None.
+        caplog.set_level("WARNING")
+        final = SimpleNamespace(usage=self._usage(), stop_reason="refusal")
+        _log_turn_usage(123, 0, final, {f: 0 for f in (
+            "input_tokens", "cache_read_input_tokens",
+            "cache_creation_input_tokens", "output_tokens", "turns")})
+        rec = [r.message for r in caplog.records if "claude_api_refusal" in r.message]
+        assert rec and "category=None" in rec[0]
+
+
+class TestCacheBreakpointTTL:
+    """The live tool-loop path must put ttl:1h on every cache breakpoint.
+
+    Regression guard for the bug where the message-level breakpoint used the
+    default 5-minute TTL while system[2]/[3] used 1h. Discord turns are spaced
+    >5 min apart routinely, so a 5-min breakpoint expired between user turns and
+    the whole replayed history was re-written to cache on every resume. All
+    breakpoints must be 1h so the history prefix survives the inter-turn gap.
+    """
+
+    _FIVE_MSGS = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "r1"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "r2"},
+        {"role": "user", "content": "third"},
+    ]
+
+    def test_string_content_breakpoint_is_1h(self):
+        result = _inject_cache_breakpoints(self._FIVE_MSGS)
+        # second-to-last user (index 2, "second") becomes the breakpoint
+        block = result[2]["content"][0]
+        assert block["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+    def test_list_content_breakpoint_is_1h(self):
+        msgs = list(self._FIVE_MSGS)
+        msgs[2] = {"role": "user", "content": [
+            {"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}
+        result = _inject_cache_breakpoints(msgs)
+        assert result[2]["content"][-1]["cache_control"] == {
+            "type": "ephemeral", "ttl": "1h"}
+
+    def test_system_and_message_breakpoints_share_1h_ttl(self):
+        # All cache breakpoints across the request must agree on ttl:1h so the
+        # cached prefix expires as one unit, not piecemeal.
+        system = _build_cached_system("persona", self._FIVE_MSGS)
+        sys_ttls = [b["cache_control"]["ttl"] for b in system
+                    if "cache_control" in b]
+        assert sys_ttls == ["1h", "1h"]
+        msg_block = _inject_cache_breakpoints(self._FIVE_MSGS)[2]["content"][0]
+        assert msg_block["cache_control"]["ttl"] == "1h"
+
+    def test_breakpoint_count_within_limit(self):
+        # Anthropic allows max 4 cache_control breakpoints per request. We use
+        # system[2] + system[3] + one message breakpoint = 3. Guard the budget.
+        system = _build_cached_system("persona", self._FIVE_MSGS)
+        msgs = _inject_cache_breakpoints(self._FIVE_MSGS)
+        n = sum(1 for b in system if "cache_control" in b)
+        for m in msgs:
+            c = m["content"]
+            if isinstance(c, list):
+                n += sum(1 for b in c if isinstance(b, dict) and "cache_control" in b)
+        assert n <= 4
+
+    def test_render_is_deterministic(self):
+        # The behavioural claim behind ttl:1h is that the NEXT turn can READ the
+        # cache this turn wrote. That only holds if re-rendering the same inputs
+        # produces byte-identical system + breakpoint bytes — a per-request
+        # timestamp/uuid/non-deterministic JSON anywhere upstream of the
+        # breakpoint would silently invalidate the prefix every turn (the exact
+        # symptom this fix targets). Lock determinism so a future silent
+        # invalidator fails loudly here instead of in production cache_read=0.
+        import json
+        sys_a = json.dumps(_build_cached_system("persona", self._FIVE_MSGS))
+        sys_b = json.dumps(_build_cached_system("persona", self._FIVE_MSGS))
+        msg_a = json.dumps(_inject_cache_breakpoints(self._FIVE_MSGS))
+        msg_b = json.dumps(_inject_cache_breakpoints(self._FIVE_MSGS))
+        assert sys_a == sys_b, "system render is non-deterministic — cache prefix will churn"
+        assert msg_a == msg_b, "message render is non-deterministic — cache prefix will churn"
+
+    def test_breakpoint_message_text_is_preserved(self):
+        # Converting a string-content message to a [{text}] block to carry the
+        # breakpoint must not alter the text itself — only wrap it. (The server
+        # normalizes "x" and [{type:text,text:"x"}] to the same content hash, so
+        # the wrap is cache-neutral; what matters is the text survives intact.)
+        result = _inject_cache_breakpoints(self._FIVE_MSGS)
+        assert result[2]["content"][0]["text"] == "second"
+        # And the original history object is not mutated by the wrap.
+        assert self._FIVE_MSGS[2]["content"] == "second"

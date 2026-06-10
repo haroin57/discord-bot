@@ -98,12 +98,11 @@ def speaker_label(user_id: int | str | None) -> str:
 CWD = os.environ.get("BOT_CWD", "/home/ubuntu")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-fable-5")
-# Per-turn output cap. 128k is the max streamable output on Fable 5 / Opus
-# 4.6+ (requires streaming, which the bot always uses). Raised from 64k on
-# 2026-06-10 (haroin request) so long agent-loop turns never truncate
-# mid-thought. The SDK requires streaming for max_tokens this large — the bot
-# already streams via messages.stream(), so the HTTP-timeout guard is satisfied.
-CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "128000"))
+# Per-turn output cap. Matched to the real claude-cli, which sends 32000 on
+# Fable 5 (mitm capture). Briefly raised to 128k, but reverted to 32000 to keep
+# the request byte-identical to the CLI while debugging fable-5 refusals — the
+# only large structural diff that remained between bot and CLI requests.
+CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "32000"))
 # Per-request turn ceiling for admin (trusted) callers. Was hard-coded to 999
 # which let a single CLI invocation hold ~500MB of node/MCP child processes
 # for the full CLAUDE_TIMEOUT window. 100 covers heavy image-review workflows
@@ -138,11 +137,11 @@ _ensure_mode_700(ATTACHMENT_DIR)
 MAX_SESSIONS = 100
 MAX_HISTORY = 50
 # Resume replays MAX_MESSAGES_PER_CHANNEL * 2 turns (load_api_replay_channel).
-# Raised 75→200 on 2026-06-10 (haroin request) → up to 400 turns of context.
-# Fable 5 / Opus have a 1M-token context window, and each replayed turn is
-# capped (COMPACT_HISTORY_USER_CHARS 2000 + ASSISTANT 3000), so even 400 turns
-# stays well within MAX_PROMPT_CHARS and the model's window.
-MAX_MESSAGES_PER_CHANNEL = 200
+# 50 → up to 100 turns of replayed context. Briefly raised to 200 (400 turns)
+# on 2026-06-10 but reverted to 100-turn replay (haroin request): the larger
+# tail ballooned cache_creation to ~226k tokens with no benefit while debugging
+# fable-5 refusals.
+MAX_MESSAGES_PER_CHANNEL = 50
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 MAX_RESOLVED_LINKS = 5
 MAX_RESPONSE_IMAGES = 10

@@ -83,14 +83,38 @@ def _build_cached_system(system_prompt: str, messages: list[dict]) -> list[dict]
     return [
         {"type": "text", "text": attribution},
         {"type": "text", "text": CLI_IDENTITY_TEXT},
+        # ttl:1h matches the real CLI (mitm capture: system[2] carries
+        # {ephemeral, ttl:1h, scope:global}). Without ttl the block falls
+        # back to the 5-minute default and the cached prefix expires between
+        # turns, forcing a full re-write (observed as cache_read=0).
         {"type": "text", "text": CLI_DEFAULT_SYSTEM_PROMPT,
-         "cache_control": {"type": "ephemeral", "scope": "global"}},
-        {"type": "text", "text": system_prompt},
+         "cache_control": {"type": "ephemeral", "ttl": "1h", "scope": "global"}},
+        # The CLI also caches system[3] (the persona prompt) with ttl:1h.
+        {"type": "text", "text": system_prompt,
+         "cache_control": {"type": "ephemeral", "ttl": "1h"}},
     ]
 
 
 def _inject_cache_breakpoints(messages: list[dict]) -> list[dict]:
-    """Mirrors the helper in __init__.py (see _build_cached_system above)."""
+    """Mirrors the helper in __init__.py (see _build_cached_system above).
+
+    PLACEMENT: the breakpoint goes on the second-to-last user message
+    (user_indices[-2]), not the last. The last user message is the volatile new
+    input that changes every request, so a breakpoint there would write a fresh
+    entry that the next turn never reads. Targeting [-2] caches the stable prefix
+    (system + all prior turns) and leaves only the newest turn uncached.
+
+    TTL: the breakpoint carries ttl:1h, matching the ttl:1h value the real
+    claude-cli uses on its message breakpoint (mitm capture cli_resume.json) and
+    the ttl:1h on system[2]/[3] in _build_cached_system. The default 5-minute
+    TTL is wrong for this workload: Discord turns are routinely spaced >5 min
+    apart, so a 5-min breakpoint expires between user turns and the entire
+    replayed conversation history is re-written to cache every resume (observed
+    as cache_read pinned to system-block size while cache_creation re-pays the
+    full history — up to ~227k tokens — on each turn). ttl:1h keeps the history
+    prefix warm across the gap so the next turn reads it at ~0.1x instead.
+    Requires the extended-cache-ttl beta, which MODEL_BETAS already sends.
+    """
     if len(messages) < 4:
         return messages
     user_indices = [i for i, m in enumerate(messages) if m["role"] == "user"]
@@ -102,12 +126,13 @@ def _inject_cache_breakpoints(messages: list[dict]) -> list[dict]:
     content = msg["content"]
     if isinstance(content, str):
         msg["content"] = [
-            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": content,
+             "cache_control": {"type": "ephemeral", "ttl": "1h"}},
         ]
     elif isinstance(content, list):
         content = list(content)
         last_block = dict(content[-1])
-        last_block["cache_control"] = {"type": "ephemeral"}
+        last_block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
         content[-1] = last_block
         msg["content"] = content
     messages[target_idx] = msg
@@ -442,6 +467,7 @@ def _log_turn_usage(channel_id: int, turn: int, final_msg, totals: dict[str, int
     for field, value in values.items():
         totals[field] += value
     totals["turns"] += 1
+    stop_reason = getattr(final_msg, "stop_reason", None)
     log.info(
         "claude_api_usage channel=%d turn=%d input_tokens=%d "
         "cache_read_input_tokens=%d cache_creation_input_tokens=%d "
@@ -451,8 +477,20 @@ def _log_turn_usage(channel_id: int, turn: int, final_msg, totals: dict[str, int
         values["cache_read_input_tokens"],
         values["cache_creation_input_tokens"],
         values["output_tokens"],
-        getattr(final_msg, "stop_reason", None),
+        stop_reason,
     )
+    # On a model refusal, surface stop_details (category: cyber|bio|None +
+    # explanation) so refusals are diagnosable instead of silently becoming
+    # "(no response)" (ADR-0008). The bot was previously blind to WHY fable-5
+    # refused. getattr-guarded so older SDKs / mocks without the field are safe.
+    if stop_reason == "refusal":
+        sd = getattr(final_msg, "stop_details", None)
+        log.warning(
+            "claude_api_refusal channel=%d turn=%d category=%s explanation=%r",
+            channel_id, turn + 1,
+            getattr(sd, "category", None),
+            getattr(sd, "explanation", None),
+        )
 
 
 def _log_total_usage(channel_id: int, totals: dict[str, int]) -> None:
@@ -569,8 +607,15 @@ async def run_agent_loop(
             betas=extra_betas,
             metadata=get_metadata(),
             thinking=THINKING_CONFIG,
+            # output_config MUST be a direct kwarg, NOT nested in extra_body.
+            # anthropic SDK 0.88.0's beta streaming path silently DROPS
+            # output_config when it's inside extra_body (verified by mitmproxy:
+            # effort never reached the wire), while context_management survives.
+            # With effort gone but the effort-2025-11-24 beta header still set,
+            # the server saw a contradictory request and returned
+            # stop_reason=refusal. Direct kwarg puts effort on the wire (ADR-0009).
+            output_config=OUTPUT_CONFIG,
             extra_body={
-                "output_config": OUTPUT_CONFIG,
                 "context_management": CONTEXT_MANAGEMENT_CONFIG,
             },
         )

@@ -6,11 +6,13 @@ import anthropic
 import pytest
 
 from services.claude_api.errors import (
+    NON_PERSISTABLE_REPLIES,
     _classify_error,
     _error_message,
     _is_transient,
     _redact_secrets,
     classify_anthropic_error,
+    is_non_persistable_reply,
 )
 
 
@@ -132,6 +134,40 @@ class TestErrorMessage:
         assert overloaded != fallback
         assert "内部エラー" not in overloaded
         assert "混雑" in overloaded
+
+
+class TestNonPersistableReply:
+    """ADR-0008: sentinel/error replies must never enter the JSONL history,
+    or they prime fable-5 into a self-reinforcing refusal loop."""
+
+    def test_no_response_sentinel_blocked(self):
+        assert is_non_persistable_reply("(no response)")
+
+    def test_all_error_messages_blocked(self):
+        # Every user-facing error string the bot can emit must be non-persistable.
+        for et in ("rate_limit", "overloaded", "auth", "context_overflow",
+                   "max_turns", "invalid_request", "api_exit"):
+            assert is_non_persistable_reply(_error_message(et)), et
+        assert is_non_persistable_reply(_error_message("brand_new"))  # fallback
+        assert is_non_persistable_reply("⏰ タイムアウトしました")
+
+    def test_real_reply_is_persistable(self):
+        assert not is_non_persistable_reply("先輩、それは違いますよ。")
+        # A real reply that merely mentions an error word is still persisted.
+        assert not is_non_persistable_reply("さっき (no response) って出てましたね")
+
+    def test_whitespace_stripped(self):
+        assert is_non_persistable_reply("  (no response)\n")
+
+    def test_empty_is_not_flagged_here(self):
+        # Empty string is handled by the separate `if response_text:` guard,
+        # not this set — keep them distinct.
+        assert not is_non_persistable_reply("")
+        assert not is_non_persistable_reply("   ")
+
+    def test_set_covers_no_response_and_errors(self):
+        assert "(no response)" in NON_PERSISTABLE_REPLIES
+        assert len(NON_PERSISTABLE_REPLIES) >= 8
 
 
 class TestIsTransient:

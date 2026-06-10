@@ -232,13 +232,17 @@ class TestBuildCachedSystem:
         assert result[3]["text"] == "hello system"
 
     def test_cache_control_on_default_prompt_block(self):
-        # Only system[2] (the static CLI default prompt) carries cache_control;
-        # the per-request blocks (attribution, identity, caller prompt) do not.
+        # Matches the real CLI request: system[2] (static CLI default prompt)
+        # carries {ephemeral, ttl:1h, scope:global}, and system[3] (persona
+        # prompt) carries {ephemeral, ttl:1h}. The volatile per-request blocks
+        # (attribution, identity) carry no cache_control.
         result = _build_cached_system("prompt", [{"role": "user", "content": "hi"}])
-        assert result[2]["cache_control"] == {"type": "ephemeral", "scope": "global"}
+        assert result[2]["cache_control"] == {
+            "type": "ephemeral", "ttl": "1h", "scope": "global",
+        }
+        assert result[3]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
         assert "cache_control" not in result[0]
         assert "cache_control" not in result[1]
-        assert "cache_control" not in result[3]
 
 
 class TestInjectCacheBreakpoints:
@@ -272,7 +276,7 @@ class TestInjectCacheBreakpoints:
         # second-to-last user is index 2 ("second")
         modified = result[2]
         assert isinstance(modified["content"], list)
-        assert modified["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert modified["content"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
         assert modified["content"][0]["text"] == "second"
 
     def test_list_content_gets_cache_control_on_last_block(self):
@@ -286,7 +290,7 @@ class TestInjectCacheBreakpoints:
         result = _inject_cache_breakpoints(msgs)
         modified_content = result[2]["content"]
         assert isinstance(modified_content, list)
-        assert modified_content[-1]["cache_control"] == {"type": "ephemeral"}
+        assert modified_content[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
     def test_does_not_mutate_original(self):
         msgs = [

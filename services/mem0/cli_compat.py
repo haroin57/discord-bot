@@ -42,13 +42,13 @@ def cli_system(task_prompt: str) -> list[dict]:
         {
             "type": "text",
             "text": get_attribution_header_value([]),
-            "cache_control": {"type": "ephemeral", "scope": "global"},
+            "cache_control": {"type": "ephemeral", "ttl": "1h", "scope": "global"},
         },
         {"type": "text", "text": CLI_IDENTITY_TEXT},
         {
             "type": "text",
             "text": CLI_DEFAULT_SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral", "scope": "global"},
+            "cache_control": {"type": "ephemeral", "ttl": "1h", "scope": "global"},
         },
         {"type": "text", "text": task_prompt},
     ]

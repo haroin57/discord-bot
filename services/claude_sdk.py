@@ -81,7 +81,7 @@ _RESTRICTED_DENY_LIST = [
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
-MODEL = "claude-opus-4-7"
+MODEL = "claude-fable-5"
 
 # ---------------------------------------------------------------------------
 # Timeout / turns
@@ -365,8 +365,14 @@ async def call_with_tools(
     raw_user_text: str = "",
     is_thread: bool = False,
     has_image_attachment: bool = False,
+    author: str = "",
 ) -> tuple[str, "SessionInfo | None", bool]:
-    """Call Claude via SDK. Model decides tool usage (free-code QueryEngine pattern)."""
+    """Call Claude via SDK. Model decides tool usage (free-code QueryEngine pattern).
+
+    ``author`` (stable speaker label) is accepted for signature parity with the
+    API path so the dispatcher can pass it through uniformly. The legacy SDK/CLI
+    path does not manage the JSONL transcript itself, so it is ignored here.
+    """
     # H-3: pick the correct concurrency slot so non-admins can't starve
     # the admin pool.
     sema = restricted_claude_semaphore if restricted else claude_semaphore

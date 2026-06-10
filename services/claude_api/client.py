@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 # run daily). DO NOT edit between the marker comments; manual edits will be
 # clobbered on the next refresh run.
 # AUTO-CAPTURE-START
-CC_VERSION = "2.1.156"
+CC_VERSION = "2.1.170"
 CC_ENTRYPOINT = "sdk-cli"
 MODEL_BETAS = [
     "claude-code-20250219",
@@ -26,6 +26,7 @@ MODEL_BETAS = [
     "interleaved-thinking-2025-05-14",
     "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
+    "mid-conversation-system-2026-04-07",
     "advanced-tool-use-2025-11-20",
     "effort-2025-11-24",
     "extended-cache-ttl-2025-04-11",
@@ -40,27 +41,31 @@ USER_AGENT = f"claude-cli/{CC_VERSION} (external, {CC_ENTRYPOINT})"
 # against /v1/messages so the bot's request byte-shape matches the
 # subscriber-tier identification path.
 #
-# - thinking.type = "adaptive": let the model spend as much thinking
-#   budget as it judges necessary (no fixed cap below max_tokens).
-# - output_config.effort = "max": the absolute top of Anthropic's effort
-#   dial (low < medium < high < xhigh < max). Available on Opus 4.6 / 4.7
-#   under the effort-2025-11-24 beta. The mitm capture of claude-cli
-#   2.1.92 shows "high" because that's the CLI's default, but the dial
-#   actually goes higher — the model spends more thinking + tool calls
-#   per turn at "max" in exchange for slower / pricier responses. The
-#   bot opts in deliberately (haroin preference: correctness > cost).
+# - thinking.type = "adaptive": let the model spend as much thinking budget as
+#   it judges necessary (no fixed cap below max_tokens). Kept byte-identical to
+#   the real claude-cli, which sends {"type":"adaptive"} with no display field.
+#   (We briefly tried display="summarized" while debugging fable-5 refusals, but
+#   the real fix was output_config reaching the wire (ADR-0009), so we reverted
+#   to match the CLI exactly.)
+# - output_config.effort = "xhigh": one notch below "max" on Anthropic's
+#   effort dial (low < medium < high < xhigh < max). The real claude-cli
+#   sends "high" on Fable 5 (its default; confirmed in the mitm capture),
+#   but we deliberately step up to "xhigh" for more thinking + tool-call
+#   budget per turn — a quality-over-speed choice (haroin preference,
+#   2026-06-10). This is an intentional divergence from the CLI request,
+#   unlike CC_VERSION / cache-ttl which we keep byte-matched.
 # - context_management.clear_thinking_20251015 with keep="all": the
 #   server-side bookkeeping the CLI requests for the new
 #   advanced-tool-use beta. Mirroring it keeps overage-cohort routing
 #   working under sustained load.
 THINKING_CONFIG = {"type": "adaptive"}
-OUTPUT_CONFIG = {"effort": "max"}
+OUTPUT_CONFIG = {"effort": "xhigh"}
 CONTEXT_MANAGEMENT_CONFIG = {
     "edits": [
         {"type": "clear_thinking_20251015", "keep": "all"},
     ],
 }
-CLAUDE_MAX_TOKENS_OPUS = 64000
+CLAUDE_MAX_TOKENS_OPUS = 32000  # matched to real claude-cli request (2026-06-10)
 
 _session_id = str(uuid.uuid4())
 

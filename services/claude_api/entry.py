@@ -57,6 +57,7 @@ from services.claude_api.errors import (
     _error_message,
     _is_transient,
     classify_anthropic_error,
+    is_non_persistable_reply,
 )
 from services.claude_api.mcp_client import (
     McpPool,
@@ -88,7 +89,7 @@ from services.claude_api.tools import (
 
 log = logging.getLogger(__name__)
 
-MODEL = "claude-opus-4-7"
+MODEL = "claude-fable-5"
 
 # MCP servers whose tool schemas we advertise on every admin API request.
 # The process is still spawned lazily via McpPool.call_tool() on first use.
@@ -201,8 +202,15 @@ async def call_with_tools(
     raw_user_text: str = "",
     is_thread: bool = False,
     has_image_attachment: bool = False,
+    author: str = "",
 ) -> tuple[str, SessionInfo | None, bool]:
     """Direct-API replacement for services/claude_sdk.py:call_with_tools.
+
+    ``author`` is the stable speaker label of the message sender (e.g. "先輩").
+    It is stamped onto the user turn in the JSONL transcript so that, when a
+    later turn resumes this channel, replayed history can tell apart messages
+    from different admins sharing the channel. Empty string = unknown/unlabelled
+    (no attribution recorded — preserves the pre-existing behaviour).
 
     Returns ``(response_text, session_info, actually_resumed)`` where
     ``actually_resumed`` is True only when JSONL history was loaded and
@@ -495,6 +503,30 @@ async def call_with_tools(
                             f"🔄 リトライ中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})",
                         )
                         await asyncio.sleep(backoff)
+                    except httpx.RequestError as exc:
+                        # SSE streaming 中の HTTP/2 接続切断 (GOAWAY /
+                        # RemoteProtocolError / ReadError 等) が、MCP の
+                        # anyio TaskGroup を経由せず *裸* の httpx.RequestError
+                        # として上がってくるケース。anthropic SDK はこれを
+                        # AnthropicError でラップしないため above の except に
+                        # 入らず、下の BaseExceptionGroup 経路 (= TaskGroup 越し
+                        # にラップされた版) にも入らない。リトライせず素通り
+                        # させると bot.py の generic except が「❌ エラー」を返し、
+                        # 1 回再接続すれば通る transient 障害を恒久エラー扱いして
+                        # しまっていた (ADR-0007)。ラップ版と同じ transient
+                        # retry ロジックに合流させる。
+                        log.warning(
+                            "[ch=%d] transport error (bare) attempt %d/%d: %r",
+                            channel_id, attempt + 1, TRANSIENT_MAX_ATTEMPTS, exc,
+                        )
+                        if attempt >= TRANSIENT_MAX_ATTEMPTS - 1:
+                            return _error_message("overloaded"), None, resumable
+                        backoff = compute_backoff(attempt)
+                        await _safe_status(
+                            status_callback,
+                            f"🔄 接続リトライ中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})",
+                        )
+                        await asyncio.sleep(backoff)
                     except BaseExceptionGroup as eg:
                         # SSE streaming中に httpx 層で接続が切れると
                         # (e.g. HTTP/2 GOAWAY mid-stream), anthropic SDK は
@@ -547,13 +579,20 @@ async def call_with_tools(
         # ``build_compact_history_entries`` carries the previous snapshot
         # forward when the current turn lacks a fresh one.
         # Failures here (disk full, perms) must not abort the request.
-        if response_text:
+        #
+        # Never persist sentinel/error replies ("(no response)", タイムアウト,
+        # 混雑 etc). Replaying them into a resumed transcript primes the model
+        # (fable-5 especially) to keep emitting empty/refused turns — a
+        # self-reinforcing poison loop (ADR-0008). "(no response)" is truthy so
+        # the old `if response_text:` guard let it through; gate on content too.
+        if response_text and not is_non_persistable_reply(response_text):
             try:
                 user_entry, assistant_entry = build_compact_history_entries(
                     raw_user_text=raw_user_text or prompt_text,
                     prompt_text=prompt_text,
                     assistant_text=response_text,
                     previous_context_snapshot=latest_context_snapshot,
+                    author=author,
                 )
                 await asyncio.to_thread(append_jsonl, channel_id, user_entry)
                 await asyncio.to_thread(append_jsonl, channel_id, assistant_entry)

@@ -295,9 +295,11 @@ def _build_cached_system(system_prompt: str, messages: list[dict]) -> list[dict]
     return [
         {"type": "text", "text": attribution},
         {"type": "text", "text": CLI_IDENTITY_TEXT},
+        # ttl:1h matches the real CLI (see tool_loop._build_cached_system).
         {"type": "text", "text": CLI_DEFAULT_SYSTEM_PROMPT,
-         "cache_control": {"type": "ephemeral", "scope": "global"}},
-        {"type": "text", "text": system_prompt},
+         "cache_control": {"type": "ephemeral", "ttl": "1h", "scope": "global"}},
+        {"type": "text", "text": system_prompt,
+         "cache_control": {"type": "ephemeral", "ttl": "1h"}},
     ]
 
 
@@ -322,13 +324,17 @@ def _inject_cache_breakpoints(messages: list[dict]) -> list[dict]:
     content = msg["content"]
     if isinstance(content, str):
         msg["content"] = [
-            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": content,
+             "cache_control": {"type": "ephemeral", "ttl": "1h"}},
         ]
     elif isinstance(content, list):
-        # Clone the last block and add cache_control
+        # Clone the last block and add cache_control. ttl:1h matches the real
+        # CLI and tool_loop._inject_cache_breakpoints — see the rationale there
+        # (default 5-min TTL expires between Discord turns and forces a full
+        # history re-write every resume).
         content = list(content)
         last_block = dict(content[-1])
-        last_block["cache_control"] = {"type": "ephemeral"}
+        last_block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
         content[-1] = last_block
         msg["content"] = content
     messages[target_idx] = msg

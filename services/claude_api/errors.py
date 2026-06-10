@@ -103,20 +103,44 @@ def classify_anthropic_error(exc: BaseException) -> str:
     return "unknown"
 
 
+_ERROR_MESSAGE_TABLE = {
+    "rate_limit": "⏳ APIのレート制限に達しました。少し待ってから再試行してください。",
+    "overloaded": "🔄 サーバーが混雑しています。しばらく待ってから再試行してください。",
+    "auth": "🔑 認証エラーが発生しました。管理者に連絡してください。",
+    "context_overflow": "📝 メッセージが長すぎます。短くして送り直してください。",
+    "max_turns": "🔄 ターン上限に達しました。もう一度話しかけてください。",
+    "invalid_request": "⚠️ リクエストの形式に問題があり処理できませんでした。もう一度試しても直らない場合は管理者に連絡してください。",
+    "api_exit": "⚠️ 処理が中断されました。もう一度試してください。",
+    # Backwards-compat alias for callers still using the SDK-era key.
+    "cli_exit": "⚠️ 処理が中断されました。もう一度試してください。",
+}
+_ERROR_MESSAGE_FALLBACK = "❌ 内部エラーが発生しました。再試行してください。"
+
+# Sentinel/error replies that must NEVER be persisted to the JSONL history.
+# Replaying these back into a resumed transcript primes the model (especially
+# fable-5) to keep emitting empty/refused turns — a self-reinforcing poison
+# loop that surfaces as recurring "(no response)" (ADR-0008). These are exact
+# strings the bot emits when no real model text was produced; persisting them
+# adds no conversational signal and actively degrades resume quality.
+NON_PERSISTABLE_REPLIES: frozenset[str] = frozenset(
+    {"(no response)", "⏰ タイムアウトしました", _ERROR_MESSAGE_FALLBACK}
+    | set(_ERROR_MESSAGE_TABLE.values())
+)
+
+
+def is_non_persistable_reply(text: str) -> bool:
+    """True if ``text`` is a sentinel/error reply that must not enter history.
+
+    Exact-match only — a real model reply that merely *mentions* an error
+    string is still persisted. Whitespace is stripped so trailing newlines
+    from the delivery layer don't defeat the check.
+    """
+    return (text or "").strip() in NON_PERSISTABLE_REPLIES
+
+
 def _error_message(error_type: str) -> str:
     """User-facing message for a classified error type."""
-    table = {
-        "rate_limit": "⏳ APIのレート制限に達しました。少し待ってから再試行してください。",
-        "overloaded": "🔄 サーバーが混雑しています。しばらく待ってから再試行してください。",
-        "auth": "🔑 認証エラーが発生しました。管理者に連絡してください。",
-        "context_overflow": "📝 メッセージが長すぎます。短くして送り直してください。",
-        "max_turns": "🔄 ターン上限に達しました。もう一度話しかけてください。",
-        "invalid_request": "⚠️ リクエストの形式に問題があり処理できませんでした。もう一度試しても直らない場合は管理者に連絡してください。",
-        "api_exit": "⚠️ 処理が中断されました。もう一度試してください。",
-        # Backwards-compat alias for callers still using the SDK-era key.
-        "cli_exit": "⚠️ 処理が中断されました。もう一度試してください。",
-    }
-    return table.get(error_type, "❌ 内部エラーが発生しました。再試行してください。")
+    return _ERROR_MESSAGE_TABLE.get(error_type, _ERROR_MESSAGE_FALLBACK)
 
 
 def _is_transient(error_type: str) -> bool:

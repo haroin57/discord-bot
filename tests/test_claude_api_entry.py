@@ -246,3 +246,38 @@ class TestDispatcher:
         total = claude_sdk.kill_orphan_claude_cli()
         assert total == 3
         assert legacy_calls["n"] == 1 and api_calls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Bare transport-error retry (ADR-0007)
+# ---------------------------------------------------------------------------
+class TestBareTransportErrorRetry:
+    """A mid-stream HTTP/2 disconnect surfaces as a *bare* httpx.RequestError
+    (e.g. RemoteProtocolError <ConnectionTerminated>) when it does NOT pass
+    through an MCP anyio TaskGroup. Before ADR-0007 entry.py only caught the
+    TaskGroup-wrapped (BaseExceptionGroup) form, so the bare exception escaped
+    to bot.py's generic except and returned "❌ エラー" without retrying a
+    transient, usually-recoverable failure."""
+
+    def test_remote_protocol_error_is_a_request_error(self):
+        # The whole fix hinges on this subclass relationship: if it ever stops
+        # holding, the `except httpx.RequestError` clause would miss GOAWAY.
+        import httpx
+        assert issubclass(httpx.RemoteProtocolError, httpx.RequestError)
+
+    def test_entry_has_bare_request_error_clause_before_exceptiongroup(self):
+        # Order matters: the bare `except httpx.RequestError` must precede
+        # `except BaseExceptionGroup` (and follow `except anthropic...`), or
+        # the bare transport error would never be caught here.
+        import inspect
+        from services.claude_api import entry as entry_mod
+
+        src = inspect.getsource(entry_mod.call_with_tools)
+        bare = src.index("except httpx.RequestError as exc:")
+        grp = src.index("except BaseExceptionGroup as eg:")
+        assert bare < grp, "bare httpx.RequestError clause must come first"
+        # And it must funnel into the same transient handling: exhaustion
+        # returns the overloaded message, not the unknown fallback.
+        after_bare = src[bare:grp]
+        assert '_error_message("overloaded")' in after_bare
+        assert "TRANSIENT_MAX_ATTEMPTS - 1" in after_bare

@@ -53,6 +53,17 @@ class TestCliSystem:
         assert "cache_control" not in system[1]
         assert "cache_control" not in system[3]
 
+    def test_cli_system_cache_control_ttl_is_1h(self):
+        """The cached system blocks carry ttl:1h, matching the main bot path
+        (services/claude_api/tool_loop.py:_build_cached_system) and the real CLI
+        capture. The default 5-min TTL would expire between Mem0 helper calls and
+        re-pay the cached CLI prefix on every fact-extraction / dedup / rerank."""
+        system = compat_mod.cli_system("some prompt")
+        assert system[0]["cache_control"] == {
+            "type": "ephemeral", "ttl": "1h", "scope": "global"}
+        assert system[2]["cache_control"] == {
+            "type": "ephemeral", "ttl": "1h", "scope": "global"}
+
 
 # ---------------------------------------------------------------------------
 # cli_headers tests
@@ -167,7 +178,11 @@ class TestCliMessagesCreate:
             user_message="hi",
             task_prompt="task",
         )
-        assert mock_create.call_args.kwargs.get("thinking") == {"type": "adaptive"}
+        # Mirror the canonical THINKING_CONFIG rather than hard-coding it, so
+        # display/effort tweaks don't break this compat test.
+        from services.claude_api.client import THINKING_CONFIG
+        assert mock_create.call_args.kwargs.get("thinking") == THINKING_CONFIG
+        assert mock_create.call_args.kwargs["thinking"]["type"] == "adaptive"
 
 
 # ---------------------------------------------------------------------------
