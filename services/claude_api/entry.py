@@ -587,12 +587,25 @@ async def call_with_tools(
         # the old `if response_text:` guard let it through; gate on content too.
         if response_text and not is_non_persistable_reply(response_text):
             try:
+                # Lossless CLI-parity replay: run_agent_loop appended THIS
+                # request's full structured expansion (user prompt, assistant
+                # thinking(+signature)/tool_use turns, tool_result turns, final
+                # assistant) into history_for_loop in place. Everything past the
+                # prior transcript is the new turns; new_turns[0] is the user
+                # prompt (persisted separately as raw_user_text so the Mem0
+                # snapshot is not re-baked into the transcript), and new_turns[1:]
+                # is the assistant/tool_result expansion we store verbatim so a
+                # later resume replays signed thinking + tool context instead of
+                # flattened text (the structureless replay caused the refusals).
+                new_turns = history_for_loop[len(prior_history):]
+                api_messages = new_turns[1:] if len(new_turns) > 1 else None
                 user_entry, assistant_entry = build_compact_history_entries(
                     raw_user_text=raw_user_text or prompt_text,
                     prompt_text=prompt_text,
                     assistant_text=response_text,
                     previous_context_snapshot=latest_context_snapshot,
                     author=author,
+                    api_messages=api_messages,
                 )
                 await asyncio.to_thread(append_jsonl, channel_id, user_entry)
                 await asyncio.to_thread(append_jsonl, channel_id, assistant_entry)

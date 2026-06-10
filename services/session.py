@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from config import (
     COMPACT_HISTORY_ASSISTANT_CHARS,
     COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS,
+    COMPACT_HISTORY_TOOL_RESULT_CHARS,
     COMPACT_HISTORY_USER_CHARS,
     HISTORY_DIR,
     MAX_MESSAGES_PER_CHANNEL,
@@ -273,6 +274,61 @@ def _clean_author_label(author: str) -> str:
     return author.replace("\n", " ").replace("\r", " ").replace("]", "").strip()[:40]
 
 
+def _cap_tool_result_content(content, limit: int):
+    """Cap a tool_result block's ``content`` (str, or list of text/image blocks)."""
+    if isinstance(content, str):
+        return _compact_text(content, limit)
+    if isinstance(content, list):
+        out = []
+        for b in content:
+            if (
+                isinstance(b, dict)
+                and b.get("type") == "text"
+                and isinstance(b.get("text"), str)
+            ):
+                nb = dict(b)
+                nb["text"] = _compact_text(b["text"], limit)
+                out.append(nb)
+            else:
+                out.append(b)
+        return out
+    return content
+
+
+def _prepare_api_messages(
+    turns: list[dict],
+    tool_result_limit: int = COMPACT_HISTORY_TOOL_RESULT_CHARS,
+) -> list[dict]:
+    """Return a JSON-safe, tool_result-capped copy of structured turns.
+
+    ``turns`` are the assistant + tool_result messages the agent loop appended
+    to its in-memory history (already plain block-dicts via ``_block_to_dict``).
+    We copy defensively so the live in-memory history is never mutated, and cap
+    each tool_result payload so a huge Bash dump / file read does not bloat every
+    future replay. thinking ``signature`` and tool_use ``id``/``input`` are kept
+    verbatim — they are load-bearing for the resumed request.
+    """
+    prepared: list[dict] = []
+    for m in turns:
+        role = m.get("role")
+        content = m.get("content")
+        if isinstance(content, list):
+            new_content = []
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    nb = dict(b)
+                    nb["content"] = _cap_tool_result_content(
+                        b.get("content"), tool_result_limit
+                    )
+                    new_content.append(nb)
+                else:
+                    new_content.append(b)
+            prepared.append({"role": role, "content": new_content})
+        else:
+            prepared.append({"role": role, "content": content})
+    return prepared
+
+
 def build_compact_history_entries(
     raw_user_text: str,
     prompt_text: str,
@@ -280,6 +336,7 @@ def build_compact_history_entries(
     *,
     previous_context_snapshot: str = "",
     author: str = "",
+    api_messages: list[dict] | None = None,
 ) -> tuple[dict, dict]:
     """Build the user+assistant JSONL pair without re-saving the full prompt.
 
@@ -294,6 +351,17 @@ def build_compact_history_entries(
     ``author`` (stable speaker label) is stamped onto the user entry so a
     later resume can attribute past turns when multiple admins share a channel.
     Empty string = no attribution recorded (back-compat: old rows have no author).
+
+    ``api_messages`` (optional) is the agent loop's full structured expansion
+    for THIS request — the assistant thinking(+signature)/tool_use turns and
+    their tool_result turns. When supplied it is attached to the assistant entry
+    so ``load_api_replay_channel`` can replay a lossless, CLI-shaped transcript
+    instead of the flattened ``content`` text (the structureless replay was the
+    cause of the resume refusals). The ``content`` field stays a display string
+    either way, so the web view / BM25 index are unaffected, and old rows lacking
+    this field replay via ``content`` (back-compat). Because each request's whole
+    tool_use/tool_result expansion lives inside one assistant row, tail
+    truncation can never split a tool_use from its tool_result.
     """
     snapshot = extract_context_snapshot(prompt_text) or previous_context_snapshot
     user_entry: dict = {
@@ -311,6 +379,10 @@ def build_compact_history_entries(
         "role": "assistant",
         "content": _compact_text(assistant_text or "", COMPACT_HISTORY_ASSISTANT_CHARS),
     }
+    if api_messages:
+        prepared = _prepare_api_messages(api_messages)
+        if prepared:
+            assistant_entry["api_messages"] = prepared
     return user_entry, assistant_entry
 
 
@@ -403,6 +475,11 @@ def _tail_jsonl(
             # old rows / assistant turns — harmless to omit.
             if isinstance(entry.get("author"), str) and entry["author"]:
                 msg["author"] = entry["author"]
+            # Carry the lossless structured replay transcript (CLI-parity) so
+            # load_api_replay_channel can expand it. Absent on old/display-only
+            # rows — those replay via the flattened `content` string.
+            if isinstance(entry.get("api_messages"), list):
+                msg["api_messages"] = entry["api_messages"]
             if include_context_snapshot and isinstance(entry.get("context_snapshot"), str):
                 msg["context_snapshot"] = entry["context_snapshot"]
                 if entry.get("timestamp"):
@@ -452,24 +529,54 @@ def load_api_replay_channel(channel_id: int) -> tuple[list[dict], str, str]:
 
     latest_snapshot = ""
     latest_snapshot_ts = ""
-    messages: list[dict] = []
+    # Track the most recent Mem0 snapshot across the FULL tail (a snapshot can
+    # sit on any row) before trimming the head for replay validity.
     for row in rows:
         if row.get("context_snapshot"):
             latest_snapshot = row["context_snapshot"]
             latest_snapshot_ts = row.get("timestamp", "")
-        if row["role"] == "assistant" and is_non_persistable_reply(row["content"]):
+
+    # The replayed window MUST begin with a clean user turn. The Messages API
+    # rejects a leading role=assistant message, and an assistant row's
+    # api_messages expansion starts with an assistant message (its tool_result
+    # turns are user messages INSIDE the expansion, which would be orphaned if
+    # they led the window). Tail truncation can land mid-conversation on an
+    # assistant row, so drop leading assistant rows until the first row is a
+    # top-level user turn (always a plain string in our format).
+    start = 0
+    while start < len(rows) and rows[start].get("role") != "user":
+        start += 1
+    rows = rows[start:]
+
+    messages: list[dict] = []
+    for row in rows:
+        if row["role"] == "assistant":
+            # Self-heal: never replay a persisted sentinel/error reply — it
+            # primes the model to keep refusing (ADR-0008). Skipping the row
+            # drops its api_messages too, so no tool_result is orphaned.
+            if is_non_persistable_reply(row.get("content")):
+                continue
+            api_messages = row.get("api_messages")
+            if isinstance(api_messages, list) and api_messages:
+                # Lossless CLI-shaped replay: splice this request's full
+                # assistant thinking(+signature)/tool_use + tool_result
+                # expansion in verbatim. The whole tool_use/tool_result chain is
+                # self-contained in this one row, so pairs are never split.
+                messages.extend(api_messages)
+            else:
+                # Old / display-only row: replay the flattened assistant text.
+                messages.append({"role": "assistant", "content": row["content"]})
             continue
+        # user row — attribute past turns to their speaker so resume can tell
+        # apart multiple admins sharing a channel. The Messages API has no author
+        # field on the user role, so we prepend it into the content. Deterministic
+        # so the cached prefix stays stable; only top-level user turns (plain
+        # strings) get the prefix — tool_result turns live inside api_messages.
         content = row["content"]
-        # Attribute past user turns to their speaker so resume can tell apart
-        # multiple admins sharing a channel. The Anthropic Messages API has no
-        # author field on the user role, so we prepend it into the content.
-        # Composed at read time (JSONL content stays raw) and only when an
-        # author label exists — old rows replay unchanged (back-compat) and the
-        # prefix is deterministic, so prompt-cache prefixes stay stable.
         author = row.get("author")
-        if row["role"] == "user" and isinstance(author, str) and author:
+        if isinstance(author, str) and author:
             content = f"[発言者: {author}]\n{content}"
-        messages.append({"role": row["role"], "content": content})
+        messages.append({"role": "user", "content": content})
     return messages, latest_snapshot, latest_snapshot_ts
 
 

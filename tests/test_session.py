@@ -477,3 +477,132 @@ class TestSpeakerAttribution:
         assert "(no response)" not in asst
         assert all("内部エラー" not in c for c in asst)
         assert "ちゃんと答えます" in asst
+
+
+class TestStructuredApiReplay:
+    """Lossless CLI-parity replay via the api_messages field.
+
+    The structureless (flattened-text) replay was the cause of fable-5 resume
+    refusals. These lock the new behaviour: an assistant row carries its full
+    tool-loop expansion (thinking+signature / tool_use / tool_result) in
+    api_messages, and load_api_replay_channel splices it back verbatim.
+    """
+
+    _CID = 1488369795807055964
+
+    @staticmethod
+    def _api_messages(sig="SIG1", tool_id="toolu_A", result="ok"):
+        return [
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": sig},
+                {"type": "tool_use", "id": tool_id, "name": "Bash",
+                 "input": {"command": "echo hi"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": result},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": sig + "_final"},
+                {"type": "text", "text": "done"},
+            ]},
+        ]
+
+    def test_display_content_stays_string_with_api_messages(self):
+        # The `content` field (web view + BM25 index source) must remain a plain
+        # string even when the structured replay is attached.
+        _u, a = build_compact_history_entries(
+            raw_user_text="run", prompt_text="", assistant_text="done",
+            api_messages=self._api_messages(),
+        )
+        assert isinstance(a["content"], str) and a["content"] == "done"
+        assert isinstance(a["api_messages"], list)
+
+    def test_round_trip_preserves_signatures_and_tool_pairs(self, tmp_state_dir):
+        u, a = build_compact_history_entries(
+            raw_user_text="run", prompt_text="", assistant_text="done",
+            author="先輩", api_messages=self._api_messages(sig="ZZZ", tool_id="toolu_X"),
+        )
+        append_jsonl(self._CID, u)
+        append_jsonl(self._CID, a)
+        msgs, _s, _t = load_api_replay_channel(self._CID)
+
+        sigs = [b["signature"] for m in msgs if isinstance(m["content"], list)
+                for b in m["content"] if b.get("type") == "thinking"]
+        assert "ZZZ" in sigs and "ZZZ_final" in sigs
+        uses = {b["id"] for m in msgs if isinstance(m["content"], list)
+                for b in m["content"] if b.get("type") == "tool_use"}
+        results = {b["tool_use_id"] for m in msgs if isinstance(m["content"], list)
+                   for b in m["content"] if b.get("type") == "tool_result"}
+        assert uses == {"toolu_X"} and results == {"toolu_X"}
+
+    def test_expansion_sequence_and_first_is_user(self, tmp_state_dir):
+        u, a = build_compact_history_entries(
+            raw_user_text="run", prompt_text="", assistant_text="done",
+            api_messages=self._api_messages(),
+        )
+        append_jsonl(self._CID, u)
+        append_jsonl(self._CID, a)
+        msgs, _s, _t = load_api_replay_channel(self._CID)
+        # user(str) -> assistant(blocks) -> user(tool_result) -> assistant(final)
+        roles = [m["role"] for m in msgs]
+        assert roles == ["user", "assistant", "user", "assistant"]
+        assert msgs[0]["role"] == "user" and isinstance(msgs[0]["content"], str)
+        assert isinstance(msgs[1]["content"], list)  # expanded structure
+
+    def test_tool_result_content_capped(self, tmp_state_dir):
+        from config import COMPACT_HISTORY_TOOL_RESULT_CHARS
+        huge = "x" * (COMPACT_HISTORY_TOOL_RESULT_CHARS + 9000)
+        u, a = build_compact_history_entries(
+            raw_user_text="run", prompt_text="", assistant_text="done",
+            api_messages=self._api_messages(result=huge),
+        )
+        append_jsonl(self._CID, u)
+        append_jsonl(self._CID, a)
+        msgs, _s, _t = load_api_replay_channel(self._CID)
+        tr = [b for m in msgs if isinstance(m["content"], list)
+              for b in m["content"] if b.get("type") == "tool_result"]
+        assert tr and len(tr[0]["content"]) < len(huge)
+        assert len(tr[0]["content"]) <= COMPACT_HISTORY_TOOL_RESULT_CHARS + 200
+
+    def test_mixed_old_and_new_rows_replay(self, tmp_state_dir):
+        # New structured turn, then an OLD-format (string-only) turn.
+        u1, a1 = build_compact_history_entries(
+            raw_user_text="new", prompt_text="", assistant_text="done",
+            api_messages=self._api_messages(),
+        )
+        u2, a2 = build_compact_history_entries(
+            raw_user_text="old", prompt_text="", assistant_text="plain reply",
+        )
+        for e in (u1, a1, u2, a2):
+            append_jsonl(self._CID, e)
+        msgs, _s, _t = load_api_replay_channel(self._CID)
+        # old assistant row replays as a plain string; new one as structure.
+        assert any(m["role"] == "assistant" and m["content"] == "plain reply"
+                   for m in msgs)
+        assert any(m["role"] == "assistant" and isinstance(m["content"], list)
+                   for m in msgs)
+
+    def test_head_sanitizer_drops_leading_assistant_row(self, tmp_state_dir):
+        # Simulate tail truncation landing mid-conversation: the file's first
+        # row is an assistant row whose api_messages expansion starts with an
+        # assistant message (and contains a tool_result user turn). Replaying it
+        # at the head would 400 (leading non-user / orphaned tool_result). The
+        # head sanitizer must drop the leading assistant row entirely.
+        _u, a_orphan = build_compact_history_entries(
+            raw_user_text="run", prompt_text="", assistant_text="done",
+            api_messages=self._api_messages(tool_id="toolu_ORPHAN"),
+        )
+        u, a = build_compact_history_entries(
+            raw_user_text="clean", prompt_text="", assistant_text="ok2",
+            api_messages=self._api_messages(tool_id="toolu_OK"),
+        )
+        append_jsonl(self._CID, a_orphan)  # leading assistant row (truncated head)
+        append_jsonl(self._CID, u)
+        append_jsonl(self._CID, a)
+        msgs, _s, _t = load_api_replay_channel(self._CID)
+        assert msgs[0]["role"] == "user", "window must start with a user turn"
+        # the orphaned tool_result must not survive at the head
+        orphan = [b for m in msgs if isinstance(m["content"], list)
+                  for b in m["content"]
+                  if b.get("type") == "tool_result" and b.get("tool_use_id") == "toolu_ORPHAN"]
+        assert orphan == [], "leading assistant row (with orphan tool_result) must be dropped"

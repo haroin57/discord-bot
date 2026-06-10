@@ -169,6 +169,14 @@ HISTORY_MAX_AGE_DAYS = int(os.environ.get("HISTORY_MAX_AGE_DAYS", "15"))
 COMPACT_HISTORY_USER_CHARS = int(os.environ.get("COMPACT_HISTORY_USER_CHARS", "2000"))
 COMPACT_HISTORY_ASSISTANT_CHARS = int(os.environ.get("COMPACT_HISTORY_ASSISTANT_CHARS", "3000"))
 COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS = int(os.environ.get("COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS", "2000"))
+# Per-tool_result cap inside the structured replay transcript (api_messages).
+# The lossless CLI-style transcript stores tool_use/tool_result blocks verbatim
+# so a resumed turn carries real signed thinking + tool context (matches the
+# real claude-cli and avoids the structureless-replay refusal). Raw tool output
+# (Bash dumps, file reads) can be huge, so each tool_result content string is
+# truncated to this many chars on persist; replay is consistent with what was
+# stored. Display (content field) is unaffected.
+COMPACT_HISTORY_TOOL_RESULT_CHARS = int(os.environ.get("COMPACT_HISTORY_TOOL_RESULT_CHARS", "4000"))
 
 # kanae_state timestamp bucket. Floors `now.minute` to this width so the
 # rendered <kanae_state> block stays byte-identical across short bursts,
