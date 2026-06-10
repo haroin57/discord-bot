@@ -71,7 +71,13 @@ def format_history_for_prompt(results: list[dict]) -> str:
         role = r.get("role", "")
         author = (r.get("author") or "").strip()
         if role == "user":
-            who = "この人"
+            # history_search はチャンネル過去ログから keyword 一致で行を拾う。
+            # 複数の admin が同居するチャンネルでは、現発言者とは別人の過去発言も
+            # 混ざる。"この人" は Mem0 ブロック ([Mem0 — この人についての…]) と同語で
+            # 現発言者の情報だと誤読させるため避ける。author が分かればそれを使い、
+            # 不明なら話者非断定の中立ラベルにフォールバックする (author 列は
+            # JSONL author 保存の修正後に実名化される)。
+            who = author or "過去の発言者"
         elif role == "assistant":
             who = "私"
         elif role == "channel":

@@ -57,18 +57,53 @@ if _raw_ids:
 _raw_haroin_dm = os.environ.get("HAROIN_DM_CHANNEL_ID", "").strip()
 HAROIN_DM_CHANNEL_ID: int | None = int(_raw_haroin_dm) if _raw_haroin_dm.isdigit() else None
 
+# Stable per-user speaker labels for resume-history attribution. When two
+# admins share a channel, the JSONL transcript records each user turn's author
+# as one of THESE labels (not the raw, user-mutable display_name) so the model
+# can tell who said what across turns without leaking display names and without
+# breaking prompt-cache prefixes when someone renames themselves.
+#
+# Format: env SPEAKER_LABELS="<user_id>:<label>,<user_id>:<label>,..."
+# Real names are kept in env (like ADMIN_USER_IDS), not hard-coded here.
+SPEAKER_LABELS: dict[int, str] = {}
+_raw_labels = os.environ.get("SPEAKER_LABELS", "")
+if _raw_labels:
+    for _pair in _raw_labels.split(","):
+        _pair = _pair.strip()
+        if ":" not in _pair:
+            continue
+        _uid_s, _label = _pair.split(":", 1)
+        _uid_s, _label = _uid_s.strip(), _label.strip()
+        if _uid_s.isdigit() and _label:
+            SPEAKER_LABELS[int(_uid_s)] = _label
+
+
+def speaker_label(user_id: int | str | None) -> str:
+    """Return the stable speaker label for a user id, or "" if unknown.
+
+    Unknown ids return "" so callers can fall back to no-attribution rather
+    than emitting a misleading guess. Used to stamp resume-history author.
+    """
+    if user_id is None:
+        return ""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return ""
+    return SPEAKER_LABELS.get(uid, "")
+
 # ---------------------------------------------------------------------------
 # Claude
 # ---------------------------------------------------------------------------
 CWD = os.environ.get("BOT_CWD", "/home/ubuntu")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
-# Sonnet/Haiku per-turn output cap. 64k matches what claude-cli 2.1.92
-# sends in its own request body (2026-05-14 mitm capture); the previous
-# 16k floor was forcing the model to truncate long agent-loop turns
-# (image reviews, multi-file edits) mid-thought. CLAUDE_MAX_TOKENS_OPUS
-# already sits at 64k in client.py, so this aligns Sonnet with Opus.
-CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "64000"))
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-fable-5")
+# Per-turn output cap. 128k is the max streamable output on Fable 5 / Opus
+# 4.6+ (requires streaming, which the bot always uses). Raised from 64k on
+# 2026-06-10 (haroin request) so long agent-loop turns never truncate
+# mid-thought. The SDK requires streaming for max_tokens this large — the bot
+# already streams via messages.stream(), so the HTTP-timeout guard is satisfied.
+CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "128000"))
 # Per-request turn ceiling for admin (trusted) callers. Was hard-coded to 999
 # which let a single CLI invocation hold ~500MB of node/MCP child processes
 # for the full CLAUDE_TIMEOUT window. 100 covers heavy image-review workflows
@@ -102,7 +137,12 @@ _ensure_mode_700(ATTACHMENT_DIR)
 # ---------------------------------------------------------------------------
 MAX_SESSIONS = 100
 MAX_HISTORY = 50
-MAX_MESSAGES_PER_CHANNEL = 75
+# Resume replays MAX_MESSAGES_PER_CHANNEL * 2 turns (load_api_replay_channel).
+# Raised 75→200 on 2026-06-10 (haroin request) → up to 400 turns of context.
+# Fable 5 / Opus have a 1M-token context window, and each replayed turn is
+# capped (COMPACT_HISTORY_USER_CHARS 2000 + ASSISTANT 3000), so even 400 turns
+# stays well within MAX_PROMPT_CHARS and the model's window.
+MAX_MESSAGES_PER_CHANNEL = 200
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 MAX_RESOLVED_LINKS = 5
 MAX_RESPONSE_IMAGES = 10

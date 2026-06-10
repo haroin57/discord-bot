@@ -263,12 +263,23 @@ def prompt_has_context_snapshot(prompt_text: str) -> bool:
     return bool(extract_context_snapshot(prompt_text, limit=1))
 
 
+def _clean_author_label(author: str) -> str:
+    """Sanitize a speaker label for safe inline use in ``[発言者: ...]``.
+
+    Strips newlines and the ``]`` that would close the attribution bracket, so
+    a stored label can't break the prompt fence on replay. Labels come from the
+    config SPEAKER_LABELS table (operator-controlled), so this is belt-and-braces.
+    """
+    return author.replace("\n", " ").replace("\r", " ").replace("]", "").strip()[:40]
+
+
 def build_compact_history_entries(
     raw_user_text: str,
     prompt_text: str,
     assistant_text: str,
     *,
     previous_context_snapshot: str = "",
+    author: str = "",
 ) -> tuple[dict, dict]:
     """Build the user+assistant JSONL pair without re-saving the full prompt.
 
@@ -279,12 +290,19 @@ def build_compact_history_entries(
     ``context_snapshot`` field that carries the latest Mem0 blocks for
     short follow-ups. The snapshot is replayed by ``load_api_replay_channel``
     only; the web history view ignores it.
+
+    ``author`` (stable speaker label) is stamped onto the user entry so a
+    later resume can attribute past turns when multiple admins share a channel.
+    Empty string = no attribution recorded (back-compat: old rows have no author).
     """
     snapshot = extract_context_snapshot(prompt_text) or previous_context_snapshot
     user_entry: dict = {
         "role": "user",
         "content": _compact_text(raw_user_text or "", COMPACT_HISTORY_USER_CHARS),
     }
+    cleaned_author = _clean_author_label(author) if author else ""
+    if cleaned_author:
+        user_entry["author"] = cleaned_author
     if snapshot:
         user_entry["context_snapshot"] = _compact_text(
             snapshot, COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS
@@ -380,6 +398,11 @@ def _tail_jsonl(
                     except (ValueError, TypeError):
                         pass
             msg = {"role": entry["role"], "content": entry["content"]}
+            # Carry the speaker label forward when present so callers that care
+            # about attribution (load_api_replay_channel) can use it. Absent on
+            # old rows / assistant turns — harmless to omit.
+            if isinstance(entry.get("author"), str) and entry["author"]:
+                msg["author"] = entry["author"]
             if include_context_snapshot and isinstance(entry.get("context_snapshot"), str):
                 msg["context_snapshot"] = entry["context_snapshot"]
                 if entry.get("timestamp"):
@@ -420,6 +443,13 @@ def load_api_replay_channel(channel_id: int) -> tuple[list[dict], str, str]:
         include_context_snapshot=True,
         max_age_days=HISTORY_MAX_AGE_DAYS,
     )
+    # Self-heal channels already poisoned by persisted sentinel/error replies:
+    # drop assistant rows whose content is "(no response)" or an error message.
+    # Replaying them primes the model to keep refusing (ADR-0008). New writes are
+    # already filtered in entry.py; this cleans pre-existing history at read time
+    # without mutating the JSONL on disk. Lazy import avoids a layering cycle.
+    from services.claude_api.errors import is_non_persistable_reply
+
     latest_snapshot = ""
     latest_snapshot_ts = ""
     messages: list[dict] = []
@@ -427,7 +457,19 @@ def load_api_replay_channel(channel_id: int) -> tuple[list[dict], str, str]:
         if row.get("context_snapshot"):
             latest_snapshot = row["context_snapshot"]
             latest_snapshot_ts = row.get("timestamp", "")
-        messages.append({"role": row["role"], "content": row["content"]})
+        if row["role"] == "assistant" and is_non_persistable_reply(row["content"]):
+            continue
+        content = row["content"]
+        # Attribute past user turns to their speaker so resume can tell apart
+        # multiple admins sharing a channel. The Anthropic Messages API has no
+        # author field on the user role, so we prepend it into the content.
+        # Composed at read time (JSONL content stays raw) and only when an
+        # author label exists — old rows replay unchanged (back-compat) and the
+        # prefix is deterministic, so prompt-cache prefixes stay stable.
+        author = row.get("author")
+        if row["role"] == "user" and isinstance(author, str) and author:
+            content = f"[発言者: {author}]\n{content}"
+        messages.append({"role": row["role"], "content": content})
     return messages, latest_snapshot, latest_snapshot_ts
 
 

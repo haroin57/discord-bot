@@ -106,6 +106,22 @@ class PromptBuilder:
         return queries[:max_queries]
 
     @staticmethod
+    def build_speaker_line(sender_name: str, sender_tag: str) -> str:
+        """Minimal current-speaker header for the lean resume prompt.
+
+        The full ``build_header`` (trust boundary + tool-permission preamble)
+        only needs to be sent once, on the session's first turn. Continued
+        turns take the lean path, which omits that header entirely — so the
+        model loses track of *who is speaking now* when two admins share a
+        channel (haroin vs b0nchichi). This one short line re-declares the
+        current speaker every lean turn at a fraction of the token cost.
+
+        Callers pass values already run through ``sanitize_untrusted_text``
+        (same contract as ``build_header``).
+        """
+        return f"[現在の発言者: {sender_name} ({sender_tag})]"
+
+    @staticmethod
     def build_header(sender_name: str, sender_tag: str, is_admin: bool) -> str:
         """Build the trusted context header for the prompt."""
         if is_admin:

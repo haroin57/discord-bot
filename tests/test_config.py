@@ -276,3 +276,34 @@ class TestModuleLevelEnvBranches:
             importlib.reload(config)
         short_warns = [x for x in w if "shorter than 3 chars" in str(x.message)]
         assert len(short_warns) >= 1
+
+
+class TestSpeakerLabels:
+    def test_parses_env_and_resolves(self, monkeypatch):
+        monkeypatch.setenv("SPEAKER_LABELS", "573489206240870410:先輩, 1037285234200297522:お父さん")
+        import config
+        importlib.reload(config)
+        try:
+            assert config.SPEAKER_LABELS[573489206240870410] == "先輩"
+            assert config.speaker_label(1037285234200297522) == "お父さん"
+            assert config.speaker_label("573489206240870410") == "先輩"  # str id ok
+        finally:
+            monkeypatch.delenv("SPEAKER_LABELS", raising=False)
+            importlib.reload(config)
+
+    def test_unknown_and_invalid_return_empty(self, monkeypatch):
+        import config
+        importlib.reload(config)  # no SPEAKER_LABELS env → empty table
+        assert config.speaker_label(999) == ""
+        assert config.speaker_label(None) == ""
+        assert config.speaker_label("notanumber") == ""
+
+    def test_malformed_pairs_skipped(self, monkeypatch):
+        monkeypatch.setenv("SPEAKER_LABELS", "noColon, 123:OK, :emptyid, 456:")
+        import config
+        importlib.reload(config)
+        try:
+            assert config.SPEAKER_LABELS == {123: "OK"}
+        finally:
+            monkeypatch.delenv("SPEAKER_LABELS", raising=False)
+            importlib.reload(config)

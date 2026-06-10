@@ -128,6 +128,44 @@ class TestIndexAndSearch:
         hits = history_index.search_history("新玉ねぎ", 3)
         assert hits and hits[0]["author"] == "b0nchichi"
 
+    def test_connection_sets_busy_timeout(self, fresh_history_db):
+        # ADR-0007: without busy_timeout, concurrent writers hit a hard
+        # "database is locked" and silently drop a row from the FTS index.
+        from services.mem0 import history_index
+        with history_index._conn() as c:
+            (timeout_ms,) = c.execute("PRAGMA busy_timeout").fetchone()
+            assert timeout_ms >= 5000
+            (mode,) = c.execute("PRAGMA journal_mode").fetchone()
+            assert mode.lower() == "wal"
+
+    def test_concurrent_writes_do_not_drop_rows(self, fresh_history_db):
+        # Two threads indexing the same channel at once must not lose a row
+        # to a lock error (the failure mode observed at 18:22:54 in prod).
+        import threading
+        from services.mem0 import history_index
+
+        results: list[bool] = []
+        lock = threading.Lock()
+
+        def _writer(n: int):
+            ok = True
+            for i in range(20):
+                if not history_index.index_line(
+                    99, f"t{n}-{i}", "channel", f"並行書き込み{n}-{i}", "tester"
+                ):
+                    ok = False
+            with lock:
+                results.append(ok)
+
+        threads = [threading.Thread(target=_writer, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert all(results), "a concurrent index_line() returned False (lock loss)"
+        assert history_index.stats()["rows"] == 80
+
 
 class TestFormatHistoryForPrompt:
     def test_empty_returns_empty_string(self):
@@ -141,10 +179,22 @@ class TestFormatHistoryForPrompt:
             {"role": "assistant", "memory": "メモしました", "ts": "t", "rank": 2},
         ])
         assert "東洋水産を買った" in out
-        assert "この人" in out  # user label
+        # user with no author → neutral label (NOT "この人", which reads as the
+        # current speaker and caused haroin/b0nchichi mislabelling).
+        assert "過去の発言者" in out
+        assert "この人" not in out
         assert "私" in out      # assistant label
         assert out.startswith("[History")
         assert out.rstrip().endswith("[End of history]")
+
+    def test_user_role_with_author_uses_author(self):
+        from services.mem0.format import format_history_for_prompt
+        out = format_history_for_prompt([
+            {"role": "user", "author": "お父さん", "memory": "決算きた", "ts": "t"},
+        ])
+        assert "(お父さん)" in out
+        assert "この人" not in out
+        assert "過去の発言者" not in out
 
     def test_scrubs_fence_close_markers(self):
         from services.mem0.format import format_history_for_prompt

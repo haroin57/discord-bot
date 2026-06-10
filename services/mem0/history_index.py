@@ -83,10 +83,18 @@ def _reset_db_path_for_test(path: str | None) -> None:
 @contextmanager
 def _conn():
     path = _resolve_db_path()
-    c = sqlite3.connect(path, check_same_thread=False)
+    # timeout=5.0 makes sqlite3 wait (and internally retry) up to 5s for a
+    # write lock instead of raising "database is locked" immediately. WAL is
+    # already on, but WAL still serializes *writers*, so concurrent indexing
+    # of two messages would otherwise lose a row to a hard lock error (the row
+    # is silently dropped from the history-search FTS index). busy_timeout is
+    # the SQLite-level equivalent and is set explicitly so it applies even if
+    # the connection timeout is bypassed (ADR-0007).
+    c = sqlite3.connect(path, check_same_thread=False, timeout=5.0)
     c.row_factory = sqlite3.Row
     try:
         c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA busy_timeout=5000")
         with _db_lock:
             c.executescript(_SCHEMA)
         yield c

@@ -729,6 +729,51 @@ class TestOnMessage:
             assert "external untrusted user" not in captured_prompt
 
     @pytest.mark.asyncio
+    async def test_lean_resume_prompt_declares_current_speaker(self, monkeypatch):
+        # Continued (lean) turns omit the full trusted header. Without the
+        # speaker line the prompt never states who is speaking now, which let
+        # the model mislabel haroin vs b0nchichi. Verify the lean path now
+        # declares the current speaker.
+        import bot
+        from services.session import SessionInfo
+        monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345})
+
+        cid = 99999
+        bot.sessions[cid] = SessionInfo(session_id="sess-abc")
+        monkeypatch.setattr("bot._is_session_fresh", lambda _cid: True)
+
+        msg = _make_message(content="かなえ hello", author_id=12345, channel_id=cid)
+
+        captured_prompt = None
+
+        async def capture_call_with_tools(prompt, *args, **kwargs):
+            nonlocal captured_prompt
+            captured_prompt = prompt
+            return ("ok", None, True)
+
+        try:
+            with patch("bot.strip_mention", return_value="hello"), \
+                 patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call_with_tools), \
+                 patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+                 patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+                 patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
+                 patch("bot.extract_image_paths", return_value=[]), \
+                 patch("bot.split_message", return_value=["ok"]), \
+                 patch("bot.cleanup_attachments"), \
+                 patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+                 patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+                await self._dispatch(msg)
+
+            assert captured_prompt is not None
+            # Lean path declares the current speaker...
+            assert "[現在の発言者:" in captured_prompt
+            assert "TestUser" in captured_prompt
+            # ...but does NOT carry the heavyweight full-path header.
+            assert "All tools are allowed" not in captured_prompt
+        finally:
+            bot.sessions.pop(cid, None)
+
+    @pytest.mark.asyncio
     async def test_reply_context_fetched(self, monkeypatch):
         import bot
 

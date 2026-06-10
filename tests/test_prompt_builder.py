@@ -249,6 +249,25 @@ class TestBuildHeader:
 
 
 # ---------------------------------------------------------------------------
+# build_speaker_line (lean resume current-speaker header)
+# ---------------------------------------------------------------------------
+
+class TestBuildSpeakerLine:
+    def test_contains_name_and_tag(self):
+        line = PromptBuilder.build_speaker_line("Alice", "alice#0001")
+        assert "Alice" in line
+        assert "alice#0001" in line
+        assert "現在の発言者" in line
+
+    def test_shorter_than_full_header(self):
+        # The lean line must stay lighter than the full trusted-context header,
+        # since it is sent on every continued turn.
+        sl = PromptBuilder.build_speaker_line("Alice", "alice#0001")
+        full = PromptBuilder.build_header("Alice", "alice#0001", is_admin=True)
+        assert len(sl) < len(full)
+
+
+# ---------------------------------------------------------------------------
 # build_prompt (async)
 # ---------------------------------------------------------------------------
 
