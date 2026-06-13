@@ -26,6 +26,9 @@ even though utilization is < 1.0; pace by sleeping at least
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +57,26 @@ class RateLimitState:
 
 _state = RateLimitState()
 
+_LIMIT_METRICS = (
+    ("リクエスト", "anthropic-ratelimit-requests"),
+    ("総トークン", "anthropic-ratelimit-tokens"),
+    ("入力トークン", "anthropic-ratelimit-input-tokens"),
+    ("出力トークン", "anthropic-ratelimit-output-tokens"),
+    ("Priority入力", "anthropic-priority-input-tokens"),
+    ("Priority出力", "anthropic-priority-output-tokens"),
+)
+
+_UNIFIED_RESETS = (
+    ("5時間枠", "anthropic-ratelimit-unified-5h-reset"),
+    ("7日枠", "anthropic-ratelimit-unified-7d-reset"),
+)
+
+
+try:
+    _DISPLAY_TZ = ZoneInfo("Asia/Tokyo")
+except ZoneInfoNotFoundError:
+    _DISPLAY_TZ = timezone.utc
+
 
 def _float_or(headers, name: str, default: float = 0.0) -> float:
     v = headers.get(name)
@@ -78,6 +101,182 @@ def _int_or(headers, name: str, default: int = 0) -> int:
 def _str_or(headers, name: str, default: str = "") -> str:
     v = headers.get(name)
     return v if isinstance(v, str) else default
+
+
+def _normalize_headers(headers) -> dict[str, str]:
+    norm: dict[str, str] = {}
+    try:
+        items = headers.items()
+    except AttributeError:
+        return norm
+    for key, value in items:
+        norm[str(key).lower()] = str(value)
+    return norm
+
+
+def _optional_int(headers: dict[str, str], name: str) -> int | None:
+    value = headers.get(name)
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value.replace(",", "")))
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(headers: dict[str, str], name: str) -> float | None:
+    value = headers.get(name)
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_rfc3339(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _parse_unix_seconds(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _retry_after_seconds(value: str | None, now: datetime) -> int | None:
+    if not value:
+        return None
+    try:
+        return max(0, int(float(value)))
+    except ValueError:
+        pass
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0, int((parsed - now).total_seconds()))
+
+
+def _format_dt(value: datetime) -> str:
+    return value.astimezone(_DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _format_wait(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}秒"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}分{sec}秒" if sec else f"{minutes}分"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}時間{minutes}分" if minutes else f"{hours}時間"
+    days, hours = divmod(hours, 24)
+    return f"{days}日{hours}時間" if hours else f"{days}日"
+
+
+def _format_usage(label: str, limit: int | None, remaining: int | None) -> str | None:
+    if limit is None and remaining is None:
+        return None
+    if limit is None:
+        return f"{label}: 残り {remaining:,}"
+    if remaining is None:
+        return f"{label}: 上限 {limit:,}"
+    used = max(limit - remaining, 0)
+    pct = (used / limit * 100.0) if limit > 0 else 0.0
+    return f"{label}: {used:,}/{limit:,} 使用（残り {remaining:,}、{pct:.0f}%）"
+
+
+def _reset_candidates(norm: dict[str, str], now: datetime) -> list[datetime]:
+    candidates: list[datetime] = []
+    retry_after = _retry_after_seconds(norm.get("retry-after"), now)
+    if retry_after is not None:
+        candidates.append(now + timedelta(seconds=retry_after))
+    for _, prefix in _LIMIT_METRICS:
+        parsed = _parse_rfc3339(norm.get(f"{prefix}-reset"))
+        if parsed is not None:
+            candidates.append(parsed)
+    for _, name in _UNIFIED_RESETS:
+        parsed = _parse_unix_seconds(norm.get(name))
+        if parsed is not None:
+            candidates.append(parsed)
+    return [candidate for candidate in candidates if candidate >= now]
+
+
+def format_rate_limit_details(headers, *, now: datetime | None = None) -> str:
+    """Return user-facing details extracted from Anthropic rate-limit headers."""
+    norm = _normalize_headers(headers)
+    if not norm:
+        return ""
+
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    lines: list[str] = []
+    retry_after = _retry_after_seconds(norm.get("retry-after"), now)
+    candidates = _reset_candidates(norm, now)
+    if retry_after is not None:
+        reset_at = now + timedelta(seconds=retry_after)
+        lines.append(
+            f"解除目安: {_format_dt(reset_at)}（約{_format_wait(retry_after)}後）"
+        )
+    elif candidates:
+        reset_at = min(candidates)
+        wait_seconds = max(0, int((reset_at - now).total_seconds()))
+        lines.append(
+            f"解除目安: {_format_dt(reset_at)}（約{_format_wait(wait_seconds)}後）"
+        )
+
+    usage_parts: list[str] = []
+    for label, prefix in _LIMIT_METRICS:
+        part = _format_usage(
+            label,
+            _optional_int(norm, f"{prefix}-limit"),
+            _optional_int(norm, f"{prefix}-remaining"),
+        )
+        if part:
+            usage_parts.append(part)
+    if usage_parts:
+        lines.append("使用状況: " + " / ".join(usage_parts))
+
+    unified_parts: list[str] = []
+    five_h = _optional_float(norm, "anthropic-ratelimit-unified-5h-utilization")
+    seven_d = _optional_float(norm, "anthropic-ratelimit-unified-7d-utilization")
+    fallback = _optional_float(norm, "anthropic-ratelimit-unified-fallback-percentage")
+    representative = norm.get("anthropic-ratelimit-unified-representative-claim")
+    if representative:
+        unified_parts.append(f"代表枠 {representative}")
+    if five_h is not None:
+        unified_parts.append(f"5時間枠 {five_h * 100:.0f}%")
+    if seven_d is not None:
+        unified_parts.append(f"7日枠 {seven_d * 100:.0f}%")
+    if fallback is not None:
+        unified_parts.append(f"fallback {fallback * 100:.0f}%")
+    if unified_parts:
+        lines.append("購読枠: " + " / ".join(unified_parts))
+
+    return "\n".join(lines)
+
+
+def append_rate_limit_details(message: str, headers) -> str:
+    details = format_rate_limit_details(headers)
+    if not details:
+        return message
+    return f"{message}\n{details}"
 
 
 def observe(headers) -> RateLimitState:

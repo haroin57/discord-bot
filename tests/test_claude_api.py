@@ -536,7 +536,14 @@ class TestCallDirect:
         def always_rate_limit(api_client, messages, system_prompt, response_chunks):
             raise anthropic.RateLimitError(
                 message="rate limited",
-                response=MagicMock(status_code=429, headers={}),
+                response=MagicMock(
+                    status_code=429,
+                    headers={
+                        "retry-after": "60",
+                        "anthropic-ratelimit-requests-limit": "10",
+                        "anthropic-ratelimit-requests-remaining": "0",
+                    },
+                ),
                 body={},
             )
 
@@ -546,7 +553,9 @@ class TestCallDirect:
 
         history = {}
         result = await api_mod.call_direct("hi", _CHAN_A, history)
-        assert "APIエラー" in result
+        assert "レート制限" in result
+        assert "解除目安" in result
+        assert "リクエスト: 10/10 使用" in result
 
     @pytest.mark.asyncio
     async def test_lru_eviction_with_ordered_dict(self, monkeypatch):

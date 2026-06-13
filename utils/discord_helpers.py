@@ -69,21 +69,82 @@ def strip_mention(content: str, user_id: int) -> str:
 # ---------------------------------------------------------------------------
 # Message splitting
 # ---------------------------------------------------------------------------
-def split_message(text: str, limit: int = 2000) -> list[str]:
-    """Split text into chunks that fit within Discord's message limit."""
+# A fence line: up to 3 leading spaces, ``` (or longer), optional language tag.
+_FENCE_RE = re.compile(r"^\s{0,3}(`{3,})(\S*)\s*$")
+# Room reserved per chunk for the "\n-# (xx/xx)" part marker.
+_PART_MARKER_RESERVE = 12
+
+
+def split_message(text: str, limit: int = 2000, *, numbered: bool = True) -> list[str]:
+    """Split text into chunks that fit within Discord's message limit.
+
+    Code-fence aware: a chunk never ends inside an unbalanced ``` fence.
+    When a fence has to span chunks it is closed at the end of the current
+    chunk and reopened (same language tag) at the start of the next, so
+    every chunk renders correctly on its own. With ``numbered`` (default),
+    multi-chunk output gets a small ``-# (i/n)`` subtext marker appended to
+    each chunk; single-chunk output is returned untouched.
+    """
     if len(text) <= limit:
         return [text]
+    reserve = _PART_MARKER_RESERVE if numbered else 0
+    chunks = _split_fence_aware(text, max(limit - reserve, 64))
+    if numbered and len(chunks) > 1:
+        total = len(chunks)
+        chunks = [f"{c}\n-# ({i}/{total})" for i, c in enumerate(chunks, 1)]
+    return chunks
+
+
+def _split_fence_aware(text: str, limit: int) -> list[str]:
+    """Line-based splitter that keeps ``` fences balanced per chunk."""
+    # Pre-split any single line longer than a chunk (space-preferring, then
+    # hard) so the main loop only ever handles lines that fit. The -8 margin
+    # leaves room for a "\n```" fence close on fenced chunks.
+    line_cap = limit - 8
+    lines: list[str] = []
+    for raw in text.split("\n"):
+        while len(raw) > line_cap:
+            cut = raw.rfind(" ", 0, line_cap)
+            if cut <= 0:
+                cut = line_cap
+            lines.append(raw[:cut])
+            raw = raw[cut:].lstrip(" ")
+        lines.append(raw)
+
     chunks: list[str] = []
-    while len(text) > limit:
-        split_at = text.rfind("\n", 0, limit)
-        if split_at == -1:
-            split_at = text.rfind(" ", 0, limit)
-        if split_at == -1:
-            split_at = limit
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip("\n")
-    if text:
-        chunks.append(text)
+    cur: list[str] = []
+    cur_len = 0  # == len("\n".join(cur))
+    fence_open: str | None = None  # opening fence line, e.g. "```python"
+
+    def flush() -> None:
+        nonlocal cur, cur_len
+        if not cur:
+            return
+        body = "\n".join(cur)
+        if fence_open:
+            body += "\n```"
+        chunks.append(body)
+        cur = []
+        cur_len = 0
+        if fence_open:
+            cur.append(fence_open)
+            cur_len = len(fence_open)
+
+    for line in lines:
+        sep = 1 if cur else 0
+        close_margin = 4 if fence_open else 0  # "\n```"
+        if cur_len + sep + len(line) + close_margin > limit:
+            flush()
+            sep = 1 if cur else 0
+        cur.append(line)
+        cur_len += sep + len(line)
+        if _FENCE_RE.match(line):
+            fence_open = None if fence_open else (line.strip() or "```")
+
+    # Final chunk: emitted as-is — if the source text itself left a fence
+    # unclosed, that is the author's content, not a split artifact.
+    if cur:
+        chunks.append("\n".join(cur))
     return chunks
 
 

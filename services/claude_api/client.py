@@ -11,6 +11,8 @@ import logging
 import os
 import uuid
 
+from config import CLAUDE_EFFORT
+
 log = logging.getLogger(__name__)
 
 # === Auto-captured CLI identity block ===
@@ -29,6 +31,8 @@ MODEL_BETAS = [
     "mid-conversation-system-2026-04-07",
     "advanced-tool-use-2025-11-20",
     "effort-2025-11-24",
+    "server-side-fallback-2026-06-01",
+    "fallback-credit-2026-06-01",
     "extended-cache-ttl-2025-04-11",
 ]
 CLI_IDENTITY_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
@@ -47,22 +51,35 @@ USER_AGENT = f"claude-cli/{CC_VERSION} (external, {CC_ENTRYPOINT})"
 #   (We briefly tried display="summarized" while debugging fable-5 refusals, but
 #   the real fix was output_config reaching the wire (ADR-0009), so we reverted
 #   to match the CLI exactly.)
-# - output_config.effort = "xhigh": one notch below "max" on Anthropic's
-#   effort dial (low < medium < high < xhigh < max). The real claude-cli
-#   sends "high" on Fable 5 (its default; confirmed in the mitm capture),
-#   but we deliberately step up to "xhigh" for more thinking + tool-call
-#   budget per turn — a quality-over-speed choice (haroin preference,
-#   2026-06-10). This is an intentional divergence from the CLI request,
-#   unlike CC_VERSION / cache-ttl which we keep byte-matched.
+# - output_config.effort: defaults to "medium" (haroin's instruction — keep
+#   Fable 5 on the medium tier for predictable latency and token usage; the
+#   CLI's own default is "high"). Env-tunable via CLAUDE_EFFORT /
+#   CLAUDE_CODE_EFFORT_LEVEL so the dial is a config knob, not a buried
+#   constant (audit #4).
 # - context_management.clear_thinking_20251015 with keep="all": the
 #   server-side bookkeeping the CLI requests for the new
 #   advanced-tool-use beta. Mirroring it keeps overage-cohort routing
 #   working under sustained load.
 THINKING_CONFIG = {"type": "adaptive"}
-OUTPUT_CONFIG = {"effort": "xhigh"}
+OUTPUT_CONFIG = {"effort": CLAUDE_EFFORT}
 CONTEXT_MANAGEMENT_CONFIG = {
     "edits": [
         {"type": "clear_thinking_20251015", "keep": "all"},
+        # ADR-0010 phase 2: server-side auto-compaction of old tool results.
+        # Fires only once the request is already heavy (Fable 5 starts
+        # refusing around ~240k input tokens; 150k leaves headroom), so the
+        # prompt-cache prefix is NOT rewritten on normal-sized turns. Every
+        # clear invalidates the cache prefix, so we only pay that cost when
+        # it frees a meaningful chunk (clear_at_least). Keeps the 5 most
+        # recent tool uses so mid-workflow context survives. Note: this
+        # compacts tool results only — plain long conversations are handled
+        # by the sticky fallback-model pinning in entry.py, not by this edit.
+        {
+            "type": "clear_tool_uses_20250919",
+            "trigger": {"type": "input_tokens", "value": 150000},
+            "keep": {"type": "tool_uses", "value": 5},
+            "clear_at_least": {"type": "input_tokens", "value": 20000},
+        },
     ],
 }
 CLAUDE_MAX_TOKENS_OPUS = 32000  # matched to real claude-cli request (2026-06-10)

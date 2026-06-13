@@ -249,6 +249,31 @@ class TestDispatcher:
 
 
 # ---------------------------------------------------------------------------
+# Rate-limit error details
+# ---------------------------------------------------------------------------
+class TestRateLimitErrorDetails:
+    def test_classified_rate_limit_message_includes_headers(self):
+        from unittest.mock import MagicMock
+
+        from services.claude_api.entry import _classified_error_message
+
+        exc = RuntimeError("rate limited")
+        exc.response = MagicMock(
+            headers={
+                "retry-after": "60",
+                "anthropic-ratelimit-tokens-limit": "40000",
+                "anthropic-ratelimit-tokens-remaining": "0",
+            },
+        )
+
+        msg = _classified_error_message("rate_limit", exc)
+
+        assert "レート制限" in msg
+        assert "解除目安" in msg
+        assert "総トークン: 40,000/40,000 使用" in msg
+
+
+# ---------------------------------------------------------------------------
 # Bare transport-error retry (ADR-0007)
 # ---------------------------------------------------------------------------
 class TestBareTransportErrorRetry:

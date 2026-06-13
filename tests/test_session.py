@@ -606,3 +606,269 @@ class TestStructuredApiReplay:
                   for b in m["content"]
                   if b.get("type") == "tool_result" and b.get("tool_use_id") == "toolu_ORPHAN"]
         assert orphan == [], "leading assistant row (with orphan tool_result) must be dropped"
+
+    def test_empty_content_array_message_dropped(self, tmp_state_dir):
+        # CLI-parity (deserializeMessages): a message whose content is an
+        # empty list is an interrupted-stream artifact and must be dropped on
+        # replay, not spliced in as an empty frame.
+        u, a = build_compact_history_entries(
+            raw_user_text="run", prompt_text="", assistant_text="done",
+            api_messages=[
+                {"role": "assistant", "content": []},          # interrupted: drop
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "real"}]},
+            ],
+        )
+        append_jsonl(self._CID, u)
+        append_jsonl(self._CID, a)
+        msgs, _s, _t = load_api_replay_channel(self._CID)
+        empties = [m for m in msgs
+                   if isinstance(m["content"], list) and len(m["content"]) == 0]
+        assert empties == [], "empty-content frame must not be replayed"
+        assert any(isinstance(m["content"], list)
+                   and any(b.get("text") == "real" for b in m["content"])
+                   for m in msgs)
+
+    def test_non_string_text_block_stripped_keeps_rest(self, tmp_state_dir):
+        # CLI-parity (binary DKf): a text block whose `text` is not a string
+        # is dropped, but sibling blocks in the same message survive.
+        u, a = build_compact_history_entries(
+            raw_user_text="run", prompt_text="", assistant_text="done",
+            api_messages=[
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": None},          # artifact: strip
+                    {"type": "text", "text": "kept"},        # survives
+                ]},
+            ],
+        )
+        append_jsonl(self._CID, u)
+        append_jsonl(self._CID, a)
+        msgs, _s, _t = load_api_replay_channel(self._CID)
+        texts = [b.get("text") for m in msgs if isinstance(m["content"], list)
+                 for b in m["content"] if b.get("type") == "text"]
+        assert "kept" in texts
+        assert None not in texts, "non-string text block must be stripped"
+
+    def test_all_artifact_blocks_falls_back_to_display_text(self, tmp_state_dir):
+        # When sanitization empties every api_messages frame, the turn must
+        # still replay via the flattened display content rather than vanish.
+        u, a = build_compact_history_entries(
+            raw_user_text="run", prompt_text="", assistant_text="fallback text",
+            api_messages=[
+                {"role": "assistant", "content": [{"type": "text", "text": None}]},
+            ],
+        )
+        append_jsonl(self._CID, u)
+        append_jsonl(self._CID, a)
+        msgs, _s, _t = load_api_replay_channel(self._CID)
+        assert any(m["role"] == "assistant" and m["content"] == "fallback text"
+                   for m in msgs)
+
+
+class TestTextInvokePoisonStripping:
+    """A tool call emitted as plain text must be stripped at persist AND replay
+    (2026-06-13 poison). docs/2026-06-13_tool_call_text_invoke_poison.md."""
+
+    _CID = 1488369795807055966
+
+    _POISON = (
+        '初値、確認します。\n\ncourse\n<invoke name="brave_news_search">\n'
+        '<parameter name="query">x</parameter>'
+    )
+
+    def test_persist_strips_text_invoke_from_api_messages(self):
+        # build_compact_history_entries -> _prepare_api_messages must not store
+        # the raw <invoke> text.
+        _u, a = build_compact_history_entries(
+            raw_user_text="調べて", prompt_text="", assistant_text=self._POISON,
+            api_messages=[{"role": "assistant",
+                           "content": [{"type": "text", "text": self._POISON}]}],
+        )
+        import json as _json
+        blob = _json.dumps(a, ensure_ascii=False)
+        assert "<invoke name=" not in blob
+        # natural-language prefix survives in the display content
+        assert "初値、確認します。" in a["content"]
+
+    def test_replay_decontaminates_existing_poison(self, tmp_state_dir):
+        # Simulate an already-poisoned transcript on disk (api_messages stores
+        # the call as text, no tool_use) and confirm replay strips it.
+        append_jsonl(self._CID, {"role": "user", "content": "調べて"})
+        append_jsonl(self._CID, {
+            "role": "assistant", "content": self._POISON,
+            "api_messages": [{"role": "assistant",
+                              "content": [{"type": "text", "text": self._POISON}]}],
+        })
+        msgs, _s, _t = load_api_replay_channel(self._CID)
+        blob = "".join(
+            str(m.get("content")) for m in msgs
+        )
+        assert "<invoke name=" not in blob
+        # the turn isn't lost — its prefix remains
+        assert any("初値、確認します。" in str(m.get("content")) for m in msgs)
+
+    def test_replay_drops_turn_that_was_only_a_text_invoke(self, tmp_state_dir):
+        only = 'course\n<invoke name="Bash">\n<parameter name="command">ls</parameter>'
+        append_jsonl(self._CID + 1, {"role": "user", "content": "やって"})
+        append_jsonl(self._CID + 1, {
+            "role": "assistant", "content": only,
+            "api_messages": [{"role": "assistant",
+                              "content": [{"type": "text", "text": only}]}],
+        })
+        msgs, _s, _t = load_api_replay_channel(self._CID + 1)
+        blob = "".join(str(m.get("content")) for m in msgs)
+        assert "<invoke" not in blob
+
+
+class TestCompactSummaryReplay:
+    """ADR-0010 phase 3: a compact-summary row collapses the replay window.
+
+    Mirrors the official CLI, which on resume starts from the compact summary
+    (the anchor) plus the recent verbatim tail, dropping older turns.
+    """
+
+    _CID = 1488369795807055965
+
+    def test_summary_row_collapses_window(self, tmp_state_dir):
+        # old turns (should be dropped), then a summary keeping the last 2 rows.
+        for i in range(3):
+            u, a = build_compact_history_entries(
+                raw_user_text=f"old{i}", prompt_text="", assistant_text=f"oldreply{i}",
+            )
+            append_jsonl(self._CID, u)
+            append_jsonl(self._CID, a)
+        append_jsonl(self._CID, {
+            "role": "user",
+            "content": "CONTINUATION SUMMARY ANCHOR",
+            "is_compact_summary": True,
+            "keep_tail_rows": 2,
+        })
+        u, a = build_compact_history_entries(
+            raw_user_text="newest", prompt_text="", assistant_text="newreply",
+        )
+        append_jsonl(self._CID, u)
+        append_jsonl(self._CID, a)
+
+        msgs, _s, _t = load_api_replay_channel(self._CID)
+        # The window starts at the summary (rendered as a user turn).
+        assert any("CONTINUATION SUMMARY ANCHOR" in m["content"]
+                   for m in msgs if isinstance(m["content"], str))
+        # Old turns before the kept tail are gone.
+        assert not any(isinstance(m["content"], str) and "oldreply0" in m["content"]
+                       for m in msgs)
+        # Newest turn after the summary survives.
+        assert any(isinstance(m["content"], str) and "newreply" in m["content"]
+                   for m in msgs)
+
+class TestOrphanToolBlockSweep:
+    """Audit #2 (binary fn Yy8): no orphan tool_use / tool_result may survive
+    the assembled replay window — they hard-400 the next Messages call."""
+
+    def _sweep(self, msgs):
+        from services.session import _prune_orphan_tool_blocks
+        return _prune_orphan_tool_blocks(msgs)
+
+    def test_orphan_tool_use_message_dropped(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "a", "name": "Read", "input": {}}]},
+            {"role": "assistant", "content": "reply"},
+        ]
+        out = self._sweep(msgs)
+        assert len(out) == 2
+        assert out[0]["content"] == "hi"
+        assert out[1]["content"] == "reply"
+
+    def test_orphan_tool_use_block_dropped_text_kept(self):
+        msgs = [
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "let me read"},
+                {"type": "tool_use", "id": "a", "name": "Read", "input": {}},
+            ]},
+        ]
+        out = self._sweep(msgs)
+        assert out[0]["content"] == [{"type": "text", "text": "let me read"}]
+
+    def test_orphan_tool_result_dropped(self):
+        msgs = [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "ghost",
+                 "content": "data"}]},
+            {"role": "assistant", "content": "reply"},
+        ]
+        out = self._sweep(msgs)
+        assert len(out) == 1
+        assert out[0]["content"] == "reply"
+
+    def test_valid_pair_survives_untouched(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "a", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "ok"}]},
+            {"role": "assistant", "content": "done"},
+        ]
+        assert self._sweep(msgs) == msgs
+
+    def test_cascade_assistant_drop_orphans_its_result(self):
+        # An assistant frame holding tool_use B vanished (e.g. sanitized away);
+        # the tool_result B left behind must be swept too.
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "b", "content": "x"},
+            ]},
+            {"role": "assistant", "content": "done"},
+        ]
+        out = self._sweep(msgs)
+        assert [m["content"] for m in out] == ["hi", "done"]
+
+    def test_mixed_results_only_orphan_removed(self):
+        msgs = [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "a", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "ok"},
+                {"type": "tool_result", "tool_use_id": "ghost", "content": "x"},
+            ]},
+        ]
+        out = self._sweep(msgs)
+        assert out[1]["content"] == [
+            {"type": "tool_result", "tool_use_id": "a", "content": "ok"}]
+
+
+class TestThinkingOnlyFramePrune:
+    """Audit #15 (binary fn WS$): thinking-only assistant frames are dropped."""
+
+    def _sanitize(self, msgs):
+        from services.session import _sanitize_replay_messages
+        return _sanitize_replay_messages(msgs)
+
+    def test_thinking_only_assistant_dropped(self):
+        msgs = [{"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hmm", "signature": "sig"}]}]
+        assert self._sanitize(msgs) == []
+
+    def test_redacted_thinking_only_dropped(self):
+        msgs = [{"role": "assistant", "content": [
+            {"type": "redacted_thinking", "data": "xx"}]}]
+        assert self._sanitize(msgs) == []
+
+    def test_thinking_plus_text_kept(self):
+        msgs = [{"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hmm", "signature": "sig"},
+            {"type": "text", "text": "answer"}]}]
+        assert self._sanitize(msgs) == msgs
+
+    def test_thinking_plus_tool_use_kept(self):
+        msgs = [{"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hmm", "signature": "sig"},
+            {"type": "tool_use", "id": "a", "name": "Read", "input": {}}]}]
+        assert self._sanitize(msgs) == msgs
+
+    def test_user_tool_result_frame_not_affected(self):
+        msgs = [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "a", "content": "ok"}]}]
+        assert self._sanitize(msgs) == msgs

@@ -49,7 +49,10 @@ class TestSplitMessage:
         text = "x" * 3000
         chunks = split_message(text, limit=2000)
         assert len(chunks) == 2
-        assert chunks[0] == "x" * 2000
+        assert all(len(c) <= 2000 for c in chunks)
+        # content survives minus the part markers
+        joined = "".join(c.split("\n-# (")[0] for c in chunks)
+        assert joined == text
 
     def test_empty_string(self):
         assert split_message("") == [""]
@@ -62,7 +65,55 @@ class TestSplitMessage:
         text = "a" * 5000
         chunks = split_message(text, limit=2000)
         assert len(chunks) == 3
+        joined = "".join(c.split("\n-# (")[0] for c in chunks)
+        assert joined == text
+
+    def test_part_markers_on_multichunk(self):
+        text = ("line\n" * 200) + ("x" * 1500)
+        chunks = split_message(text, limit=2000)
+        n = len(chunks)
+        assert n > 1
+        for i, c in enumerate(chunks, 1):
+            assert c.endswith(f"-# ({i}/{n})")
+            assert len(c) <= 2000
+
+    def test_single_chunk_has_no_marker(self):
+        assert split_message("short") == ["short"]
+
+    def test_numbered_false_keeps_content_joinable(self):
+        text = "a" * 5000
+        chunks = split_message(text, limit=2000, numbered=False)
         assert "".join(chunks) == text
+
+    def test_fence_not_left_unbalanced(self):
+        code = "\n".join(f"print({i})" for i in range(400))
+        text = f"intro\n```python\n{code}\n```\noutro"
+        chunks = split_message(text, limit=2000)
+        assert len(chunks) > 1
+        for c in chunks:
+            body = c.split("\n-# (")[0]
+            assert body.count("```") % 2 == 0, f"unbalanced fence in: {body[-80:]}"
+        # continuation chunks reopen with the language tag
+        assert any(
+            c.split("\n-# (")[0].startswith("```python") for c in chunks[1:]
+        )
+
+    def test_fence_language_preserved_across_splits(self):
+        long_line_code = "\n".join("x = " + "1" * 60 for _ in range(60))
+        text = f"```js\n{long_line_code}\n```"
+        chunks = split_message(text, limit=2000)
+        for c in chunks[1:]:
+            body = c.split("\n-# (")[0]
+            assert body.startswith("```js")
+
+    def test_unclosed_source_fence_passes_through(self):
+        # The author's own unclosed fence is not a split artifact — the last
+        # chunk may legitimately end inside it.
+        text = "```python\n" + ("y = 2\n" * 500)
+        chunks = split_message(text, limit=2000)
+        for c in chunks[:-1]:
+            body = c.split("\n-# (")[0]
+            assert body.count("```") % 2 == 0
 
 
 class TestStripMention:

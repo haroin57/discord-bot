@@ -19,6 +19,7 @@ Notes:
   yield streaming events.
 """
 
+import asyncio
 import logging
 import re
 import time
@@ -27,7 +28,12 @@ from dataclasses import dataclass
 
 import anthropic
 
-from config import CLAUDE_MAX_TOKENS
+from config import (
+    CLAUDE_MAX_TOKENS,
+    PROACTIVE_COMPACT_ENABLED,
+    PROACTIVE_COMPACT_TRIGGER_TOKENS,
+    SLOW_FIRST_BYTE_MS,
+)
 
 from services.claude_api.client import (
     CLAUDE_MAX_TOKENS_OPUS,
@@ -39,7 +45,11 @@ from services.claude_api.client import (
     get_attribution_header_value,
     get_metadata,
 )
-from services.claude_api.errors import classify_anthropic_error
+from services.claude_api.errors import (
+    classify_anthropic_error,
+    contains_text_tool_call,
+    strip_text_tool_call,
+)
 from services.claude_api.mcp_client import kill_orphan_mcp_processes
 from services.claude_api.ratelimit import (
     maybe_wait_before_request,
@@ -57,6 +67,61 @@ class AgentLoopResult:
     text: str
     synthetic_session_id: str | None
     active_mcp_keys: list[str]
+    # Set to the fallback model id (e.g. "claude-opus-4-8") when the primary
+    # model (Fable 5) returned stop_reason=refusal and the loop retried the
+    # request on the fallback. None when no fallback happened.
+    fallback_model: str | None = None
+    # Number of leading ``history`` entries that belong to the PRIOR
+    # transcript after the loop finished. Equal to the caller's
+    # ``prior_turns`` unless an in-loop proactive compaction replaced the
+    # prior window mid-request (audit #3) — entry.py slices new turns for
+    # JSONL persistence at this index, not at len(prior_history).
+    prior_len: int | None = None
+
+
+# Header the official CLI sets on every API request once a refusal fallback
+# has occurred in the session (claude.exe fetch wrapper, gated on
+# hasRefusalFallbackOccurred), so the API can tell fallback-leg traffic apart.
+# Same semantics here: set on the in-turn retry leg (fallback_used below) and
+# on every turn of a sticky-pinned session (entry.py passes it through
+# extra_headers). ADR-0010.
+REFUSAL_FALLBACK_HEADER = "x-is-refusal-fallback"
+
+
+def _model_display(m: str) -> str:
+    """Short human label for a model id, for the user-facing fallback note."""
+    ml = (m or "").lower()
+    if "opus-4-8" in ml:
+        return "Opus 4.8"
+    if "opus" in ml:
+        return "Opus"
+    if "fable" in ml:
+        return "Fable 5"
+    return m or "?"
+
+
+def _fallback_alert(model: str) -> str:
+    """The user-facing alert pushed to Discord when a refusal fell back.
+
+    A blockquote + warning so it reads as a system alert, visually distinct
+    from かなえ's reply. Single source of truth — used both for the live note
+    (streaming) and the text prepend (non-streaming)."""
+    return (
+        f"> ⚠️ **Fable 5 が応答を拒否したため {_model_display(model)} に"
+        "フォールバックしました**"
+    )
+
+
+# Max corrective re-prompts when the model emits a tool call as plain text.
+MAX_TEXT_INVOKE_CORRECTIONS = 1
+# Corrective nudge appended as a user turn when a text-form tool call is seen.
+_TEXT_INVOKE_CORRECTION = (
+    "⚠️ 直前のツール呼び出しが通常テキスト（<invoke …> の生 XML）として出力され、"
+    "実行されませんでした。ツール呼び出しは地の文に書かず、正規の tool_use 形式で"
+    "呼び出してください。ツール名は広告された完全名（例: "
+    "mcp__brave-search__brave_news_search）を使ってください。同じツールを今すぐ"
+    "正しい形式で呼び出し直してください。"
+)
 
 
 def _build_cached_system(system_prompt: str, messages: list[dict]) -> list[dict]:
@@ -95,14 +160,35 @@ def _build_cached_system(system_prompt: str, messages: list[dict]) -> list[dict]
     ]
 
 
+def _mark_cache_breakpoint(msg: dict) -> dict:
+    """Return a copy of ``msg`` with a ttl:1h breakpoint on its last block."""
+    msg = dict(msg)
+    content = msg["content"]
+    if isinstance(content, str):
+        msg["content"] = [
+            {"type": "text", "text": content,
+             "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+        ]
+    elif isinstance(content, list) and content:
+        content = list(content)
+        last_block = dict(content[-1])
+        last_block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+        content[-1] = last_block
+        msg["content"] = content
+    return msg
+
+
 def _inject_cache_breakpoints(messages: list[dict]) -> list[dict]:
     """Mirrors the helper in __init__.py (see _build_cached_system above).
 
-    PLACEMENT: the breakpoint goes on the second-to-last user message
-    (user_indices[-2]), not the last. The last user message is the volatile new
-    input that changes every request, so a breakpoint there would write a fresh
-    entry that the next turn never reads. Targeting [-2] caches the stable prefix
-    (system + all prior turns) and leaves only the newest turn uncached.
+    PLACEMENT (CLI parity, binary fn Def — audit #8): breakpoints go on BOTH
+    the last and the second-to-last user message. [-2] caches the stable
+    prefix (system + all prior turns). [-1] additionally writes the newest
+    user turn, so the NEXT request's read window covers this turn's reply +
+    tool results instead of stopping at the previous turn — without it, every
+    resume re-pays the latest exchange as cache_creation (one leg of the
+    ADR-0010 cache_read=0 cascade). Budget: 2 system blocks + these 2 = the
+    API's 4-breakpoint maximum.
 
     TTL: the breakpoint carries ttl:1h, matching the ttl:1h value the real
     claude-cli uses on its message breakpoint (mitm capture cli_resume.json) and
@@ -115,27 +201,15 @@ def _inject_cache_breakpoints(messages: list[dict]) -> list[dict]:
     prefix warm across the gap so the next turn reads it at ~0.1x instead.
     Requires the extended-cache-ttl beta, which MODEL_BETAS already sends.
     """
-    if len(messages) < 4:
-        return messages
     user_indices = [i for i, m in enumerate(messages) if m["role"] == "user"]
-    if len(user_indices) < 2:
+    if not user_indices:
         return messages
-    target_idx = user_indices[-2]
     messages = list(messages)
-    msg = dict(messages[target_idx])
-    content = msg["content"]
-    if isinstance(content, str):
-        msg["content"] = [
-            {"type": "text", "text": content,
-             "cache_control": {"type": "ephemeral", "ttl": "1h"}},
-        ]
-    elif isinstance(content, list):
-        content = list(content)
-        last_block = dict(content[-1])
-        last_block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-        content[-1] = last_block
-        msg["content"] = content
-    messages[target_idx] = msg
+    targets = {user_indices[-1]}
+    if len(user_indices) >= 2:
+        targets.add(user_indices[-2])
+    for target_idx in targets:
+        messages[target_idx] = _mark_cache_breakpoint(messages[target_idx])
     return messages
 
 
@@ -435,6 +509,40 @@ def _normalize_history_for_api(history: list[dict]) -> list[dict]:
     return out
 
 
+# Tools that only read state and can safely run concurrently (CLI
+# isConcurrencySafe, audit #12). When a turn's tool_use blocks are ALL in
+# this set they are dispatched via asyncio.gather; anything else (writes,
+# Bash, MCP tools with unknown side effects) keeps the sequential path.
+CONCURRENCY_SAFE_TOOLS = frozenset({"Read", "Glob", "Grep"})
+
+
+def _validate_tool_input(schema, args: dict) -> str | None:
+    """Validate ``args`` against an input_schema; return an error string or None.
+
+    Mirrors the CLI's pre-dispatch zod validation (audit #11): a malformed
+    call comes back as a ``<tool_use_error>InputValidationError: …</tool_use_error>``
+    tool_result naming the offending field, so the model can self-correct in
+    one turn instead of decoding an arbitrary handler traceback. Soft
+    dependency — when jsonschema is unavailable or the schema itself is
+    broken, validation is skipped (the handlers keep their own guards).
+    """
+    if not isinstance(schema, dict) or not schema:
+        return None
+    try:
+        import jsonschema
+    except ImportError:
+        return None
+    try:
+        jsonschema.validate(args, schema)
+    except jsonschema.ValidationError as e:
+        path = ".".join(str(p) for p in e.absolute_path)
+        loc = f" at '{path}'" if path else ""
+        return f"{e.message}{loc}"
+    except jsonschema.SchemaError:
+        return None  # broken schema is our bug; never block the tool on it
+    return None
+
+
 _USAGE_FIELDS = (
     "input_tokens",
     "cache_read_input_tokens",
@@ -453,12 +561,47 @@ def _usage_number(usage, field: str) -> int:
     return value if isinstance(value, int) else 0
 
 
-def _log_turn_usage(channel_id: int, turn: int, final_msg, totals: dict[str, int]) -> None:
+# Last observed per-channel context footprint (input + cache_read +
+# cache_creation of the most recent turn). entry.py reads this for the
+# token-based boundary compaction trigger (audit #7) — real tokens, not the
+# 2-4x-noisy char estimate.
+_last_context_tokens: dict[int, int] = {}
+
+
+def get_last_context_tokens(channel_id: int) -> int:
+    """Most recent context-size observation for a channel, 0 if none yet."""
+    return _last_context_tokens.get(channel_id, 0)
+
+
+def _context_tokens(values: dict[str, int]) -> int:
+    return (
+        values["input_tokens"]
+        + values["cache_read_input_tokens"]
+        + values["cache_creation_input_tokens"]
+    )
+
+
+def _log_turn_usage(
+    channel_id: int,
+    turn: int,
+    final_msg,
+    totals: dict[str, int],
+    *,
+    model: str = "",
+    request_id: str = "",
+    duration_ms: int | None = None,
+    ttft_ms: int | None = None,
+    message_count: int = 0,
+) -> None:
     """Emit per-turn usage if the SDK message exposes it.
 
     Stays silent for mocks / responses without ``usage`` so the agent loop
     keeps running. Bumps ``totals`` so a later call to ``_log_total_usage``
     can summarize multi-turn (tool_use) requests.
+
+    ``request_id`` / ``duration_ms`` / ``ttft_ms`` / ``message_count`` mirror
+    the CLI's tengu_api_success payload (audit #17) — request-id especially,
+    since without it a refusal/error can never be correlated server-side.
     """
     usage = getattr(final_msg, "usage", None)
     if usage is None:
@@ -467,17 +610,24 @@ def _log_turn_usage(channel_id: int, turn: int, final_msg, totals: dict[str, int
     for field, value in values.items():
         totals[field] += value
     totals["turns"] += 1
+    _last_context_tokens[channel_id] = _context_tokens(values)
     stop_reason = getattr(final_msg, "stop_reason", None)
     log.info(
-        "claude_api_usage channel=%d turn=%d input_tokens=%d "
+        "claude_api_usage channel=%d turn=%d model=%s input_tokens=%d "
         "cache_read_input_tokens=%d cache_creation_input_tokens=%d "
-        "output_tokens=%d stop_reason=%s",
+        "output_tokens=%d stop_reason=%s request_id=%s duration_ms=%s "
+        "ttft_ms=%s message_count=%d",
         channel_id, turn + 1,
+        model or "-",
         values["input_tokens"],
         values["cache_read_input_tokens"],
         values["cache_creation_input_tokens"],
         values["output_tokens"],
         stop_reason,
+        request_id or "-",
+        duration_ms if duration_ms is not None else "-",
+        ttft_ms if ttft_ms is not None else "-",
+        message_count,
     )
     # On a model refusal, surface stop_details (category: cyber|bio|None +
     # explanation) so refusals are diagnosable instead of silently becoming
@@ -506,6 +656,66 @@ def _log_total_usage(channel_id: int, totals: dict[str, int]) -> None:
     )
 
 
+# --- DIAGNOSTIC (temporary): capture the exact request that produced a refusal.
+# stop_reason=refusal with category=None is not a normal safety refusal; this
+# dumps the full system + messages + config + response headers for the live
+# request so we can inspect what fable-5 actually rejected. Bounded per process,
+# best-effort, never raises into the agent loop. Remove once root-caused.
+_REFUSAL_CAPTURES = 0
+_REFUSAL_CAPTURE_MAX = 15
+
+
+def _capture_refusal_request(channel_id, turn, model, cached_system, messages,
+                             betas, final_msg, resp_headers):
+    global _REFUSAL_CAPTURES
+    if _REFUSAL_CAPTURES >= _REFUSAL_CAPTURE_MAX:
+        return
+    try:
+        import json as _json
+        import os as _os
+        import time as _time
+        sd = getattr(final_msg, "stop_details", None)
+        usage = getattr(final_msg, "usage", None)
+        hdrs = {}
+        try:
+            for k, v in dict(resp_headers or {}).items():
+                kl = k.lower()
+                if kl.startswith("anthropic-ratelimit") or kl in (
+                    "request-id", "retry-after", "anthropic-beta", "x-should-retry",
+                ):
+                    hdrs[k] = v
+        except Exception:
+            pass
+        payload = {
+            "channel_id": channel_id, "turn": turn, "model": model,
+            "betas": list(betas or []),
+            "stop_reason": getattr(final_msg, "stop_reason", None),
+            "stop_details": {
+                "category": getattr(sd, "category", None) if sd else None,
+                "explanation": getattr(sd, "explanation", None) if sd else None,
+            },
+            "usage": {
+                f: getattr(usage, f, None) if usage else None
+                for f in ("input_tokens", "cache_read_input_tokens",
+                          "cache_creation_input_tokens", "output_tokens")
+            },
+            "response_headers": hdrs,
+            "system": cached_system,
+            "messages": messages,
+        }
+        d = "/tmp/fable5_capture"
+        _os.makedirs(d, exist_ok=True)
+        ts = _time.strftime("%Y%m%dT%H%M%S")
+        path = _os.path.join(d, f"bot_refusal_{channel_id}_{turn}_{ts}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(payload, f, ensure_ascii=False, indent=2)
+        _os.chmod(path, 0o600)
+        _REFUSAL_CAPTURES += 1
+        log.warning("captured refusal request -> %s", path)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("refusal capture failed: %s", exc)
+
+
 async def run_agent_loop(
     prompt: str,
     channel_id: int,
@@ -516,7 +726,8 @@ async def run_agent_loop(
     can_use_tool,  # (name, input) -> (bool, reason)
     execute_tool,  # async (name, input) -> str
     status_callback=None,
-    incremental_text_callback=None,   # async (text:str)->None
+    incremental_text_callback=None,   # async (text:str)->None  (per-turn final)
+    text_stream_callback=None,        # async (partial_turn_text:str)->None
     tool_invocation_callback=None,    # async (name:str, args:dict)->None
     max_turns: int,
     stall_watchdog: StallWatchdog,
@@ -525,6 +736,9 @@ async def run_agent_loop(
     extra_betas: list[str],
     extra_headers: dict | None = None,
     active_mcp_keys: list[str] | None = None,
+    refusal_fallback_model: str | None = None,
+    proactive_compact=None,  # async () -> list[dict] | None (new prior window)
+    prior_turns: int = 0,
 ) -> AgentLoopResult:
     """Run the streaming + tool-use loop. See module docstring for invariants.
 
@@ -567,6 +781,34 @@ async def run_agent_loop(
     # tool_use blocks). Initialized OUTSIDE the loop so the cap accumulates;
     # reset to 0 whenever a turn yields real tool_results.
     consecutive_empty = 0
+    # Refusal fallback state. When Fable 5 returns stop_reason=refusal (its
+    # category=None content classifier — not a real safety stop for this private
+    # deployment), retry the SAME request once on ``refusal_fallback_model``
+    # (Opus 4.8), which does not share that classifier. The switch is surfaced
+    # to the user (live note when streaming, prepended note otherwise) — never
+    # silent.
+    current_model = model
+    fallback_used = False
+    fallback_note_sent_live = False
+    # Text-form tool-call guard. If the model emits a tool call as plain TEXT
+    # (`<invoke …>`) with no real tool_use block, nothing executes; re-prompt
+    # once for a proper call before giving up (2026-06-13 poison, see
+    # docs/2026-06-13_tool_call_text_invoke_poison.md).
+    text_invoke_corrections = 0
+    # In-loop proactive compaction state (audit #3, ADR-0012). ``prior_len``
+    # tracks how many leading history entries belong to the prior transcript;
+    # a mid-loop compaction replaces history[:prior_len] with the collapsed
+    # window and updates it. At most one compaction per agent loop — repeated
+    # refills within one request are thrashing (rapid-refill breaker territory),
+    # not something more summarization fixes.
+    prior_len = prior_turns
+    proactive_compacted = False
+    # name → input_schema for pre-dispatch validation (audit #11).
+    tool_schemas = {
+        t.get("name"): t.get("input_schema")
+        for t in (tools_for_api or [])
+        if isinstance(t, dict)
+    }
 
     for turn in range(max_turns):
         messages = _normalize_history_for_api(history)
@@ -581,6 +823,7 @@ async def run_agent_loop(
                 text=f"⏳ {reason}",
                 synthetic_session_id=None,
                 active_mcp_keys=active_mcp_keys,
+                prior_len=prior_len,
             )
         # Soft pacing — sleep up to a few seconds if last response told us
         # we're in the warning zone, so we don't trip the probabilistic throttle.
@@ -596,11 +839,11 @@ async def run_agent_loop(
         # to read its dial from, so the model behaves as if effort were
         # unset.
         max_tokens = (
-            CLAUDE_MAX_TOKENS_OPUS if "opus" in (model or "").lower()
+            CLAUDE_MAX_TOKENS_OPUS if "opus" in (current_model or "").lower()
             else CLAUDE_MAX_TOKENS
         )
         stream_kwargs = dict(
-            model=model,
+            model=current_model,
             max_tokens=max_tokens,
             system=cached_system,
             messages=messages,
@@ -621,13 +864,35 @@ async def run_agent_loop(
         )
         if tools_for_api:
             stream_kwargs["tools"] = tools_for_api
-        if extra_headers:
-            stream_kwargs["extra_headers"] = extra_headers
+        merged_headers = dict(extra_headers or {})
+        if fallback_used:
+            merged_headers[REFUSAL_FALLBACK_HEADER] = "true"
+        if merged_headers:
+            stream_kwargs["extra_headers"] = merged_headers
 
+        # Live token stream for the CURRENT turn's visible text. Accumulated
+        # across text_delta events so text_stream_callback always receives the
+        # full prose-so-far (bot.py edits one draft message, throttled). Reset
+        # each turn so a new turn starts a fresh partial.
+        live_turn_text = ""
+        # Per-attempt timing (audit #16/#17): dispatch → first stream event is
+        # the TTFB leg the StallWatchdog can't see (its heartbeat starts on the
+        # first event, so a slow first byte and a mid-stream stall look alike).
+        request_start = time.monotonic()
+        ttft_ms: int | None = None
         try:
             async with api_client.beta.messages.stream(**stream_kwargs) as stream:
                 async for event in stream:
                     stall_watchdog.heartbeat()
+                    if ttft_ms is None:
+                        ttft_ms = int((time.monotonic() - request_start) * 1000)
+                        if ttft_ms > SLOW_FIRST_BYTE_MS:
+                            log.warning(
+                                "claude_api_slow_first_byte channel=%d turn=%d "
+                                "ttft_ms=%d threshold_ms=%d model=%s",
+                                channel_id, turn + 1, ttft_ms,
+                                SLOW_FIRST_BYTE_MS, current_model,
+                            )
                     etype = getattr(event, "type", None)
                     if etype == "content_block_start":
                         block = getattr(event, "content_block", None)
@@ -644,8 +909,48 @@ async def run_agent_loop(
                             if hint:
                                 label += f" `{hint[:60]}`"
                             await _safe_status(status_callback, label)
+                    elif etype == "content_block_delta" and text_stream_callback is not None:
+                        delta = getattr(event, "delta", None)
+                        if getattr(delta, "type", None) == "text_delta":
+                            piece = getattr(delta, "text", "") or ""
+                            if piece:
+                                live_turn_text += piece
+                                # bot.py owns throttling (≤1 edit / 1.5s) and
+                                # delivery; never let a UI hiccup abort the loop.
+                                try:
+                                    await text_stream_callback(live_turn_text)
+                                except Exception as exc:
+                                    log.debug("text_stream_callback failed: %s", exc)
                 final_msg = await stream.get_final_message()
-                _log_turn_usage(channel_id, turn, final_msg, usage_totals)
+                request_id = ""
+                try:
+                    _resp = getattr(stream, "response", None)
+                    _hdrs = getattr(_resp, "headers", None) if _resp else None
+                    if _hdrs is not None:
+                        request_id = _hdrs.get("request-id", "") or ""
+                except Exception:
+                    pass
+                _log_turn_usage(
+                    channel_id, turn, final_msg, usage_totals,
+                    # current_model, not the request arg: a mid-loop refusal
+                    # fallback swaps models between turns and the log must
+                    # show which one actually answered.
+                    model=current_model,
+                    request_id=request_id,
+                    duration_ms=int((time.monotonic() - request_start) * 1000),
+                    ttft_ms=ttft_ms,
+                    message_count=len(messages),
+                )
+                if getattr(final_msg, "stop_reason", None) == "refusal":
+                    try:
+                        _resp = getattr(stream, "response", None)
+                        _hdrs = getattr(_resp, "headers", None) if _resp else None
+                        _capture_refusal_request(
+                            channel_id, turn, model, cached_system, messages,
+                            extra_betas, final_msg, _hdrs,
+                        )
+                    except Exception:
+                        pass
                 # Update the shared rate-limit state from the response so
                 # the next turn (and the next call from entry.py) can pace
                 # itself before sending. anthropic SDK exposes the raw
@@ -698,6 +1003,38 @@ async def run_agent_loop(
             turn=turn,
         )
 
+        # Text-form tool-call guard: the model wrote a tool call as plain text
+        # (`<invoke …>`) instead of a real tool_use block, so nothing ran. The
+        # assistant turn was just appended (above); leave it in place and add a
+        # corrective user turn so the model re-issues a real call. Bounded to
+        # one correction; the persist/replay chokepoints strip the raw XML so
+        # it never poisons the transcript even if the retry is exhausted.
+        if (
+            not fired_tools_this_turn
+            and contains_text_tool_call(turn_text)
+            and text_invoke_corrections < MAX_TEXT_INVOKE_CORRECTIONS
+        ):
+            text_invoke_corrections += 1
+            history.append({
+                "role": "user",
+                "content": [{"type": "text", "text": _TEXT_INVOKE_CORRECTION}],
+            })
+            consecutive_empty = 0
+            log.warning(
+                "[ch=%d] turn=%d text-form tool call emitted as text → "
+                "corrective re-prompt (%d/%d)",
+                channel_id, turn + 1, text_invoke_corrections,
+                MAX_TEXT_INVOKE_CORRECTIONS,
+            )
+            await _safe_status(status_callback, "🔧 ツール呼び出しをやり直し中")
+            continue
+
+        # Belt-and-suspenders: if a text-form call slipped through (correction
+        # budget exhausted), strip the raw XML so neither Discord nor the
+        # accumulated answer shows it.
+        if turn_text and contains_text_tool_call(turn_text):
+            turn_text = strip_text_tool_call(turn_text)
+
         if turn_text:
             if incremental_text_callback is not None:
                 # Live-stream this turn's prose to the caller. The
@@ -722,31 +1059,77 @@ async def run_agent_loop(
             text_across_turns.append(turn_text)
 
         stop_reason = getattr(final_msg, "stop_reason", None)
+
+        # Refusal fallback: Fable 5's content classifier (stop_reason=refusal,
+        # category=None) does not fire on Opus 4.8. Retry the SAME request once
+        # on the fallback model. The refused assistant turn was just appended
+        # above — pop it so the retry re-sends the identical pre-turn context.
+        if (
+            stop_reason == "refusal"
+            and refusal_fallback_model
+            and not fallback_used
+            and current_model != refusal_fallback_model
+        ):
+            if history and history[-1].get("role") == "assistant":
+                history.pop()
+            fallback_used = True
+            current_model = refusal_fallback_model
+            consecutive_empty = 0
+            log.warning(
+                "[ch=%d] turn=%d Fable refusal → fallback to %s",
+                channel_id, turn + 1, current_model,
+            )
+            await _safe_status(
+                status_callback,
+                f"⚠️ {_model_display(current_model)} にフォールバック中",
+            )
+            # Push the alert into the Discord conversation (persistent), not just
+            # the transient status, so the user always sees that a fallback
+            # happened. When not streaming, it is prepended to the reply below.
+            if incremental_text_callback is not None:
+                try:
+                    await incremental_text_callback(_fallback_alert(current_model))
+                    fallback_note_sent_live = True
+                except Exception as exc:
+                    log.warning("fallback alert callback failed: %s", exc)
+            continue
+
         if stop_reason in ("end_turn", "stop_sequence"):
             last_text = "\n\n".join(text_across_turns)
+            if fallback_used and not fallback_note_sent_live and last_text:
+                last_text = (
+                    _fallback_alert(current_model) + "\n\n"
+                    + last_text
+                )
             _log_total_usage(channel_id, usage_totals)
             return AgentLoopResult(
                 text=last_text,
                 synthetic_session_id=uuid.uuid4().hex,
                 active_mcp_keys=active_mcp_keys,
+                fallback_model=current_model if fallback_used else None,
+                prior_len=prior_len,
             )
         if stop_reason != "tool_use":
             # max_tokens / refusal / unexpected — return whatever text we
             # accumulated up to this point. Falls back to the current
             # turn's text alone if for some reason we never appended.
             last_text = "\n\n".join(text_across_turns)
+            if fallback_used and not fallback_note_sent_live and last_text:
+                last_text = (
+                    _fallback_alert(current_model) + "\n\n"
+                    + last_text
+                )
             _log_total_usage(channel_id, usage_totals)
             return AgentLoopResult(
                 text=last_text or "(no response)",
                 synthetic_session_id=None,
                 active_mcp_keys=active_mcp_keys,
+                fallback_model=current_model if fallback_used else None,
+                prior_len=prior_len,
             )
 
         # Execute every tool_use block in this turn.
-        tool_results: list[dict] = []
-        for block in final_msg.content or []:
-            if getattr(block, "type", None) != "tool_use":
-                continue
+        async def _run_one_tool(block) -> dict:
             tool_id = getattr(block, "id", "")
             tool_name = getattr(block, "name", "")
             tool_input = getattr(block, "input", None) or {}
@@ -765,16 +1148,37 @@ async def run_agent_loop(
                         tool_name, turn, exc,
                     )
 
+            # Pre-dispatch schema validation (audit #11): a malformed call
+            # is answered in the CLI's <tool_use_error> shape, naming the
+            # field, so the model can fix it in one turn.
+            validation_error = _validate_tool_input(
+                tool_schemas.get(tool_name), tool_input,
+            )
+            if validation_error is not None:
+                log.info(
+                    "tool %s input validation failed: %s",
+                    tool_name, validation_error,
+                )
+                await _safe_status(status_callback, "❌ ツール入力エラー")
+                return {
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": (
+                        "<tool_use_error>InputValidationError: "
+                        f"{validation_error}</tool_use_error>"
+                    ),
+                    "is_error": True,
+                }
+
             allowed, reason = can_use_tool(tool_name, tool_input)
             if not allowed:
-                tool_results.append({
+                await _safe_status(status_callback, "❌ ツール拒否")
+                return {
                     "type": "tool_result",
                     "tool_use_id": tool_id,
                     "content": f"Tool {tool_name} denied: {reason}",
                     "is_error": True,
-                })
-                await _safe_status(status_callback, "❌ ツール拒否")
-                continue
+                }
 
             try:
                 t0 = time.monotonic()
@@ -791,24 +1195,41 @@ async def run_agent_loop(
                     result_content = output
                 else:
                     result_content = str(output)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_id,
-                    "content": result_content,
-                })
                 await _safe_status(
                     status_callback,
                     f"📨 結果を受信 ({dt:.1f}s)",
                 )
-            except Exception as exc:
-                log.warning("tool %s failed: %s", tool_name, exc)
-                tool_results.append({
+                return {
                     "type": "tool_result",
                     "tool_use_id": tool_id,
-                    "content": f"Error: {exc}",
-                    "is_error": True,
-                })
+                    "content": result_content,
+                }
+            except Exception as exc:
+                log.warning("tool %s failed: %s", tool_name, exc)
                 await _safe_status(status_callback, "❌ ツールエラー")
+                return {
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": f"<tool_use_error>{exc}</tool_use_error>",
+                    "is_error": True,
+                }
+
+        tool_blocks = [
+            b for b in (final_msg.content or [])
+            if getattr(b, "type", None) == "tool_use"
+        ]
+        # Read-only batches run concurrently (CLI isConcurrencySafe, audit
+        # #12); tool_result order still follows tool_use order because
+        # asyncio.gather preserves input order.
+        if len(tool_blocks) > 1 and all(
+            getattr(b, "name", "") in CONCURRENCY_SAFE_TOOLS
+            for b in tool_blocks
+        ):
+            tool_results = list(await asyncio.gather(
+                *(_run_one_tool(b) for b in tool_blocks)
+            ))
+        else:
+            tool_results = [await _run_one_tool(b) for b in tool_blocks]
 
         if not tool_results:
             # Pause turn: stop_reason was tool_use but the model emitted only
@@ -833,23 +1254,69 @@ async def run_agent_loop(
                 channel_id, turn + 1, consecutive_empty,
             )
             last_text = "\n\n".join(text_across_turns)
+            if fallback_used and not fallback_note_sent_live and last_text:
+                last_text = (
+                    _fallback_alert(current_model) + "\n\n"
+                    + last_text
+                )
             _log_total_usage(channel_id, usage_totals)
             return AgentLoopResult(
                 text=last_text or "(no response)",
                 synthetic_session_id=None,
                 active_mcp_keys=active_mcp_keys,
+                fallback_model=current_model if fallback_used else None,
+                prior_len=prior_len,
             )
         consecutive_empty = 0
         history.append({"role": "user", "content": tool_results})
+
+        # In-loop proactive compaction (audit #3, ADR-0012): the CLI folds the
+        # conversation BEFORE it overflows (proactive floor with a 20% buffer);
+        # the bot used to compact only at the session boundary, leaving a long
+        # in-loop turn to ride straight into a Fable refusal. When the last
+        # turn's real context footprint crossed the floor, replace the prior
+        # window with the freshly compacted one and continue the same loop.
+        if (
+            PROACTIVE_COMPACT_ENABLED
+            and proactive_compact is not None
+            and not proactive_compacted
+            and _context_tokens({
+                f: _usage_number(getattr(final_msg, "usage", None), f)
+                for f in _USAGE_FIELDS
+            }) > PROACTIVE_COMPACT_TRIGGER_TOKENS
+        ):
+            try:
+                new_prior = await proactive_compact()
+            except Exception as exc:  # noqa: BLE001 — never kill the loop
+                log.warning(
+                    "[ch=%d] in-loop proactive compaction failed: %s",
+                    channel_id, exc,
+                )
+                new_prior = None
+            proactive_compacted = True
+            if new_prior is not None:
+                log.info(
+                    "[ch=%d] in-loop proactive compaction: prior %d → %d entries",
+                    channel_id, prior_len, len(new_prior),
+                )
+                history[:prior_len] = new_prior
+                prior_len = len(new_prior)
 
     # Reached max_turns.
     log.warning("agent loop exhausted max_turns=%d for ch=%d", max_turns, channel_id)
     _log_total_usage(channel_id, usage_totals)
     accumulated = "\n\n".join(text_across_turns)
+    if fallback_used and not fallback_note_sent_live and accumulated:
+        accumulated = (
+            _fallback_alert(current_model) + "\n\n"
+            + accumulated
+        )
     return AgentLoopResult(
         text=accumulated or last_text or "🔄 ターン上限に達しました。もう一度話しかけてください。",
         synthetic_session_id=None,
         active_mcp_keys=active_mcp_keys,
+        fallback_model=current_model if fallback_used else None,
+        prior_len=prior_len,
     )
 
 

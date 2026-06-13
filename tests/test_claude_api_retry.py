@@ -111,3 +111,29 @@ class TestTransientRetryBound:
         # otherwise the loop falls through with result=None.
         last_attempt = list(range(TRANSIENT_MAX_ATTEMPTS))[-1]
         assert last_attempt >= TRANSIENT_MAX_ATTEMPTS - 1
+
+
+class TestRetryAfterFromHeaders:
+    """Audit #5: server retry-after must reach the backoff sleep."""
+
+    def test_numeric_seconds(self):
+        from services.claude_api.retry import retry_after_from_headers
+        assert retry_after_from_headers({"Retry-After": "45"}) == 45.0
+
+    def test_http_date(self):
+        from datetime import datetime, timedelta, timezone
+        from email.utils import format_datetime
+        from services.claude_api.retry import retry_after_from_headers
+        future = datetime.now(timezone.utc) + timedelta(seconds=60)
+        got = retry_after_from_headers({"retry-after": format_datetime(future)})
+        assert got is not None and 55 <= got <= 61
+
+    def test_missing_or_garbage(self):
+        from services.claude_api.retry import retry_after_from_headers
+        assert retry_after_from_headers(None) is None
+        assert retry_after_from_headers({}) is None
+        assert retry_after_from_headers({"retry-after": "soon"}) is None
+
+    def test_negative_clamped_to_zero(self):
+        from services.claude_api.retry import retry_after_from_headers
+        assert retry_after_from_headers({"retry-after": "-5"}) == 0.0

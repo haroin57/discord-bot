@@ -478,6 +478,10 @@ class TestOnMessage:
         import bot
 
         msg = _make_message(content="かなえ hello", author_id=12345)
+        # status_msg (the intake reply) must be awaitable so the error path
+        # can edit a short explanation onto it instead of deleting it.
+        status_msg = AsyncMock()
+        msg.reply = AsyncMock(return_value=status_msg)
 
         with patch("bot.strip_mention", return_value="hello"), \
              patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=RuntimeError("boom")), \
@@ -490,9 +494,11 @@ class TestOnMessage:
              patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
             await self._dispatch(msg)
 
-            calls = msg.reply.call_args_list
-            error_replied = any("❌" in str(c) for c in calls)
-            assert error_replied
+            # Error surfaces as an edit of the status message (P0: errors keep
+            # a short explanation rather than vanishing).
+            edit_calls = status_msg.edit.call_args_list
+            error_shown = any("❌" in str(c) for c in edit_calls)
+            assert error_shown
 
     @pytest.mark.asyncio
     async def test_channel_busy_cleared_after_success(self, monkeypatch):

@@ -59,6 +59,18 @@ def check_daily_quota(discord_id: str, is_admin: bool) -> tuple[bool, int]:
         return True, RESTRICTED_DAILY_QUOTA - len(bucket)
 
 
+def daily_quota_reset_seconds(discord_id: str, is_admin: bool) -> int:
+    """Return seconds until this user's current daily quota window opens."""
+    if is_admin or RESTRICTED_DAILY_QUOTA <= 0:
+        return 0
+    with _lock:
+        now = time.time()
+        bucket = [t for t in _daily_quota.get(discord_id, []) if now - t < _QUOTA_WINDOW_S]
+        if not bucket:
+            return 0
+        return max(0, int(_QUOTA_WINDOW_S - (now - min(bucket))))
+
+
 def reset_for_tests() -> None:
     """Test helper. Do not call from production code."""
     with _lock:

@@ -88,8 +88,17 @@ _IMAGE_SAVE_KWARGS = {
 GLOB_MAX_RESULTS = 1000
 GREP_MAX_RESULTS = 1000
 
+# Default and MAX are separate knobs, mirroring the CLI's
+# BASH_DEFAULT_TIMEOUT_MS / BASH_MAX_TIMEOUT_MS pair. The old code clamped the
+# model-supplied timeout DOWN to the default (min(timeout, default)), which
+# silently disabled the argument in the upward direction while the tool-loop
+# status line displayed the requested value — a contract lie (audit #1).
 BASH_DEFAULT_TIMEOUT_S = float(os.environ.get("CLAUDE_BASH_TIMEOUT_S", "120"))
-BASH_OUTPUT_CAP_BYTES = 100_000
+BASH_MAX_TIMEOUT_S = float(os.environ.get("CLAUDE_BASH_MAX_TIMEOUT_S", "600"))
+# Per-stream output cap. The CLI defaults to ~30KB; the old 100KB×2 was a
+# token sink (audit #13). Truncation is middle-cut (head+tail preserved) so
+# the FAILED/traceback tail of a test run is never hidden from the model.
+BASH_OUTPUT_CAP_BYTES = int(os.environ.get("CLAUDE_BASH_OUTPUT_CAP_BYTES", "30000"))
 
 # Whitelist of env vars that survive into Bash subprocesses. Anything else
 # (ANTHROPIC_API_KEY, DISCORD_TOKEN, etc.) must not leak to spawned shells.
@@ -489,12 +498,59 @@ def _bash_env() -> dict:
     return {k: v for k, v in os.environ.items() if k in BASH_ENV_ALLOWLIST}
 
 
+class _StreamCapture:
+    """Bounded head+tail capture of a subprocess stream.
+
+    Keeps the first ``cap`` bytes and a rolling buffer of the last ``cap``
+    bytes, so memory stays bounded for arbitrarily chatty commands while the
+    middle-cut rendering below can still show both the start of the output
+    and the tail (where test FAILED lines / tracebacks live).
+    """
+
+    def __init__(self, cap: int) -> None:
+        self.cap = cap
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.total = 0
+
+    def feed(self, chunk: bytes) -> None:
+        self.total += len(chunk)
+        if len(self.head) < self.cap:
+            take = self.cap - len(self.head)
+            self.head.extend(chunk[:take])
+            chunk = chunk[take:]
+        if chunk:
+            self.tail.extend(chunk)
+            if len(self.tail) > self.cap:
+                del self.tail[:len(self.tail) - self.cap]
+
+    def render(self) -> str:
+        """Decoded output, middle-cut when over budget (audit #13)."""
+        if self.total <= self.cap:
+            return self.head.decode("utf-8", errors="replace")
+        keep = self.cap // 2
+        head = self.head[:keep].decode("utf-8", errors="replace")
+        tail = self.tail[-keep:].decode("utf-8", errors="replace")
+        dropped = self.total - 2 * keep
+        return f"{head}\n... [{dropped} bytes truncated] ...\n{tail}"
+
+
+async def _drain_stream(stream, capture: _StreamCapture) -> None:
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            return
+        capture.feed(chunk)
+
+
 async def _tool_bash(args: dict, ctx: ToolContext) -> str:
     cmd = args.get("command")
     if not cmd or not isinstance(cmd, str):
         raise ValueError("command is required (string)")
+    # The model-supplied timeout is honored up to BASH_MAX_TIMEOUT_S (CLI
+    # parity: default and max are independent). Values are SECONDS.
     timeout_s = float(args.get("timeout", BASH_DEFAULT_TIMEOUT_S))
-    timeout_s = min(timeout_s, BASH_DEFAULT_TIMEOUT_S)  # cap to default
+    timeout_s = max(1.0, min(timeout_s, BASH_MAX_TIMEOUT_S))
 
     proc = await asyncio.create_subprocess_exec(
         "/bin/bash", "-c", cmd,
@@ -504,24 +560,47 @@ async def _tool_bash(args: dict, ctx: ToolContext) -> str:
         env=_bash_env(),
         start_new_session=True,  # isolate process group for clean termination
     )
+    # Incremental drain instead of communicate(): on timeout the buffered
+    # partial output is returned to the model (audit #10) instead of being
+    # discarded with a bare TimeoutError — `npm test` / `pip install` runs
+    # that time out keep their diagnostics.
+    out_cap = _StreamCapture(BASH_OUTPUT_CAP_BYTES)
+    err_cap = _StreamCapture(BASH_OUTPUT_CAP_BYTES)
+    drain = asyncio.gather(
+        _drain_stream(proc.stdout, out_cap),
+        _drain_stream(proc.stderr, err_cap),
+    )
+    timed_out = False
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        await asyncio.wait_for(drain, timeout=timeout_s)
+        await proc.wait()
     except asyncio.TimeoutError:
+        timed_out = True
+        drain.cancel()
+        try:
+            await drain
+        except (asyncio.CancelledError, Exception):
+            pass
         # Kill the whole process group
         try:
             os.killpg(os.getpgid(proc.pid), 9)
         except (OSError, ProcessLookupError):
             pass
-        raise TimeoutError(f"command timed out after {timeout_s}s")
 
-    out = (stdout or b"").decode("utf-8", errors="replace")[:BASH_OUTPUT_CAP_BYTES]
-    err = (stderr or b"").decode("utf-8", errors="replace")[:BASH_OUTPUT_CAP_BYTES]
+    out = out_cap.render()
+    err = err_cap.render()
     pieces = []
     if out:
         pieces.append(out)
     if err:
         pieces.append(f"--- stderr ---\n{err}")
-    pieces.append(f"--- exit code: {proc.returncode} ---")
+    if timed_out:
+        pieces.append(
+            f"--- command timed out after {timeout_s:.0f}s; "
+            "partial output above ---"
+        )
+    else:
+        pieces.append(f"--- exit code: {proc.returncode} ---")
     return "\n".join(pieces)
 
 
@@ -689,7 +768,15 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
-                "timeout": {"type": "number"},
+                "timeout": {
+                    "type": "number",
+                    "description": (
+                        f"Optional timeout in SECONDS (default "
+                        f"{BASH_DEFAULT_TIMEOUT_S:.0f}, max "
+                        f"{BASH_MAX_TIMEOUT_S:.0f}). Values above the max "
+                        "are clamped."
+                    ),
+                },
             },
             "required": ["command"],
         },

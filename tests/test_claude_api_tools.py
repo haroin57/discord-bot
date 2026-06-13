@@ -212,10 +212,17 @@ class TestBash:
 
     @pytest.mark.asyncio
     async def test_bash_timeout(self, tmpdir_ctx):
-        with pytest.raises(TimeoutError):
-            await execute_builtin_tool(
-                "Bash", {"command": "sleep 5", "timeout": 0.2}, tmpdir_ctx,
-            )
+        # Timeout no longer raises (audit #10): the buffered partial output is
+        # returned with a timed-out marker so npm test / pip install runs keep
+        # their diagnostics.
+        out = await execute_builtin_tool(
+            "Bash",
+            {"command": "echo partial; sleep 5", "timeout": 1},
+            tmpdir_ctx,
+        )
+        assert "partial" in out
+        assert "timed out after" in out
+        assert "exit code" not in out
 
     @pytest.mark.asyncio
     async def test_bash_output_capped(self, tmpdir_ctx):
@@ -227,7 +234,10 @@ class TestBash:
         # Output portion alone must not exceed the cap (the trailing
         # "exit code" line is appended separately).
         stdout_section = out.split("--- stderr ---")[0].rsplit("--- exit", 1)[0]
-        assert len(stdout_section) <= BASH_OUTPUT_CAP_BYTES + 16
+        # Middle-cut keeps head+tail halves plus a "[N bytes truncated]"
+        # marker line between them (audit #13).
+        assert len(stdout_section) <= BASH_OUTPUT_CAP_BYTES + 64
+        assert "bytes truncated" in out
 
 
 class TestGlob:

@@ -31,10 +31,21 @@ from config import (
     ATTACHMENT_DIR,
     CLAUDE_MAX_PARALLEL,
     CWD,
+    FABLE_REFUSAL_FALLBACK_ENABLED,
+    FABLE_REFUSAL_FALLBACK_MODEL,
+    HISTORY_COMPACT_TRIGGER_CHARS,
+    HISTORY_COMPACT_TRIGGER_TOKENS,
     RESTRICTED_CLAUDE_MAX_PARALLEL,
     RESTRICTED_SYSTEM_PROMPT,
+    RETRY_AFTER_MAX_S,
     MCP_SERVERS,
     SYSTEM_PROMPT,
+)
+from services.claude_api.compaction import (
+    compact_channel_history,
+    estimate_replay_chars,
+    record_proactive_compaction,
+    reset_rapid_refill,
 )
 from services.mcp_selector import (
     get_mcp_servers_by_keys,
@@ -72,15 +83,24 @@ from services.claude_api.retry import (
     TRANSIENT_MAX_ATTEMPTS,
     check_and_record_retry_budget,
     compute_backoff,
+    retry_after_from_headers,
 )
+from services.claude_api.ratelimit import append_rate_limit_details
 from services.claude_api.session_store import (
     _clear_session_time,
+    _get_sticky_model,
     _is_session_fresh,
     _record_session_time,
+    _record_sticky_model,
 )
 from services.claude_api.stall import StallWatchdog
 from services.claude_api.status import _safe_status
-from services.claude_api.tool_loop import AgentLoopResult, run_agent_loop
+from services.claude_api.tool_loop import (
+    REFUSAL_FALLBACK_HEADER,
+    AgentLoopResult,
+    get_last_context_tokens,
+    run_agent_loop,
+)
 from services.claude_api.tools import (
     ToolContext,
     builtin_tools_for_api,
@@ -100,9 +120,28 @@ MODEL = "claude-fable-5"
 # follow-up, so the tools fell out of advertised_tools and Kanae burned
 # the whole agent loop hunting for tools that were no longer in her
 # schema list. Static-advertise + lazy-spawn matches the mem0 pattern.
-ALWAYS_ADVERTISED_MCP_KEYS = {"mem0", "x-scraper", "news-curator", "brave-search"}
+ALWAYS_ADVERTISED_MCP_KEYS = {
+    "mem0", "x-scraper", "news-curator", "brave-search",
+    # Market data (2026-06-13): replaces the Brave-search-the-finance-page
+    # pattern for quotes, and feeds the VI strategy signal checks. Static
+    # schemas + lazy spawn, same as the rest.
+    "nikkei-indexes", "yfj-quote",
+}
 
 _SNAPSHOT_MAX_AGE_S = int(os.environ.get("SNAPSHOT_MAX_AGE_S", "900"))
+
+
+def _anthropic_error_headers(exc: BaseException):
+    resp = getattr(exc, "response", None)
+    return getattr(resp, "headers", None) if resp is not None else None
+
+
+def _classified_error_message(category: str, exc: BaseException | None = None) -> str:
+    message = _error_message(category)
+    if category == "rate_limit" and exc is not None:
+        return append_rate_limit_details(message, _anthropic_error_headers(exc))
+    return message
+
 
 def _prepend_context_snapshot(
     user_content: "str | list[dict]", snapshot: str,
@@ -197,6 +236,7 @@ async def call_with_tools(
     sessions: dict[int, SessionInfo],
     status_callback=None,
     incremental_text_callback=None,
+    text_stream_callback=None,
     tool_invocation_callback=None,
     restricted: bool = False,
     raw_user_text: str = "",
@@ -261,14 +301,12 @@ async def call_with_tools(
         # by session_id does not exist, so we must replay the transcript on
         # every turn — the same trick the official `claude --resume` does
         # against ~/.claude/projects/<cwd>/<session_id>.jsonl.
-        # The replayed message list is only safe to feed back to the API when
-        # the MCP set still matches (resumable=True). The Mem0 snapshot on the
-        # other hand is always safe to inherit — it is opaque text, not
-        # tool_use / tool_result blocks — and is the only way short
-        # follow-ups after an MCP-mismatch turn keep their Mem0 context (see
-        # bug postmortem in docs/plans/pdf-pdf-pdf-pdf-tingly-moth.md). So we
-        # call load_api_replay_channel for everyone except restricted and
-        # only gate the prior_history assignment on resumable.
+        # The transcript is replayed for every non-restricted turn, session
+        # boundary or not (ADR-0010 phase 3) — MCP keys merge instead of
+        # invalidating (see _resolve_session), so replayed tool_use blocks
+        # stay valid. The Mem0 snapshot is likewise always inherited — it is
+        # opaque text, not tool_use / tool_result blocks (see bug postmortem
+        # in docs/plans/pdf-pdf-pdf-pdf-tingly-moth.md).
         prior_history: list[dict] = []
         latest_context_snapshot = ""
         if not restricted:
@@ -297,8 +335,14 @@ async def call_with_tools(
                             latest_context_snapshot = ""
                     except (ValueError, TypeError):
                         pass
-                if resumable:
-                    prior_history = loaded_history
+                # ADR-0010 phase 3: seed the prior transcript regardless of
+                # session freshness — the same thing the official CLI's
+                # --resume does. Before this, a restart / 30-min TTL lapse
+                # (resumable=False) silently dropped the whole conversation;
+                # now the context survives the boundary, and when the window
+                # has grown past the Fable-safe budget it is compacted below
+                # before the request goes out.
+                prior_history = loaded_history
 
         # 5. Per-call settings
         if restricted:
@@ -352,6 +396,63 @@ async def call_with_tools(
             # 7. API client
             api_client = await _make_api_client(restricted)
 
+            # 7b. History compaction (ADR-0010 phase 3): when the replay
+            # window has outgrown the Fable-safe budget, fold the older
+            # portion into a compact-summary row (official-CLI compact
+            # semantics) and reload the collapsed window. Every failure mode
+            # is non-fatal — the raw history still works via the refusal
+            # fallback downstream, just at higher cost.
+            if not restricted and prior_history:
+                try:
+                    # Token-first trigger (audit #7): once a previous turn has
+                    # reported real usage, gate on tokens (chars mis-estimate
+                    # JP/code transcripts by 2-4x). The char gate remains as
+                    # the cold-start fallback (no usage observed yet — fresh
+                    # process). force=True on the token path so the summary
+                    # call's own char gate cannot veto a token decision.
+                    over_tokens = (
+                        get_last_context_tokens(channel_id)
+                        > HISTORY_COMPACT_TRIGGER_TOKENS
+                    )
+                    _replay_chars = estimate_replay_chars(prior_history)
+                    over_chars = _replay_chars > HISTORY_COMPACT_TRIGGER_CHARS
+                    if over_tokens or over_chars:
+                        log.info(
+                            "[ch=%d] boundary compaction trigger: "
+                            "last_context_tokens=%d (trigger=%d, over=%s) "
+                            "replay_chars=%d (trigger=%d, over=%s) force=%s",
+                            channel_id,
+                            get_last_context_tokens(channel_id),
+                            HISTORY_COMPACT_TRIGGER_TOKENS, over_tokens,
+                            _replay_chars,
+                            HISTORY_COMPACT_TRIGGER_CHARS, over_chars,
+                            over_tokens,
+                        )
+                    if (
+                        (over_tokens or over_chars)
+                        and await compact_channel_history(
+                            channel_id, api_client, status_callback,
+                            force=over_tokens,
+                        )
+                    ):
+                        reloaded, _snap, _ts = await asyncio.to_thread(
+                            load_api_replay_channel, channel_id
+                        )
+                        if reloaded:
+                            log.info(
+                                "[ch=%d] boundary compaction reload: "
+                                "replay %d → %d turns, %d → %d chars",
+                                channel_id,
+                                len(prior_history), len(reloaded),
+                                _replay_chars, estimate_replay_chars(reloaded),
+                            )
+                            prior_history = reloaded
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "[ch=%d] history compaction failed (non-fatal): %s",
+                        channel_id, exc,
+                    )
+
             # 8. Retry loop around run_agent_loop. The loop range
             # (TRANSIENT_MAX_ATTEMPTS) is the single source of truth for the
             # attempt count — there is no separate max_attempts to keep in
@@ -359,6 +460,36 @@ async def call_with_tools(
             # failures as "unknown").
             response_text: str | None = None
             result: AgentLoopResult | None = None
+            # Fallback-ladder state (audit #6): set when a 404 (model renamed/
+            # retired) or near-exhausted 529 streak forces the request onto the
+            # fallback model for the remaining attempts. Distinct from the
+            # refusal sticky pin — this is a transport-level escape, scoped to
+            # this request only.
+            forced_model: str | None = None
+            # Rapid-refill accounting for the in-loop proactive compaction
+            # (audit #19): True when this request triggered one.
+            proactive_fired = False
+
+            async def _proactive_compact() -> "list[dict] | None":
+                """In-loop compaction callback for run_agent_loop (audit #3).
+
+                Folds the prior transcript mid-request and returns the
+                reloaded (collapsed) replay window, or None when compaction
+                did not happen (disabled / breaker open / summary failed).
+                """
+                nonlocal proactive_fired
+                ok = await compact_channel_history(
+                    channel_id, api_client, status_callback, force=True,
+                )
+                if not ok:
+                    return None
+                proactive_fired = True
+                record_proactive_compaction(channel_id)
+                reloaded, _s, _t = await asyncio.to_thread(
+                    load_api_replay_channel, channel_id
+                )
+                return reloaded
+
             for attempt in range(TRANSIENT_MAX_ATTEMPTS):
                 if attempt > 0 and not check_and_record_retry_budget(channel_id):
                     log.warning("Retry budget exhausted for ch=%d", channel_id)
@@ -412,6 +543,17 @@ async def call_with_tools(
                             _user_chars, _user_blocks, len(system_prompt or ""),
                             len(advertised_tools), resumable, attempt + 1,
                         )
+                        # ADR-0010: once this session fell back to Opus, pin
+                        # subsequent turns to Opus. Re-trying Fable on every
+                        # turn at long context re-pays the full cache_creation
+                        # (~240k tokens observed) only to get refused again,
+                        # and the alternating models keep both prompt caches
+                        # cold (cache_read=0 on every Fable turn). Restricted
+                        # channels stay on the default model (no pinning).
+                        sticky_model = (
+                            _get_sticky_model(channel_id) if not restricted else None
+                        )
+                        effective_model = forced_model or sticky_model or MODEL
                         result = await run_agent_loop(
                             user_content_for_loop,
                             channel_id,
@@ -422,17 +564,54 @@ async def call_with_tools(
                             execute_tool=_execute_tool,
                             status_callback=status_callback,
                             incremental_text_callback=incremental_text_callback,
+                            text_stream_callback=text_stream_callback,
                             tool_invocation_callback=tool_invocation_callback,
                             max_turns=max_turns,
                             stall_watchdog=watchdog,
                             api_client=api_client,
-                            model=MODEL,
+                            model=effective_model,
                             extra_betas=MODEL_BETAS,
                             active_mcp_keys=sorted(
                                 chosen_mcp_keys | always_advertised_mcp_keys
                             ),
+                            # On a Fable 5 refusal (content classifier, not a
+                            # real safety stop here), retry once on Opus 4.8 and
+                            # surface the switch. Only when the primary model is
+                            # actually Fable — never fall Opus back onto Opus.
+                            refusal_fallback_model=(
+                                FABLE_REFUSAL_FALLBACK_MODEL
+                                if (FABLE_REFUSAL_FALLBACK_ENABLED
+                                    and "fable" in (effective_model or "").lower())
+                                else None
+                            ),
+                            # A sticky pin means a refusal fallback already
+                            # happened in this session — mark every subsequent
+                            # request the way the official CLI does
+                            # (x-is-refusal-fallback: true, ADR-0010).
+                            extra_headers=(
+                                {REFUSAL_FALLBACK_HEADER: "true"}
+                                if sticky_model else None
+                            ),
+                            # In-loop proactive compaction (audit #3): admin
+                            # channels only — restricted is stateless, there
+                            # is no transcript to fold.
+                            proactive_compact=(
+                                _proactive_compact if not restricted else None
+                            ),
+                            prior_turns=len(history_for_loop),
                         )
                         response_text = result.text
+                        if getattr(result, "fallback_model", None):
+                            log.warning(
+                                "[ch=%d] response generated via refusal fallback model=%s",
+                                channel_id, result.fallback_model,
+                            )
+                            if not restricted:
+                                # Pin the session so the next turn starts on
+                                # the fallback model directly (ADR-0010).
+                                _record_sticky_model(
+                                    channel_id, result.fallback_model
+                                )
                         break
                     except asyncio.CancelledError:
                         # Stall watchdog fired or shutdown — surface as timeout.
@@ -450,7 +629,37 @@ async def call_with_tools(
                             # the next turn loads a shorter JSONL tail.
                             sessions.pop(channel_id, None)
                             _clear_session_time(channel_id)
-                            return _error_message(category), None, False
+                            return _classified_error_message(category, exc), None, False
+                        if category == "tool_use_mismatch":
+                            # tool_use/tool_result pairing 400 (audit #14):
+                            # the replayed transcript desynced. Recoverable —
+                            # drop the session so the next turn reloads a
+                            # clean, Yy8-swept replay window instead of
+                            # treating the channel as permanently broken.
+                            sessions.pop(channel_id, None)
+                            _clear_session_time(channel_id)
+                            return _classified_error_message(category, exc), None, False
+                        if category == "model_not_found":
+                            # Model renamed/retired (audit #6, CLI
+                            # tengu_api_model_not_found_fallback). Escape to
+                            # the fallback model once; a 404 on the fallback
+                            # too is a real outage.
+                            if (
+                                forced_model is None
+                                and FABLE_REFUSAL_FALLBACK_ENABLED
+                                and effective_model != FABLE_REFUSAL_FALLBACK_MODEL
+                            ):
+                                forced_model = FABLE_REFUSAL_FALLBACK_MODEL
+                                log.warning(
+                                    "[ch=%d] model %s not found → fallback to %s",
+                                    channel_id, effective_model, forced_model,
+                                )
+                                await _safe_status(
+                                    status_callback,
+                                    "⚠️ モデル不在のためフォールバック中",
+                                )
+                                continue
+                            return _classified_error_message(category, exc), None, resumable
                         if category == "auth" and attempt == 0:
                             # OAuth race: a sibling process (typically the
                             # mem0-mcp MCP server) refreshed the token while
@@ -478,12 +687,12 @@ async def call_with_tools(
                             # invalid. Surface to user.
                             # max_turns: tool-loop hit the per-request turn
                             # cap — session history is still valid.
-                            return _error_message(category), None, resumable
+                            return _classified_error_message(category, exc), None, resumable
                         if not _is_transient(category):
                             # Permanent errors (api_exit, invalid_request,
                             # unknown) — retrying won't help. Return
                             # immediately to avoid wasting API calls.
-                            return _error_message(category), None, resumable
+                            return _classified_error_message(category, exc), None, resumable
                         # Transient (overloaded / rate_limit): the loop runs
                         # `range(TRANSIENT_MAX_ATTEMPTS)`, so the final attempt
                         # is `TRANSIENT_MAX_ATTEMPTS - 1`. We MUST return the
@@ -496,11 +705,46 @@ async def call_with_tools(
                             # Transient errors exhausted retries — keep the
                             # session alive so the next user message can
                             # resume without losing context.
-                            return _error_message(category), None, resumable
+                            return _classified_error_message(category, exc), None, resumable
+                        # Overload escape hatch (audit #6, CLI
+                        # tengu_api_opus_fallback): when 529s have nearly
+                        # exhausted the budget and we are still on Fable,
+                        # spend the remaining attempt(s) on the fallback
+                        # model instead of hammering the same overloaded pool.
+                        if (
+                            category == "overloaded"
+                            and attempt >= TRANSIENT_MAX_ATTEMPTS - 2
+                            and forced_model is None
+                            and FABLE_REFUSAL_FALLBACK_ENABLED
+                            and "fable" in (effective_model or "").lower()
+                        ):
+                            forced_model = FABLE_REFUSAL_FALLBACK_MODEL
+                            log.warning(
+                                "[ch=%d] overload streak on %s → trying %s",
+                                channel_id, effective_model, forced_model,
+                            )
+                        # Honor the server's retry-after when present (audit
+                        # #5): the longer of server-requested wait and our
+                        # computed backoff wins (CLI lqH). A wait beyond
+                        # RETRY_AFTER_MAX_S is pointless for a chat reply —
+                        # surface the classified error immediately instead.
                         backoff = compute_backoff(attempt)
+                        retry_after = retry_after_from_headers(
+                            _anthropic_error_headers(exc)
+                        )
+                        if retry_after is not None:
+                            if retry_after > RETRY_AFTER_MAX_S:
+                                log.warning(
+                                    "[ch=%d] retry-after=%.0fs exceeds max %.0fs"
+                                    " — giving up early",
+                                    channel_id, retry_after, RETRY_AFTER_MAX_S,
+                                )
+                                return _classified_error_message(category, exc), None, resumable
+                            backoff = max(backoff, retry_after)
                         await _safe_status(
                             status_callback,
-                            f"🔄 リトライ中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})",
+                            f"🔄 再試行中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})"
+                            f"、次は約{int(round(backoff))}秒後",
                         )
                         await asyncio.sleep(backoff)
                     except httpx.RequestError as exc:
@@ -524,7 +768,8 @@ async def call_with_tools(
                         backoff = compute_backoff(attempt)
                         await _safe_status(
                             status_callback,
-                            f"🔄 接続リトライ中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})",
+                            f"🔄 接続再試行中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})"
+                            f"、次は約{int(round(backoff))}秒後",
                         )
                         await asyncio.sleep(backoff)
                     except BaseExceptionGroup as eg:
@@ -552,13 +797,18 @@ async def call_with_tools(
                         backoff = compute_backoff(attempt)
                         await _safe_status(
                             status_callback,
-                            f"🔄 接続リトライ中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})",
+                            f"🔄 接続再試行中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})"
+                            f"、次は約{int(round(backoff))}秒後",
                         )
                         await asyncio.sleep(backoff)
 
         # 9. Wrap into SessionInfo
         if response_text is None or result is None:
             return _error_message("unknown"), None, False
+        # Rapid-refill breaker bookkeeping (audit #19): a request that finished
+        # without needing an in-loop compaction resets the consecutive counter.
+        if not restricted and not proactive_fired:
+            reset_rapid_refill(channel_id)
         session_info = SessionInfo(
             session_id=result.synthetic_session_id or "",
             mcp_server_keys=result.active_mcp_keys,
@@ -597,7 +847,15 @@ async def call_with_tools(
                 # is the assistant/tool_result expansion we store verbatim so a
                 # later resume replays signed thinking + tool context instead of
                 # flattened text (the structureless replay caused the refusals).
-                new_turns = history_for_loop[len(prior_history):]
+                # The prior-window boundary may have moved if an in-loop
+                # proactive compaction replaced history[:prior_len] (audit #3);
+                # result.prior_len is authoritative when set.
+                _prior_len = (
+                    result.prior_len
+                    if result.prior_len is not None
+                    else len(prior_history)
+                )
+                new_turns = history_for_loop[_prior_len:]
                 api_messages = new_turns[1:] if len(new_turns) > 1 else None
                 user_entry, assistant_entry = build_compact_history_entries(
                     raw_user_text=raw_user_text or prompt_text,

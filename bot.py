@@ -58,6 +58,10 @@ from services.session import SessionInfo, load_history_channel, load_sessions, u
 from services.prompt_builder import PromptBuilder
 from services.music_analyzer import analyze_music_attachments
 from utils.attachments import (
+    IMAGE_CONTENT_TYPES,
+    MAX_ARBITRARY_ATTACHMENT_BYTES,
+    MAX_TEXT_ATTACHMENT_BYTES,
+    TEXT_CONTENT_TYPES,
     cleanup_attachments,
     cleanup_stale_attachments,
     download_arbitrary_attachments,
@@ -138,11 +142,74 @@ def _mark_mem0_recorded(channel_id: int) -> None:
 # Shared rate-limit module (H6) — defensive import with legacy fallback
 # ---------------------------------------------------------------------------
 try:
-    from services.rate_limit import check_cooldown as _rl_check_cooldown, check_daily_quota as _rl_check_daily_quota
+    from services.rate_limit import (
+        check_cooldown as _rl_check_cooldown,
+        check_daily_quota as _rl_check_daily_quota,
+        daily_quota_reset_seconds as _rl_daily_quota_reset_seconds,
+    )
     _USE_SHARED_RATE_LIMIT = True
 except ImportError:
     _USE_SHARED_RATE_LIMIT = False
     log.warning("services.rate_limit not available; using local cooldown/quota fallback")
+
+from services.job_state import (
+    JobPhase,
+    JobState,
+    cancel_channel_jobs,
+    queue_position,
+    register_job,
+    unregister_job,
+)
+
+
+def _fmt_clock(epoch_s: float) -> str:
+    """HH:MM local-time label for '解除目安' style user-facing wording."""
+    return time.strftime("%H:%M", time.localtime(epoch_s))
+
+
+def _mb(n: int) -> str:
+    return f"{n // (1024 * 1024)}MB"
+
+
+def _classify_attachment_rejections(
+    attachments: list, *, caller_is_admin: bool,
+) -> tuple[int, list[tuple[str, str]]]:
+    """Predict which attachments the downloaders will silently drop (P2).
+
+    Mirrors the size / type gates in utils.attachments from each attachment's
+    metadata so the user gets a reason instead of a silent drop. Returns
+    ``(accepted_count, [(filename, reason), ...])``. Best-effort: a file
+    counted "accepted" here can still fail mid-download (logged separately),
+    but the common rejections (oversize, unsupported type, non-admin) are
+    surfaced.
+    """
+    accepted = 0
+    rejected: list[tuple[str, str]] = []
+    for att in attachments:
+        name = getattr(att, "filename", None) or "attachment"
+        size = getattr(att, "size", 0) or 0
+        ctype = (getattr(att, "content_type", None) or "").split(";")[0].strip().lower()
+        if ctype in IMAGE_CONTENT_TYPES:
+            if size > MAX_ATTACHMENT_BYTES:
+                rejected.append((name, f"サイズ超過(>{_mb(MAX_ATTACHMENT_BYTES)})"))
+            else:
+                accepted += 1
+        elif ctype in TEXT_CONTENT_TYPES:
+            if size > MAX_TEXT_ATTACHMENT_BYTES:
+                rejected.append((name, "サイズ超過(テキストは100KBまで)"))
+            else:
+                accepted += 1
+        else:
+            # Non-image, non-text: admin-only arbitrary attachment path.
+            if not caller_is_admin:
+                rejected.append((name, "非対応の形式(管理者のみ対応)"))
+            elif size > MAX_ARBITRARY_ATTACHMENT_BYTES:
+                rejected.append(
+                    (name, f"サイズ超過(>{_mb(MAX_ARBITRARY_ATTACHMENT_BYTES)})")
+                )
+            else:
+                accepted += 1
+    return accepted, rejected
 
 # ---------------------------------------------------------------------------
 # Correlation / request-ID module (SRE-H4) — defensive import with no-op fallback
@@ -184,11 +251,9 @@ _cleanup_scheduled: bool = False
 # and run_daemon() must not be scheduled twice.
 _vscode_sync_started: bool = False
 
-# /abort target registry: channel_id → on_message Task currently generating
-# a reply in that channel. Populated at on_message entry (after the early
-# dispatch filters) and cleared in the finally block. The /abort command
-# looks up the entry by channel_id and calls task.cancel().
-_active_message_jobs: dict[int, asyncio.Task] = {}
+# Job lifecycle tracking moved to services/job_state.py: jobs register BEFORE
+# the channel semaphore, so /abort reaches queued work too, and the queue
+# position can be shown to the user.
 
 
 def _track_task(coro, *, name: str | None = None) -> asyncio.Task:
@@ -564,15 +629,16 @@ async def abort_cmd(interaction: discord.Interaction):
         return
 
     channel_id = interaction.channel_id
-    task = _active_message_jobs.get(channel_id) if channel_id is not None else None
-    if task is None or task.done():
+    cancelled = cancel_channel_jobs(channel_id) if channel_id is not None else 0
+    if cancelled == 0:
         await interaction.response.send_message(
-            "中断対象なし (進行中の応答はありません)", ephemeral=True,
+            "中断対象なし (進行中・待機中の応答はありません)", ephemeral=True,
         )
         return
-
-    task.cancel()
-    await interaction.response.send_message("中断要求を送りました", ephemeral=True)
+    await interaction.response.send_message(
+        f"中断要求を送りました({cancelled}件: 実行中と待機中のジョブを含む)",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="vscode-sync", description="VSCode Claude Code → Discord 同期の切替 (admin only)")
@@ -721,7 +787,10 @@ async def on_message(message: discord.Message):
     if _USE_SHARED_RATE_LIMIT:
         _cd_allowed, _cd_wait = _rl_check_cooldown(str(message.author.id), caller_is_admin)
         if not _cd_allowed:
-            await message.reply(f"⏳ Please wait {_cd_wait}s before sending another request.")
+            await message.reply(
+                f"⏳ クールダウン中です。あと{_cd_wait}秒"
+                f"({_fmt_clock(time.time() + _cd_wait)} 頃に解除)で送信できます。"
+            )
             return
     else:
         now = time.time()
@@ -729,7 +798,10 @@ async def on_message(message: discord.Message):
         effective_cooldown = COOLDOWN_SECONDS if caller_is_admin else RESTRICTED_COOLDOWN_SECONDS
         if now - last < effective_cooldown:
             remaining = int(effective_cooldown - (now - last))
-            await message.reply(f"⏳ Please wait {remaining}s before sending another request.")
+            await message.reply(
+                f"⏳ クールダウン中です。あと{remaining}秒"
+                f"({_fmt_clock(now + remaining)} 頃に解除)で送信できます。"
+            )
             return
         cooldowns[message.author.id] = now
         cooldowns.move_to_end(message.author.id)
@@ -743,7 +815,22 @@ async def on_message(message: discord.Message):
         else:
             _q_allowed, _q_remaining = _check_daily_quota(message.author.id)
         if not _q_allowed:
-            await message.reply("⏳ 今日の利用上限に達しました。また明日来てください。")
+            quota_msg = "⏳ 今日の利用上限に達しました。"
+            if _USE_SHARED_RATE_LIMIT:
+                reset_s = _rl_daily_quota_reset_seconds(
+                    str(message.author.id), caller_is_admin
+                )
+                if reset_s > 0:
+                    reset_at = time.time() + reset_s
+                    quota_msg += (
+                        f"{time.strftime('%m/%d %H:%M', time.localtime(reset_at))}"
+                        " 頃に回復します。"
+                    )
+                else:
+                    quota_msg += "また明日来てください。"
+            else:
+                quota_msg += "また明日来てください。"
+            await message.reply(quota_msg)
             return
 
     raw_user_text = message.content.strip() if is_dm else strip_mention(message.content, bot.user.id)
@@ -757,25 +844,120 @@ async def on_message(message: discord.Message):
     sema = _get_channel_sema(message.channel.id)
     was_queued = sema.locked()
 
-    if was_queued:
-        try:
-            await message.add_reaction("\u23f3")  # ⏳ queued
-        except discord.errors.Forbidden:
-            pass
-        log.info("Message %s queued in channel %s (waiting for semaphore)",
-                 message.id, message.channel.id)
-    else:
-        try:
+    # P0 job lifecycle: register BEFORE the semaphore so queued work is
+    # visible (/abort can cancel it) and the user gets an immediate status
+    # reply — queue position while waiting, instead of emoji reactions.
+    job = JobState(
+        rid=get_request_id(),
+        channel_id=message.channel.id,
+        user_id=message.author.id,
+        task=asyncio.current_task(),
+    )
+    register_job(job)
+
+    status_msg: discord.Message | None = None
+    try:
+        if was_queued:
+            wait_pos = max(1, queue_position(job) - 1)
+            status_msg = await message.reply(f"⏳ 待機中({wait_pos}番目)")
+            log.info("Message %s queued in channel %s (pos=%d)",
+                     message.id, message.channel.id, wait_pos)
+        else:
+            status_msg = await message.reply("⏳ 考え中...")
+    except discord.errors.HTTPException:
+        status_msg = None
+
+    # 👀/⏳ reaction marker on the user's message (restored 2026-06-13,
+    # haroin request). The job-state status reply above replaced the old
+    # reaction-only flow, but the reaction is the at-a-glance "seen" signal
+    # on the message itself — keep BOTH: ⏳ while queued, 👀 once processing.
+    try:
+        if was_queued:
+            await message.add_reaction("⏳")  # ⏳ queued
+        else:
             await message.add_reaction("\U0001f440")  # 👀 processing
-        except discord.errors.Forbidden:
+    except discord.errors.HTTPException:
+        pass
+
+    # Status updater (latest-wins, 2s rate limit) — defined this early so
+    # the queue/preprocessing phases share the message the model phases
+    # edit later.
+    last_status_update = 0.0
+    _pending_status: dict = {"text": None, "task": None}
+    STATUS_INTERVAL_S = 2.0
+
+    async def _do_edit(text: str) -> None:
+        if status_msg is None:
+            return
+        try:
+            await status_msg.edit(content=text)
+        except discord.errors.HTTPException:
             pass
 
-    await sema.acquire()  # waits if channel is busy (FIFO)
-
-    # Swap ⏳→👀 when processing starts after waiting
-    if was_queued:
+    async def _delayed_edit(text: str, delay: float) -> None:
         try:
-            await message.remove_reaction("\u23f3", bot.user)
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        nonlocal last_status_update
+        last_status_update = time.monotonic()
+        _pending_status["task"] = None
+        await _do_edit(text)
+
+    async def _update_status(text: str):
+        """Latest-wins status updater with 2s rate limit.
+
+        Never drops the most recent text: if called within the cool-down,
+        schedule a delayed edit (cancelling any previously pending one).
+        Discord message limit is 2000 chars — truncate to stay safe.
+        """
+        if len(text) > 1990:
+            text = text[:1990] + "…"
+        nonlocal last_status_update
+        now_mono = time.monotonic()
+        elapsed = now_mono - last_status_update
+        if elapsed >= STATUS_INTERVAL_S:
+            # Cancel any pending delayed edit — this call is fresh enough.
+            pending = _pending_status.get("task")
+            if pending and not pending.done():
+                pending.cancel()
+                _pending_status["task"] = None
+            last_status_update = now_mono
+            # Fire-and-forget so the streaming loop isn't blocked on Discord I/O.
+            _track_task(_do_edit(text), name="status_edit")
+            return
+        # Too soon: remember latest text, schedule a single delayed edit.
+        _pending_status["text"] = text
+        pending = _pending_status.get("task")
+        if pending and not pending.done():
+            pending.cancel()
+        _pending_status["task"] = _track_task(
+            _delayed_edit(text, STATUS_INTERVAL_S - elapsed),
+            name="status_delayed_edit",
+        )
+
+    try:
+        await sema.acquire()  # waits if channel is busy (FIFO)
+    except asyncio.CancelledError:
+        # /abort while still queued — the semaphore is NOT held here, so
+        # there is nothing to release.
+        job.phase = JobPhase.FAILED
+        unregister_job(job)
+        if status_msg is not None:
+            try:
+                await status_msg.edit(content="⏹️ 待機中に中断されました")
+            except discord.errors.HTTPException:
+                pass
+        log.info("Message %s cancelled while queued in channel %s",
+                 message.id, message.channel.id)
+        return
+
+    job.phase = JobPhase.PREPROCESSING
+    if was_queued:
+        await _update_status("⏳ 考え中...")
+        # Swap ⏳→👀 now that processing actually starts.
+        try:
+            await message.remove_reaction("⏳", bot.user)
             await message.add_reaction("\U0001f440")
         except discord.errors.HTTPException:
             pass
@@ -784,9 +966,6 @@ async def on_message(message: discord.Message):
 
     mem0_user_id = str(message.author.id)
     image_paths: list[str] = []
-    _abort_task = asyncio.current_task()
-    if _abort_task is not None:
-        _active_message_jobs[message.channel.id] = _abort_task
     try:
         # --- Parallel pre-processing ---
         async def _fetch_reply():
@@ -912,6 +1091,16 @@ async def on_message(message: discord.Message):
                     }
                     for a in all_attachments
                 ],
+            )
+        _attach_rejected: list[tuple[str, str]] = []
+        if all_attachments:
+            _attach_accepted, _attach_rejected = _classify_attachment_rejections(
+                all_attachments, caller_is_admin=caller_is_admin,
+            )
+            await _update_status(
+                f"📎 添付ファイルを確認中({_attach_accepted}件受理"
+                + (f"・{len(_attach_rejected)}件不可" if _attach_rejected else "")
+                + ")"
             )
         http_session = await get_http_session()
         image_paths = await download_attachments(http_session, all_attachments)
@@ -1155,6 +1344,8 @@ async def on_message(message: discord.Message):
         # Mem0 recall — always inject when available (both resume and fresh).
         # Non-admins only see memories from their OWN user_id space.
         if mem0_task is not None:
+            job.phase = JobPhase.RECALLING
+            await _update_status("🧠 記憶を検索中")
             try:
                 mem_results = await mem0_task
                 mem0_block = format_memories_for_prompt(mem_results)
@@ -1227,58 +1418,11 @@ async def on_message(message: discord.Message):
 
         admin = caller_is_admin
 
-        status_msg = await message.reply("⏳ 考え中...")
-        last_status_update = 0.0
-        _pending_status: dict = {"text": None, "task": None}
-        STATUS_INTERVAL_S = 2.0
-
-        async def _do_edit(text: str) -> None:
-            try:
-                await status_msg.edit(content=text)
-            except discord.errors.HTTPException:
-                pass
-
-        async def _delayed_edit(text: str, delay: float) -> None:
-            try:
-                await asyncio.sleep(delay)
-            except asyncio.CancelledError:
-                return
-            nonlocal last_status_update
-            last_status_update = time.monotonic()
-            _pending_status["task"] = None
-            await _do_edit(text)
-
-        async def _update_status(text: str):
-            """Latest-wins status updater with 2s rate limit.
-
-            Never drops the most recent text: if called within the cool-down,
-            schedule a delayed edit (cancelling any previously pending one).
-            Discord message limit is 2000 chars — truncate to stay safe.
-            """
-            if len(text) > 1990:
-                text = text[:1990] + "…"
-            nonlocal last_status_update
-            now_mono = time.monotonic()
-            elapsed = now_mono - last_status_update
-            if elapsed >= STATUS_INTERVAL_S:
-                # Cancel any pending delayed edit — this call is fresh enough.
-                pending = _pending_status.get("task")
-                if pending and not pending.done():
-                    pending.cancel()
-                    _pending_status["task"] = None
-                last_status_update = now_mono
-                # Fire-and-forget so the streaming loop isn't blocked on Discord I/O.
-                _track_task(_do_edit(text), name="status_edit")
-                return
-            # Too soon: remember latest text, schedule a single delayed edit.
-            _pending_status["text"] = text
-            pending = _pending_status.get("task")
-            if pending and not pending.done():
-                pending.cancel()
-            _pending_status["task"] = _track_task(
-                _delayed_edit(text, STATUS_INTERVAL_S - elapsed),
-                name="status_delayed_edit",
-            )
+        # Status message + updater were created at intake (before the
+        # semaphore) so the queued phase shares the same message. Transition
+        # into the model phase here.
+        job.phase = JobPhase.CALLING_CLAUDE
+        await _update_status("📨 Claudeへ送信中")
 
         log.info("Routing to SDK/CLI (restricted=%s, is_thread=%s)", not admin, is_thread)
 
@@ -1289,46 +1433,85 @@ async def on_message(message: discord.Message):
         # the user would see a 2-3 minute silence while 20 manga pages
         # are read, then one mega-chunk at the very end.
         _live_sent_any = {"v": False}
-        # Track every message we post via _incremental_send so the
-        # post-stream math/table detection (bot.py:2035 block) can delete
-        # them and re-emit via _send_segmented when the response actually
-        # contains $$..$$ or a markdown table that streaming couldn't
-        # render. Insertion order is preserved.
+        # Track every draft message so the post-stream math/table detection
+        # can delete them and re-emit via _send_segmented when the response
+        # actually contains $$..$$ or a markdown table that the live drafts
+        # couldn't render. Insertion order is preserved.
         _live_messages: list[discord.Message] = []
+
+        # Draft-edit live accumulator (P1 + "精製時の中間表示を詳細に"):
+        #   - committed = prose from all completed turns (joined),
+        #   - the whole display (committed + in-progress partial) is re-split
+        #     into ≤LIVE_DRAFT_LIMIT chunks on every render; chunk i maps to
+        #     _live_messages[i] (edited in place), new chunks become new sends.
+        # split_message fills greedily from the start, so once an early chunk
+        # is full its content stops changing — only the tail message keeps
+        # growing, which is what gets edited. Edits are throttled to one per
+        # STREAM_EDIT_INTERVAL_S; turn boundaries / the final flush force an
+        # immediate render. The first message is a reply to the user's
+        # message; the rest are channel sends.
+        LIVE_DRAFT_LIMIT = 1900
+        STREAM_EDIT_INTERVAL_S = 1.5
+        _draft = {"committed": "", "last_edit": 0.0}
+
+        async def _render_drafts(full_text: str, *, force: bool) -> None:
+            full_text = (full_text or "").rstrip()
+            if not full_text:
+                return
+            now_mono = time.monotonic()
+            if not force and (now_mono - _draft["last_edit"]) < STREAM_EDIT_INTERVAL_S:
+                return
+            _draft["last_edit"] = now_mono
+            # numbered=False keeps early-chunk content stable across renders
+            # (a part marker's "n" would change as the tail grows, forcing
+            # needless edits to already-settled messages).
+            chunks = split_message(full_text, limit=LIVE_DRAFT_LIMIT, numbered=False)
+            for i, chunk in enumerate(chunks):
+                if not chunk.strip():
+                    continue
+                if i < len(_live_messages):
+                    existing = _live_messages[i]
+                    if getattr(existing, "content", None) == chunk:
+                        continue  # unchanged — skip the edit
+                    try:
+                        await existing.edit(content=chunk)
+                    except discord.errors.HTTPException:
+                        pass
+                else:
+                    try:
+                        if not _live_messages:
+                            sent = await message.reply(chunk)
+                        else:
+                            sent = await message.channel.send(chunk)
+                    except discord.errors.HTTPException as exc:
+                        log.warning("[rid=%s] draft send failed: %s",
+                                    get_request_id(), exc)
+                        return
+                    _live_messages.append(sent)
+                    _live_sent_any["v"] = True
+
+        async def _stream_preview(partial_turn_text: str) -> None:
+            # In-progress text of the CURRENT turn appended to everything
+            # already committed. Throttled; never forced (the turn-final
+            # _incremental_send forces the authoritative render).
+            sep = "\n\n" if _draft["committed"] else ""
+            await _render_drafts(
+                _draft["committed"] + sep + (partial_turn_text or ""), force=False,
+            )
 
         async def _incremental_send(text: str) -> None:
             text = (text or "").strip()
             if not text:
                 return
-            try:
-                chunks = split_message(text)
-                log.info(
-                    "[rid=%s] incremental send: %d chunk(s), %d chars",
-                    get_request_id(), len(chunks), len(text),
-                )
-                for chunk in chunks:
-                    if not chunk.strip():
-                        continue
-                    sent = await message.channel.send(chunk)
-                    _live_messages.append(sent)
-                    # Mark "live delivered" as soon as ONE chunk lands. If a
-                    # later chunk throws, the final-block path must still see
-                    # _live_sent_any=True so it does NOT re-send the whole
-                    # response_text and duplicate chunks 1..k-1 (rid=6072977f
-                    # class of bug).
-                    _live_sent_any["v"] = True
-                    log.info(
-                        "[rid=%s] sent live chunk %d/%d len=%d",
-                        get_request_id(), len(_live_messages), len(chunks), len(chunk),
-                    )
-            except Exception as exc:
-                log.warning(
-                    "[rid=%s] incremental send failed after %d chunk(s): %s",
-                    get_request_id(), len(_live_messages), exc,
-                )
-                # Re-raise so the agent loop falls back to accumulation
-                # (caller catches and stops sending live for this turn).
-                raise
+            sep = "\n\n" if _draft["committed"] else ""
+            _draft["committed"] = _draft["committed"] + sep + text
+            log.info(
+                "[rid=%s] live commit: turn=%d chars committed=%d",
+                get_request_id(), len(text), len(_draft["committed"]),
+            )
+            # Force an authoritative, fence-aware render of the full committed
+            # text (this is what splits >LIVE_DRAFT_LIMIT into extra drafts).
+            await _render_drafts(_draft["committed"], force=True)
 
         # Single edit-overwriting notice for tool invocations. The user
         # asked that tool scaffolding (Bash command, Read path, Edit
@@ -1339,6 +1522,7 @@ async def on_message(message: discord.Message):
         _tool_notice_state: dict = {"msg": None}
 
         async def _tool_invocation_send(tool_name: str, tool_input: dict) -> None:
+            job.phase = JobPhase.TOOL_RUNNING
             try:
                 from services.claude_api.tool_loop import (
                     _format_tool_invocation_for_display,
@@ -1380,6 +1564,7 @@ async def on_message(message: discord.Message):
             prompt, message.channel.id, sessions,
             status_callback=_update_status,
             incremental_text_callback=_incremental_send,
+            text_stream_callback=_stream_preview,
             tool_invocation_callback=_tool_invocation_send,
             restricted=not admin,
             raw_user_text=raw_user_text,
@@ -1387,6 +1572,9 @@ async def on_message(message: discord.Message):
             has_image_attachment=bool(image_paths),
             author=sender_speaker_label,
         )
+
+        job.phase = JobPhase.FINALIZING
+        await _update_status("🪄 整形中")
 
         if will_resume and not actually_resumed:
             # actually_resumed is the 3rd return value from call_with_tools.
@@ -1440,11 +1628,13 @@ async def on_message(message: discord.Message):
             pending_status_task.cancel()
             _pending_status["task"] = None
 
-        # Delete status message
-        try:
-            await status_msg.delete()
-        except discord.errors.HTTPException:
-            pass
+        # Delete status message (success path only — error paths leave a
+        # short explanation on it instead).
+        if status_msg is not None:
+            try:
+                await status_msg.delete()
+            except discord.errors.HTTPException:
+                pass
 
         # Empty-response guard. The model occasionally returns an empty
         # message (refusal stripped to nothing, ThinkingBlock-only output,
@@ -1652,7 +1842,7 @@ async def on_message(message: discord.Message):
                     if len(all_files) > 10:
                         log.warning("Capping attachments %d -> 10 for Discord limit", len(all_files))
                         all_files = all_files[:10]
-                    await message.reply("Response is too long, sending as file(s):", files=all_files)
+                    await message.reply("📄 長文のため response.md として添付します。", files=all_files)
                 elif _has_rich:
                     await _send_segmented(message, response_text, attach_files)
                 else:
@@ -1673,23 +1863,55 @@ async def on_message(message: discord.Message):
             for f in attach_files:
                 f.close()
 
+        # Surface rejected attachments (P2): one short line per file with its
+        # reason, instead of silently dropping. non-admin rejections are
+        # reported too so the sender knows why a file was ignored.
+        if _attach_rejected:
+            lines = [
+                f"⚠️ {name} は{reason}のため読み込めませんでした"
+                for name, reason in _attach_rejected[:10]
+            ]
+            try:
+                await message.channel.send("\n".join(lines))
+            except discord.errors.HTTPException:
+                pass
+
     except asyncio.CancelledError:
+        job.phase = JobPhase.FAILED
         log.info(
             "[rid=%s] on_message cancelled via /abort (channel=%s, user=%s)",
             get_request_id(), message.channel.id, message.author.id,
         )
+        # Leave a short note on the status message instead of deleting it
+        # (P0: errors keep a brief explanation; success deletes).
         try:
-            await message.channel.send("中断しました")
+            if status_msg is not None:
+                await status_msg.edit(content="⏹️ 中断しました")
+            else:
+                await message.channel.send("⏹️ 中断しました")
         except Exception:
             pass
     except Exception:
+        job.phase = JobPhase.FAILED
         log.exception(
             "Error processing message from user ...%s in #%s",
             str(message.author.id)[-4:], message.channel,
         )
-        await message.reply("❌ エラーが発生しました。")
+        err_text = "❌ エラーが発生しました。再試行してください。"
+        rid = get_request_id()
+        if caller_is_admin and rid:
+            # Short request id so the admin can grep the logs (P2).
+            err_text += f"\n-# req: {rid}"
+        try:
+            if status_msg is not None:
+                await status_msg.edit(content=err_text)
+            else:
+                await message.reply(err_text)
+        except Exception:
+            pass
     finally:
-        if _abort_task is not None and _active_message_jobs.get(message.channel.id) is _abort_task:
-            _active_message_jobs.pop(message.channel.id, None)
+        if job.phase not in (JobPhase.FAILED,):
+            job.phase = JobPhase.DONE
+        unregister_job(job)
         sema.release()
         await asyncio.to_thread(cleanup_attachments, image_paths)

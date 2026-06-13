@@ -53,7 +53,9 @@ from services.claude_api.mcp_client import (
 )
 from services.claude_api.ratelimit import (
     RateLimitState,
+    append_rate_limit_details,
     get_state as get_ratelimit_state,
+    format_rate_limit_details,
     maybe_wait_before_request,
     observe as observe_ratelimit,
     should_block as ratelimit_should_block,
@@ -135,6 +137,8 @@ __all__ = [
     "AgentLoopResult",
     "kill_orphan_claude_cli",
     "run_agent_loop",
+    "append_rate_limit_details",
+    "format_rate_limit_details",
     # restricted + entry (PR7)
     "RESTRICTED_DENY_LIST",
     "RESTRICTED_MAX_TURNS",
@@ -449,6 +453,13 @@ async def call_direct(
         await asyncio.to_thread(append_jsonl, channel_id, assistant_msg)
         return full_response.strip() or "(No response from Claude)"
 
+    except anthropic.RateLimitError as e:
+        log.error("Direct API rate limit: %s", e, exc_info=True)
+        if history and history[-1]["role"] == "user":
+            history.pop()
+        resp = getattr(e, "response", None)
+        headers = getattr(resp, "headers", None) if resp is not None else None
+        return append_rate_limit_details(_error_message("rate_limit"), headers)
     except Exception as e:
         log.error("Direct API error: %s", e, exc_info=True)
         if history and history[-1]["role"] == "user":

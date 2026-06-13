@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -91,6 +92,62 @@ class TestObserve:
         ratelimit.observe({"anthropic-ratelimit-unified-status": "rejected"})
         assert ratelimit._state.status == "rejected"
         assert abs(ratelimit._state.fallback_percentage - 0.5) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# User-facing detail formatting
+# ---------------------------------------------------------------------------
+class TestFormatRateLimitDetails:
+    def test_formats_standard_headers(self):
+        from services.claude_api import ratelimit
+
+        details = ratelimit.format_rate_limit_details(
+            {
+                "retry-after": "90",
+                "anthropic-ratelimit-requests-limit": "50",
+                "anthropic-ratelimit-requests-remaining": "0",
+                "anthropic-ratelimit-requests-reset": "2026-06-13T03:31:30Z",
+                "anthropic-ratelimit-input-tokens-limit": "40000",
+                "anthropic-ratelimit-input-tokens-remaining": "1000",
+                "anthropic-ratelimit-input-tokens-reset": "2026-06-13T03:32:00Z",
+            },
+            now=datetime(2026, 6, 13, 3, 30, 0, tzinfo=timezone.utc),
+        )
+
+        assert "解除目安: 2026-06-13 12:31:30 JST（約1分30秒後）" in details
+        assert "リクエスト: 50/50 使用（残り 0、100%）" in details
+        assert "入力トークン: 39,000/40,000 使用（残り 1,000、98%）" in details
+
+    def test_formats_unified_headers(self):
+        from services.claude_api import ratelimit
+
+        details = ratelimit.format_rate_limit_details(
+            {
+                "anthropic-ratelimit-unified-representative-claim": "five_hour",
+                "anthropic-ratelimit-unified-5h-utilization": "0.85",
+                "anthropic-ratelimit-unified-7d-utilization": "0.40",
+                "anthropic-ratelimit-unified-fallback-percentage": "0.10",
+                "anthropic-ratelimit-unified-5h-reset": "4102444800",
+            },
+            now=datetime(2026, 6, 13, 3, 30, 0, tzinfo=timezone.utc),
+        )
+
+        assert "解除目安:" in details
+        assert "購読枠: 代表枠 five_hour / 5時間枠 85% / 7日枠 40% / fallback 10%" in details
+
+    def test_append_no_headers_returns_original_message(self):
+        from services.claude_api import ratelimit
+
+        assert ratelimit.append_rate_limit_details("base", {}) == "base"
+
+    def test_append_with_headers_adds_details(self):
+        from services.claude_api import ratelimit
+
+        message = ratelimit.append_rate_limit_details(
+            "base",
+            {"retry-after": "1"},
+        )
+        assert message.startswith("base\n解除目安:")
 
 
 # ---------------------------------------------------------------------------

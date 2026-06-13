@@ -834,20 +834,26 @@ class TestSystemPromptHardening:
 class TestErrorMasking:
     @pytest.mark.asyncio
     async def test_internal_error_replies_generic(self, capture, monkeypatch):
-        async def boom(prompt, channel_id, sessions, status_callback=None,
-                       restricted=False, raw_user_text="",
-                       is_thread=False, has_image_attachment=False):
+        # Accept arbitrary kwargs (text_stream_callback / author / etc.) so the
+        # intended RuntimeError is what propagates, not a signature mismatch.
+        async def boom(prompt, channel_id, sessions, **kwargs):
             raise RuntimeError("internal path /home/ubuntu/discord-bot/.env leaked")
         monkeypatch.setattr("bot.call_with_tools", boom)
 
         msg = _make_message(author_id=NONADMIN_ID, content="かなえ hi")
+        # The error surfaces by editing the intake status message (P0: errors
+        # keep a short explanation instead of vanishing), so it must be
+        # awaitable.
+        status_msg = AsyncMock()
+        msg.reply = AsyncMock(return_value=status_msg)
         await _dispatch(msg)
-        replied_content = " ".join(
-            str(c.args[0]) if c.args else str(c.kwargs.get("content", ""))
-            for c in msg.reply.await_args_list
+        # Gather every user-facing string: the intake reply AND any status edit.
+        shown = " ".join(
+            (str(c.args[0]) if c.args else str(c.kwargs.get("content", "")))
+            for c in list(msg.reply.await_args_list) + list(status_msg.edit.await_args_list)
         )
-        assert "/home/ubuntu/discord-bot/.env" not in replied_content
-        assert "エラー" in replied_content or "error" in replied_content.lower()
+        assert "/home/ubuntu/discord-bot/.env" not in shown
+        assert "エラー" in shown or "error" in shown.lower()
 
 
 # ===========================================================================

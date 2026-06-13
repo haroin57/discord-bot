@@ -55,6 +55,8 @@ _MCP_CMDLINE_PATTERNS = (
     "x-scraper/mcp_server.py",
     "scholarly-mcp/server.py",
     "news-curator/mcp_server.py",
+    "nikkei-indexes/mcp_server.py",
+    "yfj-quote/mcp_server.py",
     "papermcp",
     "tavily-mcp",
 )

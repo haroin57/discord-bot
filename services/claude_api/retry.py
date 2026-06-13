@@ -49,6 +49,41 @@ def check_and_record_retry_budget(channel_id: int) -> bool:
     return True
 
 
+def retry_after_from_headers(headers) -> float | None:
+    """Server-requested wait in seconds from a ``retry-after`` header, or None.
+
+    Accepts any mapping (httpx.Headers / dict); both the delta-seconds and
+    HTTP-date forms are handled. Used by entry.py so the backoff sleep honors
+    the server's request instead of hammering the same wall every ~3-6s
+    (audit #5 — the CLI computes max(retryAfter*1000, computedBackoff)).
+    """
+    if headers is None:
+        return None
+    value = None
+    try:
+        for k, v in headers.items():
+            if str(k).lower() == "retry-after":
+                value = str(v)
+                break
+    except AttributeError:
+        return None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    from datetime import datetime, timezone
+    from email.utils import parsedate_to_datetime
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+
+
 def compute_backoff(attempt: int, *, jitter: bool = True) -> float:
     """Exponential backoff: BASE * 2**attempt, capped at MAX_BACKOFF_S.
 

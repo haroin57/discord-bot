@@ -12,8 +12,51 @@ from services.claude_api.errors import (
     _is_transient,
     _redact_secrets,
     classify_anthropic_error,
+    contains_text_tool_call,
     is_non_persistable_reply,
+    strip_text_tool_call,
 )
+
+
+class TestTextToolCallPoison:
+    """Detect/strip tool calls emitted as plain TEXT (2026-06-13 poison)."""
+
+    POISON = (
+        "初値、確認します。お父さん少々お待ちを。\n\ncourse\n"
+        '<invoke name="brave_news_search">\n'
+        '<parameter name="query">SpaceX SPCX</parameter>\n'
+        '<parameter name="count">10</parameter>'
+    )
+
+    def test_detects_invoke_with_parameter(self):
+        assert contains_text_tool_call(self.POISON) is True
+
+    def test_detects_function_calls_block(self):
+        s = '承知。\n<function_calls>\n<invoke name="Bash">\n</invoke>\n</function_calls>'
+        assert contains_text_tool_call(s) is True
+
+    def test_strip_keeps_natural_language_prefix(self):
+        assert strip_text_tool_call(self.POISON) == (
+            "初値、確認します。お父さん少々お待ちを。"
+        )
+        # the degraded "course" opener token is removed too
+        assert "course" not in strip_text_tool_call(self.POISON)
+        assert "<invoke" not in strip_text_tool_call(self.POISON)
+
+    def test_clean_text_untouched(self):
+        clean = "普通の返事です。ツールは使いません。"
+        assert contains_text_tool_call(clean) is False
+        assert strip_text_tool_call(clean) == clean
+
+    def test_bare_mention_not_flagged(self):
+        # A passing mention without a parameter / closing tag must not trip
+        # (avoid stripping prose that merely discusses the syntax).
+        s = '`<invoke name="X">` のような書き方はテキストでは無効です'
+        assert contains_text_tool_call(s) is False
+
+    def test_empty_safe(self):
+        assert contains_text_tool_call("") is False
+        assert strip_text_tool_call("") == ""
 
 
 class TestClassifyAnthropicError:
@@ -202,3 +245,59 @@ class TestRedactSecrets:
     def test_no_secrets_unchanged(self):
         plain = "ordinary log line with no key"
         assert _redact_secrets(plain) == plain
+
+
+class TestAuditClassifications:
+    """2026-06-13 CLI audit: model_not_found (#6) / tool_use_mismatch (#14)."""
+
+    def _make_status_error(self, status: int, body: dict | None = None):
+        exc = anthropic.APIStatusError.__new__(anthropic.APIStatusError)
+        exc.status_code = status
+        exc.body = body or {}
+        exc.response = MagicMock()
+        exc.request = MagicMock()
+        return exc
+
+    def test_not_found_error_instance(self):
+        exc = anthropic.NotFoundError.__new__(anthropic.NotFoundError)
+        assert classify_anthropic_error(exc) == "model_not_found"
+
+    def test_404_status_is_model_not_found(self):
+        assert classify_anthropic_error(
+            self._make_status_error(404)
+        ) == "model_not_found"
+
+    def test_not_found_error_type_in_body(self):
+        exc = self._make_status_error(
+            400, {"error": {"type": "not_found_error", "message": "no model"}}
+        )
+        assert classify_anthropic_error(exc) == "model_not_found"
+
+    @pytest.mark.parametrize("msg", [
+        "messages.5: tool_use ids were found without tool_result blocks "
+        "immediately after",
+        "unexpected `tool_use_id` found in tool_result blocks",
+        "tool_result block(s) provided without corresponding tool_use",
+        "each tool_result must have a corresponding tool_use in the previous "
+        "message",
+    ])
+    def test_pairing_400_is_tool_use_mismatch(self, msg):
+        exc = self._make_status_error(
+            400, {"error": {"type": "invalid_request_error", "message": msg}}
+        )
+        assert classify_anthropic_error(exc) == "tool_use_mismatch"
+
+    def test_plain_400_stays_invalid_request(self):
+        exc = self._make_status_error(
+            400, {"error": {"type": "invalid_request_error",
+                            "message": "messages: field required"}}
+        )
+        assert classify_anthropic_error(exc) == "invalid_request"
+
+    def test_new_categories_are_not_transient(self):
+        assert _is_transient("model_not_found") is False
+        assert _is_transient("tool_use_mismatch") is False
+
+    def test_new_categories_have_messages(self):
+        assert "モデル" in _error_message("model_not_found")
+        assert "リセット" in _error_message("tool_use_mismatch")
