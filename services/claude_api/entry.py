@@ -30,6 +30,7 @@ from config import (
     ADMIN_MAX_TURNS,
     ATTACHMENT_DIR,
     CLAUDE_MAX_PARALLEL,
+    CLAUDE_MODEL,
     CWD,
     FABLE_REFUSAL_FALLBACK_ENABLED,
     FABLE_REFUSAL_FALLBACK_MODEL,
@@ -109,7 +110,7 @@ from services.claude_api.tools import (
 
 log = logging.getLogger(__name__)
 
-MODEL = "claude-fable-5"
+MODEL = CLAUDE_MODEL
 
 # MCP servers whose tool schemas we advertise on every admin API request.
 # The process is still spawned lazily via McpPool.call_tool() on first use.

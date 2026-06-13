@@ -97,7 +97,10 @@ def speaker_label(user_id: int | str | None) -> str:
 # ---------------------------------------------------------------------------
 CWD = os.environ.get("BOT_CWD", "/home/ubuntu")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-fable-5")
+# Primary main-loop model. Pinned to Opus 4.8 (haroin request 2026-06-13) —
+# Fable 5's long-context refusal classifier is avoided entirely by not running
+# Fable as primary. Env-overridable.
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
 # Refusal fallback. Fable 5 has a content classifier (stop_reason=refusal,
 # category=None) that fires on some conversation content even though it is not
 # a real safety stop for this private 1:1 deployment, and it is NOT overridable
@@ -166,7 +169,7 @@ PROACTIVE_COMPACT_TRIGGER_TOKENS = int(
 # "medium" (haroin's instruction — predictable per-turn latency) but the value
 # must be a tunable, not a buried constant.
 CLAUDE_EFFORT = os.environ.get(
-    "CLAUDE_EFFORT", os.environ.get("CLAUDE_CODE_EFFORT_LEVEL", "medium")
+    "CLAUDE_EFFORT", os.environ.get("CLAUDE_CODE_EFFORT_LEVEL", "xhigh")
 )
 # Honor server-supplied retry-after on transient errors (audit #5). When the
 # server asks for a wait longer than this, give up immediately with the
