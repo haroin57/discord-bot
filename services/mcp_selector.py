@@ -36,6 +36,11 @@ _WEB_TRIGGERS = tuple(kw.lower() for kw in (
     "検索", "調べて", "ググって", "ニュース",
     "twitter", "x.com", "ツイート", "tweet", "trend", "トレンド",
     "search", "ググ", "Brave", "x ", "X(", "X検索",
+    # Market-data tier (nikkei-indexes / yfj-quote) — eager spawn for finance
+    # talk. NOTE: bare "vi" is deliberately absent (substring would misfire
+    # on "via", "vim", "review", …); 日経vi covers the real usage.
+    "株価", "日経", "日経vi", "市場", "相場", "チャート", "銘柄",
+    "vix", "ドル円", "為替", "topix", "指数",
 ))
 _HEAVY_TRIGGERS = tuple(kw.lower() for kw in (
     "ブラウズ", "browse", "スクリーンショット", "screenshot",

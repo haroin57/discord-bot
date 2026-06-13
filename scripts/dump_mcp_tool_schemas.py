@@ -34,6 +34,16 @@ SERVERS = {
         "args": ["-y", "@brave/brave-search-mcp-server@2.0.80"],
         "env": {"BRAVE_API_KEY": os.environ.get("BRAVE_API_KEY", "")},
     },
+    "nikkei-indexes": {
+        "command": "/home/ubuntu/mcp-servers/nikkei-indexes/.venv/bin/python",
+        "args": ["/home/ubuntu/mcp-servers/nikkei-indexes/mcp_server.py"],
+        "env": {},
+    },
+    "yfj-quote": {
+        "command": "/home/ubuntu/mcp-servers/yfj-quote/.venv/bin/python",
+        "args": ["/home/ubuntu/mcp-servers/yfj-quote/mcp_server.py"],
+        "env": {},
+    },
 }
 
 

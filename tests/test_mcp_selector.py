@@ -105,3 +105,43 @@ def test_config_no_longer_exposes_selector():
     import config as _cfg
     assert not hasattr(_cfg, "pick_mcp_servers")
     assert not hasattr(_cfg, "get_mcp_servers_by_keys")
+
+
+class TestMarketDataRegistration:
+    """market-data MCPs (nikkei-indexes / yfj-quote, 2026-06-13 plan)."""
+
+    def test_finance_keywords_pick_web_tier(self):
+        # The autouse fixture stubs tier dicts, so membership is asserted via
+        # the sentinel "web" key (same pattern as test_web_trigger_picks_web).
+        for text in ("トヨタの株価教えて", "日経VIどうなってる", "今日の相場は？"):
+            result = mcp_selector.pick_mcp_servers(text)
+            assert "web" in result, text
+
+    def test_bare_vi_word_does_not_trigger(self):
+        # "vi" was deliberately excluded from triggers (via/vim false fire).
+        result = mcp_selector.pick_mcp_servers("vimの設定を直して")
+        assert "web" not in result
+
+    def test_config_registers_both_servers(self):
+        import config
+        for key in ("nikkei-indexes", "yfj-quote"):
+            assert key in config.MCP_SERVERS_WEB
+            cfg = config.MCP_SERVERS_WEB[key]
+            assert cfg["command"].endswith(".venv/bin/python")
+            assert cfg["args"][0].endswith("mcp_server.py")
+
+    def test_static_schemas_carry_both_servers(self):
+        import json
+        from pathlib import Path
+        schemas = json.loads(
+            Path("services/claude_api/static_mcp_schemas.json").read_text()
+        )
+        assert len(schemas.get("nikkei-indexes", [])) == 3
+        assert len(schemas.get("yfj-quote", [])) == 3
+        names = {t["name"] for v in schemas.values() for t in v}
+        assert "mcp__nikkei-indexes__check_vi_signal" in names
+        assert "mcp__yfj-quote__get_quote" in names
+
+    def test_always_advertised_includes_market_data(self):
+        from services.claude_api.entry import ALWAYS_ADVERTISED_MCP_KEYS
+        assert {"nikkei-indexes", "yfj-quote"} <= ALWAYS_ADVERTISED_MCP_KEYS

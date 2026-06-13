@@ -98,6 +98,83 @@ def speaker_label(user_id: int | str | None) -> str:
 CWD = os.environ.get("BOT_CWD", "/home/ubuntu")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-fable-5")
+# Refusal fallback. Fable 5 has a content classifier (stop_reason=refusal,
+# category=None) that fires on some conversation content even though it is not
+# a real safety stop for this private 1:1 deployment, and it is NOT overridable
+# by the system prompt (verified by ablation). Opus 4.8 does not share that
+# classifier. When the primary model is Fable 5 and a turn refuses, the agent
+# loop retries the same request once on this fallback model and surfaces the
+# switch to the user (never silent). Set FABLE_REFUSAL_FALLBACK_ENABLED=0 to
+# disable.
+FABLE_REFUSAL_FALLBACK_MODEL = os.environ.get(
+    "FABLE_REFUSAL_FALLBACK_MODEL", "claude-opus-4-8"
+)
+FABLE_REFUSAL_FALLBACK_ENABLED = os.environ.get(
+    "FABLE_REFUSAL_FALLBACK_ENABLED", "1"
+) not in ("0", "false", "False", "")
+# History compaction (ADR-0010 phase 3). When the replayed transcript exceeds
+# the trigger, the older portion is summarized into a single compact-summary
+# JSONL row (official-CLI compact semantics: continuation preamble + recent
+# tail preserved verbatim) and only that collapsed window is replayed.
+# Budgets are in CHARACTERS, not tokens — replay time has no tokenizer. Mixed
+# JP/EN/code transcripts run ~2-3 chars/token, so the 200K-char trigger lands
+# the request well inside the window where Fable 5 reliably answers (observed:
+# OK at ~145K tokens, refuses past ~240K).
+HISTORY_COMPACT_ENABLED = os.environ.get(
+    "HISTORY_COMPACT_ENABLED", "1"
+) not in ("0", "false", "False", "")
+HISTORY_COMPACT_TRIGGER_CHARS = int(
+    os.environ.get("HISTORY_COMPACT_TRIGGER_CHARS", "200000")
+)
+# How much of the newest history to keep verbatim ("Recent messages are
+# preserved verbatim" leg of the official CLI compact).
+HISTORY_COMPACT_KEEP_CHARS = int(
+    os.environ.get("HISTORY_COMPACT_KEEP_CHARS", "50000")
+)
+# The official CLI summarizes with the main-loop model; we deliberately use
+# the refusal-fallback model instead, because Fable 5 refuses exactly the
+# long contexts compaction exists to shrink.
+HISTORY_COMPACT_MODEL = os.environ.get(
+    "HISTORY_COMPACT_MODEL", FABLE_REFUSAL_FALLBACK_MODEL
+)
+# Compaction is a recursive Claude call whose single job is to losslessly
+# distill a whole conversation — quality matters far more than latency here
+# (it fires rarely, only past the trigger). Run it at the top of Anthropic's
+# effort dial (low < medium < high < xhigh < max), unlike the main loop which
+# sits at "medium" for predictable per-turn latency.
+HISTORY_COMPACT_EFFORT = os.environ.get("HISTORY_COMPACT_EFFORT", "max")
+# Token-based compaction trigger (CLI-parity, 2026-06-13 audit #7). The char
+# trigger above stays as a cold-start fallback, but chars over-estimate JP/code
+# transcripts by 2-4x; once a turn has reported real usage we gate on tokens.
+# Fable 5 reliably answers up to ~200K input tokens and starts refusing around
+# ~240K; 160K leaves the CLI-style 20% proactive buffer plus output reserve.
+HISTORY_COMPACT_TRIGGER_TOKENS = int(
+    os.environ.get("HISTORY_COMPACT_TRIGGER_TOKENS", "160000")
+)
+# In-loop proactive compaction (2026-06-13 audit #3, ADR-0012). When a turn
+# inside the agent loop reports a context footprint above this, the loop folds
+# the prior transcript mid-request instead of waiting for the session boundary
+# (where Fable would already be refusing). 0 disables.
+PROACTIVE_COMPACT_ENABLED = os.environ.get(
+    "PROACTIVE_COMPACT_ENABLED", "1"
+) not in ("0", "false", "False", "")
+PROACTIVE_COMPACT_TRIGGER_TOKENS = int(
+    os.environ.get("PROACTIVE_COMPACT_TRIGGER_TOKENS", "160000")
+)
+# Main-loop effort dial (2026-06-13 audit #4). The CLI default is "high" and
+# env-tunable (CLAUDE_CODE_EFFORT_LEVEL); the bot deliberately defaults to
+# "medium" (haroin's instruction — predictable per-turn latency) but the value
+# must be a tunable, not a buried constant.
+CLAUDE_EFFORT = os.environ.get(
+    "CLAUDE_EFFORT", os.environ.get("CLAUDE_CODE_EFFORT_LEVEL", "medium")
+)
+# Honor server-supplied retry-after on transient errors (audit #5). When the
+# server asks for a wait longer than this, give up immediately with the
+# rate-limit message instead of blocking a Discord reply for minutes.
+RETRY_AFTER_MAX_S = float(os.environ.get("RETRY_AFTER_MAX_S", "120"))
+# Slow-first-byte detection (audit #16). Matches the CLI's
+# CLAUDE_SLOW_FIRST_BYTE_MS default of 30000.
+SLOW_FIRST_BYTE_MS = int(os.environ.get("CLAUDE_SLOW_FIRST_BYTE_MS", "30000"))
 # Per-turn output cap. Matched to the real claude-cli, which sends 32000 on
 # Fable 5 (mitm capture). Briefly raised to 128k, but reverted to 32000 to keep
 # the request byte-identical to the CLI while debugging fable-5 refusals — the
@@ -424,6 +501,18 @@ MCP_SERVERS_WEB: dict = {
     "onion-search": {
         "command": "/home/ubuntu/onion-search-mcp/.venv/bin/python",
         "args": ["/home/ubuntu/onion-search-mcp/server.py"],
+    },
+    # Market data (docs/2026-06-13_market_data_mcp_plan.md). Both are
+    # always-advertised (static schemas) and lazy-spawned on first call.
+    # nikkei-indexes: 日経公式CSV (日経VI/日経平均 日足OHLC + VI戦略シグナル判定)
+    "nikkei-indexes": {
+        "command": "/home/ubuntu/mcp-servers/nikkei-indexes/.venv/bin/python",
+        "args": ["/home/ubuntu/mcp-servers/nikkei-indexes/mcp_server.py"],
+    },
+    # yfj-quote: Yahoo Finance Japan 現在値照会・銘柄検索・日経VIザラ場速報
+    "yfj-quote": {
+        "command": "/home/ubuntu/mcp-servers/yfj-quote/.venv/bin/python",
+        "args": ["/home/ubuntu/mcp-servers/yfj-quote/mcp_server.py"],
     },
 }
 

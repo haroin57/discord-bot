@@ -1056,5 +1056,96 @@
         ]
       }
     }
+  ],
+  "nikkei-indexes": [
+    {
+      "name": "mcp__nikkei-indexes__get_index_history",
+      "description": "日経公式CSVから指数の日足OHLCを取得する。\n\nArgs:\n    idx: インデックスキー (\"vi\"=日経VI, \"nikkei\"=日経平均)。\n         一覧は list_known_indexes で確認。\n    days: 直近何営業日分を返すか (1〜2000, 既定30)。\n\nReturns:\n    JSON: {index, label, bars: [{date, open, high, low, close}...],\n           source, cache, note}\n",
+      "input_schema": {
+        "properties": {
+          "idx": {
+            "default": "vi",
+            "title": "Idx",
+            "type": "string"
+          },
+          "days": {
+            "default": 30,
+            "title": "Days",
+            "type": "integer"
+          }
+        },
+        "title": "get_index_historyArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "mcp__nikkei-indexes__check_vi_signal",
+      "description": "日経VI平均回帰戦略の発火3条件を最新の確報データで判定する。\n\n条件 (全て同時成立で fire):\n  1. VI始値 >= base (恐怖の高原, 既定30)\n  2. VI終値 > VI始値 (日中に恐怖が発生)\n  3. 日経終値 < 日経始値 (株価が日中に崩れる)\n\nArgs:\n    base: VI始値の閾値 (既定30.0)。\n\nReturns:\n    JSON: {data_date, base, vi: OHLC, nikkei: OHLC,\n           conditions: {3条件のboolean}, fire,\n           is_latest_business_day, stale_note?, strategy_note}\n",
+      "input_schema": {
+        "properties": {
+          "base": {
+            "default": 30.0,
+            "title": "Base",
+            "type": "number"
+          }
+        },
+        "title": "check_vi_signalArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "mcp__nikkei-indexes__list_known_indexes",
+      "description": "動作確認済みの日経公式CSV一覧 (キー・ラベル・URL) を返す。",
+      "input_schema": {
+        "properties": {},
+        "title": "list_known_indexesArguments",
+        "type": "object"
+      }
+    }
+  ],
+  "yfj-quote": [
+    {
+      "name": "mcp__yfj-quote__get_quote",
+      "description": "Yahoo Finance Japan から銘柄/指数/為替の現在値を取得する。\n\nArgs:\n    code: 銘柄コード。例: \"7203.T\" (トヨタ), \"998407.O\" (日経平均),\n          \"998405.T\" (TOPIX), \"USDJPY=X\" (ドル円), \"^DJI\" (NYダウ)。\n          コードが不明なら先に search_ticker を使う。\n\nReturns:\n    JSON: {name, code, market, price, change, change_rate_pct,\n           previous_close, open, high, low, volume,\n           market_cap_million_yen, update_time_jp, source, cache}\n",
+      "input_schema": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "get_quoteArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "mcp__yfj-quote__search_ticker",
+      "description": "Yahoo Finance Japan の銘柄検索。銘柄名から証券コード候補を返す。\n\nArgs:\n    query: 銘柄名・キーワード (例: \"トヨタ\", \"ソニー\", \"半導体\")。\n\nReturns:\n    JSON: {query, results: [{code, name, market, price, price_change,\n           link}...]} — code はそのまま get_quote に渡せる。\n",
+      "input_schema": {
+        "properties": {
+          "query": {
+            "title": "Query",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "search_tickerArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "mcp__yfj-quote__get_fisco_vi_news",
+      "description": "日経VIのザラ場速報をフィスコ記事 (Yahoo配信) から取得する。\n\n日経公式CSVは前営業日確定値のみなので、当日日中のVI水準はこれが\n唯一の無料経路。最新の「日経VI：…」記事から現在値・前日比・\n高値・安値を抽出して返す。\n\nReturns:\n    JSON (成功): {found: true, headline, article_time, article_url,\n                  vi_current, vi_change, direction, vi_high, vi_low,\n                  partial?}\n    JSON (失敗): {found: false, stage, reason, fallback}\n",
+      "input_schema": {
+        "properties": {},
+        "title": "get_fisco_vi_newsArguments",
+        "type": "object"
+      }
+    }
   ]
 }
