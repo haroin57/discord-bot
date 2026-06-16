@@ -178,6 +178,11 @@ _EXTRACT_PROMPT = """以下の会話ターンから、長期記憶として保�
 - **知識・経験表明も拾う**: 「〜を知ってる」「〜やったことある」「〜読んだ」「〜見た」等
 - skip していいのは「うん」「そうだね」「了解」「ありがとう」のような content-free な相槌のみ。固有名詞 or 明確な感情/嗜好/行動が含まれていれば長さに関わらず skip しない
 - LLM自己言及・一般論は出力しない
+- **記憶システム自体への自己言及は fact 化しない** (Mem0 / 記憶グラフ / mention_count / co-occurrence weight / dedup / ベクトル検索 / FTS / BM25 / エンティティクラスタ 等、bot 内部の記憶ストアの状態に関する記述)。これらは fact ではなくシステムのメタ情報。
+   - ユーザー fact が記憶システムの言い回しで包まれている場合は、**システム言及を剥がしてユーザー fact だけ抽出する**:
+     - 「AbletonでDTMしている。Mem0のエンティティとして記録されており mention count 6」 → 「AbletonでDTMしている」(Mem0 部分は捨てる)
+     - 「CLANNADがMem0に22件言及されており主要エンティティ」 → 「CLANNADが好きでよく言及している」(weight/件数は捨てる)
+   - 純粋にシステム状態のみ (「記憶グラフが100ノードに成長」「Mem0のdedupを修正した」) なら fact ゼロで返す
 - importance < 2 は出力しない (ただし固有名詞 + 嗜好/行動/知識 はデフォルトで importance=2 以上で出すこと)
 - 1 fact は日本語 120字以内
 - category は personal/project/tech/science/hobby/invest/ops/meta のいずれか

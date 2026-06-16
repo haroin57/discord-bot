@@ -14,6 +14,36 @@ from services.oauth_manager import ensure_valid_token
 
 log = logging.getLogger(__name__)
 
+# P1 (ADR-0017): process-global guard against concurrent / short-window
+# duplicate inserts. The vector dedup only catches a same-text sibling once it
+# is COMMITTED; two concurrent add_memories calls (live turns or backfill
+# tasks) can each search-then-insert before either commits, producing exact
+# dups. This seen-set, guarded by a lock, makes the insert of an identical
+# (user_id, text) idempotent across the in-flight window. Bounded FIFO so it
+# never grows without limit. Offline hash sweep cleans any historical dups.
+import hashlib as _hashlib
+from collections import OrderedDict as _OrderedDict
+_INSERT_SEEN: "_OrderedDict[str, str]" = _OrderedDict()
+_INSERT_SEEN_LOCK = asyncio.Lock()
+_INSERT_SEEN_MAX = 8000
+
+
+def _fact_key(user_id: str, text: str) -> str:
+    return _hashlib.md5(f"{user_id}\x00{(text or '').strip()}".encode()).hexdigest()
+
+
+async def _claim_insert(user_id: str, text: str) -> bool:
+    """Return True if this (user_id, text) may be inserted now; False if a
+    concurrent/recent insert already claimed it (caller should skip)."""
+    key = _fact_key(user_id, text)
+    async with _INSERT_SEEN_LOCK:
+        if key in _INSERT_SEEN:
+            return False
+        _INSERT_SEEN[key] = "1"
+        while len(_INSERT_SEEN) > _INSERT_SEEN_MAX:
+            _INSERT_SEEN.popitem(last=False)
+    return True
+
 
 async def add_memories(
     messages: list[dict] | None = None,
@@ -66,7 +96,7 @@ async def add_memories(
         MEM0_GATE_ENABLED, MEM0_GATE_MIN_IMPORTANCE,
         MEM0_CLIENT_DEDUP_ENABLED, MEM0_CLIENT_DEDUP_THRESHOLD,
         MEM0_DEDUP_TWO_STAGE, MEM0_DEDUP_SEARCH_LIMIT, MEM0_DEDUP_DRY_RUN,
-        MEM0_CONFLICT_DETECTION_ENABLED,
+        MEM0_CONFLICT_DETECTION_ENABLED, MEM0_DEDUP_SUPERSET_MERGE,
         MEM0_RELATION_EXTRACT_ENABLED,
     )
 
@@ -188,31 +218,41 @@ async def add_memories(
                     # Run 2-stage checks in parallel
                     async def _check_one(f, near):
                         if isinstance(near, Exception):
-                            return (f, False, None, None)
-                        is_dup, reason, existing_id, conflict_type = await check_near_dup(
+                            return (f, False, None, None, None)
+                        is_dup, reason, existing_id, conflict_type, merged_text = await check_near_dup(
                             f["text"], f.get("category"), near,
                             dry_run=MEM0_DEDUP_DRY_RUN,
                             detect_conflict=MEM0_CONFLICT_DETECTION_ENABLED,
+                            allow_merge=MEM0_DEDUP_SUPERSET_MERGE,
                         )
-                        return (f, is_dup, existing_id, conflict_type)
+                        return (f, is_dup, existing_id, conflict_type, merged_text)
                     check_results = await asyncio.gather(
                         *(_check_one(f, near) for f, near in zip(candidates, dedup_results)),
                     )
                     reinforced_ids: list[str] = []
-                    # Phase B-2: facts that look like a state-change or
-                    # correction get their predecessor soft-archived
-                    # *after* the new row is inserted, so we record the
-                    # (existing_id, conflict_type) pair here.
+                    # Phase B-2 / 止揚: facts that update / correct / merge with
+                    # an existing fact get their predecessor soft-archived
+                    # *after* the new (or synthesized) row is inserted, so we
+                    # record the (existing_id, conflict_type) pair here.
                     conflict_archive: list[tuple[str, str]] = []
-                    for f, is_dup, existing_id, conflict_type in check_results:
+                    for f, is_dup, existing_id, conflict_type, merged_text in check_results:
                         if is_dup and not MEM0_DEDUP_DRY_RUN:
                             skip_dup += 1
                             if existing_id:
                                 reinforced_ids.append(existing_id)
                         else:
+                            # 止揚: store the synthesized fact in place of the
+                            # raw candidate so the merged detail is what lands
+                            # in ChromaDB; the older row is archived below.
+                            if (
+                                conflict_type == "merge"
+                                and merged_text
+                                and not MEM0_DEDUP_DRY_RUN
+                            ):
+                                f = {**f, "text": merged_text}
                             kept.append(f)
                             if (
-                                conflict_type in ("update", "correction")
+                                conflict_type in ("update", "correction", "merge")
                                 and existing_id
                                 and not MEM0_DEDUP_DRY_RUN
                             ):
@@ -249,6 +289,16 @@ async def add_memories(
             # serial added ~3 x latency. asyncio.gather them and tolerate
             # individual failures via return_exceptions.
             async def _insert_one(f: dict):
+                # P1: skip insert if an identical (user_id, text) is already
+                # in-flight / recently inserted this process (defeats the
+                # parallel-ingest exact-dup race). Gated by env.
+                from config import MEM0_INGEST_HASH_DEDUP
+                if MEM0_INGEST_HASH_DEDUP and not await _claim_insert(
+                    user_id, f.get("text", "")
+                ):
+                    log.info("ingest hash-dedup: skipped in-flight dup: %r",
+                             (f.get("text") or "")[:60])
+                    return None
                 fact_meta = dict(base_meta)
                 imp = int(f.get("importance", 3))
                 # importance=2 → force tier=Warm so weekly compact ages it out faster.

@@ -38,6 +38,19 @@ MODEL_BETAS = [
 CLI_IDENTITY_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 # AUTO-CAPTURE-END
 
+# Supplementary betas appended OUTSIDE the auto-capture block so the daily
+# refresh_cli_identity.sh run doesn't clobber them. context-1m-2025-08-07
+# opens the 1M-token context window; without it the effective window is 200K
+# and the 500K compaction trigger (config.HISTORY_COMPACT_TRIGGER_TOKENS) would
+# overflow before compaction ever fires. Gated on CONTEXT_1M_ENABLED so it can
+# be turned off in one place if the subscription/model rejects the beta.
+_EXTRA_BETAS = []
+if os.environ.get("CONTEXT_1M_ENABLED", "1") not in ("0", "false", "False", ""):
+    _EXTRA_BETAS.append("context-1m-2025-08-07")
+for _b in _EXTRA_BETAS:
+    if _b not in MODEL_BETAS:
+        MODEL_BETAS.append(_b)
+
 USER_AGENT = f"claude-cli/{CC_VERSION} (external, {CC_ENTRYPOINT})"
 
 # Body fields the CLI always sends alongside the betas above. These are

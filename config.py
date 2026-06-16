@@ -97,10 +97,9 @@ def speaker_label(user_id: int | str | None) -> str:
 # ---------------------------------------------------------------------------
 CWD = os.environ.get("BOT_CWD", "/home/ubuntu")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
-# Primary main-loop model. Pinned to Opus 4.8 (haroin request 2026-06-13) —
-# Fable 5's long-context refusal classifier is avoided entirely by not running
-# Fable as primary. Env-overridable.
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
+# Primary main-loop model. Pinned to Opus 4.7 (haroin request 2026-06-13).
+# Env-overridable via CLAUDE_MODEL.
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
 # Refusal fallback. Fable 5 has a content classifier (stop_reason=refusal,
 # category=None) that fires on some conversation content even though it is not
 # a real safety stop for this private 1:1 deployment, and it is NOT overridable
@@ -115,19 +114,31 @@ FABLE_REFUSAL_FALLBACK_MODEL = os.environ.get(
 FABLE_REFUSAL_FALLBACK_ENABLED = os.environ.get(
     "FABLE_REFUSAL_FALLBACK_ENABLED", "1"
 ) not in ("0", "false", "False", "")
+# Server-side model fallback (ADR-0015). The official CLI 2.1.177 sends a
+# top-level `fallbacks: [{"model": <id>}]` body field (paired with the
+# server-side-fallback / fallback-credit betas already in MODEL_BETAS) so the
+# SERVER switches to the fallback model mid-stream on a Fable refusal —
+# avoiding the bot's client-side double-request. When True (default), the
+# agent loop sends `fallbacks` whenever a refusal fallback model is in play;
+# the client-side refusal retry stays as a backstop. Set to 0 to revert to
+# pure client-side fallback.
+SERVER_SIDE_FALLBACK_ENABLED = os.environ.get(
+    "SERVER_SIDE_FALLBACK_ENABLED", "1"
+) not in ("0", "false", "False", "")
 # History compaction (ADR-0010 phase 3). When the replayed transcript exceeds
 # the trigger, the older portion is summarized into a single compact-summary
 # JSONL row (official-CLI compact semantics: continuation preamble + recent
 # tail preserved verbatim) and only that collapsed window is replayed.
 # Budgets are in CHARACTERS, not tokens — replay time has no tokenizer. Mixed
-# JP/EN/code transcripts run ~2-3 chars/token, so the 200K-char trigger lands
-# the request well inside the window where Fable 5 reliably answers (observed:
-# OK at ~145K tokens, refuses past ~240K).
+# JP/EN/code transcripts run ~2-3 chars/token. This char trigger is only the
+# cold-start fallback before a turn reports real token usage (the token trigger
+# below is the real gate). Raised 200K->240K alongside the token bump now that
+# Opus 4.8 (200K context, no Fable-style long-context refusal) is primary.
 HISTORY_COMPACT_ENABLED = os.environ.get(
     "HISTORY_COMPACT_ENABLED", "1"
 ) not in ("0", "false", "False", "")
 HISTORY_COMPACT_TRIGGER_CHARS = int(
-    os.environ.get("HISTORY_COMPACT_TRIGGER_CHARS", "200000")
+    os.environ.get("HISTORY_COMPACT_TRIGGER_CHARS", "240000")
 )
 # How much of the newest history to keep verbatim ("Recent messages are
 # preserved verbatim" leg of the official CLI compact).
@@ -149,27 +160,33 @@ HISTORY_COMPACT_EFFORT = os.environ.get("HISTORY_COMPACT_EFFORT", "max")
 # Token-based compaction trigger (CLI-parity, 2026-06-13 audit #7). The char
 # trigger above stays as a cold-start fallback, but chars over-estimate JP/code
 # transcripts by 2-4x; once a turn has reported real usage we gate on tokens.
-# Fable 5 reliably answers up to ~200K input tokens and starts refusing around
-# ~240K; 160K leaves the CLI-style 20% proactive buffer plus output reserve.
+# With the context-1m-2025-08-07 beta enabled (client.MODEL_BETAS via
+# CONTEXT_1M_ENABLED) the effective window is 1M tokens, so we let the
+# transcript grow to 500K before compacting — far less frequent compaction
+# while keeping ~500K headroom for output reserve + next input under the 1M
+# limit. WITHOUT the 1M beta the window is 200K and this MUST be lowered back to
+# ~180K or requests overflow before compaction fires.
 HISTORY_COMPACT_TRIGGER_TOKENS = int(
-    os.environ.get("HISTORY_COMPACT_TRIGGER_TOKENS", "160000")
+    os.environ.get("HISTORY_COMPACT_TRIGGER_TOKENS", "500000")
 )
 # In-loop proactive compaction (2026-06-13 audit #3, ADR-0012). When a turn
 # inside the agent loop reports a context footprint above this, the loop folds
-# the prior transcript mid-request instead of waiting for the session boundary
-# (where Fable would already be refusing). 0 disables.
+# the prior transcript mid-request instead of waiting for the session boundary.
+# Raised to 500K alongside HISTORY_COMPACT_TRIGGER_TOKENS, gated on the
+# context-1m beta (see that constant). Without the 1M beta (200K window) this
+# MUST drop back to ~180K. 0 disables.
 PROACTIVE_COMPACT_ENABLED = os.environ.get(
     "PROACTIVE_COMPACT_ENABLED", "1"
 ) not in ("0", "false", "False", "")
 PROACTIVE_COMPACT_TRIGGER_TOKENS = int(
-    os.environ.get("PROACTIVE_COMPACT_TRIGGER_TOKENS", "160000")
+    os.environ.get("PROACTIVE_COMPACT_TRIGGER_TOKENS", "500000")
 )
 # Main-loop effort dial (2026-06-13 audit #4). The CLI default is "high" and
 # env-tunable (CLAUDE_CODE_EFFORT_LEVEL); the bot deliberately defaults to
 # "medium" (haroin's instruction — predictable per-turn latency) but the value
 # must be a tunable, not a buried constant.
 CLAUDE_EFFORT = os.environ.get(
-    "CLAUDE_EFFORT", os.environ.get("CLAUDE_CODE_EFFORT_LEVEL", "xhigh")
+    "CLAUDE_EFFORT", os.environ.get("CLAUDE_CODE_EFFORT_LEVEL", "medium")
 )
 # Honor server-supplied retry-after on transient errors (audit #5). When the
 # server asks for a wait longer than this, give up immediately with the
@@ -596,6 +613,26 @@ MEM0_DEDUP_SEARCH_LIMIT = int(os.environ.get("MEM0_DEDUP_SEARCH_LIMIT", "5"))
 MEM0_DEDUP_DRY_RUN = _bool_env("MEM0_DEDUP_DRY_RUN", False)               # P4: dry-run (dropせずログのみ)
 MEM0_SMART_SEARCH = _bool_env("MEM0_SMART_SEARCH", True)                   # P3
 
+# Offline cluster consolidation (ADR-0016, 2026-06-15). scripts/mem0_consolidate.py
+# finds clusters of related-but-separately-stored facts (which ingest-time
+# pairwise dedup misses) and 止揚-merges each via synthesize_cluster, soft-
+# archiving the originals. Validated on the live store: sim>=0.83 yields clean
+# clusters with no over-merge. DRY_RUN (default True) only reports candidates.
+MEM0_CONSOLIDATE_SIM = float(os.environ.get("MEM0_CONSOLIDATE_SIM", "0.83"))
+MEM0_CONSOLIDATE_DRY_RUN = _bool_env("MEM0_CONSOLIDATE_DRY_RUN", True)
+MEM0_CONSOLIDATE_MAX_CLUSTER = int(os.environ.get("MEM0_CONSOLIDATE_MAX_CLUSTER", "8"))
+MEM0_CONSOLIDATE_MAX_CLUSTERS = int(os.environ.get("MEM0_CONSOLIDATE_MAX_CLUSTERS", "50"))
+# P3 over-merge gate (ADR-0017): split each vector cluster into pairwise
+# judge_fact_relation-mergeable sub-clusters before synthesizing, so distinct
+# aspects accidentally co-clustered are never fused. synthesize_cluster alone
+# over-merges (validated 5/5); the gate makes the guard real.
+MEM0_CONSOLIDATE_GATE = _bool_env("MEM0_CONSOLIDATE_GATE", True)
+# P1 ingest-time exact-dup prevention (ADR-0017): before inserting a fact,
+# check Chroma for an existing same-hash fact for this user; if found, skip
+# the insert and reinforce the existing one instead (defeats the parallel
+# re-ingest race that produced 78 exact dups).
+MEM0_INGEST_HASH_DEDUP = _bool_env("MEM0_INGEST_HASH_DEDUP", True)
+
 # Phase A-1 (mem0-recall-hybrid-hyde-kg): BM25 hybrid retrieval over sqlite FTS5.
 # When True, smart_search runs vector search and BM25 in parallel and fuses
 # their ranked lists via Reciprocal Rank Fusion. Falls back to vector-only
@@ -627,6 +664,18 @@ MEM0_HYDE_ENABLED = _bool_env("MEM0_HYDE_ENABLED", True)
 # be flipped off without code revert.
 MEM0_CONFLICT_DETECTION_ENABLED = _bool_env("MEM0_CONFLICT_DETECTION_ENABLED", True)
 MEM0_HIDE_ARCHIVED = _bool_env("MEM0_HIDE_ARCHIVED", True)
+
+# Aufhebung (止揚) dedup: when a gray-zone candidate is the same fact/aspect as
+# an existing memory but carries extra concrete detail (date / number / proper
+# noun / qualifier) — a superset or complementary overlap — synthesize the two
+# into a single fact that preserves all detail, insert the synthesis, and
+# soft-archive the older row. The pre-2026-06-14 behavior dropped the richer
+# candidate and kept the vaguer existing fact (silent information loss). Flip to
+# False to restore the drop-the-superset behavior.
+MEM0_DEDUP_SUPERSET_MERGE = _bool_env("MEM0_DEDUP_SUPERSET_MERGE", True)
+MEM0_DEDUP_MERGE_MODEL = os.environ.get(
+    "MEM0_DEDUP_MERGE_MODEL", "claude-haiku-4-5-20251001"
+)
 
 # Phase C-2 (mem0-recall-hybrid-hyde-kg): entity-entity relation extraction.
 # Sonnet's extract step now emits a relations[] list alongside facts[];

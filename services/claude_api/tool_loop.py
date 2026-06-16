@@ -32,6 +32,7 @@ from config import (
     CLAUDE_MAX_TOKENS,
     PROACTIVE_COMPACT_ENABLED,
     PROACTIVE_COMPACT_TRIGGER_TOKENS,
+    SERVER_SIDE_FALLBACK_ENABLED,
     SLOW_FIRST_BYTE_MS,
 )
 
@@ -862,6 +863,18 @@ async def run_agent_loop(
                 "context_management": CONTEXT_MANAGEMENT_CONFIG,
             },
         )
+        # Server-side model fallback (ADR-0015). When a refusal fallback model
+        # is in play (Fable primary + enabled; entry.py passes None once
+        # sticky-pinned to Opus, so this is auto-gated off there), declare it
+        # to the server via the `fallbacks` body field. The server switches to
+        # it mid-stream on a Fable refusal — no client-side second request. The
+        # SDK (0.88.0) doesn't model `fallbacks`, so it must ride extra_body;
+        # wire arrival is verified by mitm capture (plan gate A). The two
+        # required betas are already in MODEL_BETAS.
+        if SERVER_SIDE_FALLBACK_ENABLED and refusal_fallback_model:
+            stream_kwargs["extra_body"]["fallbacks"] = [
+                {"model": refusal_fallback_model}
+            ]
         if tools_for_api:
             stream_kwargs["tools"] = tools_for_api
         merged_headers = dict(extra_headers or {})
@@ -875,6 +888,12 @@ async def run_agent_loop(
         # full prose-so-far (bot.py edits one draft message, throttled). Reset
         # each turn so a new turn starts a fresh partial.
         live_turn_text = ""
+        # Server-side fallback detection (ADR-0015). The server signals a
+        # mid-stream model switch via a content_block_start whose content_block
+        # type is "fallback" (carrying from.model / to.model). SDK 0.88.0 does
+        # not model this block, so we sniff the raw event defensively. Set to
+        # the fallback target model id when seen.
+        server_fallback_to: str | None = None
         # Per-attempt timing (audit #16/#17): dispatch → first stream event is
         # the TTFB leg the StallWatchdog can't see (its heartbeat starts on the
         # first event, so a slow first byte and a mid-stream stall look alike).
@@ -897,6 +916,21 @@ async def run_agent_loop(
                     if etype == "content_block_start":
                         block = getattr(event, "content_block", None)
                         btype = getattr(block, "type", None) if block else None
+                        if btype == "fallback":
+                            # Server-side model fallback fired mid-stream
+                            # (ADR-0015). content_block.to.model is the model
+                            # that actually produced this response.
+                            _to = getattr(block, "to", None)
+                            to_model = getattr(_to, "model", None)
+                            if isinstance(_to, dict):
+                                to_model = _to.get("model")
+                            if isinstance(to_model, str) and to_model:
+                                server_fallback_to = to_model
+                                log.warning(
+                                    "[ch=%d] turn=%d server-side fallback → %s",
+                                    channel_id, turn + 1, to_model,
+                                )
+                            continue
                         if btype == "thinking":
                             await _safe_status(status_callback, "💭 thinking…")
                         elif btype == "text":
@@ -961,6 +995,58 @@ async def run_agent_loop(
                         observe_ratelimit(resp.headers)
                 except Exception as exc:
                     log.debug("ratelimit observe failed: %s", exc)
+
+                # Server-side fallback detection (ADR-0015), multiplexed so any
+                # one signal counts: (1) the mid-stream `fallback` content block
+                # sniffed above, (2) final_msg.model diverging from the model we
+                # asked for (if the SDK propagated it), (3) the
+                # x-is-refusal-fallback response header. When a server-side
+                # fallback fired we treat it exactly like the client-side one:
+                # mark fallback_used, switch current_model so the result carries
+                # the real answering model, and surface the alert. The
+                # client-side stop_reason==refusal retry below then does NOT
+                # fire (the server already produced a good answer).
+                if not fallback_used and refusal_fallback_model:
+                    detected = server_fallback_to
+                    final_model = getattr(final_msg, "model", None)
+                    if (
+                        not detected
+                        and isinstance(final_model, str)
+                        and final_model
+                        and final_model != current_model
+                    ):
+                        detected = final_model
+                    if not detected:
+                        try:
+                            _resp = getattr(stream, "response", None)
+                            _hdrs = getattr(_resp, "headers", None) if _resp else None
+                            if _hdrs is not None and _hdrs.get(
+                                REFUSAL_FALLBACK_HEADER
+                            ) == "true":
+                                detected = refusal_fallback_model
+                        except Exception:
+                            pass
+                    if detected:
+                        fallback_used = True
+                        current_model = detected
+                        log.warning(
+                            "[ch=%d] turn=%d server-side fallback confirmed "
+                            "(answering model=%s)",
+                            channel_id, turn + 1, detected,
+                        )
+                        if (
+                            incremental_text_callback is not None
+                            and not fallback_note_sent_live
+                        ):
+                            try:
+                                await incremental_text_callback(
+                                    _fallback_alert(current_model)
+                                )
+                                fallback_note_sent_live = True
+                            except Exception as exc:
+                                log.warning(
+                                    "server fallback alert callback failed: %s", exc
+                                )
         except anthropic.AnthropicError as exc:
             category = classify_anthropic_error(exc)
             log.error("agent loop API error turn=%d category=%s: %s",

@@ -116,8 +116,8 @@ class TestCheckNearDupDetectConflict:
 
         # Patch the LLM judge to say "not same"
         async def _judge(_e, _c):
-            return False
-        monkeypatch.setattr("services.mem0.dedup.llm_judge_same_fact", _judge)
+            return "different"
+        monkeypatch.setattr("services.mem0.dedup.judge_fact_relation", _judge)
 
         # Patch classify_conflict to return update
         async def _classify(_e, _c):
@@ -130,7 +130,7 @@ class TestCheckNearDupDetectConflict:
             [{"id": "old1", "memory": "先輩の髪は黒", "score": 0.25}],
             detect_conflict=True,
         )
-        is_dup, reason, existing_id, conflict_type = result
+        is_dup, reason, existing_id, conflict_type, _merged = result
         assert is_dup is False
         assert "conflict_update" in reason
         assert existing_id == "old1"
@@ -143,8 +143,8 @@ class TestCheckNearDupDetectConflict:
         from services.mem0 import dedup
 
         async def _judge(_e, _c):
-            return False
-        monkeypatch.setattr("services.mem0.dedup.llm_judge_same_fact", _judge)
+            return "different"
+        monkeypatch.setattr("services.mem0.dedup.judge_fact_relation", _judge)
 
         async def _classify(_e, _c):
             return {"conflict_type": "addition", "reason": "diff aspect"}
@@ -156,7 +156,7 @@ class TestCheckNearDupDetectConflict:
             [{"id": "old1", "memory": "Rust が好き", "score": 0.25}],
             detect_conflict=True,
         )
-        is_dup, reason, existing_id, conflict_type = result
+        is_dup, reason, existing_id, conflict_type, _merged = result
         assert is_dup is False
         assert reason == "novel"
         assert conflict_type is None
@@ -167,8 +167,8 @@ class TestCheckNearDupDetectConflict:
         from services.mem0 import dedup
 
         async def _judge(_e, _c):
-            return False
-        monkeypatch.setattr("services.mem0.dedup.llm_judge_same_fact", _judge)
+            return "different"
+        monkeypatch.setattr("services.mem0.dedup.judge_fact_relation", _judge)
 
         classify_mock = AsyncMock(return_value={"conflict_type": "update"})
         monkeypatch.setattr("services.mem0.conflict.classify_conflict", classify_mock)

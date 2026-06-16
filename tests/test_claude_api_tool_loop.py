@@ -1247,3 +1247,105 @@ class TestUsageLogModel:
         with caplog.at_level(logging.INFO, logger="services.claude_api.tool_loop"):
             _log_turn_usage(424245, 0, msg, totals)
         assert any("model=-" in r.message for r in caplog.records)
+
+
+class TestServerSideFallback:
+    """ADR-0015: send the `fallbacks` body field and detect server-side
+    mid-stream model switches."""
+
+    def _capture_client(self, events, final):
+        captured: dict = {}
+
+        def stream_factory(**kwargs):
+            captured.update(kwargs)
+            return _FakeStream(events, final)
+        client = MagicMock()
+        client.beta.messages.stream = stream_factory
+        return client, captured
+
+    async def _run(self, client, **over):
+        kw = dict(
+            prompt="hi", channel_id=1, history=[], system_prompt="s",
+            tools_for_api=[], can_use_tool=_allow_all,
+            execute_tool=AsyncMock(), status_callback=_noop_status,
+            max_turns=1, stall_watchdog=over.pop("watchdog"),
+            api_client=client, model="claude-fable-5", extra_betas=[],
+            refusal_fallback_model="claude-opus-4-8",
+        )
+        kw.update(over)
+        return await run_agent_loop(**kw)
+
+    @pytest.mark.asyncio
+    async def test_fallbacks_field_sent_when_refusal_model_set(self, watchdog):
+        client, cap = self._capture_client(
+            [], _final_msg([_block("text", text="ok")], "end_turn"))
+        await self._run(client, watchdog=watchdog)
+        assert cap["extra_body"]["fallbacks"] == [{"model": "claude-opus-4-8"}]
+
+    @pytest.mark.asyncio
+    async def test_fallbacks_not_sent_without_refusal_model(self, watchdog):
+        client, cap = self._capture_client(
+            [], _final_msg([_block("text", text="ok")], "end_turn"))
+        await self._run(client, watchdog=watchdog,
+                        model="claude-opus-4-7", refusal_fallback_model=None)
+        assert "fallbacks" not in cap["extra_body"]
+
+    @pytest.mark.asyncio
+    async def test_fallbacks_gated_off_by_flag(self, watchdog, monkeypatch):
+        import services.claude_api.tool_loop as tl
+        monkeypatch.setattr(tl, "SERVER_SIDE_FALLBACK_ENABLED", False)
+        client, cap = self._capture_client(
+            [], _final_msg([_block("text", text="ok")], "end_turn"))
+        await self._run(client, watchdog=watchdog)
+        assert "fallbacks" not in cap["extra_body"]
+
+    @pytest.mark.asyncio
+    async def test_detect_via_fallback_content_block(self, watchdog):
+        # Mid-stream content_block_start with type=fallback, to.model=opus.
+        fb_event = _block(
+            "content_block_start",
+            content_block=_block("fallback",
+                                 to=SimpleNamespace(model="claude-opus-4-8")),
+        )
+        client, _ = self._capture_client(
+            [fb_event],
+            _final_msg([_block("text", text="answer")], "end_turn"))
+        sent: list[str] = []
+        async def inc(t): sent.append(t)
+        result = await self._run(client, watchdog=watchdog,
+                                 incremental_text_callback=inc)
+        assert result.fallback_model == "claude-opus-4-8"
+        assert any("フォールバック" in s for s in sent)
+
+    @pytest.mark.asyncio
+    async def test_detect_via_final_model_divergence(self, watchdog):
+        final = SimpleNamespace(
+            content=[_block("text", text="answer")],
+            stop_reason="end_turn", model="claude-opus-4-8",
+            usage=None,
+        )
+        client, _ = self._capture_client([], final)
+        result = await self._run(client, watchdog=watchdog)
+        assert result.fallback_model == "claude-opus-4-8"
+
+    @pytest.mark.asyncio
+    async def test_no_false_positive_when_model_matches(self, watchdog):
+        final = SimpleNamespace(
+            content=[_block("text", text="answer")],
+            stop_reason="end_turn", model="claude-fable-5", usage=None,
+        )
+        client, _ = self._capture_client([], final)
+        result = await self._run(client, watchdog=watchdog)
+        assert result.fallback_model is None
+
+    @pytest.mark.asyncio
+    async def test_client_side_backstop_still_fires_on_refusal(self, watchdog):
+        # No server-side fallback signal; stop_reason=refusal must still trigger
+        # the client-side retry on the fallback model.
+        client = _make_client(
+            ([], _final_msg([_block("text", text="")], "refusal")),
+            ([], _final_msg([_block("text", text="recovered")], "end_turn")),
+        )
+        result = await self._run(client, watchdog=watchdog, max_turns=2)
+        assert result.fallback_model == "claude-opus-4-8"
+        assert "recovered" in result.text

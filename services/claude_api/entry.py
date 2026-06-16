@@ -411,19 +411,28 @@ async def call_with_tools(
                     # the cold-start fallback (no usage observed yet — fresh
                     # process). force=True on the token path so the summary
                     # call's own char gate cannot veto a token decision.
-                    over_tokens = (
-                        get_last_context_tokens(channel_id)
-                        > HISTORY_COMPACT_TRIGGER_TOKENS
-                    )
+                    _last_tokens = get_last_context_tokens(channel_id)
+                    over_tokens = _last_tokens > HISTORY_COMPACT_TRIGGER_TOKENS
                     _replay_chars = estimate_replay_chars(prior_history)
-                    over_chars = _replay_chars > HISTORY_COMPACT_TRIGGER_CHARS
+                    # Cold-start ONLY: the char gate fires solely before the
+                    # first real token reading (_last_tokens == 0, fresh
+                    # process). After that, tokens are authoritative — else a
+                    # single tool-heavy keep-tail turn pins replay_chars above
+                    # the trigger permanently, so boundary compaction fired on
+                    # EVERY turn (compression≈100%, turns unchanged). The
+                    # comment above always said char was the cold-start
+                    # fallback; this restores the missing guard. 2026-06-13.
+                    over_chars = (
+                        _last_tokens == 0
+                        and _replay_chars > HISTORY_COMPACT_TRIGGER_CHARS
+                    )
                     if over_tokens or over_chars:
                         log.info(
                             "[ch=%d] boundary compaction trigger: "
                             "last_context_tokens=%d (trigger=%d, over=%s) "
                             "replay_chars=%d (trigger=%d, over=%s) force=%s",
                             channel_id,
-                            get_last_context_tokens(channel_id),
+                            _last_tokens,
                             HISTORY_COMPACT_TRIGGER_TOKENS, over_tokens,
                             _replay_chars,
                             HISTORY_COMPACT_TRIGGER_CHARS, over_chars,
