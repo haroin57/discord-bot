@@ -50,11 +50,18 @@ def is_investment_query(text: str) -> bool:
 
 
 def _row_to_result(row: dict, score: float) -> dict:
-    """Convert a LanceDB row to the Mem0-shaped result dict."""
+    """Convert a LanceDB row to the Mem0-shaped result dict.
+
+    ``score`` here is the raw cosine similarity (1.0 - cosine distance), kept
+    separately on the result as ``cosine_score`` so the downstream RRF merge
+    can overwrite ``score`` without losing the raw signal the noise gate
+    (Patch 3) needs.
+    """
     return {
         "id": row.get("id") or "",
         "memory": row.get("summary") or row.get("text") or "",
         "score": float(score),
+        "cosine_score": float(score),
         "metadata": {
             "source": row.get("source") or "",
             "source_id": row.get("source_id") or "",
@@ -94,18 +101,28 @@ async def _vector_search(tbl, vec: list[float], col: str, limit: int) -> list[di
 
 
 def _rrf_merge(*lists: list[dict], k: int = 60, limit: int = 20) -> list[dict]:
-    """Reciprocal rank fusion across multiple ranked lists by id."""
+    """Reciprocal rank fusion across multiple ranked lists by id.
+
+    Each merged item keeps the max raw cosine_score it received in any
+    list — Patch 3's noise gate filters on this so an embedding-fakehit that
+    only ranks high by coincidence is still cut.
+    """
     score: dict[str, float] = {}
     items: dict[str, dict] = {}
+    best_cosine: dict[str, float] = {}
     for lst in lists:
         for rank, item in enumerate(lst):
             cid = item["id"]
             score[cid] = score.get(cid, 0.0) + 1.0 / (k + rank + 1)
+            cs = float(item.get("cosine_score", item.get("score", 0.0)))
+            if cs > best_cosine.get(cid, -1.0):
+                best_cosine[cid] = cs
             if cid not in items:
                 items[cid] = item
     merged = sorted(items.values(), key=lambda x: score[x["id"]], reverse=True)
     for m in merged:
         m["score"] = score[m["id"]]
+        m["cosine_score"] = best_cosine.get(m["id"], 0.0)
     return merged[:limit]
 
 
@@ -156,6 +173,15 @@ async def search_invest_kb(
         tasks.append(_vector_search(tbl, v, "vector_summary", per_variant_lim))
     hits = await asyncio.gather(*tasks)
     merged = _rrf_merge(*hits, limit=max(20, limit * 5))
+
+    # Patch 3 (2026-06-17) — noise gate. Embedding cosine fakes a ~0.30-0.36
+    # match on completely unrelated text via shared kanji/loanword frequency,
+    # which dragged citation relevance scores down to 0 on concepts the KB
+    # doesn't actually cover. Drop everything below the gate so we just return
+    # zero hits instead of injecting noise.
+    from config import INVEST_KB_MIN_SCORE
+    if INVEST_KB_MIN_SCORE > 0:
+        merged = [m for m in merged if m.get("cosine_score", 0.0) >= INVEST_KB_MIN_SCORE]
 
     # Final rerank
     if use_haiku and len(merged) > limit:

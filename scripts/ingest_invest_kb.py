@@ -211,6 +211,139 @@ def _load_cfa_rows(repo_path: Path) -> list[dict]:
 HAYATOITO_URL = "https://hayatoito.github.io/2020/investing/"
 
 
+# Patch 2 (2026-06-17): additional neutral sources to cover the concept-level
+# queries citation eval surfaced as worst (CAPM, EMH, PER/PBR/ROE/ROA,
+# rebalancing, NISA/iDeCo specifics). Order chosen for neutrality:
+#   - Wikipedia finance theory articles (academic neutral, well-cited)
+#   - FSA (Japan's Financial Services Agency) NISA / iDeCo official pages
+#   - Damodaran's NYU lecture page (academic standard, no commercial pitch)
+_WIKI_URLS = [
+    ("https://en.wikipedia.org/wiki/Capital_asset_pricing_model", "en", "CAPM"),
+    ("https://en.wikipedia.org/wiki/Modern_portfolio_theory", "en", "Modern Portfolio Theory"),
+    ("https://en.wikipedia.org/wiki/Efficient-market_hypothesis", "en", "Efficient Market Hypothesis"),
+    ("https://en.wikipedia.org/wiki/Price%E2%80%93earnings_ratio", "en", "PER"),
+    ("https://en.wikipedia.org/wiki/P/B_ratio", "en", "PBR"),
+    ("https://en.wikipedia.org/wiki/Return_on_equity", "en", "ROE"),
+    ("https://en.wikipedia.org/wiki/Return_on_assets", "en", "ROA"),
+    ("https://en.wikipedia.org/wiki/Rebalancing_investments", "en", "Rebalancing"),
+    ("https://en.wikipedia.org/wiki/Index_fund", "en", "Index Fund"),
+    ("https://en.wikipedia.org/wiki/Dollar_cost_averaging", "en", "Dollar Cost Averaging"),
+    ("https://en.wikipedia.org/wiki/Asset_allocation", "en", "Asset Allocation"),
+    ("https://en.wikipedia.org/wiki/Sharpe_ratio", "en", "Sharpe Ratio"),
+    ("https://en.wikipedia.org/wiki/Bond_duration", "en", "Bond Duration"),
+    ("https://en.wikipedia.org/wiki/Diversification_(finance)", "en", "Diversification"),
+]
+
+_FSA_URLS = [
+    ("https://www.fsa.go.jp/policy/nisa2/about/nisa2024/", "ja", "新NISA 制度の概要 (金融庁)"),
+    ("https://www.fsa.go.jp/policy/nisa2/about/", "ja", "NISA とは (金融庁)"),
+    ("https://www.ideco-koushiki.jp/start/", "ja", "iDeCo を始める (公式)"),
+]
+
+
+def _fetch_url(url: str) -> str:
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; invest_kb_ingest/1.0)"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def _html_to_markdown(html: str) -> str:
+    """Coarse HTML -> markdown. Strip scripts/styles, convert headings,
+    paragraphs, list items, then drop residual tags."""
+    html = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.IGNORECASE)
+    html = re.sub(r"<style[\s\S]*?</style>", " ", html, flags=re.IGNORECASE)
+    # Headings
+    for lv, tag in [(1, "h1"), (2, "h2"), (3, "h3"), (4, "h4"), (5, "h5"), (6, "h6")]:
+        html = re.sub(
+            rf"<{tag}[^>]*>([\s\S]*?)</{tag}>",
+            lambda m: f"\n\n{'#' * lv} {m.group(1).strip()}\n\n",
+            html, flags=re.IGNORECASE,
+        )
+    html = re.sub(r"<li[^>]*>([\s\S]*?)</li>", r"\n- \1", html, flags=re.IGNORECASE)
+    html = re.sub(r"<p[^>]*>([\s\S]*?)</p>", r"\n\n\1\n\n", html, flags=re.IGNORECASE)
+    html = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    # HTML entities (very small subset; let stdlib handle the rest)
+    import html as _html_lib
+    html = _html_lib.unescape(html)
+    # Strip remaining tags
+    html = re.sub(r"<[^>]+>", " ", html)
+    # Collapse whitespace
+    html = re.sub(r"[ \t]+", " ", html)
+    html = re.sub(r"\n\s*\n\s*\n+", "\n\n", html).strip()
+    return html
+
+
+def _load_wikipedia_rows(urls=None) -> list[dict]:
+    """Pull main article body from each wiki page. Use the public REST plain-
+    text endpoint when available to avoid wrestling with the full HTML."""
+    rows: list[dict] = []
+    for url, lang, title in (urls or _WIKI_URLS):
+        try:
+            html = _fetch_url(url)
+        except Exception as exc:
+            log.warning("wiki fetch failed (%s): %s", url, exc)
+            continue
+        # Strip everything outside <main> if present; wikipedia uses
+        # <main id="content"> or just <div id="content"> in legacy skin.
+        m = (
+            re.search(r"<main[^>]*>([\s\S]*?)</main>", html, re.IGNORECASE)
+            or re.search(r'<div[^>]*id="bodyContent"[^>]*>([\s\S]*?)</div>\s*<div[^>]*id="footer"', html, re.IGNORECASE)
+            or re.search(r'<div[^>]*id="content"[^>]*>([\s\S]*?)</div>\s*<div[^>]*id="footer"', html, re.IGNORECASE)
+        )
+        body = m.group(1) if m else html
+        # Drop wikipedia's edit-section anchors, references, navboxes
+        body = re.sub(r"<span[^>]*class=\"mw-editsection\"[\s\S]*?</span>", " ", body, flags=re.IGNORECASE)
+        body = re.sub(r"\[edit\]", " ", body, flags=re.IGNORECASE)
+        body = re.sub(r"\[\d+\]", " ", body)
+        text = _html_to_markdown(body)
+        if not text or len(text) < 500:
+            log.warning("wiki body suspiciously short for %s: %d chars", url, len(text))
+        rows.append({
+            "text": text,
+            "source": "wikipedia",
+            "source_id": title.replace(" ", "_"),
+            "title": title,
+            "source_url": url,
+            "lang": lang,
+            "license": "CC-BY-SA-4.0",
+            "category": "framework",
+            "published_at": 0,
+        })
+    return rows
+
+
+def _load_fsa_rows(urls=None) -> list[dict]:
+    rows: list[dict] = []
+    for url, lang, title in (urls or _FSA_URLS):
+        try:
+            html = _fetch_url(url)
+        except Exception as exc:
+            log.warning("fsa fetch failed (%s): %s", url, exc)
+            continue
+        m = (
+            re.search(r"<main[^>]*>([\s\S]*?)</main>", html, re.IGNORECASE)
+            or re.search(r"<article[^>]*>([\s\S]*?)</article>", html, re.IGNORECASE)
+            or re.search(r"<body[^>]*>([\s\S]*?)</body>", html, re.IGNORECASE)
+        )
+        body = m.group(1) if m else html
+        text = _html_to_markdown(body)
+        if not text or len(text) < 200:
+            log.warning("fsa body too short for %s: %d chars", url, len(text))
+        rows.append({
+            "text": text,
+            "source": "fsa",
+            "source_id": url.rsplit("/", 2)[-2] if url.endswith("/") else url.rsplit("/", 1)[-1],
+            "title": title,
+            "source_url": url,
+            "lang": lang,
+            "license": "Japan-Government-PDL",
+            "category": "tax_jp",
+            "published_at": 0,
+        })
+    return rows
+
+
 def _load_hayatoito_rows() -> list[dict]:
     """Fetch the article via urllib and crudely convert to markdown text."""
     import urllib.request
@@ -301,6 +434,20 @@ def cmd_hayatoito(args):
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+def cmd_wikipedia(args):
+    rows = _load_wikipedia_rows()
+    log.info("wikipedia rows extracted: %d (lengths=%s)", len(rows), [len(r["text"]) for r in rows])
+    result = asyncio.run(_run_ingest(rows, dry_run=args.dry_run))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_fsa(args):
+    rows = _load_fsa_rows()
+    log.info("fsa rows extracted: %d (lengths=%s)", len(rows), [len(r["text"]) for r in rows])
+    result = asyncio.run(_run_ingest(rows, dry_run=args.dry_run))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 def cmd_status(args):
     from services.invest_kb.client import table_stats
     print(json.dumps(table_stats(), ensure_ascii=False, indent=2))
@@ -324,6 +471,14 @@ def main():
     p_h = sub.add_parser("hayatoito")
     p_h.add_argument("--dry-run", action="store_true")
     p_h.set_defaults(func=cmd_hayatoito)
+
+    p_w = sub.add_parser("wikipedia")
+    p_w.add_argument("--dry-run", action="store_true")
+    p_w.set_defaults(func=cmd_wikipedia)
+
+    p_f = sub.add_parser("fsa")
+    p_f.add_argument("--dry-run", action="store_true")
+    p_f.set_defaults(func=cmd_fsa)
 
     p_s = sub.add_parser("status")
     p_s.set_defaults(func=cmd_status)
