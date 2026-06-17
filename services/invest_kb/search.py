@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 # Conservative — false negatives are fine (user can /context to peek), false
 # positives blow Haiku budget on chitchat.
 _GATE_KEYWORDS_JA = (
+    # core finance vocabulary
     "投資", "株式", "株価", "資産", "運用", "NISA", "iDeCo", "つみたて",
     "ETF", "投資信託", "債券", "金利", "配当", "利回り", "インデックス",
     "アクティブ", "PER", "PBR", "ROE", "ROA", "EPS", "決算", "有報",
@@ -28,6 +29,19 @@ _GATE_KEYWORDS_JA = (
     "リバランス", "アセットアロケーション", "リスク資産", "ベンチマーク",
     "TOPIX", "日経平均", "S&P", "ドルコスト", "リーマン", "暴落", "バブル",
     "経常利益", "営業利益", "純資産", "時価総額", "ファンダメンタル",
+    # academic / theoretical concepts added in Patch 2b after the E2E run
+    # showed gated=False on queries like "CAPM の前提と限界" — the KB now
+    # covers these well so a missed gate is pure lost recall.
+    "CAPM", "資本資産価格モデル", "EMH", "効率的市場", "効率市場",
+    "現代ポートフォリオ理論", "MPT", "シャープレシオ", "シャープ・レシオ", "シャープ比",
+    "ファクター投資", "ファクター", "リスクプレミアム", "リスクフリー",
+    "信用リスク", "金利リスク", "為替リスク", "ボラティリティ", "標準偏差",
+    "ベータ", "アルファ", "市場ポートフォリオ", "分散投資", "シングルファクター",
+    "マルチファクター", "ロー・ボラティリティ", "クオリティ", "モメンタム",
+    "債券価格", "デュレーション", "信用格付け", "格付", "国債",
+    "確定拠出年金", "確定給付年金", "所得控除", "譲渡所得", "配当所得",
+    "特定口座", "一般口座", "源泉徴収", "総合課税", "申告分離",
+    "決算短信", "MD&A", "経営者の所信表明", "セグメント情報", "有価証券報告書",
 )
 _GATE_KEYWORDS_EN = (
     " invest", "stock", "equity", "bond", "yield", "dividend", "nisa",

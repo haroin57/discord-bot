@@ -231,12 +231,13 @@ INVEST_KB_LIMIT = int(os.environ.get("INVEST_KB_LIMIT", "3"))
 # auto | always | off — gate that decides whether to fire Haiku rewrite/HyDE/
 # rerank on this turn. "auto" uses services.invest_kb.search.is_investment_query.
 INVEST_KB_QUERY_GATE = os.environ.get("INVEST_KB_QUERY_GATE", "auto")
-# Patch 3 (2026-06-17): minimum raw cosine similarity (max of body/summary
+# Patch 3 / 2b (2026-06-17): minimum raw cosine similarity (max of body/summary
 # vector) below which a chunk is considered noise and dropped from recall.
-# Tuned from empirical samples: strong hits ≥ 0.50, weak/unrelated ≈ 0.30-0.36,
-# unrelated chitchat ≈ 0.25. 0.40 cuts off "embedding-fakehit" noise without
-# blocking real matches. Set to 0.0 to disable.
-INVEST_KB_MIN_SCORE = float(os.environ.get("INVEST_KB_MIN_SCORE", "0.40"))
+# Initially 0.40. Raised to 0.45 after adding ja-wikipedia / nta / extended fsa
+# sources let the top hit on CAPM/iDeCo/有報/ドルコスト/リバランス reach 0.45+,
+# so the noise band 0.30-0.36 (embedding fakehits on unrelated words) can be
+# cut more aggressively. Set to 0.0 to disable.
+INVEST_KB_MIN_SCORE = float(os.environ.get("INVEST_KB_MIN_SCORE", "0.45"))
 SETTINGS_PATH = os.path.join(BOT_DIR, ".claude", "settings.json")
 CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 ATTACHMENT_DIR = os.path.join(tempfile.gettempdir(), "discord_bot_attachments")

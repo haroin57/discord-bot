@@ -238,12 +238,61 @@ _FSA_URLS = [
     ("https://www.fsa.go.jp/policy/nisa2/about/nisa2024/", "ja", "新NISA 制度の概要 (金融庁)"),
     ("https://www.fsa.go.jp/policy/nisa2/about/", "ja", "NISA とは (金融庁)"),
     ("https://www.ideco-koushiki.jp/start/", "ja", "iDeCo を始める (公式)"),
+    # Patch 2b additions (2026-06-17)
+    ("https://www.fsa.go.jp/policy/nisa2/about/tsumitate/target/index.html", "ja", "つみたて投資枠 対象商品 (金融庁)"),
+    ("https://www.fsa.go.jp/policy/nisa2/knowledge/basic/index.html", "ja", "資産形成の基礎知識 (金融庁)"),
+]
+
+
+# Patch 2b (2026-06-17) — Japanese-language sources for queries that fail
+# to cross-lingual embed against the English Wikipedia entries (e.g. "PER の
+# 意味" stayed at 0.307 after the English wiki ingest).
+_JA_WIKI_URLS = [
+    ("https://ja.wikipedia.org/wiki/株価収益率", "ja", "株価収益率 (PER)"),
+    ("https://ja.wikipedia.org/wiki/株価純資産倍率", "ja", "株価純資産倍率 (PBR)"),
+    ("https://ja.wikipedia.org/wiki/株主資本利益率", "ja", "株主資本利益率 (ROE)"),
+    ("https://ja.wikipedia.org/wiki/総資産利益率", "ja", "総資産利益率 (ROA)"),
+    ("https://ja.wikipedia.org/wiki/効率的市場仮説", "ja", "効率的市場仮説"),
+    ("https://ja.wikipedia.org/wiki/資本資産価格モデル", "ja", "資本資産価格モデル (CAPM)"),
+    ("https://ja.wikipedia.org/wiki/現代ポートフォリオ理論", "ja", "現代ポートフォリオ理論"),
+    ("https://ja.wikipedia.org/wiki/インデックスファンド", "ja", "インデックスファンド"),
+    ("https://ja.wikipedia.org/wiki/上場投資信託", "ja", "上場投資信託 (ETF)"),
+    ("https://ja.wikipedia.org/wiki/シャープ・レシオ", "ja", "シャープ・レシオ"),
+    ("https://ja.wikipedia.org/wiki/分散投資", "ja", "分散投資"),
+    ("https://ja.wikipedia.org/wiki/NISA", "ja", "NISA (少額投資非課税制度)"),
+    ("https://ja.wikipedia.org/wiki/個人型確定拠出年金", "ja", "個人型確定拠出年金 (iDeCo)"),
+    ("https://ja.wikipedia.org/wiki/有価証券報告書", "ja", "有価証券報告書"),
+    ("https://ja.wikipedia.org/wiki/ドル・コスト平均法", "ja", "ドル・コスト平均法"),
+    ("https://ja.wikipedia.org/wiki/アセットアロケーション", "ja", "アセットアロケーション"),
+    ("https://ja.wikipedia.org/wiki/債券", "ja", "債券"),
+    ("https://ja.wikipedia.org/wiki/格付け", "ja", "格付け"),
+]
+
+# 国税庁 タックスアンサー — 中立な税制公式情報 (license: 政府著作権、利用可)
+_NTA_URLS = [
+    ("https://www.nta.go.jp/taxes/shiraberu/taxanswer/shotoku/1135.htm", "ja", "小規模企業共済等掛金控除 (No.1135, 国税庁)"),
+    ("https://www.nta.go.jp/taxes/shiraberu/taxanswer/shotoku/1100.htm", "ja", "所得控除のあらまし (No.1100, 国税庁)"),
+    ("https://www.nta.go.jp/taxes/shiraberu/taxanswer/shotoku/1110.htm", "ja", "医療費を支払ったとき (No.1110, 国税庁)"),
+    ("https://www.nta.go.jp/taxes/shiraberu/taxanswer/shotoku/1130.htm", "ja", "社会保険料控除 (No.1130, 国税庁)"),
+    ("https://www.nta.go.jp/taxes/shiraberu/taxanswer/joto/1463.htm", "ja", "株式等を譲渡したときの課税 (No.1463, 国税庁)"),
+    ("https://www.nta.go.jp/taxes/shiraberu/taxanswer/shotoku/1240.htm", "ja", "外貨で支払われた給与等の邦貨換算 (No.1240, 国税庁)"),
 ]
 
 
 def _fetch_url(url: str) -> str:
+    """Fetch a URL and return decoded text. urllib refuses non-ASCII chars in
+    the request line, so percent-encode the path (and any non-ASCII query
+    chars) before issuing the request — this is what browsers do internally.
+    """
+    import urllib.parse
     import urllib.request
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; invest_kb_ingest/1.0)"})
+    parts = urllib.parse.urlsplit(url)
+    safe_path = urllib.parse.quote(parts.path, safe="/-_.~%")
+    safe_query = urllib.parse.quote(parts.query, safe="=&%")
+    safe_url = urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, safe_path, safe_query, parts.fragment)
+    )
+    req = urllib.request.Request(safe_url, headers={"User-Agent": "Mozilla/5.0 (compatible; invest_kb_ingest/1.0)"})
     with urllib.request.urlopen(req, timeout=60) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
@@ -272,6 +321,84 @@ def _html_to_markdown(html: str) -> str:
     html = re.sub(r"[ \t]+", " ", html)
     html = re.sub(r"\n\s*\n\s*\n+", "\n\n", html).strip()
     return html
+
+
+def _load_ja_wikipedia_rows(urls=None) -> list[dict]:
+    """Same pipeline as _load_wikipedia_rows but with throttle for ja.wikipedia
+    rate limits (the public host is stricter than en. on rapid requests).
+    """
+    import time
+    rows: list[dict] = []
+    for url, lang, title in (urls or _JA_WIKI_URLS):
+        # be a polite client — 1 RPS keeps us under the public-API rate envelope
+        time.sleep(1.1)
+        try:
+            html = _fetch_url(url)
+        except Exception as exc:
+            log.warning("ja-wiki fetch failed (%s): %s", url, exc)
+            continue
+        m = (
+            re.search(r"<main[^>]*>([\s\S]*?)</main>", html, re.IGNORECASE)
+            or re.search(r'<div[^>]*id="bodyContent"[^>]*>([\s\S]*?)</div>\s*<div[^>]*id="footer"', html, re.IGNORECASE)
+            or re.search(r'<div[^>]*id="content"[^>]*>([\s\S]*?)</div>\s*<div[^>]*id="footer"', html, re.IGNORECASE)
+        )
+        body = m.group(1) if m else html
+        body = re.sub(r"<span[^>]*class=\"mw-editsection\"[\s\S]*?</span>", " ", body, flags=re.IGNORECASE)
+        body = re.sub(r"\[編集\]", " ", body)
+        body = re.sub(r"\[\d+\]", " ", body)
+        text = _html_to_markdown(body)
+        if not text or len(text) < 300:
+            log.warning("ja-wiki body suspiciously short for %s: %d chars", url, len(text))
+        # Use the article slug as the source_id so we can dedupe with English wiki
+        # without colliding (lang prefix).
+        slug = url.rsplit("/", 1)[-1]
+        rows.append({
+            "text": text,
+            "source": "ja-wikipedia",
+            "source_id": slug,
+            "title": title,
+            "source_url": url,
+            "lang": lang,
+            "license": "CC-BY-SA-4.0",
+            "category": "framework",
+            "published_at": 0,
+        })
+    return rows
+
+
+def _load_nta_rows(urls=None) -> list[dict]:
+    """国税庁 タックスアンサー (公的税制説明) を取得して登録する。"""
+    rows: list[dict] = []
+    for url, lang, title in (urls or _NTA_URLS):
+        try:
+            html = _fetch_url(url)
+        except Exception as exc:
+            log.warning("nta fetch failed (%s): %s", url, exc)
+            continue
+        # NTA pages have <div class="taxAnswer"> or <div id="contentsMain">
+        m = (
+            re.search(r'<div[^>]*class="taxAnswer"[^>]*>([\s\S]*?)</div>\s*</div>', html, re.IGNORECASE)
+            or re.search(r'<div[^>]*id="contentsMain"[^>]*>([\s\S]*?)</div>\s*<div[^>]*id="bottom_link"', html, re.IGNORECASE)
+            or re.search(r'<main[^>]*>([\s\S]*?)</main>', html, re.IGNORECASE)
+            or re.search(r'<body[^>]*>([\s\S]*?)</body>', html, re.IGNORECASE)
+        )
+        body = m.group(1) if m else html
+        text = _html_to_markdown(body)
+        if not text or len(text) < 200:
+            log.warning("nta body too short for %s: %d chars", url, len(text))
+        no = url.rsplit("/", 1)[-1].replace(".htm", "")
+        rows.append({
+            "text": text,
+            "source": "nta",
+            "source_id": no,
+            "title": title,
+            "source_url": url,
+            "lang": lang,
+            "license": "Japan-Government-PDL",
+            "category": "tax_jp",
+            "published_at": 0,
+        })
+    return rows
 
 
 def _load_wikipedia_rows(urls=None) -> list[dict]:
@@ -448,6 +575,20 @@ def cmd_fsa(args):
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+def cmd_ja_wikipedia(args):
+    rows = _load_ja_wikipedia_rows()
+    log.info("ja-wikipedia rows extracted: %d (lengths=%s)", len(rows), [len(r["text"]) for r in rows])
+    result = asyncio.run(_run_ingest(rows, dry_run=args.dry_run))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_nta(args):
+    rows = _load_nta_rows()
+    log.info("nta rows extracted: %d (lengths=%s)", len(rows), [len(r["text"]) for r in rows])
+    result = asyncio.run(_run_ingest(rows, dry_run=args.dry_run))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 def cmd_status(args):
     from services.invest_kb.client import table_stats
     print(json.dumps(table_stats(), ensure_ascii=False, indent=2))
@@ -479,6 +620,14 @@ def main():
     p_f = sub.add_parser("fsa")
     p_f.add_argument("--dry-run", action="store_true")
     p_f.set_defaults(func=cmd_fsa)
+
+    p_jw = sub.add_parser("ja-wikipedia")
+    p_jw.add_argument("--dry-run", action="store_true")
+    p_jw.set_defaults(func=cmd_ja_wikipedia)
+
+    p_n = sub.add_parser("nta")
+    p_n.add_argument("--dry-run", action="store_true")
+    p_n.set_defaults(func=cmd_nta)
 
     p_s = sub.add_parser("status")
     p_s.set_defaults(func=cmd_status)
