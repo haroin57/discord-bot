@@ -1,0 +1,186 @@
+"""invest_kb search: Haiku rewrite + HyDE + dual-vector ANN + Haiku rerank.
+
+Returned dicts mirror Mem0's search result shape so bot.py can pass them to
+`format_memories_for_prompt` with light wrapping for source attribution.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+
+log = logging.getLogger(__name__)
+
+
+# Curated gate keywords. Tuned to fire on:
+#   - 投資 / 株 / 資産運用 vocabulary
+#   - 制度名 (NISA, iDeCo, つみたて)
+#   - 評価指標 (PER, PBR, ROE, 配当)
+#   - 商品 (ETF, 投資信託, 債券, インデックス)
+#   - 専門単語 (有報, 決算, 自己資本, バリュエーション)
+# Conservative — false negatives are fine (user can /context to peek), false
+# positives blow Haiku budget on chitchat.
+_GATE_KEYWORDS_JA = (
+    "投資", "株式", "株価", "資産", "運用", "NISA", "iDeCo", "つみたて",
+    "ETF", "投資信託", "債券", "金利", "配当", "利回り", "インデックス",
+    "アクティブ", "PER", "PBR", "ROE", "ROA", "EPS", "決算", "有報",
+    "貸借", "損益", "自己資本", "バリュエーション", "ポートフォリオ",
+    "リバランス", "アセットアロケーション", "リスク資産", "ベンチマーク",
+    "TOPIX", "日経平均", "S&P", "ドルコスト", "リーマン", "暴落", "バブル",
+    "経常利益", "営業利益", "純資産", "時価総額", "ファンダメンタル",
+)
+_GATE_KEYWORDS_EN = (
+    " invest", "stock", "equity", "bond", "yield", "dividend", "nisa",
+    "ideco", "etf", "valuation", "portfolio", "fund", "benchmark",
+)
+
+
+def is_investment_query(text: str) -> bool:
+    """Cheap keyword gate to decide whether to spend Haiku budget on a query."""
+    if not text:
+        return False
+    s = text.lower()
+    for kw in _GATE_KEYWORDS_JA:
+        if kw in text:  # JP keywords are case-irrelevant
+            return True
+    for kw in _GATE_KEYWORDS_EN:
+        if kw in s:
+            return True
+    return False
+
+
+def _row_to_result(row: dict, score: float) -> dict:
+    """Convert a LanceDB row to the Mem0-shaped result dict."""
+    return {
+        "id": row.get("id") or "",
+        "memory": row.get("summary") or row.get("text") or "",
+        "score": float(score),
+        "metadata": {
+            "source": row.get("source") or "",
+            "source_id": row.get("source_id") or "",
+            "source_url": row.get("source_url") or "",
+            "title": row.get("title") or "",
+            "lang": row.get("lang") or "",
+            "license": row.get("license") or "",
+            "category": row.get("category") or "",
+            "text": row.get("text") or "",
+        },
+    }
+
+
+async def _embed_one(text: str) -> list[float]:
+    from services.invest_kb.embed import embed_batch
+    out = await embed_batch([text])
+    return out[0] if out else []
+
+
+async def _vector_search(tbl, vec: list[float], col: str, limit: int) -> list[dict]:
+    """Run a single ANN search on the given vector column."""
+    if not vec:
+        return []
+    # LanceDB returns _distance ascending (lower = closer for cosine).
+    df = (
+        tbl.search(vec, vector_column_name=col)
+        .metric("cosine")
+        .limit(limit)
+        .to_pandas()
+    )
+    rows = []
+    for _, r in df.iterrows():
+        d = float(r.get("_distance", 1.0))
+        sim = 1.0 - d  # cosine sim
+        rows.append(_row_to_result(r.to_dict(), sim))
+    return rows
+
+
+def _rrf_merge(*lists: list[dict], k: int = 60, limit: int = 20) -> list[dict]:
+    """Reciprocal rank fusion across multiple ranked lists by id."""
+    score: dict[str, float] = {}
+    items: dict[str, dict] = {}
+    for lst in lists:
+        for rank, item in enumerate(lst):
+            cid = item["id"]
+            score[cid] = score.get(cid, 0.0) + 1.0 / (k + rank + 1)
+            if cid not in items:
+                items[cid] = item
+    merged = sorted(items.values(), key=lambda x: score[x["id"]], reverse=True)
+    for m in merged:
+        m["score"] = score[m["id"]]
+    return merged[:limit]
+
+
+async def search_invest_kb(
+    query: str,
+    *,
+    limit: int = 5,
+    use_haiku: bool = True,
+) -> list[dict]:
+    """End-to-end search.
+
+    Pipeline:
+      1. Haiku rewrite -> 3 variants
+      2. Haiku HyDE -> 1 hypothetical
+      3. embed [original, *rewrites, hypothetical] concurrently
+      4. ANN each query against vector_body and vector_summary
+      5. RRF merge into top-20
+      6. Haiku rerank -> top-`limit`
+    """
+    from services.invest_kb.client import get_table
+    q = (query or "").strip()
+    if not q:
+        return []
+    tbl = get_table()
+    if tbl.count_rows() == 0:
+        return []
+
+    queries: list[str] = [q]
+    hyde_text = ""
+    if use_haiku:
+        from services.invest_kb import haiku
+        rewrite_task = asyncio.create_task(haiku.rewrite_query(q))
+        hyde_task = asyncio.create_task(haiku.hyde(q))
+        rewrites, hyde_text = await asyncio.gather(rewrite_task, hyde_task)
+        queries.extend(rewrites)
+        if hyde_text:
+            queries.append(hyde_text)
+
+    # Embed all variants in one batched call.
+    from services.invest_kb.embed import embed_batch
+    vecs = await embed_batch(queries)
+
+    # ANN each variant against both vectors, in parallel.
+    per_variant_lim = max(8, limit * 4)
+    tasks = []
+    for v in vecs:
+        tasks.append(_vector_search(tbl, v, "vector_body", per_variant_lim))
+        tasks.append(_vector_search(tbl, v, "vector_summary", per_variant_lim))
+    hits = await asyncio.gather(*tasks)
+    merged = _rrf_merge(*hits, limit=max(20, limit * 5))
+
+    # Final rerank
+    if use_haiku and len(merged) > limit:
+        from services.invest_kb import haiku
+        return await haiku.rerank(q, merged, top_k=limit)
+    return merged[:limit]
+
+
+def format_for_prompt(results: list[dict], *, max_chars: int = 1500) -> str:
+    """Render results as the <shared_investment_knowledge> body."""
+    if not results:
+        return ""
+    lines: list[str] = []
+    used = 0
+    for r in results:
+        md = r.get("metadata") or {}
+        tag = f"{md.get('source','?')}:{md.get('source_id','?')}"
+        body = (r.get("memory") or "").strip().replace("\n", " ")
+        title = md.get("title")
+        prefix = f"- [{tag}] "
+        if title:
+            prefix += f"{title} — "
+        line = prefix + body
+        if used + len(line) > max_chars:
+            break
+        lines.append(line)
+        used += len(line)
+    return "\n".join(lines)

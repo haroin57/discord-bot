@@ -94,7 +94,18 @@ async def cli_messages_create(
     accepts identically.
     """
     headers = cli_headers()
-    headers["anthropic-beta"] = ",".join(MODEL_BETAS)
+    # 2026-06-17: filter MODEL_BETAS for Haiku — context-1m-2025-08-07 was
+    # added for Opus 4.7's 500K compaction window but Haiku models return
+    # 400 "long context beta is not yet available for this subscription"
+    # when they see it, which was silently failing-open every Mem0 rewrite/
+    # HyDE/rerank/dedup call (and the new invest_kb Haiku pipeline). Strip
+    # the long-context beta whenever the model is a Haiku.
+    is_haiku = "haiku" in (model or "").lower()
+    effective_betas = [
+        b for b in MODEL_BETAS
+        if not (is_haiku and b.startswith("context-1m-"))
+    ]
+    headers["anthropic-beta"] = ",".join(effective_betas)
     kwargs = dict(
         model=model,
         max_tokens=max_tokens,

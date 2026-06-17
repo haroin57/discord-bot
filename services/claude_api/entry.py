@@ -34,7 +34,6 @@ from config import (
     CWD,
     FABLE_REFUSAL_FALLBACK_ENABLED,
     FABLE_REFUSAL_FALLBACK_MODEL,
-    HISTORY_COMPACT_TRIGGER_CHARS,
     HISTORY_COMPACT_TRIGGER_TOKENS,
     RESTRICTED_CLAUDE_MAX_PARALLEL,
     RESTRICTED_SYSTEM_PROMPT,
@@ -415,44 +414,33 @@ async def call_with_tools(
             # fallback downstream, just at higher cost.
             if not restricted and prior_history:
                 try:
-                    # Token-first trigger (audit #7): once a previous turn has
-                    # reported real usage, gate on tokens (chars mis-estimate
-                    # JP/code transcripts by 2-4x). The char gate remains as
-                    # the cold-start fallback (no usage observed yet — fresh
-                    # process). force=True on the token path so the summary
-                    # call's own char gate cannot veto a token decision.
+                    # Token-only trigger (2026-06-17): the char-based cold-start
+                    # fallback used to fire boundary compaction on the very first
+                    # turn after a restart whenever the replayed transcript
+                    # exceeded HISTORY_COMPACT_TRIGGER_CHARS (240K), which was
+                    # absurd now that the 1M context beta is enabled and the
+                    # token trigger sits at 500K — a restart was spending the
+                    # whole first turn summarising a window that was nowhere
+                    # near the real limit. We now gate purely on tokens. Cold-
+                    # start (_last_tokens == 0) means no compaction this turn;
+                    # the very next turn reports usage and the gate becomes
+                    # authoritative. In-loop proactive compaction (ADR-0012)
+                    # still catches a runaway turn mid-stream.
                     _last_tokens = get_last_context_tokens(channel_id)
                     over_tokens = _last_tokens > HISTORY_COMPACT_TRIGGER_TOKENS
-                    _replay_chars = estimate_replay_chars(prior_history)
-                    # Cold-start ONLY: the char gate fires solely before the
-                    # first real token reading (_last_tokens == 0, fresh
-                    # process). After that, tokens are authoritative — else a
-                    # single tool-heavy keep-tail turn pins replay_chars above
-                    # the trigger permanently, so boundary compaction fired on
-                    # EVERY turn (compression≈100%, turns unchanged). The
-                    # comment above always said char was the cold-start
-                    # fallback; this restores the missing guard. 2026-06-13.
-                    over_chars = (
-                        _last_tokens == 0
-                        and _replay_chars > HISTORY_COMPACT_TRIGGER_CHARS
-                    )
-                    if over_tokens or over_chars:
+                    if over_tokens:
                         log.info(
                             "[ch=%d] boundary compaction trigger: "
-                            "last_context_tokens=%d (trigger=%d, over=%s) "
-                            "replay_chars=%d (trigger=%d, over=%s) force=%s",
+                            "last_context_tokens=%d (trigger=%d) force=True",
                             channel_id,
                             _last_tokens,
-                            HISTORY_COMPACT_TRIGGER_TOKENS, over_tokens,
-                            _replay_chars,
-                            HISTORY_COMPACT_TRIGGER_CHARS, over_chars,
-                            over_tokens,
+                            HISTORY_COMPACT_TRIGGER_TOKENS,
                         )
                     if (
-                        (over_tokens or over_chars)
+                        over_tokens
                         and await compact_channel_history(
                             channel_id, api_client, status_callback,
-                            force=over_tokens,
+                            force=True,
                         )
                     ):
                         reloaded, _snap, _ts = await asyncio.to_thread(
@@ -464,7 +452,8 @@ async def call_with_tools(
                                 "replay %d → %d turns, %d → %d chars",
                                 channel_id,
                                 len(prior_history), len(reloaded),
-                                _replay_chars, estimate_replay_chars(reloaded),
+                                estimate_replay_chars(prior_history),
+                                estimate_replay_chars(reloaded),
                             )
                             prior_history = reloaded
                 except Exception as exc:  # noqa: BLE001

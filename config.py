@@ -221,6 +221,16 @@ SESSIONS_PATH = os.path.join(STATE_DIR, "sessions.json")
 SESSION_TTL_S = int(os.environ.get("SESSION_TTL_S", str(30 * 60)))
 # Where runtime_state.py persists in-memory state across restarts (機能2).
 RUNTIME_STATE_PATH = os.path.join(STATE_DIR, "runtime_state.json")
+# invest_kb (Phase A, 2026-06-17): LanceDB side-store for neutral investment
+# knowledge (EDINET narrative / CFA RPC markdown / hayatoito philosophy etc).
+# Separate from Mem0 because Mem0's 120-char fact compression discards
+# long-form documentary text.
+INVEST_KB_PATH = os.path.join(STATE_DIR, "invest_kb")
+INVEST_KB_ENABLED = os.environ.get("INVEST_KB_ENABLED", "1") not in ("0", "false", "False", "")
+INVEST_KB_LIMIT = int(os.environ.get("INVEST_KB_LIMIT", "3"))
+# auto | always | off — gate that decides whether to fire Haiku rewrite/HyDE/
+# rerank on this turn. "auto" uses services.invest_kb.search.is_investment_query.
+INVEST_KB_QUERY_GATE = os.environ.get("INVEST_KB_QUERY_GATE", "auto")
 SETTINGS_PATH = os.path.join(BOT_DIR, ".claude", "settings.json")
 CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 ATTACHMENT_DIR = os.path.join(tempfile.gettempdir(), "discord_bot_attachments")
