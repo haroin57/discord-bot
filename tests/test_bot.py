@@ -745,8 +745,13 @@ class TestOnMessage:
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345})
 
         cid = 99999
-        bot.sessions[cid] = SessionInfo(session_id="sess-abc")
-        monkeypatch.setattr("bot._is_session_fresh", lambda _cid: True)
+        # 機能1: will_resume now checks the composite (channel, user) session
+        # via get_session, and _is_session_fresh takes user_id too.
+        monkeypatch.setattr(
+            "bot.get_session",
+            lambda _cid, _uid=None: SessionInfo(session_id="sess-abc"),
+        )
+        monkeypatch.setattr("bot._is_session_fresh", lambda _cid, _uid=None: True)
 
         msg = _make_message(content="かなえ hello", author_id=12345, channel_id=cid)
 

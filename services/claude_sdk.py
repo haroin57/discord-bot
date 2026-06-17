@@ -102,7 +102,10 @@ STREAM_IDLE_TIMEOUT_S = 120     # raise TimeoutError after 2 min of silence
 # ---------------------------------------------------------------------------
 # Session resume
 # ---------------------------------------------------------------------------
-SESSION_TTL_S = int(os.environ.get("SESSION_TTL_S", str(6 * 60 * 60)))
+# 機能2: unified with the API path via config (was env-default 6h here vs a
+# hard-coded 30m in claude_api/session_store.py). Legacy SDK path only — used
+# when CLAUDE_BACKEND=sdk; keeps its own monotonic timestamps (not persisted).
+from config import SESSION_TTL_S  # noqa: E402
 _session_timestamps: dict[int, float] = {}
 
 # ---------------------------------------------------------------------------
@@ -841,10 +844,11 @@ async def call_with_tools(*args, **kwargs):
     return await _legacy_call_with_tools(*args, **kwargs)
 
 
-def _is_session_fresh(channel_id: int) -> bool:
+def _is_session_fresh(channel_id: int, user_id: "int | None" = None) -> bool:
     if _backend() == "api":
         from services.claude_api import _is_session_fresh as _impl
-        return _impl(channel_id)
+        return _impl(channel_id, user_id)
+    # Legacy SDK path keys freshness by channel only; user_id is ignored there.
     return _legacy_is_session_fresh(channel_id)
 
 

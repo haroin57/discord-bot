@@ -159,18 +159,22 @@ class TestResolveSession:
         assert sessions == {}
 
     def test_reuses_when_subset(self, monkeypatch):
+        # 機能1: session は composite (channel, user) store 経由。user_id=None
+        # の legacy bucket でセットアップする。
         from services.claude_api import session_store as ss
+        from services.session import set_session, get_session, clear_session
         ss._record_session_time(1)
         monkeypatch.setattr(
             entry_mod, "get_mcp_servers_by_keys",
             lambda keys: {k: {"command": "echo"} for k in keys},
         )
-        sessions = {1: SessionInfo(session_id="abc", mcp_server_keys=["brave-search", "x-scraper"])}
-        cfg, resumable = _resolve_session(sessions, 1, {"brave-search"})
+        set_session(1, None, SessionInfo(session_id="abc", mcp_server_keys=["brave-search", "x-scraper"]))
+        cfg, resumable = _resolve_session({}, 1, {"brave-search"})
         # Subset → stored full set is reused.
         assert set(cfg.keys()) == {"brave-search", "x-scraper"}
         assert resumable is True
-        assert 1 in sessions
+        assert get_session(1, None) is not None
+        clear_session(1, None)
         ss._clear_session_time(1)
 
     def test_mismatch_merges_keys(self, monkeypatch):
@@ -179,19 +183,21 @@ class TestResolveSession:
         # blocks in the JSONL transcript stay valid and the will_resume
         # flag matches the actual resumable state. See entry.py:_resolve_session.
         from services.claude_api import session_store as ss
+        from services.session import set_session, get_session, clear_session
         ss._record_session_time(1)
         monkeypatch.setattr(
             entry_mod, "get_mcp_servers_by_keys",
             lambda keys: {k: {"command": "echo"} for k in keys},
         )
-        sessions = {1: SessionInfo(session_id="abc", mcp_server_keys=["brave-search"])}
-        cfg, resumable = _resolve_session(sessions, 1, {"x-scraper"})
+        set_session(1, None, SessionInfo(session_id="abc", mcp_server_keys=["brave-search"]))
+        cfg, resumable = _resolve_session({}, 1, {"x-scraper"})
         # Merged: stored {'brave-search'} | needed {'x-scraper'} → both advertised,
         # session preserved, resume still valid.
-        assert 1 in sessions
-        assert sessions[1].mcp_server_keys == ["brave-search", "x-scraper"]
+        assert get_session(1, None) is not None
+        assert get_session(1, None).mcp_server_keys == ["brave-search", "x-scraper"]
         assert set(cfg.keys()) == {"brave-search", "x-scraper"}
         assert resumable is True
+        clear_session(1, None)
         ss._clear_session_time(1)
 
 
@@ -215,7 +221,7 @@ class TestDispatcher:
         from services import claude_sdk
         # Patch the api-side implementation so we can detect the call.
         called = {"n": 0}
-        def fake(channel_id):
+        def fake(channel_id, user_id=None):
             called["n"] += 1
             return False
         import services.claude_api

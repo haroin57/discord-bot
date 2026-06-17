@@ -166,3 +166,25 @@ async def vi_signal_daemon() -> None:
             logger.exception(f"VI signal daemon error: {exc}")
             # エラー時は1分待って再試行 (無限エラーループ防止)
             await asyncio.sleep(60)
+
+
+def main() -> None:
+    """独立 systemd service (`python -m services.vi_signal_scheduler`) のエントリ。
+
+    bot 本体には結合させず、専用の vi-signal-scheduler.service として常駐させる
+    (機能8, 2026-06-17)。bot が落ちても scheduler は生き続ける。営業日・時刻判定が
+    `datetime.now()` に依存するため、service 側で `Environment=TZ=Asia/Tokyo` を必須に
+    する (deploy/systemd/vi-signal-scheduler.service)。
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    try:
+        asyncio.run(vi_signal_daemon())
+    except KeyboardInterrupt:
+        logger.info("VI signal daemon stopped (SIGINT/SIGTERM)")
+
+
+if __name__ == "__main__":
+    main()

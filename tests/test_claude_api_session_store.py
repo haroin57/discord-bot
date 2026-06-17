@@ -34,7 +34,9 @@ class TestSessionFreshness:
 
     def test_after_ttl_is_not_fresh(self, monkeypatch):
         now = [1000.0]
-        monkeypatch.setattr(time, "monotonic", lambda: now[0])
+        # 機能2: freshness now uses wall-clock (time.time), not monotonic, so
+        # it can be persisted across restarts. Patch time.time accordingly.
+        monkeypatch.setattr(time, "time", lambda: now[0])
         _record_session_time(42)
         now[0] += SESSION_TTL_S + 1
         assert _is_session_fresh(42) is False
@@ -68,7 +70,9 @@ class TestStickyModel:
 
     def test_ttl_lapse_resets_to_none(self, monkeypatch):
         now = [1000.0]
-        monkeypatch.setattr(time, "monotonic", lambda: now[0])
+        # 機能2: freshness now uses wall-clock (time.time), not monotonic, so
+        # it can be persisted across restarts. Patch time.time accordingly.
+        monkeypatch.setattr(time, "time", lambda: now[0])
         _record_session_time(42)
         _record_sticky_model(42, "claude-opus-4-8")
         assert _get_sticky_model(42) == "claude-opus-4-8"

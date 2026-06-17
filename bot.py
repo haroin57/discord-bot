@@ -48,13 +48,21 @@ from services import vscode_sync
 from services.vscode_sync.discord_post import make_post_callback
 from services.mem0_service import (
     add_memories,
+    delete_memory,
     format_history_for_prompt,
     format_memories_for_prompt,
+    get_all_memories,
     search_memories,
     search_memories_smart,
     should_use_memory_llm_mode,
 )
-from services.session import SessionInfo, load_history_channel, load_sessions, update_session
+from services.session import (
+    SessionInfo,
+    get_session,
+    load_history_channel,
+    load_sessions,
+    update_session,
+)
 from services.prompt_builder import PromptBuilder
 from services.music_analyzer import analyze_music_attachments
 from utils.attachments import (
@@ -231,6 +239,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 sessions = load_sessions()
 cooldowns: OrderedDict[int, float] = OrderedDict()
+# 機能6: /model and /effort live overrides, keyed per (channel, user). Set by
+# the slash commands, consumed by call_with_tools below. In-memory only — a
+# restart clears overrides back to the env defaults intentionally; the commands
+# are cheap to re-issue.
+_MODEL_OVERRIDES: dict[tuple[int, int], str] = {}
+_EFFORT_OVERRIDES: dict[tuple[int, int], str] = {}
 # SRE-H1: gate bot.tree.sync() to once per process (not per Discord reconnect).
 _tree_synced: bool = False
 # LRU-bounded: evict least-recently-used channel sema when over MAX_CHANNEL_SEMAS.
@@ -699,6 +713,290 @@ async def vscode_sync_cmd(
     await interaction.followup.send("stopped", ephemeral=True)
 
 
+# --- Mem0 ユーザー制御コマンド (機能3) -------------------------------------
+# /remember /recall /forget — 自動 ingest に加え、ユーザーが明示的に記憶を
+# 登録/閲覧/削除できる口。すべて発話者本人の Mem0 namespace
+# (user_id = interaction.user.id) のみを対象にするので、所有権は構造的に担保
+# される (get_all/search は user_id スコープ、delete は本人の候補からしか選べない)。
+@bot.tree.command(name="remember", description="指定したテキストを長期記憶に登録する (admin only)")
+@app_commands.describe(text="覚えておいてほしい内容")
+async def remember_cmd(interaction: discord.Interaction, text: str):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("admin only", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    uid = str(interaction.user.id)
+    try:
+        result = await add_memories(
+            user_text=text, user_id=uid, context_hint="(手動登録 via /remember)",
+        )
+    except Exception as exc:
+        await interaction.followup.send(f"記憶に失敗しました: {exc}", ephemeral=True)
+        return
+    if not result:
+        await interaction.followup.send("記憶システムが利用できませんでした", ephemeral=True)
+        return
+    kept = result.get("kept", 0)
+    if kept > 0:
+        await interaction.followup.send(f"✅ {kept}件を記憶しました", ephemeral=True)
+    else:
+        sk = result.get("skipped", {})
+        await interaction.followup.send(
+            f"記憶対象として保存されませんでした (重複や低重要度と判定: {sk})",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="recall", description="自分についての記憶を検索・一覧する (admin only)")
+@app_commands.describe(query="検索語 (省略で最近の記憶を一覧)")
+async def recall_cmd(interaction: discord.Interaction, query: str | None = None):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("admin only", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    uid = str(interaction.user.id)
+    try:
+        if query:
+            rows = await search_memories_smart(query, uid, limit=10, rewrite=True, rerank=True)
+        else:
+            rows = await get_all_memories(uid, limit=20)
+    except Exception as exc:
+        await interaction.followup.send(f"検索に失敗しました: {exc}", ephemeral=True)
+        return
+    if not rows:
+        await interaction.followup.send("該当する記憶はありませんでした", ephemeral=True)
+        return
+    lines = [f"{i}. {(r.get('memory') or '').strip()}" for i, r in enumerate(rows, 1)]
+    header = (
+        f"🧠 記憶 {len(rows)}件"
+        + (f"（検索: {query}）" if query else "（最近の登録）")
+        + ":\n"
+    )
+    for chunk in split_message(header + "\n".join(lines)):
+        await interaction.followup.send(chunk, ephemeral=True)
+
+
+class _ForgetSelect(discord.ui.Select):
+    """削除候補から複数選択させ、選ばれた memory_id を delete_memory する。
+
+    候補は forget_cmd 側で本人 namespace から引いているので、ここで削除できるのは
+    必ず発話者本人の記憶に限られる。
+    """
+
+    def __init__(self, rows: list[dict]):
+        self._by_value: dict[str, tuple[str, str]] = {}
+        options: list[discord.SelectOption] = []
+        for i, r in enumerate(rows[:25]):
+            mid = r.get("id")
+            if not mid:
+                continue
+            text = (r.get("memory") or "").strip()
+            self._by_value[str(i)] = (mid, text)
+            options.append(
+                discord.SelectOption(label=(text[:95] or "(空の記憶)"), value=str(i))
+            )
+        super().__init__(
+            placeholder="削除する記憶を選択（複数可）",
+            min_values=1,
+            max_values=max(len(options), 1),
+            options=options or [discord.SelectOption(label="(候補なし)", value="_none")],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        deleted: list[str] = []
+        failed: list[str] = []
+        for v in self.values:
+            entry = self._by_value.get(v)
+            if not entry:
+                continue
+            mid, text = entry
+            ok = await delete_memory(mid)
+            (deleted if ok else failed).append(text[:60] or "(空)")
+        msg = ""
+        if deleted:
+            msg += "🗑️ 削除しました:\n" + "\n".join(f"- {t}" for t in deleted)
+        if failed:
+            msg += ("\n" if msg else "") + "削除失敗:\n" + "\n".join(f"- {t}" for t in failed)
+        await interaction.followup.send(msg or "削除対象なし", ephemeral=True)
+
+
+class _ForgetView(discord.ui.View):
+    def __init__(self, rows: list[dict]):
+        super().__init__(timeout=120)
+        self.add_item(_ForgetSelect(rows))
+
+
+@bot.tree.command(name="forget", description="自分についての記憶を選んで削除する (admin only)")
+@app_commands.describe(query="削除候補を絞る検索語 (省略で最近の記憶から選択)")
+async def forget_cmd(interaction: discord.Interaction, query: str | None = None):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("admin only", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    uid = str(interaction.user.id)
+    try:
+        if query:
+            rows = await search_memories_smart(query, uid, limit=25, rewrite=True, rerank=True)
+        else:
+            rows = await get_all_memories(uid, limit=25)
+    except Exception as exc:
+        await interaction.followup.send(f"検索に失敗しました: {exc}", ephemeral=True)
+        return
+    rows = [r for r in rows if r.get("id")]
+    if not rows:
+        await interaction.followup.send("削除できる記憶がありませんでした", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"削除する記憶を選んでください（候補 {len(rows[:25])}件、120秒以内）:",
+        view=_ForgetView(rows),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="compact", description="このチャンネルの会話履歴を手動で圧縮する (admin only)")
+async def compact_cmd(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("admin only", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message("チャンネル外では使えません", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        # 遅延 import: startup 時の循環 import (bot ← claude_api ← bot) を避ける。
+        from services.claude_api.client_factory import make_api_client
+        from services.claude_api.compaction import compact_channel_history
+
+        api_client = await make_api_client(restricted=False)
+        ok = await compact_channel_history(channel_id, api_client, force=True)
+    except Exception as exc:
+        await interaction.followup.send(f"圧縮に失敗しました: {exc}", ephemeral=True)
+        return
+    if ok:
+        await interaction.followup.send(
+            "✅ 会話履歴を圧縮しました（次ターンから反映されます）", ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            "圧縮は実行されませんでした（無効・circuit breaker 開放・対象が小さい等）",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="context", description="このチャンネルでの直近トークン使用量と圧縮余裕を表示する (admin only)")
+async def context_cmd(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("admin only", ephemeral=True)
+        return
+    cid = interaction.channel_id
+    uid = interaction.user.id
+    info = get_session(cid, uid) if cid is not None else None
+    usage = getattr(info, "last_usage", None) if info else None
+    if not usage:
+        await interaction.response.send_message(
+            "このチャンネル × あなたの組み合わせでは、まだ usage を観測していません",
+            ephemeral=True,
+        )
+        return
+    inp = int(usage.get("input_tokens", 0) or 0)
+    cr = int(usage.get("cache_read_input_tokens", 0) or 0)
+    cc = int(usage.get("cache_creation_input_tokens", 0) or 0)
+    out = int(usage.get("output_tokens", 0) or 0)
+    total_in = inp + cr + cc
+    # 500K の圧縮トリガーまでの余裕。env override されてれば追従する。
+    from config import HISTORY_COMPACT_TRIGGER_TOKENS
+    head = max(0, HISTORY_COMPACT_TRIGGER_TOKENS - total_in)
+    msg = (
+        f"**直近ターンの usage**\n"
+        f"- input: {inp:,}\n"
+        f"- cache_read: {cr:,}\n"
+        f"- cache_creation: {cc:,}\n"
+        f"- output: {out:,}\n"
+        f"\n"
+        f"**圧縮トリガーまでの余裕**\n"
+        f"- 入力側合計: {total_in:,} / 閾値 {HISTORY_COMPACT_TRIGGER_TOKENS:,}\n"
+        f"- 残り {head:,} トークン"
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(name="model", description="このチャンネル×自分用にモデルを切り替える (admin only)")
+@app_commands.describe(model="例: claude-opus-4-8 / claude-opus-4-7 / claude-fable-5 / clear で解除")
+async def model_cmd(interaction: discord.Interaction, model: str):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("admin only", ephemeral=True)
+        return
+    cid = interaction.channel_id
+    uid = interaction.user.id
+    if cid is None:
+        await interaction.response.send_message("チャンネル外では使えません", ephemeral=True)
+        return
+    key = (cid, uid)
+    if model.strip().lower() in ("clear", "reset", "off", "default", ""):
+        _MODEL_OVERRIDES.pop(key, None)
+        await interaction.response.send_message(
+            "🧹 モデル override を解除しました（env 既定に戻ります）", ephemeral=True,
+        )
+        return
+    _MODEL_OVERRIDES[key] = model.strip()
+    await interaction.response.send_message(
+        f"✅ 次のターンから `{model.strip()}` を使います（このチャンネル × あなただけ）",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="effort", description="このチャンネル×自分用に推論強度を切り替える (admin only)")
+@app_commands.describe(level="low / medium / high / xhigh / max / clear")
+@app_commands.choices(level=[
+    app_commands.Choice(name="low", value="low"),
+    app_commands.Choice(name="medium", value="medium"),
+    app_commands.Choice(name="high", value="high"),
+    app_commands.Choice(name="xhigh", value="xhigh"),
+    app_commands.Choice(name="max", value="max"),
+    app_commands.Choice(name="clear", value="clear"),
+])
+async def effort_cmd(interaction: discord.Interaction, level: app_commands.Choice[str]):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("admin only", ephemeral=True)
+        return
+    cid = interaction.channel_id
+    uid = interaction.user.id
+    if cid is None:
+        await interaction.response.send_message("チャンネル外では使えません", ephemeral=True)
+        return
+    key = (cid, uid)
+    if level.value == "clear":
+        _EFFORT_OVERRIDES.pop(key, None)
+        await interaction.response.send_message(
+            "🧹 effort override を解除しました", ephemeral=True,
+        )
+        return
+    _EFFORT_OVERRIDES[key] = level.value
+    await interaction.response.send_message(
+        f"✅ 次のターンから effort=`{level.value}`（このチャンネル × あなただけ）",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="help", description="使えるコマンドの一覧と使い方を表示する")
+async def help_cmd(interaction: discord.Interaction):
+    # スラッシュコマンドは tree から動的に列挙するので、コマンドを足しても
+    # /help は自動で追従する。prefix コマンドだけ手書きで補う。
+    lines = ["**スラッシュコマンド**"]
+    for cmd in sorted(bot.tree.get_commands(), key=lambda c: c.name):
+        desc = getattr(cmd, "description", "") or ""
+        lines.append(f"- `/{cmd.name}` — {desc}")
+    lines.append("")
+    lines.append("**プレフィックスコマンド（admin、メッセージ本文で）**")
+    lines.append("- `!purge <N>` — かなえ自身の直近メッセージを N 件削除")
+    lines.append("- `!purge-since HH:MM` — 指定時刻（JST・24h）以降のかなえの投稿を削除")
+    lines.append("- `!purge-from` — 起点にしたいメッセージへ**返信**して、それ以降を削除")
+    lines.append("- 削除したいメッセージへ**返信**で `!delete` / `削除` / `消して` — その1件を削除")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
 async def _index_channel_message(message: discord.Message) -> None:
     """Persist + index a non-mention message for later literal keyword recall.
 
@@ -1142,10 +1440,12 @@ async def on_message(message: discord.Message):
         # If we expect to resume an existing session in this channel,
         # skip fetching thread/channel context — Claude already has it
         # in its context window. Saves tokens on every resumed turn.
+        # 機能1: resume 可否は (channel, user) 単位で判定する。同一チャンネルに
+        # 複数 admin がいても、相手のセッションを自分の resume 判定に使わない。
         will_resume = (
             caller_is_admin
-            and message.channel.id in sessions
-            and _is_session_fresh(message.channel.id)
+            and get_session(message.channel.id, message.author.id) is not None
+            and _is_session_fresh(message.channel.id, message.author.id)
         )
 
         async def _fetch_thread():
@@ -1580,45 +1880,61 @@ async def on_message(message: discord.Message):
         # STREAM_EDIT_INTERVAL_S; turn boundaries / the final flush force an
         # immediate render. The first message is a reply to the user's
         # message; the rest are channel sends.
-        LIVE_DRAFT_LIMIT = 1900
+        # 機能4: LIVE_DRAFT_LIMIT を 1880 に下げて、code-fence balancing で
+        # split_message が +α 伸ばすケースでも Discord の 2000 字を超えない
+        # 安全マージンを確保する。
+        LIVE_DRAFT_LIMIT = 1880
         STREAM_EDIT_INTERVAL_S = 1.5
+        DISCORD_HARD_CAP = 1990  # 2000 字 hard cap の保険、末尾は安全側で切る。
         _draft = {"committed": "", "last_edit": 0.0}
+        # 機能4: 並行する _stream_preview (throttle) と _incremental_send
+        # (force) が同時に同じ _live_messages を編集してちらつくのを Lock で
+        # 直列化する。Discord の edit は冪等なので Lock 内で順序を守れば最終
+        # 状態は正しい。
+        _render_lock = asyncio.Lock()
 
         async def _render_drafts(full_text: str, *, force: bool) -> None:
             full_text = (full_text or "").rstrip()
             if not full_text:
                 return
-            now_mono = time.monotonic()
-            if not force and (now_mono - _draft["last_edit"]) < STREAM_EDIT_INTERVAL_S:
-                return
-            _draft["last_edit"] = now_mono
-            # numbered=False keeps early-chunk content stable across renders
-            # (a part marker's "n" would change as the tail grows, forcing
-            # needless edits to already-settled messages).
-            chunks = split_message(full_text, limit=LIVE_DRAFT_LIMIT, numbered=False)
-            for i, chunk in enumerate(chunks):
-                if not chunk.strip():
-                    continue
-                if i < len(_live_messages):
-                    existing = _live_messages[i]
-                    if getattr(existing, "content", None) == chunk:
-                        continue  # unchanged — skip the edit
-                    try:
-                        await existing.edit(content=chunk)
-                    except discord.errors.HTTPException:
-                        pass
-                else:
-                    try:
-                        if not _live_messages:
-                            sent = await message.reply(chunk)
-                        else:
-                            sent = await message.channel.send(chunk)
-                    except discord.errors.HTTPException as exc:
-                        log.warning("[rid=%s] draft send failed: %s",
-                                    get_request_id(), exc)
-                        return
-                    _live_messages.append(sent)
-                    _live_sent_any["v"] = True
+            async with _render_lock:
+                now_mono = time.monotonic()
+                if not force and (now_mono - _draft["last_edit"]) < STREAM_EDIT_INTERVAL_S:
+                    return
+                _draft["last_edit"] = now_mono
+                # numbered=False keeps early-chunk content stable across renders
+                # (a part marker's "n" would change as the tail grows, forcing
+                # needless edits to already-settled messages).
+                chunks = split_message(full_text, limit=LIVE_DRAFT_LIMIT, numbered=False)
+                for i, chunk in enumerate(chunks):
+                    if not chunk.strip():
+                        continue
+                    # Safety net: a fence-balancing split could theoretically push
+                    # a chunk over LIVE_DRAFT_LIMIT to keep ``` pairs intact.
+                    # Truncate to DISCORD_HARD_CAP so we never trigger the 2000-
+                    # char API error.
+                    if len(chunk) > DISCORD_HARD_CAP:
+                        chunk = chunk[:DISCORD_HARD_CAP - 1] + "…"
+                    if i < len(_live_messages):
+                        existing = _live_messages[i]
+                        if getattr(existing, "content", None) == chunk:
+                            continue  # unchanged — skip the edit
+                        try:
+                            await existing.edit(content=chunk)
+                        except discord.errors.HTTPException:
+                            pass
+                    else:
+                        try:
+                            if not _live_messages:
+                                sent = await message.reply(chunk)
+                            else:
+                                sent = await message.channel.send(chunk)
+                        except discord.errors.HTTPException as exc:
+                            log.warning("[rid=%s] draft send failed: %s",
+                                        get_request_id(), exc)
+                            return
+                        _live_messages.append(sent)
+                        _live_sent_any["v"] = True
 
         async def _stream_preview(partial_turn_text: str) -> None:
             # In-progress text of the CURRENT turn appended to everything
@@ -1701,6 +2017,14 @@ async def on_message(message: discord.Message):
             is_thread=is_thread,
             has_image_attachment=bool(image_paths),
             author=sender_speaker_label,
+            user_id=message.author.id,
+            # 機能6: per-(channel,user) overrides set by /model and /effort.
+            forced_model_override=_MODEL_OVERRIDES.get(
+                (message.channel.id, message.author.id)
+            ),
+            forced_effort_override=_EFFORT_OVERRIDES.get(
+                (message.channel.id, message.author.id)
+            ),
         )
 
         job.phase = JobPhase.FINALIZING
@@ -1799,7 +2123,10 @@ async def on_message(message: discord.Message):
             return
 
         if session_info:
-            await asyncio.to_thread(update_session, sessions, message.channel.id, session_info)
+            await asyncio.to_thread(
+                update_session, sessions, message.channel.id, session_info,
+                message.author.id,
+            )
 
         # --- Mem0: batch turn accumulation + per-turn kanae extract ---
         # Only admin callers may write to long-term memory. Non-admin writes

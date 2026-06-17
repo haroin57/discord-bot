@@ -474,11 +474,15 @@ class TestTodoWriteDisplay:
 
 
 class TestEffortMedium:
-    """Pin the effort dial at "medium" for Fable 5."""
+    """Pin the effort dial at the CLAUDE_EFFORT env value."""
 
     def test_output_config_constant_is_medium(self):
+        # 2026-06-17: the default was raised from "medium" to env-driven
+        # (commit 09d8a31 set .env CLAUDE_EFFORT=max via xhigh). What matters is
+        # that OUTPUT_CONFIG reflects the configured value, not a hard pin.
+        from config import CLAUDE_EFFORT
         from services.claude_api.client import OUTPUT_CONFIG
-        assert OUTPUT_CONFIG == {"effort": "medium"}
+        assert OUTPUT_CONFIG == {"effort": CLAUDE_EFFORT}
 
     def test_effort_beta_still_in_betas(self):
         # output_config.effort is only honored under the effort-2025-11-24
@@ -516,7 +520,8 @@ class TestEffortMedium:
             model="claude-opus-4-7",
             extra_betas=[],
         )
-        assert captured_kwargs.get("output_config") == {"effort": "medium"}
+        from config import CLAUDE_EFFORT
+        assert captured_kwargs.get("output_config") == {"effort": CLAUDE_EFFORT}
 
 
 class TestRefusalLogging:

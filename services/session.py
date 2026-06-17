@@ -38,6 +38,11 @@ _save_tasks: set[asyncio.Task] = set()
 class SessionInfo:
     session_id: str
     mcp_server_keys: list[str] = field(default_factory=list)
+    # 機能6: last turn's usage breakdown (input/cache_read/cache_creation/output
+    # tokens). Surfaced to /context so the admin can see "how close are we to
+    # the 500K compaction trigger". Not persisted to sessions.json — the disk
+    # serializer keeps the legacy {session_id, mcp_server_keys} contract.
+    last_usage: dict | None = None
 
 
 # ---------------------------------------------------------------------------

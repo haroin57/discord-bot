@@ -56,9 +56,12 @@ from services.session import (
     SessionInfo,
     append_jsonl,
     build_compact_history_entries,
+    clear_session,
+    get_session,
     load_api_replay_channel,
     load_history_channel,
     prompt_has_context_snapshot,
+    set_session,
 )
 
 from services.claude_api.client import (
@@ -190,21 +193,25 @@ def _resolve_session(
     sessions: dict[int, SessionInfo],
     channel_id: int,
     chosen_mcp_keys: set[str],
+    user_id: "int | None" = None,
 ) -> tuple[dict[str, dict], bool]:
     """Apply the MCP-subset / TTL rules and return ``(mcp_cfg, resumable)``.
 
-    Mirrors services/claude_sdk.py:606-625. May mutate ``sessions`` by
-    invalidating an incompatible-MCP session.
+    Mirrors services/claude_sdk.py:606-625. Reads/writes the (channel, user)
+    session via the composite-key store (機能1) rather than the legacy
+    channel-only ``sessions`` dict, so co-located admins don't clobber each
+    other's session. ``sessions`` is kept in the signature for back-compat
+    (the bootstrap dict bot.py loads) but is no longer the source of truth.
 
     ``resumable`` is True when the caller may load prior turns from the
     JSONL transcript and seed them into the agent loop. False whenever
     the session is missing, stale, or MCP-incompatible.
     """
-    info = sessions.get(channel_id)
-    if info is None or not _is_session_fresh(channel_id):
+    info = get_session(channel_id, user_id)
+    if info is None or not _is_session_fresh(channel_id, user_id):
         if info is not None:
-            sessions.pop(channel_id, None)
-            _clear_session_time(channel_id)
+            clear_session(channel_id, user_id)
+            _clear_session_time(channel_id, user_id)
         return get_mcp_servers_by_keys(list(chosen_mcp_keys)), False
 
     stored = set(info.mcp_server_keys or [])
@@ -244,6 +251,9 @@ async def call_with_tools(
     is_thread: bool = False,
     has_image_attachment: bool = False,
     author: str = "",
+    user_id: "int | None" = None,
+    forced_model_override: "str | None" = None,
+    forced_effort_override: "str | None" = None,
 ) -> tuple[str, SessionInfo | None, bool]:
     """Direct-API replacement for services/claude_sdk.py:call_with_tools.
 
@@ -285,7 +295,7 @@ async def call_with_tools(
         resumable = False
         if not restricted:
             chosen_mcp_cfg, resumable = _resolve_session(
-                sessions, channel_id, chosen_mcp_keys
+                sessions, channel_id, chosen_mcp_keys, user_id
             )
             chosen_mcp_keys = set(chosen_mcp_cfg.keys())
 
@@ -475,7 +485,8 @@ async def call_with_tools(
             # fallback model for the remaining attempts. Distinct from the
             # refusal sticky pin — this is a transport-level escape, scoped to
             # this request only.
-            forced_model: str | None = None
+            # 機能6: /model command can pre-seed a per-request override.
+            forced_model: str | None = forced_model_override
             # Rapid-refill accounting for the in-loop proactive compaction
             # (audit #19): True when this request triggered one.
             proactive_fired = False
@@ -561,7 +572,7 @@ async def call_with_tools(
                         # cold (cache_read=0 on every Fable turn). Restricted
                         # channels stay on the default model (no pinning).
                         sticky_model = (
-                            _get_sticky_model(channel_id) if not restricted else None
+                            _get_sticky_model(channel_id, user_id) if not restricted else None
                         )
                         effective_model = forced_model or sticky_model or MODEL
                         result = await run_agent_loop(
@@ -609,6 +620,11 @@ async def call_with_tools(
                                 _proactive_compact if not restricted else None
                             ),
                             prior_turns=len(history_for_loop),
+                            # 機能6: /effort command override (admin only).
+                            output_config_override=(
+                                {"effort": forced_effort_override}
+                                if forced_effort_override else None
+                            ),
                         )
                         response_text = result.text
                         if getattr(result, "fallback_model", None):
@@ -620,7 +636,7 @@ async def call_with_tools(
                                 # Pin the session so the next turn starts on
                                 # the fallback model directly (ADR-0010).
                                 _record_sticky_model(
-                                    channel_id, result.fallback_model
+                                    channel_id, result.fallback_model, user_id
                                 )
                         break
                     except asyncio.CancelledError:
@@ -637,8 +653,8 @@ async def call_with_tools(
                         if category == "context_overflow":
                             # History too long — session must restart so
                             # the next turn loads a shorter JSONL tail.
-                            sessions.pop(channel_id, None)
-                            _clear_session_time(channel_id)
+                            clear_session(channel_id, user_id)
+                            _clear_session_time(channel_id, user_id)
                             return _classified_error_message(category, exc), None, False
                         if category == "tool_use_mismatch":
                             # tool_use/tool_result pairing 400 (audit #14):
@@ -646,8 +662,8 @@ async def call_with_tools(
                             # drop the session so the next turn reloads a
                             # clean, Yy8-swept replay window instead of
                             # treating the channel as permanently broken.
-                            sessions.pop(channel_id, None)
-                            _clear_session_time(channel_id)
+                            clear_session(channel_id, user_id)
+                            _clear_session_time(channel_id, user_id)
                             return _classified_error_message(category, exc), None, False
                         if category == "model_not_found":
                             # Model renamed/retired (audit #6, CLI
@@ -822,10 +838,12 @@ async def call_with_tools(
         session_info = SessionInfo(
             session_id=result.synthetic_session_id or "",
             mcp_server_keys=result.active_mcp_keys,
+            # 機能6: surface the turn's usage to /context.
+            last_usage=getattr(result, "usage_total", None),
         )
         if result.synthetic_session_id:
-            sessions[channel_id] = session_info
-            _record_session_time(channel_id)
+            set_session(channel_id, user_id, session_info)
+            _record_session_time(channel_id, user_id)
 
         # 10. Persist this turn's user/assistant pair to the JSONL transcript
         # so the next call (within TTL) can replay it.

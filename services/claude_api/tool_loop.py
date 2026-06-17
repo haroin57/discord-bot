@@ -78,6 +78,10 @@ class AgentLoopResult:
     # prior window mid-request (audit #3) — entry.py slices new turns for
     # JSONL persistence at this index, not at len(prior_history).
     prior_len: int | None = None
+    # 機能6: per-turn aggregated usage (input/cache_read/cache_creation/output
+    # tokens). Surfaced to bot.py via SessionInfo.last_usage so /context can
+    # show "how much room is left before the 500K compaction trigger".
+    usage_total: dict | None = None
 
 
 # Header the official CLI sets on every API request once a refusal fallback
@@ -740,6 +744,7 @@ async def run_agent_loop(
     refusal_fallback_model: str | None = None,
     proactive_compact=None,  # async () -> list[dict] | None (new prior window)
     prior_turns: int = 0,
+    output_config_override: dict | None = None,  # /effort per-request override
 ) -> AgentLoopResult:
     """Run the streaming + tool-use loop. See module docstring for invariants.
 
@@ -858,7 +863,9 @@ async def run_agent_loop(
             # With effort gone but the effort-2025-11-24 beta header still set,
             # the server saw a contradictory request and returned
             # stop_reason=refusal. Direct kwarg puts effort on the wire (ADR-0009).
-            output_config=OUTPUT_CONFIG,
+            # /effort override (機能6, 2026-06-17) takes precedence per request;
+            # falls through to OUTPUT_CONFIG (env-driven default).
+            output_config=output_config_override or OUTPUT_CONFIG,
             extra_body={
                 "context_management": CONTEXT_MANAGEMENT_CONFIG,
             },
@@ -1194,6 +1201,7 @@ async def run_agent_loop(
                 active_mcp_keys=active_mcp_keys,
                 fallback_model=current_model if fallback_used else None,
                 prior_len=prior_len,
+                usage_total=dict(usage_totals),
             )
         if stop_reason != "tool_use":
             # max_tokens / refusal / unexpected — return whatever text we
@@ -1212,6 +1220,7 @@ async def run_agent_loop(
                 active_mcp_keys=active_mcp_keys,
                 fallback_model=current_model if fallback_used else None,
                 prior_len=prior_len,
+                usage_total=dict(usage_totals),
             )
 
         # Execute every tool_use block in this turn.
@@ -1352,6 +1361,7 @@ async def run_agent_loop(
                 active_mcp_keys=active_mcp_keys,
                 fallback_model=current_model if fallback_used else None,
                 prior_len=prior_len,
+                usage_total=dict(usage_totals),
             )
         consecutive_empty = 0
         history.append({"role": "user", "content": tool_results})
@@ -1403,6 +1413,7 @@ async def run_agent_loop(
         active_mcp_keys=active_mcp_keys,
         fallback_model=current_model if fallback_used else None,
         prior_len=prior_len,
+        usage_total=dict(usage_totals),
     )
 
 

@@ -213,6 +213,14 @@ BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_DIR = os.path.join(BOT_DIR, ".state")
 HISTORY_DIR = os.path.join(STATE_DIR, "history")
 SESSIONS_PATH = os.path.join(STATE_DIR, "sessions.json")
+# Single source of truth for the session freshness window (機能2, 2026-06-17).
+# Previously split: claude_sdk.py read SESSION_TTL_S from env defaulting to 6h
+# (CLI legacy), while claude_api/session_store.py hard-coded 30m — so an env
+# override moved one but not the other. Both now import this. 30m matches the
+# Mem0-refetch-skip / resume window the API path actually wants.
+SESSION_TTL_S = int(os.environ.get("SESSION_TTL_S", str(30 * 60)))
+# Where runtime_state.py persists in-memory state across restarts (機能2).
+RUNTIME_STATE_PATH = os.path.join(STATE_DIR, "runtime_state.json")
 SETTINGS_PATH = os.path.join(BOT_DIR, ".claude", "settings.json")
 CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 ATTACHMENT_DIR = os.path.join(tempfile.gettempdir(), "discord_bot_attachments")
