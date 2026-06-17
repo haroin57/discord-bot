@@ -17,7 +17,7 @@ from typing import Iterable
 log = logging.getLogger(__name__)
 
 
-async def _summarize_all(chunks_text: list[str], lang: str, concurrency: int = 4):
+async def _summarize_all(chunks_text: list[str], lang: str, concurrency: int = 10):
     """Bounded-concurrency summarize for a chunk list."""
     from services.invest_kb import haiku
     sem = asyncio.Semaphore(concurrency)
@@ -36,7 +36,7 @@ async def upsert_documents(
     max_chars: int = 1200,
     overlap: int = 120,
     dry_run: bool = False,
-    summarize_concurrency: int = 4,
+    summarize_concurrency: int = 10,
 ) -> dict:
     """Upsert a batch of source-level documents.
 

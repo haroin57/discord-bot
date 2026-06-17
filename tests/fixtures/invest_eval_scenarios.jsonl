@@ -1,0 +1,30 @@
+{"query": "インデックス投資の本質的な根拠を教えて", "intent": "philosophy"}
+{"query": "ドルコスト平均法はどんな時に有効?", "intent": "philosophy"}
+{"query": "アクティブファンドがインデックスに長期で勝てない理由は?", "intent": "philosophy"}
+{"query": "市場ポートフォリオって何を意味する?", "intent": "framework"}
+{"query": "CAPM の前提と限界を簡潔に", "intent": "framework"}
+{"query": "効率的市場仮説の3形態を区別すると?", "intent": "framework"}
+{"query": "PER と PBR の使い分け方", "intent": "valuation"}
+{"query": "ROE と ROA の違いは?", "intent": "valuation"}
+{"query": "自己資本比率が高い企業はどう評価すべき?", "intent": "valuation"}
+{"query": "アセットアロケーションの考え方", "intent": "portfolio"}
+{"query": "リバランスの頻度はどう決める?", "intent": "portfolio"}
+{"query": "シャープレシオの直感的な意味", "intent": "portfolio"}
+{"query": "新NISA のつみたて投資枠の年間上限は?", "intent": "tax_jp"}
+{"query": "iDeCo の所得控除メリットを教えて", "intent": "tax_jp"}
+{"query": "特定口座と一般口座の違い", "intent": "tax_jp"}
+{"query": "ETF と投資信託の構造的違い", "intent": "product"}
+{"query": "債券利回りと価格の関係", "intent": "product"}
+{"query": "外国株式の為替リスクをどう扱う?", "intent": "product"}
+{"query": "有価証券報告書のどこを最初に読むべき?", "intent": "edgar"}
+{"query": "経営者の所信表明と MD&A はどう読み比べる?", "intent": "edgar"}
+{"query": "決算短信と有報の関係", "intent": "edgar"}
+{"query": "リスク資産と無リスク資産の組み合わせ", "intent": "portfolio"}
+{"query": "投資の長期と短期で考え方はどう違う?", "intent": "philosophy"}
+{"query": "債券ファンドの金利感応度は?", "intent": "product"}
+{"query": "成長株と割安株、自分のステージに合うのは?", "intent": "philosophy"}
+{"query": "情報の非対称性が個人投資家に与える影響", "intent": "philosophy"}
+{"query": "GenAI を投資判断に使う際の注意点", "intent": "framework"}
+{"query": "RAG とは何か、金融への応用例", "intent": "framework"}
+{"query": "explainable AI が金融で重要な理由", "intent": "framework"}
+{"query": "個別株を買う前に確認すべき開示資料", "intent": "edgar"}
