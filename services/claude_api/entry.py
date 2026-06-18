@@ -286,7 +286,7 @@ async def call_with_tools(
             chosen_mcp_cfg: dict[str, dict] = {}
             always_advertised_mcp_keys: set[str] = set()
         else:
-            chosen_mcp_cfg = pick_mcp_servers(raw_user_text)
+            chosen_mcp_cfg = pick_mcp_servers(raw_user_text, user_id=user_id)
             always_advertised_mcp_keys = set(ALWAYS_ADVERTISED_MCP_KEYS)
         chosen_mcp_keys = set(chosen_mcp_cfg.keys())
 

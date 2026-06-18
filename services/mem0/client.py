@@ -56,37 +56,54 @@ _async_anthropic_lock = asyncio.Lock()
 
 
 async def get_anthropic_client():
-    """Return a singleton AsyncAnthropic client, refreshing only on token change.
+    """Return a singleton LLM client for extraction/rewrite/rerank.
 
-    Returns None if the OAuth token cannot be obtained — callers must handle
-    that as a soft failure and fall back to their best-effort behavior.
+    Primary: AsyncAnthropic with OAuth token. When the OAuth token is
+    unavailable (expired / missing), falls back to an OpenAI-compatible
+    client pointed at OpenRouter with DeepSeek V4 Flash.
+
+    Returns None only when neither auth method is available.
     """
     global _async_anthropic_client, _async_anthropic_token
     oauth_init()  # idempotent
     await ensure_valid_token()
     token = get_access_token()
-    if not token:
-        return None
-    # Fast path: no rebuild needed.
-    if _async_anthropic_client is not None and token == _async_anthropic_token:
+
+    # OAuth token available — use Anthropic directly.
+    if token:
+        # Fast path: no rebuild needed.
+        if _async_anthropic_client is not None and token == _async_anthropic_token:
+            return _async_anthropic_client
+        # Slow path: build (or rebuild after token rotation) under a lock.
+        async with _async_anthropic_lock:
+            if _async_anthropic_client is None or token != _async_anthropic_token:
+                from anthropic import AsyncAnthropic
+                _async_anthropic_client = AsyncAnthropic(
+                    auth_token=token, max_retries=0,
+                )
+                _async_anthropic_token = token
         return _async_anthropic_client
-    # Slow path: build (or rebuild after token rotation) under a lock so two
-    # concurrent callers cannot both construct a fresh client.
-    async with _async_anthropic_lock:
-        # Re-check after acquiring the lock — another coroutine may have
-        # already built the right client while we were waiting.
-        if _async_anthropic_client is None or token != _async_anthropic_token:
-            from anthropic import AsyncAnthropic
-            # max_retries=0 — Mem0 ingest treats any 429 as fail-open, and
-            # the SDK's default 5x retry on rate-limit-error turns one burst
-            # into 5 wasted calls, ratcheting the per-minute limiter for the
-            # next caller. Bumped from default 2 to 0 on 2026-05-14 after
-            # the channel-history ingest saturated the account.
-            _async_anthropic_client = AsyncAnthropic(
-                auth_token=token, max_retries=0,
-            )
-            _async_anthropic_token = token
-    return _async_anthropic_client
+
+    # OAuth unavailable — fall back to DeepSeek V4 Flash.
+    # Tier 1: OpenRouter (explicit key). Tier 2: OpenCode Zen (free key).
+    if _OPENROUTER_API_KEY:
+        log.warning("get_anthropic_client: OAuth unavailable, using OpenRouter fallback (%s)", _DEEPSEEK_V4_FLASH)
+        from openai import AsyncOpenAI
+        return AsyncOpenAI(
+            api_key=_OPENROUTER_API_KEY,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={"HTTP-Referer": "https://discord-bot.kanae.local"},
+        )
+    if _OPENCODE_API_KEY:
+        log.warning("get_anthropic_client: OAuth unavailable, using OpenCode Zen fallback (%s)", _DEEPSEEK_V4_FLASH)
+        from openai import AsyncOpenAI
+        return AsyncOpenAI(
+            api_key=_OPENCODE_API_KEY,
+            base_url="https://api.opencode.ai/v1",
+        )
+
+    # No auth at all.
+    return None
 
 
 def _refresh_mem0_client_token() -> None:
@@ -106,6 +123,44 @@ def _refresh_mem0_client_token() -> None:
             log.debug("Failed to refresh Mem0 client token: %s", e)
 
 
+def _has_oauth_token() -> bool:
+    """Check whether Anthropic OAuth is available (not expired).
+
+    Returns True if the credentials file exists and contains a non-expired
+    access token, or if ANTHROPIC_API_KEY is set. Returns False when the
+    only auth mechanism is OAuth and the token has expired.
+    """
+    # Direct API key always works.
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return True
+    # Try reading the OAuth credentials file that discord-bot maintains.
+    try:
+        from config import CREDENTIALS_PATH
+        import json
+        if os.path.isfile(CREDENTIALS_PATH):
+            with open(CREDENTIALS_PATH, encoding="utf-8") as f:
+                creds = json.load(f)
+            expires = creds.get("expiresAt", 0)
+            # Add 60s buffer so we don't start a request with a token that
+            # expires mid-flight.
+            if expires and (expires / 1000) > (time.time() + 60):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+# Fallback LLM config (used when Anthropic OAuth is unavailable).
+# Two fallback tiers:
+#   1. OPENROUTER_API_KEY → DeepSeek V4 Flash via OpenRouter
+#   2. OPENCODE_API_KEY   → DeepSeek V4 Flash via OpenCode Zen API (free tier)
+# DeepSeek V4 Flash is fast, cheap, and multilingual. It replaces Haiku for
+# Mem0 extraction/rewrite/rerank when the primary Anthropic auth is down.
+_OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+_OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY", "")
+_DEEPSEEK_V4_FLASH = "deepseek/deepseek-chat-v4-flash"
+
+
 def _build_config() -> dict:
     """Build Mem0 configuration from env vars.
 
@@ -114,6 +169,11 @@ def _build_config() -> dict:
     write race that corrupted the HNSW index during the SEGV incident.
 
     CHROMA_MODE=embedded: legacy direct file access (kept for rollback).
+
+    LLM fallback: when Anthropic OAuth is unavailable (expired / missing)
+    and OPENROUTER_API_KEY is set, the LLM provider falls back to
+    DeepSeek V4 Flash via OpenRouter. This keeps Mem0 functional during
+    OAuth outages at slightly lower extraction quality.
     """
     from config import STATE_DIR
 
@@ -140,14 +200,58 @@ def _build_config() -> dict:
             "path": db_path,
         }
 
-    config: dict = {
-        "llm": {
-            "provider": os.environ.get("MEM0_LLM_PROVIDER", "anthropic"),
-            "config": {
-                "model": os.environ.get("MEM0_LLM_MODEL", "claude-haiku-4-5-20251001"),
+    # Determine LLM provider: primary=Anthropic OAuth, fallback=OpenRouter
+    llm_provider = os.environ.get("MEM0_LLM_PROVIDER", "anthropic")
+    llm_model = os.environ.get("MEM0_LLM_MODEL", "claude-haiku-4-5-20251001")
+    llm_config = {
+        "model": llm_model,
+        "temperature": 0.1,
+        "max_tokens": 2000,
+    }
+
+    if llm_provider == "anthropic" and not _has_oauth_token():
+        if _OPENROUTER_API_KEY:
+            log.warning(
+                "Anthropic OAuth unavailable — falling back to %s via OpenRouter",
+                _DEEPSEEK_V4_FLASH,
+            )
+            llm_provider = "openrouter"
+            llm_model = _DEEPSEEK_V4_FLASH
+            llm_config = {
+                "model": _DEEPSEEK_V4_FLASH,
                 "temperature": 0.1,
                 "max_tokens": 2000,
-            },
+            }
+        elif _OPENCODE_API_KEY:
+            log.warning(
+                "Anthropic OAuth unavailable — falling back to %s via OpenCode Zen",
+                _DEEPSEEK_V4_FLASH,
+            )
+            # OpenCode Zen speaks OpenAI-compatible API at api.opencode.ai
+            llm_provider = "openai"
+            llm_model = _DEEPSEEK_V4_FLASH
+            llm_config = {
+                "model": _DEEPSEEK_V4_FLASH,
+                "temperature": 0.1,
+                "max_tokens": 2000,
+                "openai_api_key": _OPENCODE_API_KEY,
+                "openai_base_url": "https://api.opencode.ai/v1",
+            }
+        else:
+            log.error(
+                "Anthropic OAuth unavailable and no fallback key configured "
+                "(OPENROUTER_API_KEY / OPENCODE_API_KEY) — Mem0 LLM calls will fail"
+            )
+
+    if llm_provider == "openrouter":
+        # Mem0's openrouter provider wraps the OpenAI-compatible API.
+        llm_config["openai_api_key"] = _OPENROUTER_API_KEY
+        llm_config["openai_base_url"] = "https://openrouter.ai/api/v1"
+
+    config: dict = {
+        "llm": {
+            "provider": llm_provider,
+            "config": llm_config,
         },
         "vector_store": {
             "provider": "chroma",

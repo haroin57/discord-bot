@@ -944,8 +944,16 @@ async def run_agent_loop(
                             await _safe_status(status_callback, "📝 応答を生成中")
                         elif btype == "tool_use":
                             name = getattr(block, "name", "?")
-                            hint = _tool_input_hint(name, getattr(block, "input", None))
+                            tool_input = getattr(block, "input", None)
+                            hint = _tool_input_hint(name, tool_input)
                             short_name = name.split("__", 2)[-1] if "__" in name else name
+                            # journal にも tool 名 + input を残す (audit / debug 用).
+                            # input は最大 300 文字でクリップ。MCP 通信失敗時の切り分けに使う。
+                            log.info(
+                                "[ch=%d] turn=%d tool_use: name=%s input=%s",
+                                channel_id, turn + 1, name,
+                                str(tool_input)[:300] if tool_input is not None else "",
+                            )
                             label = f"🔧 {short_name}"
                             if hint:
                                 label += f" `{hint[:60]}`"

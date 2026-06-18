@@ -7,7 +7,16 @@ without duplicating the sanitization regex patterns or assembly logic.
 import html
 import re
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Callable, Awaitable
+
+# Tokyo timezone is fixed for the time-line hook. The Discord bot serves a JST
+# audience (haroin / b0nchichi) so all time tags inject JST regardless of the
+# host machine's local timezone. This keeps the prompt deterministic across
+# deployments (Tokyo VPS vs ad-hoc local dev).
+_JST = ZoneInfo("Asia/Tokyo")
+_WEEKDAYS_JA = ("月", "火", "水", "木", "金", "土", "日")
 
 # Sanitize regexes + helper now live in services/sentinel.py — single source
 # of truth shared with bot.py. Local aliases preserve the existing names
@@ -104,6 +113,33 @@ class PromptBuilder:
             queries.append(sentences[0])
 
         return queries[:max_queries]
+
+    @staticmethod
+    def build_time_line(now: datetime | None = None) -> str:
+        """Current wall-clock time tag injected into every prompt.
+
+        The model has no physical clock — without this hook it has to guess
+        the time of day from message tone, which fails (e.g. tone-based
+        "this looks like deep-night chat" misread when b0nchichi's baseline
+        is脱力 regardless of hour). This line gives the model a deterministic
+        ground truth.
+
+        Format: ``[現在時刻: YYYY-MM-DD HH:MM:SS JST (曜日)]``
+        Timezone is fixed to JST — see module docstring for rationale.
+
+        ``now`` is injectable for tests; production passes ``None`` and the
+        helper reads the wall clock itself.
+        """
+        if now is None:
+            now = datetime.now(_JST)
+        else:
+            # Defensive: if a caller hands us a naive or non-JST datetime,
+            # normalize to JST so the printed wall-clock matches the tag's
+            # advertised timezone. Tests pin a fixed JST datetime; this
+            # branch is a safety net for ad-hoc callers.
+            now = now.astimezone(_JST) if now.tzinfo else now.replace(tzinfo=_JST)
+        weekday = _WEEKDAYS_JA[now.weekday()]
+        return f"[現在時刻: {now.strftime('%Y-%m-%d %H:%M:%S')} JST ({weekday})]"
 
     @staticmethod
     def build_speaker_line(sender_name: str, sender_tag: str) -> str:

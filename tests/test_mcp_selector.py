@@ -14,6 +14,10 @@ import pytest
 from services import mcp_selector
 
 
+_ADMIN_ID = 573489206240870410
+_NON_ADMIN_ID = 999999999999999
+
+
 @pytest.fixture(autouse=True)
 def _stub_server_tiers():
     """Replace each tier dict with a unique sentinel server entry."""
@@ -23,7 +27,8 @@ def _stub_server_tiers():
     memory = {"memory": {"command": "memory-cmd"}}
     paper = {"paper": {"command": "paper-cmd"}}
     docs = {"docs": {"command": "docs-cmd"}}
-    union = {**base, **web, **heavy, **memory, **paper, **docs}
+    realestate = {"realestate": {"command": "realestate-cmd"}}
+    union = {**base, **web, **heavy, **memory, **paper, **docs, **realestate}
     with patch.multiple(
         mcp_selector,
         MCP_SERVERS_BASE=base,
@@ -32,7 +37,9 @@ def _stub_server_tiers():
         MCP_SERVERS_MEMORY=memory,
         MCP_SERVERS_PAPER=paper,
         MCP_SERVERS_DOCS=docs,
+        MCP_SERVERS_REALESTATE=realestate,
         MCP_SERVERS=union,
+        ADMIN_USER_IDS={_ADMIN_ID},
     ):
         yield
 
@@ -56,6 +63,29 @@ def test_web_trigger_picks_web():
 def test_heavy_trigger_picks_playwright():
     out = mcp_selector.pick_mcp_servers("playwright で screenshot 撮って")
     assert "heavy" in out
+
+
+def test_realestate_admin_with_trigger():
+    out = mcp_selector.pick_mcp_servers("目黒区の物件探して", user_id=_ADMIN_ID)
+    assert "realestate" in out
+
+
+def test_realestate_admin_without_trigger():
+    out = mcp_selector.pick_mcp_servers("今日の天気は？", user_id=_ADMIN_ID)
+    assert "realestate" not in out
+
+
+def test_realestate_non_admin_with_trigger_blocked():
+    out = mcp_selector.pick_mcp_servers(
+        "SUUMO で目黒区の物件探して", user_id=_NON_ADMIN_ID
+    )
+    assert "realestate" not in out
+
+
+def test_realestate_legacy_call_no_user_id_blocked():
+    """SDK legacy path は user_id を渡さない. デフォルト None で REALESTATE 含めない."""
+    out = mcp_selector.pick_mcp_servers("目黒区の賃貸の家賃")
+    assert "realestate" not in out
 
 
 def test_memory_trigger_picks_mem0():

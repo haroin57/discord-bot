@@ -514,33 +514,37 @@ _MCP_NPX_PINS = {
     "brave-search": "2.0.80",  # @brave/brave-search-mcp-server
     "tavily": "0.2.19",        # tavily-mcp
     "playwright": "0.0.75",    # @playwright/mcp
+    "google-maps": "0.6.2",    # @modelcontextprotocol/server-google-maps (deprecated upstream 2025; last published 0.6.2)
 }
+
+
+_SHARED_MCP_HOST = os.environ.get("SHARED_MCP_HOST", "127.0.0.1")
+
+
+def _shared_mcp_http(port: int) -> dict:
+    """Return a shared streamable HTTP MCP config served by systemd."""
+    return {
+        "type": "http",
+        "url": f"http://{_SHARED_MCP_HOST}:{port}/mcp",
+    }
+
 
 # Docs MCP (Upstash context7) — only spawn when the user message mentions
 # docs / library / API reference keywords.
 MCP_SERVERS_DOCS: dict = {
-    "context7": {
-        "command": "npx",
-        "args": ["-y", f"@upstash/context7-mcp@{_MCP_NPX_PINS['context7']}"],
-    },
+    "context7": _shared_mcp_http(8022),
 }
 
-# Scholarly MCP (Google Scholar検索) — only spawn its Python subprocess when
-# the user's text actually mentions a paper-related keyword. Previously this
-# was in BASE and started on every admin request, adding 100-300ms unconditionally.
+# Scholarly MCP (Google Scholar検索) — only connect when the user's text
+# actually mentions a paper-related keyword. Previously this was in BASE and
+# started on every admin request, adding 100-300ms unconditionally.
 MCP_SERVERS_PAPER: dict = {
-    "scholarly": {
-        "command": "/home/ubuntu/scholarly-mcp/.venv/bin/python",
-        "args": ["/home/ubuntu/scholarly-mcp/server.py"],
-    },
+    "scholarly": _shared_mcp_http(8023),
 }
 
 MCP_SERVERS_WEB: dict = {
     # X (Twitter) scraper MCP
-    "x-scraper": {
-        "command": "/home/ubuntu/free-code/x-scraper/.venv/bin/python",
-        "args": ["/home/ubuntu/free-code/x-scraper/mcp_server.py"],
-    },
+    "x-scraper": _shared_mcp_http(8021),
     # Onion-search: anonymous DuckDuckGo via Tor Browser. Lazy spawned on
     # first tool call (~30-60s Tor bootstrap on cold start, ~500MB RSS).
     "onion-search": {
@@ -564,11 +568,7 @@ MCP_SERVERS_WEB: dict = {
 # API key付きWEB MCPは .env にキーがある場合のみ追加
 _brave_key = os.environ.get("BRAVE_API_KEY")
 if _brave_key:
-    MCP_SERVERS_WEB["brave-search"] = {
-        "command": "npx",
-        "args": ["-y", f"@brave/brave-search-mcp-server@{_MCP_NPX_PINS['brave-search']}"],
-        "env": {"BRAVE_API_KEY": _brave_key},
-    }
+    MCP_SERVERS_WEB["brave-search"] = _shared_mcp_http(8012)
 
 _tavily_key = os.environ.get("TAVILY_API_KEY")
 if _tavily_key:
@@ -577,6 +577,13 @@ if _tavily_key:
         "args": ["-y", f"tavily-mcp@{_MCP_NPX_PINS['tavily']}"],
         "env": {"TAVILY_API_KEY": _tavily_key},
     }
+
+# Google Maps MCP — Places / Geocoding / Directions 等。upstream は
+# 2025 に deprecated 化されたが 0.6.2 はまだ動作する。代替が固まるまで
+# 暫定運用。SRE-H6 ルールに従い npx version は _MCP_NPX_PINS でピン留め。
+_google_maps_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+if _google_maps_key:
+    MCP_SERVERS_WEB["google-maps"] = _shared_mcp_http(8025)
 
 # HEAVY tier — chromium starts at ~500MB RSS, only load on explicit demand.
 MCP_SERVERS_HEAVY: dict = {
@@ -587,13 +594,17 @@ MCP_SERVERS_HEAVY: dict = {
 }
 
 # MEMORY tier — mem0 MCP server wrapping the shared ChromaDB long-term memory.
-# ChromaDB + OpenAI embedding client init is ~100-200MB; only load when the
+# ChromaDB + OpenAI embedding client init is ~100-200MB; only connect when the
 # user's text suggests Claude should actually recall/store memories.
 MCP_SERVERS_MEMORY: dict = {
-    "mem0": {
-        "command": "/home/ubuntu/discord-bot/.venv/bin/python",
-        "args": ["/home/ubuntu/discord-bot/mcp_mem0_server.py"],
-    },
+    "mem0": _shared_mcp_http(8020),
+}
+
+# REALESTATE tier — SUUMO / HOMES property scraping MCP for haroin's Tokyo
+# housing search (院進後の物件探し). admin-only via mcp_selector + env-based
+# allowed_user_ids 二重ゲート. ADR-0020.
+MCP_SERVERS_REALESTATE: dict = {
+    "realestate": _shared_mcp_http(8024),
 }
 
 # Union (used as a default + by code paths that just need to know "all configured")
@@ -604,6 +615,7 @@ MCP_SERVERS: dict = {
     **MCP_SERVERS_MEMORY,
     **MCP_SERVERS_PAPER,
     **MCP_SERVERS_DOCS,
+    **MCP_SERVERS_REALESTATE,
 }
 
 

@@ -268,6 +268,67 @@ class TestBuildSpeakerLine:
 
 
 # ---------------------------------------------------------------------------
+# build_time_line (per-turn wall-clock hook)
+# ---------------------------------------------------------------------------
+
+class TestBuildTimeLine:
+    def test_contains_label_and_jst_marker(self):
+        line = PromptBuilder.build_time_line()
+        assert "現在時刻" in line
+        assert "JST" in line
+
+    def test_format_with_pinned_datetime(self):
+        # Pin a known JST instant — Thursday 2026-06-18 19:00:00 JST.
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        pinned = datetime(2026, 6, 18, 19, 0, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+        line = PromptBuilder.build_time_line(pinned)
+        # Format: [現在時刻: 2026-06-18 19:00:00 JST (木)]
+        assert line == "[現在時刻: 2026-06-18 19:00:00 JST (木)]"
+
+    def test_weekday_japanese(self):
+        # 2026-06-15 is a Monday — verify Japanese weekday mapping.
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        monday = datetime(2026, 6, 15, 12, 0, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+        sunday = datetime(2026, 6, 21, 12, 0, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+        assert "(月)" in PromptBuilder.build_time_line(monday)
+        assert "(日)" in PromptBuilder.build_time_line(sunday)
+
+    def test_non_jst_datetime_converted(self):
+        # Caller passes a UTC datetime — the helper should normalize to JST
+        # so the printed wall-clock matches the JST tag advertised in the
+        # output. 2026-06-18 10:00 UTC == 2026-06-18 19:00 JST.
+        from datetime import datetime, timezone
+        utc_dt = datetime(2026, 6, 18, 10, 0, 0, tzinfo=timezone.utc)
+        line = PromptBuilder.build_time_line(utc_dt)
+        assert "19:00:00" in line
+        assert "2026-06-18" in line
+
+    def test_naive_datetime_treated_as_jst(self):
+        # Defensive: if a caller hands us a naive datetime (no tzinfo) we
+        # treat it as already-JST rather than raise. This preserves the
+        # existing call contract for ad-hoc scripts.
+        from datetime import datetime
+        naive = datetime(2026, 6, 18, 19, 0, 0)
+        line = PromptBuilder.build_time_line(naive)
+        assert "2026-06-18 19:00:00" in line
+        assert "JST" in line
+
+    def test_default_uses_current_wall_clock(self):
+        # Without explicit datetime, the helper should produce a timestamp
+        # close to "now" in JST. We just check the structural shape rather
+        # than the actual value to keep the test deterministic across CI.
+        line = PromptBuilder.build_time_line()
+        # Shape: [現在時刻: YYYY-MM-DD HH:MM:SS JST (X)]
+        import re
+        assert re.match(
+            r"\[現在時刻: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} JST \([月火水木金土日]\)\]",
+            line,
+        )
+
+
+# ---------------------------------------------------------------------------
 # build_prompt (async)
 # ---------------------------------------------------------------------------
 

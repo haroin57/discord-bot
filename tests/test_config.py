@@ -250,7 +250,9 @@ class TestModuleLevelEnvBranches:
     def test_brave_api_key_adds_server(self, monkeypatch):
         cfg = self._reload_config(monkeypatch, {"BRAVE_API_KEY": "test-brave-key"})
         assert "brave-search" in cfg.MCP_SERVERS_WEB
-        assert cfg.MCP_SERVERS_WEB["brave-search"]["env"]["BRAVE_API_KEY"] == "test-brave-key"
+        assert cfg.MCP_SERVERS_WEB["brave-search"]["type"] == "http"
+        assert cfg.MCP_SERVERS_WEB["brave-search"]["url"] == "http://127.0.0.1:8012/mcp"
+        assert "env" not in cfg.MCP_SERVERS_WEB["brave-search"]
 
     def test_tavily_api_key_adds_server(self, monkeypatch):
         cfg = self._reload_config(monkeypatch, {"TAVILY_API_KEY": "test-tavily-key"})
@@ -261,6 +263,13 @@ class TestModuleLevelEnvBranches:
         cfg = self._reload_config(monkeypatch, {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_test"})
         assert "github" in cfg.MCP_SERVERS
         assert "ghp_test" in cfg.MCP_SERVERS["github"]["headers"]["Authorization"]
+
+    def test_google_maps_api_key_uses_shared_http(self, monkeypatch):
+        cfg = self._reload_config(monkeypatch, {"GOOGLE_MAPS_API_KEY": "test-google-key"})
+        assert "google-maps" in cfg.MCP_SERVERS_WEB
+        assert cfg.MCP_SERVERS_WEB["google-maps"]["type"] == "http"
+        assert cfg.MCP_SERVERS_WEB["google-maps"]["url"] == "http://127.0.0.1:8025/mcp"
+        assert "env" not in cfg.MCP_SERVERS_WEB["google-maps"]
 
     def test_admin_user_ids_invalid_raises(self, monkeypatch):
         monkeypatch.setenv("ADMIN_USER_IDS", "notanumber,alsoinvalid")

@@ -1663,17 +1663,21 @@ async def on_message(message: discord.Message):
             sender_name = _sanitize_untrusted_text(message.author.display_name)
             sender_tag = _sanitize_untrusted_text(str(message.author))
             speaker_line = PromptBuilder.build_speaker_line(sender_name, sender_tag)
+            # Time-line hook: gives the model a deterministic wall-clock so it
+            # stops guessing time-of-day from tone. JST-pinned, re-read every turn.
+            time_line = PromptBuilder.build_time_line()
             prompt_breakdown["speaker_line"] = len(speaker_line)
+            prompt_breakdown["time_line"] = len(time_line)
             # Reply context stays outside the wrapper regardless of trust level;
             # the tag (<replied_to_trusted_message> vs <replied_to_message>)
             # carries the trust. See the full-path branch for the rationale.
             if reply_context:
-                prompt = f"{speaker_line}\n{reply_context}{untrusted_block}"
+                prompt = f"{speaker_line}\n{time_line}\n{reply_context}{untrusted_block}"
                 prompt_breakdown[
                     "replied_to_trusted" if reply_is_trusted else "reply_context"
                 ] = len(reply_context)
             else:
-                prompt = f"{speaker_line}\n{untrusted_block}"
+                prompt = f"{speaker_line}\n{time_line}\n{untrusted_block}"
         else:
             # ── Full initial prompt ─────────────────────────────────
             parts = []
@@ -1773,6 +1777,9 @@ async def on_message(message: discord.Message):
             sender_name = _sanitize_untrusted_text(message.author.display_name)
             sender_tag = _sanitize_untrusted_text(str(message.author))
             header = PromptBuilder.build_header(sender_name, sender_tag, caller_is_admin)
+            # Time-line hook (full path): same as the lean branch — JST wall-clock
+            # injected so the model never has to guess time-of-day.
+            time_line = PromptBuilder.build_time_line()
             # Replied-to context ALWAYS sits outside the caller's input wrapper,
             # regardless of trust level — its tag encodes the trust:
             #   <replied_to_trusted_message>  → bot/admin authored (first-party)
@@ -1782,13 +1789,14 @@ async def on_message(message: discord.Message):
             # must not have that external text land inside their first-party
             # wrapper, where a prompt injection could read as a trusted instruction.
             if reply_context:
-                prompt = f"{header}\n{reply_context}{untrusted_block}"
+                prompt = f"{header}\n{time_line}\n{reply_context}{untrusted_block}"
                 prompt_breakdown[
                     "replied_to_trusted" if reply_is_trusted else "reply_context"
                 ] = len(reply_context)
             else:
-                prompt = f"{header}\n{untrusted_block}"
+                prompt = f"{header}\n{time_line}\n{untrusted_block}"
             prompt_breakdown["trusted_header"] = len(header)
+            prompt_breakdown["time_line"] = len(time_line)
             prompt_breakdown["untrusted_wrapper_overhead"] = len(untrusted_block) - sum(len(p) for p in parts) - (len(parts) - 1) * 2
 
         # Mem0 recall — always inject when available (both resume and fresh).

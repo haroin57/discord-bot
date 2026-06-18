@@ -15,12 +15,14 @@ top of that config.
 from __future__ import annotations
 
 from config import (
+    ADMIN_USER_IDS,
     MCP_SERVERS,
     MCP_SERVERS_BASE,
     MCP_SERVERS_DOCS,
     MCP_SERVERS_HEAVY,
     MCP_SERVERS_MEMORY,
     MCP_SERVERS_PAPER,
+    MCP_SERVERS_REALESTATE,
     MCP_SERVERS_WEB,
 )
 
@@ -41,6 +43,10 @@ _WEB_TRIGGERS = tuple(kw.lower() for kw in (
     # on "via", "vim", "review", …); 日経vi covers the real usage.
     "株価", "日経", "日経vi", "市場", "相場", "チャート", "銘柄",
     "vix", "ドル円", "為替", "topix", "指数",
+    # Google Maps tier — Places / Geocoding / Directions 系の質問で eager spawn.
+    "地図", "マップ", "google maps", "googlemaps", "経路", "ルート", "道順",
+    "最寄り駅", "近くの", "周辺の", "住所", "緯度", "経度", "ジオコー",
+    "places", "directions",
 ))
 _HEAVY_TRIGGERS = tuple(kw.lower() for kw in (
     "ブラウズ", "browse", "スクリーンショット", "screenshot",
@@ -71,6 +77,15 @@ _DOCS_TRIGGERS = tuple(kw.lower() for kw in (
     "リファレンス", "ライブラリ", "library", "使い方", "how to use",
     "npm package", "pypi", "github.com/",
 ))
+# REALESTATE tier — SUUMO/HOMES 物件検索 MCP. admin-only かつ trigger 必須.
+# 一般ユーザーが trigger word を打っても user_id ゲートで弾かれる二重防御。
+# ADR-0020、realestate-mcp/IMPLEMENTATION_PLAN.md。
+_REALESTATE_TRIGGERS = tuple(kw.lower() for kw in (
+    "不動産", "物件", "賃貸", "suumo", "homes", "ホームズ",
+    "家賃", "間取り", "敷金", "礼金", "1ldk", "2ldk",
+    "目黒区", "世田谷区", "品川区", "大田区",
+    "大岡山", "祐天寺", "中目黒",
+))
 
 
 def get_mcp_servers_by_keys(keys: list[str]) -> dict:
@@ -78,13 +93,18 @@ def get_mcp_servers_by_keys(keys: list[str]) -> dict:
     return {k: v for k, v in MCP_SERVERS.items() if k in keys}
 
 
-def pick_mcp_servers(raw_user_text: str) -> dict:
+def pick_mcp_servers(raw_user_text: str, user_id: int | None = None) -> dict:
     """Return the minimal MCP server set needed for this request.
 
     BASE is always loaded. WEB / HEAVY / MEMORY tiers are added only when the
     user text actually mentions something that would need them. The huge win
     is NOT loading playwright (~500MB chromium) or ChromaDB on every chat
     reply.
+
+    ``user_id`` (Discord snowflake) gates the REALESTATE tier: only when the
+    sender is in ``ADMIN_USER_IDS`` AND the text mentions a realestate trigger
+    do we spawn the SUUMO/HOMES MCP. Default ``None`` keeps the tier off, so
+    callers that haven't been updated yet (e.g. legacy SDK path) stay safe.
     """
     text = (raw_user_text or "").lower()
     servers = dict(MCP_SERVERS_BASE)
@@ -98,4 +118,10 @@ def pick_mcp_servers(raw_user_text: str) -> dict:
         servers.update(MCP_SERVERS_PAPER)
     if any(kw in text for kw in _DOCS_TRIGGERS):
         servers.update(MCP_SERVERS_DOCS)
+    if (
+        user_id is not None
+        and user_id in ADMIN_USER_IDS
+        and any(kw in text for kw in _REALESTATE_TRIGGERS)
+    ):
+        servers.update(MCP_SERVERS_REALESTATE)
     return servers

@@ -31,6 +31,14 @@ except ImportError:  # pragma: no cover
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+# SSE transport is still supported for remote MCP servers that expose it.
+try:
+    from mcp.client.sse import sse_client  # type: ignore
+    _HAS_SSE_TRANSPORT = True
+except ImportError:  # pragma: no cover
+    sse_client = None  # type: ignore
+    _HAS_SSE_TRANSPORT = False
+
 # streamable_http is optional / version-dependent — guard the import.
 try:
     from mcp.client.streamable_http import streamablehttp_client  # type: ignore
@@ -77,7 +85,21 @@ async def _spawn_one(
     cfg: dict,
 ) -> McpServerHandle:
     """Open transport, initialize session, list tools. Registers exits in stack."""
-    if cfg.get("type") == "http":
+    transport = cfg.get("type")
+    if transport == "sse":
+        if not _HAS_SSE_TRANSPORT:
+            raise RuntimeError(
+                f"MCP SSE transport not available, cannot spawn '{name}'",
+            )
+        read, write = await stack.enter_async_context(
+            sse_client(  # type: ignore[misc]
+                cfg["url"],
+                headers=cfg.get("headers") or {},
+                timeout=cfg.get("timeout", 5),
+                sse_read_timeout=cfg.get("sse_read_timeout", 300),
+            )
+        )
+    elif transport == "http":
         if not _HAS_HTTP_TRANSPORT:
             raise RuntimeError(
                 f"MCP HTTP transport not available, cannot spawn '{name}'",
