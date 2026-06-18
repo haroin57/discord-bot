@@ -1,0 +1,47 @@
+[Unit]
+Description=remote-opencode Discord Bot
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=3
+StartLimitIntervalSec=60
+StartLimitAction=none
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+Environment=PATH=/home/ubuntu/.opencode/bin:/home/ubuntu/.volta/bin:/home/ubuntu/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/home/ubuntu
+EnvironmentFile=-/home/ubuntu/discord-bot/.env
+ExecStart=/home/ubuntu/.volta/bin/remote-opencode start
+Restart=always
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=remote-opencode
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/.remote-opencode /home/ubuntu/.npm /home/ubuntu/.cache /home/ubuntu/.opencode /home/ubuntu/.local /home/ubuntu/discord-bot /tmp
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryMax=1200M
+MemoryHigh=700M
+OOMScoreAdjust=200
+CPUWeight=50
+IOWeight=50
+LimitNOFILE=8192
+TasksMax=200
+
+[Install]
+WantedBy=multi-user.target
