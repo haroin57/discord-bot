@@ -8,6 +8,11 @@ __pycache__/
 .env.example
 .coverage
 
+# Personal docs (private to haroin, not for repo)
+docs/2026-06-08_*
+docs/haroin_*
+opencode.json
+
 # Backup / scratch files that may contain prior secrets
 *.bak
 *.bak.*
