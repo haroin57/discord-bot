@@ -17,7 +17,7 @@ import logging
 import os
 import sys
 import time
-from datetime import timezone, timedelta
+from datetime import timezone, timedelta, datetime
 
 _JST = timezone(timedelta(hours=9))
 
@@ -42,6 +42,7 @@ async def fetch_channel_messages(
     channel_id: int,
     target_user_id: int,
     limit: int = 500,
+    after_date: datetime | None = None,
 ) -> list[tuple[discord.Message, discord.Message | None]]:
     """Stream channel history and pair user messages with their bot replies.
 
@@ -71,7 +72,12 @@ async def fetch_channel_messages(
     pairs: list[tuple[discord.Message, discord.Message | None]] = []
     fetched = 0
 
-    async for msg in channel.history(limit=limit, oldest_first=True):
+    # Convert after_date to UTC if provided
+    after_dt = None
+    if after_date:
+        after_dt = after_date.replace(tzinfo=timezone.utc) if after_date.tzinfo is None else after_date
+
+    async for msg in channel.history(limit=limit, oldest_first=True, after=after_dt):
         fetched += 1
 
         # Age out pending entries that have outlived the lookahead window.
@@ -266,6 +272,15 @@ class HistoryBot(discord.Client):
         args = self.args
         target_user_id = int(args.user_id)
 
+        # Parse --since if provided
+        after_date = None
+        if args.since:
+            try:
+                after_date = datetime.fromisoformat(args.since)
+            except ValueError:
+                log.error("Invalid --since format: %s (expected YYYY-MM-DD)", args.since)
+                return
+
         # Resolve the Mem0 storage namespace. For kanae mode we ALWAYS write
         # under the bot's own ID (regardless of --user-id, which only filters
         # which human's turns to pair against).
@@ -289,7 +304,7 @@ class HistoryBot(discord.Client):
 
         for ch_id in channels:
             pairs = await fetch_channel_messages(
-                self, ch_id, target_user_id, limit=args.limit,
+                self, ch_id, target_user_id, limit=args.limit, after_date=after_date,
             )
             if not pairs:
                 continue
@@ -332,6 +347,7 @@ def main():
     group.add_argument("--all-channels", action="store_true", help="Ingest from all text channels")
     parser.add_argument("--user-id", required=True, help="Discord user ID to filter senpai messages by (for kanae mode this is just the pairing filter; Mem0 namespace is bot id)")
     parser.add_argument("--limit", type=int, default=500, help="Max messages to fetch per channel")
+    parser.add_argument("--since", type=str, help="Only ingest messages created at or after this date (YYYY-MM-DD)")
     parser.add_argument("--dry-run", action="store_true", help="Log what would be ingested without storing")
     parser.add_argument("--delay", type=float, default=1.5, help="Delay between batches (concurrency<=1 only)")
     parser.add_argument("--batch-size", type=int, default=5, help="Messages per batch (concurrency<=1 only)")

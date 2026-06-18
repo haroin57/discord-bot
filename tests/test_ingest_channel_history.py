@@ -48,7 +48,7 @@ class _FakeChannel:
         self._messages = messages
         self.name = "fake"
 
-    def history(self, *, limit, oldest_first):
+    def history(self, *, limit, oldest_first, after=None):
         async def _gen():
             for m in self._messages[:limit]:
                 yield m

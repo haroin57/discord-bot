@@ -1,6 +1,7 @@
 """Tests for config.py — needs_tools and load_system_prompt."""
 
 import importlib
+import os
 import sys
 import types
 import warnings
@@ -8,6 +9,7 @@ import warnings
 import pytest
 
 from config import needs_tools, load_system_prompt
+from services.mcp_selector import pick_mcp_servers, get_mcp_servers_by_keys
 
 
 class TestNeedsTools:
@@ -34,17 +36,31 @@ class TestNeedsTools:
 
 
 class TestLoadSystemPrompt:
+    def _neutralize_global_md(self, monkeypatch):
+        """Make os.path.isfile return False for the global ~/.claude/CLAUDE.md path."""
+        global_path = os.path.expanduser("~/.claude/CLAUDE.md")
+        orig_isfile = os.path.isfile
+
+        def fake_isfile(path):
+            if path == global_path:
+                return False
+            return orig_isfile(path)
+
+        monkeypatch.setattr("os.path.isfile", fake_isfile)
+
     def test_returns_default_when_no_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr("config.BOT_DIR", str(tmp_path))
+        self._neutralize_global_md(monkeypatch)
         result = load_system_prompt()
         assert "helpful assistant" in result
 
     def test_reads_claude_md(self, tmp_path, monkeypatch):
         monkeypatch.setattr("config.BOT_DIR", str(tmp_path))
+        self._neutralize_global_md(monkeypatch)
         claude_md = tmp_path / "CLAUDE.md"
         claude_md.write_text("カスタムプロンプト", encoding="utf-8")
         result = load_system_prompt()
-        assert result == "カスタムプロンプト"
+        assert "カスタムプロンプト" in result
 
 
 class TestValidateDiscordToken:
@@ -68,111 +84,90 @@ class TestValidateDiscordToken:
 
 class TestPickMcpServers:
     def test_base_only_on_no_trigger(self):
-        import config
-        result = config.pick_mcp_servers("こんにちは")
+        result = pick_mcp_servers("こんにちは")
         assert result == {}
 
     def test_web_trigger_search(self):
-        import config
-        result = config.pick_mcp_servers("検索して")
+        result = pick_mcp_servers("検索して")
         assert "x-scraper" in result
 
     def test_web_trigger_twitter(self):
-        import config
-        result = config.pick_mcp_servers("twitter について調べて")
+        result = pick_mcp_servers("twitter について調べて")
         assert "x-scraper" in result
 
     def test_web_trigger_tweet(self):
-        import config
-        result = config.pick_mcp_servers("ツイートを探して")
+        result = pick_mcp_servers("ツイートを探して")
         assert "x-scraper" in result
 
     def test_web_trigger_trend(self):
-        import config
-        result = config.pick_mcp_servers("トレンド教えて")
+        result = pick_mcp_servers("トレンド教えて")
         assert "x-scraper" in result
 
     def test_heavy_trigger_browse(self):
-        import config
-        result = config.pick_mcp_servers("ブラウズして")
+        result = pick_mcp_servers("ブラウズして")
         assert "playwright" in result
 
     def test_heavy_trigger_screenshot(self):
-        import config
-        result = config.pick_mcp_servers("スクリーンショットを取って")
+        result = pick_mcp_servers("スクリーンショットを取って")
         assert "playwright" in result
 
     def test_memory_trigger_remember(self):
-        import config
-        result = config.pick_mcp_servers("覚えておいてね")
+        result = pick_mcp_servers("覚えておいてね")
         assert "mem0" in result
 
     def test_memory_trigger_recall(self):
-        import config
-        result = config.pick_mcp_servers("思い出して")
+        result = pick_mcp_servers("思い出して")
         assert "mem0" in result
 
     def test_memory_trigger_mem0(self):
-        import config
-        result = config.pick_mcp_servers("mem0に保存して")
+        result = pick_mcp_servers("mem0に保存して")
         assert "mem0" in result
 
     def test_paper_trigger_arxiv(self):
-        import config
-        result = config.pick_mcp_servers("arxivの論文を探して")
+        result = pick_mcp_servers("arxivの論文を探して")
         assert "scholarly" in result
 
     def test_paper_trigger_paper(self):
-        import config
-        result = config.pick_mcp_servers("paper を検索して")
+        result = pick_mcp_servers("paper を検索して")
         assert "scholarly" in result
 
     def test_docs_trigger_context7(self):
-        import config
-        result = config.pick_mcp_servers("context7で調べて")
+        result = pick_mcp_servers("context7で調べて")
         assert "context7" in result
 
     def test_docs_trigger_docs(self):
-        import config
-        result = config.pick_mcp_servers("docsを見たい")
+        result = pick_mcp_servers("docsを見たい")
         assert "context7" in result
 
     def test_docs_trigger_library(self):
-        import config
-        result = config.pick_mcp_servers("libraryの使い方を教えて")
+        result = pick_mcp_servers("libraryの使い方を教えて")
         assert "context7" in result
 
     def test_empty_string(self):
-        import config
-        result = config.pick_mcp_servers("")
+        result = pick_mcp_servers("")
         assert result == {}
 
     def test_none_input(self):
-        import config
-        result = config.pick_mcp_servers(None)
+        result = pick_mcp_servers(None)
         assert result == {}
 
     def test_multiple_triggers(self):
-        import config
-        result = config.pick_mcp_servers("検索してスクリーンショットも")
+        result = pick_mcp_servers("検索してスクリーンショットも")
         assert "x-scraper" in result
         assert "playwright" in result
 
 
 class TestGetMcpServersByKeys:
     def test_known_key(self):
-        import config
-        result = config.get_mcp_servers_by_keys(["x-scraper"])
+        result = get_mcp_servers_by_keys(["x-scraper"])
         assert "x-scraper" in result
 
     def test_unknown_key(self):
-        import config
-        result = config.get_mcp_servers_by_keys(["nonexistent"])
+        result = get_mcp_servers_by_keys(["nonexistent"])
         assert result == {}
 
     def test_empty_list(self):
-        import config
-        result = config.get_mcp_servers_by_keys([])
+        result = get_mcp_servers_by_keys([])
         assert result == {}
 
 
@@ -255,7 +250,9 @@ class TestModuleLevelEnvBranches:
     def test_brave_api_key_adds_server(self, monkeypatch):
         cfg = self._reload_config(monkeypatch, {"BRAVE_API_KEY": "test-brave-key"})
         assert "brave-search" in cfg.MCP_SERVERS_WEB
-        assert cfg.MCP_SERVERS_WEB["brave-search"]["env"]["BRAVE_API_KEY"] == "test-brave-key"
+        assert cfg.MCP_SERVERS_WEB["brave-search"]["type"] == "http"
+        assert cfg.MCP_SERVERS_WEB["brave-search"]["url"] == "http://127.0.0.1:8012/mcp"
+        assert "env" not in cfg.MCP_SERVERS_WEB["brave-search"]
 
     def test_tavily_api_key_adds_server(self, monkeypatch):
         cfg = self._reload_config(monkeypatch, {"TAVILY_API_KEY": "test-tavily-key"})
@@ -266,6 +263,13 @@ class TestModuleLevelEnvBranches:
         cfg = self._reload_config(monkeypatch, {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_test"})
         assert "github" in cfg.MCP_SERVERS
         assert "ghp_test" in cfg.MCP_SERVERS["github"]["headers"]["Authorization"]
+
+    def test_google_maps_api_key_uses_shared_http(self, monkeypatch):
+        cfg = self._reload_config(monkeypatch, {"GOOGLE_MAPS_API_KEY": "test-google-key"})
+        assert "google-maps" in cfg.MCP_SERVERS_WEB
+        assert cfg.MCP_SERVERS_WEB["google-maps"]["type"] == "http"
+        assert cfg.MCP_SERVERS_WEB["google-maps"]["url"] == "http://127.0.0.1:8025/mcp"
+        assert "env" not in cfg.MCP_SERVERS_WEB["google-maps"]
 
     def test_admin_user_ids_invalid_raises(self, monkeypatch):
         monkeypatch.setenv("ADMIN_USER_IDS", "notanumber,alsoinvalid")
@@ -281,3 +285,34 @@ class TestModuleLevelEnvBranches:
             importlib.reload(config)
         short_warns = [x for x in w if "shorter than 3 chars" in str(x.message)]
         assert len(short_warns) >= 1
+
+
+class TestSpeakerLabels:
+    def test_parses_env_and_resolves(self, monkeypatch):
+        monkeypatch.setenv("SPEAKER_LABELS", "573489206240870410:先輩, 1037285234200297522:お父さん")
+        import config
+        importlib.reload(config)
+        try:
+            assert config.SPEAKER_LABELS[573489206240870410] == "先輩"
+            assert config.speaker_label(1037285234200297522) == "お父さん"
+            assert config.speaker_label("573489206240870410") == "先輩"  # str id ok
+        finally:
+            monkeypatch.delenv("SPEAKER_LABELS", raising=False)
+            importlib.reload(config)
+
+    def test_unknown_and_invalid_return_empty(self, monkeypatch):
+        import config
+        importlib.reload(config)  # no SPEAKER_LABELS env → empty table
+        assert config.speaker_label(999) == ""
+        assert config.speaker_label(None) == ""
+        assert config.speaker_label("notanumber") == ""
+
+    def test_malformed_pairs_skipped(self, monkeypatch):
+        monkeypatch.setenv("SPEAKER_LABELS", "noColon, 123:OK, :emptyid, 456:")
+        import config
+        importlib.reload(config)
+        try:
+            assert config.SPEAKER_LABELS == {123: "OK"}
+        finally:
+            monkeypatch.delenv("SPEAKER_LABELS", raising=False)
+            importlib.reload(config)

@@ -1,0 +1,22 @@
+[Unit]
+Description=Shared MCP: mem0 (streamable HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/discord-bot
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.volta/tools/image/node/24.14.1/bin:/home/ubuntu/.volta/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-/home/ubuntu/discord-bot/.env
+ExecStart=/home/ubuntu/.volta/tools/image/node/24.14.1/bin/supergateway --stdio "/home/ubuntu/discord-bot/.venv/bin/python /home/ubuntu/discord-bot/mcp_mem0_server.py" --port 8020 --outputTransport streamableHttp --streamableHttpPath /mcp
+Restart=on-failure
+RestartSec=10s
+MemoryHigh=220M
+MemoryMax=320M
+LimitNOFILE=2048
+
+[Install]
+WantedBy=multi-user.target

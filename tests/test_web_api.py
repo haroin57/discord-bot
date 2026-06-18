@@ -617,7 +617,7 @@ async def test_send_message_denies_without_send_permission():
     api._sid_to_user["sid12b"] = {"discord_id": "no_send_user", "is_admin": False, "username": "u", "tag": "u#0"}
     api._check_channel_permission = AsyncMock(return_value=(False, "permission denied"))
 
-    mock_call_with_tools = AsyncMock(return_value=("never", None))
+    mock_call_with_tools = AsyncMock(return_value=("never", None, False))
     with patch("web_api.call_with_tools", new=mock_call_with_tools):
         await handlers["send_message"]("sid12b", {"channel_id": "10", "text": "hello"})
 
@@ -650,7 +650,7 @@ async def test_send_message_success_emits_assistant_message():
 
     with patch("web_api.PromptBuilder.build_prompt", new=AsyncMock(return_value="built_prompt")), \
          patch("web_api.PromptBuilder.cap_text", return_value="hello"), \
-         patch("web_api.call_with_tools", new=AsyncMock(return_value=("response text", "sess_123"))), \
+         patch("web_api.call_with_tools", new=AsyncMock(return_value=("response text", "sess_123", False))), \
          patch("web_api.update_session") as mock_update, \
          patch("web_api.asyncio.to_thread", new=AsyncMock(return_value=None)), \
          patch("web_api.asyncio.create_task"):
@@ -694,7 +694,7 @@ async def test_send_message_non_admin_does_not_store_to_mem0():
 
     with patch("web_api.PromptBuilder.build_prompt", new=AsyncMock(return_value="prompt")), \
          patch("web_api.PromptBuilder.cap_text", return_value="hi"), \
-         patch("web_api.call_with_tools", new=AsyncMock(return_value=("reply", None))), \
+         patch("web_api.call_with_tools", new=AsyncMock(return_value=("reply", None, False))), \
          patch("web_api.asyncio.to_thread", new=AsyncMock(return_value=None)), \
          patch("web_api.asyncio.create_task") as mock_task, \
          patch.dict("sys.modules", {"services.mem0_service": MagicMock(
@@ -1449,7 +1449,7 @@ async def test_send_message_skips_update_session_when_no_session_id():
 
     with patch("web_api.PromptBuilder.build_prompt", new=AsyncMock(return_value="prompt")), \
          patch("web_api.PromptBuilder.cap_text", return_value="hi"), \
-         patch("web_api.call_with_tools", new=AsyncMock(return_value=("reply", None))), \
+         patch("web_api.call_with_tools", new=AsyncMock(return_value=("reply", None, False))), \
          patch("web_api.update_session") as mock_update, \
          patch("web_api.asyncio.to_thread", new=AsyncMock(return_value=None)), \
          patch("web_api.asyncio.create_task"), \
@@ -1482,7 +1482,7 @@ async def test_send_message_admin_triggers_mem0_store():
 
     with patch("web_api.PromptBuilder.build_prompt", new=AsyncMock(return_value="prompt")), \
          patch("web_api.PromptBuilder.cap_text", return_value="hi"), \
-         patch("web_api.call_with_tools", new=AsyncMock(return_value=("reply", "sess_id"))), \
+         patch("web_api.call_with_tools", new=AsyncMock(return_value=("reply", "sess_id", False))), \
          patch("web_api.asyncio.to_thread", new=AsyncMock(return_value=None)), \
          patch("web_api.asyncio.create_task", side_effect=capture_create_task), \
          patch.dict("sys.modules", {"services.mem0_service": MagicMock(

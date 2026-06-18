@@ -555,23 +555,6 @@ class WebAPI:
                 async def _mem0_fetch(queries, user_id):
                     return await search_memories_multi(queries, user_id, limit=8)
 
-                # Emotion state — admin only, read-only here. load_state is
-                # fail-open so failure returns the default EmotionState and
-                # the prompt block is still emitted. Non-admins skip
-                # entirely so their prompts never leak Kanae's internal
-                # state.
-                emotion_state = None
-                if is_admin:
-                    try:
-                        from pathlib import Path as _Path
-                        from services.emotion.state import load_state as _load_state
-                        from config import STATE_DIR as _STATE_DIR
-                        emotion_state = await asyncio.to_thread(
-                            _load_state, _Path(_STATE_DIR) / "kanae_emotion.json",
-                        )
-                    except Exception as exc:
-                        log.warning("emotion load failed (non-fatal): %s", exc)
-
                 prompt = await PromptBuilder.build_prompt(
                     raw_text=raw_text,
                     sender_name=sender_name,
@@ -579,7 +562,6 @@ class WebAPI:
                     is_admin=is_admin,
                     mem0_user_id=discord_id,
                     mem0_fetch=_mem0_fetch,
-                    emotion_state=emotion_state,
                 )
 
                 log.info(
@@ -597,7 +579,7 @@ class WebAPI:
                 ))
                 self._sid_tasks.setdefault(sid, set()).add(task)
                 try:
-                    response_text, session_id = await task
+                    response_text, session_id, _ = await task
                 finally:
                     self._sid_tasks.get(sid, set()).discard(task)
 
@@ -647,21 +629,6 @@ class WebAPI:
                             log.debug("Mem0 store failed (non-fatal): %s", exc)
 
                     asyncio.create_task(_mem0_store())
-
-                    # Emotion feedback — admin only, fire-and-forget.
-                    async def _emotion_feedback():
-                        try:
-                            from services.emotion.feedback import schedule_feedback
-                            from config import STATE_DIR as _STATE_DIR
-                            await schedule_feedback(
-                                user_text=raw_text,
-                                assistant_text=response_text,
-                                state_dir=_STATE_DIR,
-                            )
-                        except Exception as exc:
-                            log.warning("emotion feedback failed (non-fatal): %s", exc)
-
-                    asyncio.create_task(_emotion_feedback())
 
             except Exception:
                 log.exception(

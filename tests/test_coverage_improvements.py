@@ -622,7 +622,12 @@ class TestStreamSync:
         assert "chunk" in "".join(chunks)
 
     def test_idle_timeout_aborts(self, monkeypatch):
+        import services.claude_api as _api_mod
         from services.claude_api import _stream_once
+
+        # Pin the idle-timeout constant to 90 s so the 100 s gap triggers it.
+        # (STREAM_IDLE_TIMEOUT_S changed 90 -> 300 in config; the test owns the value.)
+        monkeypatch.setattr(_api_mod, "STREAM_IDLE_TIMEOUT_S", 90)
 
         # Call sequence: last_event_time=0.0, first text now=0.0 (gap=0, appended),
         # second text now=100.0 (gap=100 > 90, break before append)
@@ -843,6 +848,7 @@ class TestSessionHelpers:
     """Cover _is_session_fresh, _record_session_time, _clear_session_time."""
 
     def test_fresh_session(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
         from services.claude_sdk import (
             _is_session_fresh,
             _record_session_time,
@@ -953,8 +959,20 @@ class TestStderrHelpers:
 class TestCallWithToolsErrorPaths:
     """Cover error/retry paths in call_with_tools."""
 
+    @pytest.fixture(autouse=True)
+    def _clear_retry_budget(self):
+        # claude_sdk._retry_budget is a module-global keyed by channel_id with a
+        # 3-retry/60s cap. Tests here share channel_id=1, so without clearing it
+        # an earlier test's retries exhaust the budget and a later test's retry
+        # gets denied — an order-dependent flake (passes alone, fails in suite).
+        from services import claude_sdk as sdk_mod
+        sdk_mod._retry_budget.clear()
+        yield
+        sdk_mod._retry_budget.clear()
+
     @pytest.mark.asyncio
     async def test_timeout_with_resume_clears_and_retries(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
         from services import claude_sdk as sdk_mod
 
         monkeypatch.setattr(sdk_mod, "claude_semaphore", asyncio.Semaphore(1))
@@ -986,7 +1004,7 @@ class TestCallWithToolsErrorPaths:
         sessions = {1: SessionInfo(session_id="old-session", mcp_server_keys=["context7", "scholarly"])}
         sdk_mod._session_timestamps[1] = time.monotonic()  # make it fresh
 
-        text, info = await sdk_mod.call_with_tools(
+        text, info, _ = await sdk_mod.call_with_tools(
             "hello", 1, sessions, raw_user_text="hello"
         )
         assert text == "recovered"
@@ -999,6 +1017,7 @@ class TestCallWithToolsErrorPaths:
 
     @pytest.mark.asyncio
     async def test_timeout_without_resume_returns_message(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
         from services import claude_sdk as sdk_mod
 
         monkeypatch.setattr(sdk_mod, "claude_semaphore", asyncio.Semaphore(1))
@@ -1010,7 +1029,7 @@ class TestCallWithToolsErrorPaths:
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
-        text, sid = await sdk_mod.call_with_tools(
+        text, sid, _ = await sdk_mod.call_with_tools(
             "hello", 1, {}, raw_user_text="hello"
         )
         assert "タイムアウト" in text
@@ -1018,6 +1037,7 @@ class TestCallWithToolsErrorPaths:
 
     @pytest.mark.asyncio
     async def test_auth_error_returns_immediately(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
         from services import claude_sdk as sdk_mod
 
         monkeypatch.setattr(sdk_mod, "claude_semaphore", asyncio.Semaphore(1))
@@ -1029,7 +1049,7 @@ class TestCallWithToolsErrorPaths:
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
-        text, sid = await sdk_mod.call_with_tools(
+        text, sid, _ = await sdk_mod.call_with_tools(
             "hello", 1, {}, raw_user_text="hello"
         )
         assert "認証" in text
@@ -1037,6 +1057,7 @@ class TestCallWithToolsErrorPaths:
 
     @pytest.mark.asyncio
     async def test_context_overflow_returns_immediately(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
         from services import claude_sdk as sdk_mod
 
         monkeypatch.setattr(sdk_mod, "claude_semaphore", asyncio.Semaphore(1))
@@ -1048,7 +1069,7 @@ class TestCallWithToolsErrorPaths:
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
-        text, sid = await sdk_mod.call_with_tools(
+        text, sid, _ = await sdk_mod.call_with_tools(
             "hello", 1, {}, raw_user_text="hello"
         )
         assert "長すぎ" in text
@@ -1056,6 +1077,7 @@ class TestCallWithToolsErrorPaths:
 
     @pytest.mark.asyncio
     async def test_transient_error_extends_retries(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
         from services import claude_sdk as sdk_mod
 
         monkeypatch.setattr(sdk_mod, "claude_semaphore", asyncio.Semaphore(1))
@@ -1084,7 +1106,7 @@ class TestCallWithToolsErrorPaths:
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
-        text, info = await sdk_mod.call_with_tools(
+        text, info, _ = await sdk_mod.call_with_tools(
             "hello", 1, {}, raw_user_text="hello"
         )
         assert text == "finally"
@@ -1092,6 +1114,7 @@ class TestCallWithToolsErrorPaths:
 
     @pytest.mark.asyncio
     async def test_no_response_returns_fallback(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
         from services import claude_sdk as sdk_mod
 
         monkeypatch.setattr(sdk_mod, "claude_semaphore", asyncio.Semaphore(1))
@@ -1103,13 +1126,14 @@ class TestCallWithToolsErrorPaths:
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
-        text, sid = await sdk_mod.call_with_tools(
+        text, sid, _ = await sdk_mod.call_with_tools(
             "hello", 1, {}, raw_user_text="hello"
         )
         assert "No response" in text
 
     @pytest.mark.asyncio
     async def test_status_callback_on_retry(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
         from services import claude_sdk as sdk_mod
 
         monkeypatch.setattr(sdk_mod, "claude_semaphore", asyncio.Semaphore(1))
@@ -1132,7 +1156,7 @@ class TestCallWithToolsErrorPaths:
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
         callback = AsyncMock()
-        text, sid = await sdk_mod.call_with_tools(
+        text, sid, _ = await sdk_mod.call_with_tools(
             "hello", 1, {}, status_callback=callback, raw_user_text="hello"
         )
         assert text == "ok"
@@ -1146,6 +1170,7 @@ class TestCallWithToolsErrorPaths:
 
     @pytest.mark.asyncio
     async def test_unknown_error_exhausts_retries(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
         from services import claude_sdk as sdk_mod
 
         monkeypatch.setattr(sdk_mod, "claude_semaphore", asyncio.Semaphore(1))
@@ -1159,7 +1184,7 @@ class TestCallWithToolsErrorPaths:
 
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
-        text, sid = await sdk_mod.call_with_tools(
+        text, sid, _ = await sdk_mod.call_with_tools(
             "hello", 1, {}, raw_user_text="hello"
         )
         assert "内部エラー" in text
@@ -1167,6 +1192,7 @@ class TestCallWithToolsErrorPaths:
 
     @pytest.mark.asyncio
     async def test_session_recorded_on_success(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
         from services import claude_sdk as sdk_mod
 
         monkeypatch.setattr(sdk_mod, "claude_semaphore", asyncio.Semaphore(1))
@@ -1187,7 +1213,7 @@ class TestCallWithToolsErrorPaths:
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
         sessions = {}
-        text, info = await sdk_mod.call_with_tools(
+        text, info, _ = await sdk_mod.call_with_tools(
             "hello", 42, sessions, raw_user_text="hello"
         )
         assert text == "done"
@@ -1201,6 +1227,7 @@ class TestCallWithToolsErrorPaths:
 
     @pytest.mark.asyncio
     async def test_stale_session_skipped(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
         from services import claude_sdk as sdk_mod
 
         monkeypatch.setattr(sdk_mod, "claude_semaphore", asyncio.Semaphore(1))
@@ -1221,7 +1248,7 @@ class TestCallWithToolsErrorPaths:
         monkeypatch.setattr(sdk_mod, "query", mock_query)
 
         sessions = {77: "old-stale-session"}
-        text, sid = await sdk_mod.call_with_tools(
+        text, sid, _ = await sdk_mod.call_with_tools(
             "hello", 77, sessions, raw_user_text="hello"
         )
         assert text == "ok"

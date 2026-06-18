@@ -23,6 +23,17 @@ def tmpdir_ctx():
         yield ToolContext(cwd=tmp, restricted=False, channel_id=1)
 
 
+@pytest.fixture
+def tmpdir_ctx_restricted():
+    # restricted=True is what every non-admin caller gets in production
+    # (entry.py derives `restricted` from is_admin). The cwd jail is a
+    # restricted-mode guard, so cwd-escape rejection must be tested here,
+    # not via the admin (restricted=False) fixture which drops the jail by
+    # design (e.g. an admin reading ~/manga).
+    with tempfile.TemporaryDirectory() as tmp:
+        yield ToolContext(cwd=tmp, restricted=True, channel_id=1)
+
+
 class TestResolveUnder:
     def test_relative_ok(self, tmpdir_ctx):
         out = _resolve_under(tmpdir_ctx.cwd, "a/b.txt")
@@ -79,15 +90,16 @@ class TestRead:
         assert "[truncated" in out
 
     @pytest.mark.asyncio
-    async def test_read_rejects_escape_via_symlink(self, tmpdir_ctx):
+    async def test_read_rejects_escape_via_symlink(self, tmpdir_ctx_restricted):
         # A symlink whose realpath escapes cwd is rejected at the path
         # gate (before the file is opened). O_NOFOLLOW alone wouldn't be
         # enough — it only protects the final path component.
-        link = os.path.join(tmpdir_ctx.cwd, "escape")
+        # Uses the restricted (non-admin) context, where the cwd jail applies.
+        link = os.path.join(tmpdir_ctx_restricted.cwd, "escape")
         os.symlink("/etc", link)
         with pytest.raises(ValueError, match="escapes"):
             await execute_builtin_tool(
-                "Read", {"file_path": "escape/passwd"}, tmpdir_ctx,
+                "Read", {"file_path": "escape/passwd"}, tmpdir_ctx_restricted,
             )
 
 
@@ -102,10 +114,12 @@ class TestWrite:
             assert fh.read() == "abc"
 
     @pytest.mark.asyncio
-    async def test_write_outside_cwd_rejected(self, tmpdir_ctx):
+    async def test_write_outside_cwd_rejected(self, tmpdir_ctx_restricted):
+        # Restricted (non-admin) context: writes outside the cwd jail are rejected.
         with pytest.raises(ValueError):
             await execute_builtin_tool(
-                "Write", {"file_path": "/tmp/evil.txt", "content": "x"}, tmpdir_ctx,
+                "Write", {"file_path": "/tmp/evil.txt", "content": "x"},
+                tmpdir_ctx_restricted,
             )
 
     @pytest.mark.asyncio
@@ -198,10 +212,17 @@ class TestBash:
 
     @pytest.mark.asyncio
     async def test_bash_timeout(self, tmpdir_ctx):
-        with pytest.raises(TimeoutError):
-            await execute_builtin_tool(
-                "Bash", {"command": "sleep 5", "timeout": 0.2}, tmpdir_ctx,
-            )
+        # Timeout no longer raises (audit #10): the buffered partial output is
+        # returned with a timed-out marker so npm test / pip install runs keep
+        # their diagnostics.
+        out = await execute_builtin_tool(
+            "Bash",
+            {"command": "echo partial; sleep 5", "timeout": 1},
+            tmpdir_ctx,
+        )
+        assert "partial" in out
+        assert "timed out after" in out
+        assert "exit code" not in out
 
     @pytest.mark.asyncio
     async def test_bash_output_capped(self, tmpdir_ctx):
@@ -213,7 +234,10 @@ class TestBash:
         # Output portion alone must not exceed the cap (the trailing
         # "exit code" line is appended separately).
         stdout_section = out.split("--- stderr ---")[0].rsplit("--- exit", 1)[0]
-        assert len(stdout_section) <= BASH_OUTPUT_CAP_BYTES + 16
+        # Middle-cut keeps head+tail halves plus a "[N bytes truncated]"
+        # marker line between them (audit #13).
+        assert len(stdout_section) <= BASH_OUTPUT_CAP_BYTES + 64
+        assert "bytes truncated" in out
 
 
 class TestGlob:
@@ -269,3 +293,90 @@ class TestRegistry:
     async def test_unknown_tool_raises(self, tmpdir_ctx):
         with pytest.raises(KeyError):
             await execute_builtin_tool("Nope", {}, tmpdir_ctx)
+
+    def test_todo_write_advertised(self):
+        out = builtin_tools_for_api(restricted=False)
+        assert "TodoWrite" in {t["name"] for t in out}
+
+    def test_task_create_alias_resolves(self):
+        from services.claude_api.tools import BUILTIN_TOOL_ALIASES
+        assert BUILTIN_TOOL_ALIASES["TaskCreate"] == "TodoWrite"
+        assert BUILTIN_TOOL_ALIASES["task_create"] == "TodoWrite"
+        assert BUILTIN_TOOL_ALIASES["todo_write"] == "TodoWrite"
+
+
+class TestTodoWrite:
+    @pytest.mark.asyncio
+    async def test_replace_semantics(self, tmpdir_ctx):
+        todos1 = [
+            {"content": "step A", "status": "in_progress", "activeForm": "Doing A"},
+            {"content": "step B", "status": "pending", "activeForm": "Doing B"},
+        ]
+        out1 = await execute_builtin_tool("TodoWrite", {"todos": todos1}, tmpdir_ctx)
+        assert "2 todos" in out1
+        assert len(tmpdir_ctx.todos) == 2
+
+        # Replace with a smaller list — old items should be gone, not merged.
+        todos2 = [
+            {"content": "step C", "status": "pending", "activeForm": "Doing C"},
+        ]
+        await execute_builtin_tool("TodoWrite", {"todos": todos2}, tmpdir_ctx)
+        assert len(tmpdir_ctx.todos) == 1
+        assert tmpdir_ctx.todos[0]["content"] == "step C"
+
+    @pytest.mark.asyncio
+    async def test_empty_clears(self, tmpdir_ctx):
+        tmpdir_ctx.todos = [
+            {"content": "x", "status": "pending", "activeForm": "X"},
+        ]
+        out = await execute_builtin_tool("TodoWrite", {"todos": []}, tmpdir_ctx)
+        assert "cleared" in out
+        assert tmpdir_ctx.todos == []
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_status(self, tmpdir_ctx):
+        with pytest.raises(ValueError, match="status"):
+            await execute_builtin_tool(
+                "TodoWrite",
+                {"todos": [{"content": "x", "status": "done", "activeForm": "X"}]},
+                tmpdir_ctx,
+            )
+
+    @pytest.mark.asyncio
+    async def test_rejects_empty_content(self, tmpdir_ctx):
+        with pytest.raises(ValueError, match="content"):
+            await execute_builtin_tool(
+                "TodoWrite",
+                {"todos": [{"content": "", "status": "pending", "activeForm": "X"}]},
+                tmpdir_ctx,
+            )
+
+    @pytest.mark.asyncio
+    async def test_rejects_multiple_in_progress(self, tmpdir_ctx):
+        with pytest.raises(ValueError, match="in_progress"):
+            await execute_builtin_tool(
+                "TodoWrite",
+                {"todos": [
+                    {"content": "a", "status": "in_progress", "activeForm": "A"},
+                    {"content": "b", "status": "in_progress", "activeForm": "B"},
+                ]},
+                tmpdir_ctx,
+            )
+
+    @pytest.mark.asyncio
+    async def test_rejects_non_list(self, tmpdir_ctx):
+        with pytest.raises(ValueError, match="array"):
+            await execute_builtin_tool("TodoWrite", {"todos": "nope"}, tmpdir_ctx)
+
+    @pytest.mark.asyncio
+    async def test_alias_TaskCreate_routes_to_TodoWrite(self, tmpdir_ctx):
+        # Mis-named call from a model that learned the old TaskCreate name
+        # from the previous CLI default prompt must still dispatch to
+        # TodoWrite via BUILTIN_TOOL_ALIASES.
+        out = await execute_builtin_tool(
+            "TaskCreate",
+            {"todos": [{"content": "x", "status": "pending", "activeForm": "X"}]},
+            tmpdir_ctx,
+        )
+        assert "1 todos" in out
+        assert len(tmpdir_ctx.todos) == 1

@@ -42,6 +42,21 @@ def _tool_input_hint(name: str, inp: dict | None) -> str:
             return inp.get("query", "")
         if n in ("Agent",):
             return inp.get("description", "")
+        if n in ("TodoWrite",):
+            todos = inp.get("todos") or []
+            if not isinstance(todos, list):
+                return ""
+            in_prog = next(
+                (
+                    t.get("activeForm") or t.get("content")
+                    for t in todos
+                    if isinstance(t, dict) and t.get("status") == "in_progress"
+                ),
+                None,
+            )
+            if in_prog:
+                return str(in_prog)
+            return f"{len(todos)} todos"
         # Generic: show first string value
         for v in inp.values():
             if isinstance(v, str) and v:

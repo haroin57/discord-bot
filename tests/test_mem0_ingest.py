@@ -65,7 +65,7 @@ class TestAddMemoriesGatePath:
         facts = [{"speaker": "self", "text": "好きな食べ物はラーメン", "importance": 4,
                   "category": "personal", "subcategory": "food", "tags": ["ramen"]}]
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", new_callable=AsyncMock, return_value=facts),
+            patch("services.mem0.ingest.extract_full_signals", new_callable=AsyncMock, return_value={"facts": facts, "relations": []}),
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", False),
@@ -86,7 +86,7 @@ class TestAddMemoriesGatePath:
         facts = [{"speaker": "self", "text": "今日は天気がいい", "importance": 1,
                   "category": "meta", "subcategory": "chat", "tags": []}]
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", new_callable=AsyncMock, return_value=facts),
+            patch("services.mem0.ingest.extract_full_signals", new_callable=AsyncMock, return_value={"facts": facts, "relations": []}),
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", False),
@@ -105,7 +105,7 @@ class TestAddMemoriesGatePath:
         facts = [{"speaker": "other", "text": "友達が長野に住んでいる", "importance": 4,
                   "category": "personal", "subcategory": "friend", "tags": []}]
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", new_callable=AsyncMock, return_value=facts),
+            patch("services.mem0.ingest.extract_full_signals", new_callable=AsyncMock, return_value={"facts": facts, "relations": []}),
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", False),
@@ -125,7 +125,7 @@ class TestAddMemoriesGatePath:
             {"speaker": "self", "text": "長野市在住", "importance": 4, "category": "personal", "subcategory": "loc", "tags": []},
         ]
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", new_callable=AsyncMock, return_value=facts),
+            patch("services.mem0.ingest.extract_full_signals", new_callable=AsyncMock, return_value={"facts": facts, "relations": []}),
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", False),
@@ -141,7 +141,7 @@ class TestAddMemoriesGatePath:
     async def test_empty_facts_returns_zero_kept(self, patch_deps):
         """If extract returns empty list, kept=0 and no insert is called."""
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", new_callable=AsyncMock, return_value=[]),
+            patch("services.mem0.ingest.extract_full_signals", new_callable=AsyncMock, return_value={"facts": [], "relations": []}),
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", False),
@@ -159,7 +159,7 @@ class TestAddMemoriesGatePath:
         facts = [{"speaker": "self", "text": "Rustを勉強している", "importance": 4,
                   "category": "tech", "subcategory": "rust", "tags": ["rust", "learning"]}]
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", new_callable=AsyncMock, return_value=facts),
+            patch("services.mem0.ingest.extract_full_signals", new_callable=AsyncMock, return_value={"facts": facts, "relations": []}),
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", False),
@@ -212,7 +212,7 @@ class TestClientDedup:
                   "category": "tech", "subcategory": "ts", "tags": []}]
         patch_deps["search"].return_value = [{"score": 0.05}]
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", new_callable=AsyncMock, return_value=facts),
+            patch("services.mem0.ingest.extract_full_signals", new_callable=AsyncMock, return_value={"facts": facts, "relations": []}),
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", True),
@@ -232,7 +232,7 @@ class TestClientDedup:
                   "category": "tech", "subcategory": "python", "tags": []}]
         patch_deps["search"].return_value = [{"score": 0.50}]
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", new_callable=AsyncMock, return_value=facts),
+            patch("services.mem0.ingest.extract_full_signals", new_callable=AsyncMock, return_value={"facts": facts, "relations": []}),
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", True),
@@ -251,7 +251,7 @@ class TestClientDedup:
                   "category": "tech", "subcategory": "go", "tags": []}]
         patch_deps["search"].side_effect = RuntimeError("chroma down")
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", new_callable=AsyncMock, return_value=facts),
+            patch("services.mem0.ingest.extract_full_signals", new_callable=AsyncMock, return_value={"facts": facts, "relations": []}),
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", True),
@@ -324,17 +324,17 @@ class TestSignatureNormalization:
         """messages list is parsed into user_text / assistant_text for gate path."""
         facts_seen = {}
 
-        async def capture_extract(user_text, assistant_text, context_hint=""):
+        async def capture_extract(user_text, assistant_text, context_hint="", **kwargs):
             facts_seen["user_text"] = user_text
             facts_seen["assistant_text"] = assistant_text
-            return []
+            return {"facts": [], "relations": []}
 
         msgs = [
             {"role": "user", "content": "ユーザー発話"},
             {"role": "assistant", "content": "アシスタント応答"},
         ]
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", side_effect=capture_extract),
+            patch("services.mem0.ingest.extract_full_signals", side_effect=capture_extract),
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", False),
@@ -351,16 +351,16 @@ class TestSignatureNormalization:
         """role=system in messages list sets context_hint for gate extract."""
         hints_seen = {}
 
-        async def capture_extract(user_text, assistant_text, context_hint=""):
+        async def capture_extract(user_text, assistant_text, context_hint="", **kwargs):
             hints_seen["context_hint"] = context_hint
-            return []
+            return {"facts": [], "relations": []}
 
         msgs = [
             {"role": "system", "content": "チャンネル履歴"},
             {"role": "user", "content": "hello"},
         ]
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", side_effect=capture_extract),
+            patch("services.mem0.ingest.extract_full_signals", side_effect=capture_extract),
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", False),
@@ -392,7 +392,7 @@ class TestEdgeCases:
     async def test_empty_input_gate_path(self, patch_deps):
         """Empty user_text and assistant_text → extract called with empty strings."""
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", new_callable=AsyncMock, return_value=[]) as mock_extract,
+            patch("services.mem0.ingest.extract_full_signals", new_callable=AsyncMock, return_value={"facts": [], "relations": []}) as mock_extract,
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", False),
@@ -409,7 +409,7 @@ class TestEdgeCases:
         """Very large input string is handled without error."""
         big_text = "x" * 100_000
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", new_callable=AsyncMock, return_value=[]),
+            patch("services.mem0.ingest.extract_full_signals", new_callable=AsyncMock, return_value={"facts": [], "relations": []}),
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", False),
@@ -439,7 +439,7 @@ class TestEdgeCases:
         facts = [{"speaker": "self", "text": "テスト", "importance": 4,
                   "category": "meta", "subcategory": "test", "tags": []}]
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", new_callable=AsyncMock, return_value=facts),
+            patch("services.mem0.ingest.extract_full_signals", new_callable=AsyncMock, return_value={"facts": facts, "relations": []}),
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", False),
@@ -465,7 +465,7 @@ class TestEdgeCases:
         facts = [{"speaker": "self", "text": "テスト失敗", "importance": 4,
                   "category": "meta", "subcategory": "test", "tags": []}]
         with (
-            patch("services.mem0.ingest.extract_facts_for_self", new_callable=AsyncMock, return_value=facts),
+            patch("services.mem0.ingest.extract_full_signals", new_callable=AsyncMock, return_value={"facts": facts, "relations": []}),
             patch("config.MEM0_GATE_ENABLED", True),
             patch("config.MEM0_GATE_MIN_IMPORTANCE", 3),
             patch("config.MEM0_CLIENT_DEDUP_ENABLED", False),

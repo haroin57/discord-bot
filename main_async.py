@@ -122,6 +122,16 @@ async def main() -> None:
     from bot import bot
     from web_api import WebAPI
 
+    # 機能2: restore cooldown/quota + session freshness/sticky persisted by the
+    # previous run, so a restart continues conversations and keeps rate limits
+    # instead of wiping all in-memory ledgers.
+    import services.runtime_state as runtime_state
+    runtime_state.load_all()
+    # Safety net: if main_task dies by exception (we skip the graceful-shutdown
+    # block below), still persist on interpreter exit. Synchronous + idempotent;
+    # the loop is already stopped by then so _collect() can't race it.
+    atexit.register(runtime_state.save_all_sync)
+
     web_api = WebAPI(bot)
 
     loop = asyncio.get_running_loop()
@@ -145,6 +155,9 @@ async def main() -> None:
 
     main_task = asyncio.create_task(_run_services())
 
+    # 機能2: snapshot runtime state every 60s and once more at shutdown.
+    flush_task = asyncio.create_task(runtime_state.periodic_flush(shutdown_event))
+
     shutdown_task = asyncio.create_task(shutdown_event.wait())
     done, pending = await asyncio.wait(
         [main_task, shutdown_task],
@@ -167,6 +180,12 @@ async def main() -> None:
             await main_task
         except (asyncio.CancelledError, Exception):
             pass
+        # 機能2: shutdown_event is set, so periodic_flush does its final flush
+        # and returns. Wait (bounded) so we don't exit before the write lands.
+        try:
+            await asyncio.wait_for(flush_task, timeout=5)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            runtime_state.save_all_sync()
 
 
 if __name__ == "__main__":

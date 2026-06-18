@@ -75,7 +75,7 @@ def _restore_oauth_after_module():
 def _reset_singletons():
     """Reset all module-level singletons between tests."""
     client_mod._mem0_instance = None
-    client_mod._init_attempted = False
+    client_mod._init_failed_at = None
     client_mod._last_token = None
     client_mod._async_anthropic_client = None
     client_mod._async_anthropic_token = None
@@ -88,6 +88,9 @@ def reset_state(monkeypatch):
     monkeypatch.setattr(client_mod, "ensure_valid_token", AsyncMock(return_value=None))
     monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value="test-token-abc"))
     monkeypatch.setattr(client_mod, "oauth_init", MagicMock(return_value=True))
+    # Default tests to embedded mode so they don't hit the HTTP heartbeat.
+    # Tests that exercise server-mode init must override this.
+    monkeypatch.setenv("CHROMA_MODE", "embedded")
     yield
     _reset_singletons()
 
@@ -122,8 +125,8 @@ class TestGetMem0:
 
         assert result is None
 
-    def test_init_attempted_flag_prevents_retry(self, monkeypatch, tmp_path):
-        """Second call to _get_mem0 returns cached result without re-init."""
+    def test_singleton_caches_successful_init(self, monkeypatch, tmp_path):
+        """Second call to _get_mem0 returns cached instance without re-init."""
         mock_memory = MagicMock()
         mock_memory_cls = MagicMock()
         mock_memory_cls.from_config = MagicMock(return_value=mock_memory)
@@ -137,8 +140,8 @@ class TestGetMem0:
         assert r1 is r2
         assert mock_memory_cls.from_config.call_count == 1
 
-    def test_returns_cached_none_after_failure(self, monkeypatch, tmp_path):
-        """After a failed init, subsequent calls return None without retrying."""
+    def test_failure_triggers_cooldown_no_retry_within_window(self, monkeypatch, tmp_path):
+        """After failed init, calls within cooldown window return None without re-init."""
         mock_memory_cls = MagicMock()
         mock_memory_cls.from_config = MagicMock(side_effect=Exception("boom"))
 
@@ -151,6 +154,74 @@ class TestGetMem0:
         assert r1 is None
         assert r2 is None
         assert mock_memory_cls.from_config.call_count == 1
+        assert client_mod._init_failed_at is not None
+
+    def test_failure_retries_after_cooldown_expires(self, monkeypatch, tmp_path):
+        """After cooldown expires, _get_mem0 retries init and can succeed."""
+        mock_memory = MagicMock()
+        mock_memory_cls = MagicMock()
+        # First call raises, second call succeeds
+        mock_memory_cls.from_config = MagicMock(side_effect=[Exception("boom"), mock_memory])
+
+        monkeypatch.setattr("config.STATE_DIR", str(tmp_path))
+
+        with patch.dict("sys.modules", {"mem0": types.SimpleNamespace(Memory=mock_memory_cls)}):
+            r1 = client_mod._get_mem0()
+            assert r1 is None
+            # Force cooldown to have already expired
+            client_mod._init_failed_at = (
+                client_mod.time.monotonic() - client_mod._INIT_RETRY_COOLDOWN_SEC - 1
+            )
+            r2 = client_mod._get_mem0()
+
+        assert r2 is mock_memory
+        assert mock_memory_cls.from_config.call_count == 2
+
+    def test_server_mode_pings_heartbeat_before_init(self, monkeypatch, tmp_path):
+        """In server mode, _get_mem0 pings ChromaDB heartbeat before Memory.from_config."""
+        monkeypatch.setenv("CHROMA_MODE", "server")
+        monkeypatch.setenv("CHROMA_HOST", "127.0.0.1")
+        monkeypatch.setenv("CHROMA_PORT", "8765")
+        monkeypatch.setattr("config.STATE_DIR", str(tmp_path))
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_get = MagicMock(return_value=mock_response)
+
+        mock_memory = MagicMock()
+        mock_memory_cls = MagicMock()
+        mock_memory_cls.from_config = MagicMock(return_value=mock_memory)
+
+        with patch.dict("sys.modules", {
+            "mem0": types.SimpleNamespace(Memory=mock_memory_cls),
+            "requests": types.SimpleNamespace(get=mock_get),
+        }):
+            result = client_mod._get_mem0()
+
+        assert result is mock_memory
+        mock_get.assert_called_once()
+        url = mock_get.call_args[0][0]
+        assert "127.0.0.1:8765" in url
+        assert "/api/v2/heartbeat" in url
+
+    def test_server_mode_heartbeat_failure_marks_init_failed(self, monkeypatch, tmp_path):
+        """If heartbeat fails, init is marked failed without attempting Memory.from_config."""
+        monkeypatch.setenv("CHROMA_MODE", "server")
+        monkeypatch.setattr("config.STATE_DIR", str(tmp_path))
+
+        mock_get = MagicMock(side_effect=ConnectionError("refused"))
+        mock_memory_cls = MagicMock()
+        mock_memory_cls.from_config = MagicMock()
+
+        with patch.dict("sys.modules", {
+            "mem0": types.SimpleNamespace(Memory=mock_memory_cls),
+            "requests": types.SimpleNamespace(get=mock_get),
+        }):
+            result = client_mod._get_mem0()
+
+        assert result is None
+        assert client_mod._init_failed_at is not None
+        mock_memory_cls.from_config.assert_not_called()
 
     def test_oauth_init_failure_logs_error(self, monkeypatch, tmp_path, caplog):
         """_get_mem0 logs an error when oauth_init returns False."""
@@ -270,79 +341,79 @@ class TestBuildConfig:
         import os
         assert os.path.isdir(cfg["vector_store"]["config"]["path"])
 
+    def test_default_collection_name(self, monkeypatch, tmp_path):
+        """Default collection is kanae_memories_safe (post-SEGV rebuilt data)."""
+        monkeypatch.setattr("config.STATE_DIR", str(tmp_path))
+        monkeypatch.delenv("MEM0_COLLECTION_NAME", raising=False)
+        cfg = client_mod._build_config()
+        assert cfg["vector_store"]["config"]["collection_name"] == "kanae_memories_safe"
+
+    def test_collection_name_env_override(self, monkeypatch, tmp_path):
+        """MEM0_COLLECTION_NAME env swaps the target collection (e.g. infer rebuild)."""
+        monkeypatch.setattr("config.STATE_DIR", str(tmp_path))
+        monkeypatch.setenv("MEM0_COLLECTION_NAME", "kanae_memories_infer")
+        cfg = client_mod._build_config()
+        assert cfg["vector_store"]["config"]["collection_name"] == "kanae_memories_infer"
+
 
 # ---------------------------------------------------------------------------
 # get_all_memories tests
 # ---------------------------------------------------------------------------
 
 class TestGetAllMemories:
-    def test_returns_list_when_result_is_dict(self, monkeypatch, tmp_path):
+    async def test_returns_list_when_result_is_dict(self, monkeypatch, tmp_path):
         mock_mem = MagicMock()
         mock_mem.get_all = MagicMock(return_value={"results": [{"id": "1"}]})
         monkeypatch.setattr(client_mod, "_get_mem0", MagicMock(return_value=mock_mem))
 
-        result = asyncio.get_event_loop().run_until_complete(
-            client_mod.get_all_memories("user123")
-        )
+        result = await client_mod.get_all_memories("user123")
         assert result == [{"id": "1"}]
 
-    def test_returns_list_when_result_is_list(self, monkeypatch):
+    async def test_returns_list_when_result_is_list(self, monkeypatch):
         mock_mem = MagicMock()
         mock_mem.get_all = MagicMock(return_value=[{"id": "2"}])
         monkeypatch.setattr(client_mod, "_get_mem0", MagicMock(return_value=mock_mem))
 
-        result = asyncio.get_event_loop().run_until_complete(
-            client_mod.get_all_memories("user123")
-        )
+        result = await client_mod.get_all_memories("user123")
         assert result == [{"id": "2"}]
 
-    def test_returns_empty_when_mem0_is_none(self, monkeypatch):
+    async def test_returns_empty_when_mem0_is_none(self, monkeypatch):
         monkeypatch.setattr(client_mod, "_get_mem0", MagicMock(return_value=None))
 
-        result = asyncio.get_event_loop().run_until_complete(
-            client_mod.get_all_memories("user123")
-        )
+        result = await client_mod.get_all_memories("user123")
         assert result == []
 
-    def test_returns_empty_on_exception(self, monkeypatch):
+    async def test_returns_empty_on_exception(self, monkeypatch):
         mock_mem = MagicMock()
         mock_mem.get_all = MagicMock(side_effect=RuntimeError("db error"))
         monkeypatch.setattr(client_mod, "_get_mem0", MagicMock(return_value=mock_mem))
 
-        result = asyncio.get_event_loop().run_until_complete(
-            client_mod.get_all_memories("user123")
-        )
+        result = await client_mod.get_all_memories("user123")
         assert result == []
 
-    def test_passes_limit_kwarg(self, monkeypatch):
+    async def test_passes_limit_kwarg(self, monkeypatch):
         mock_mem = MagicMock()
         mock_mem.get_all = MagicMock(return_value={"results": []})
         monkeypatch.setattr(client_mod, "_get_mem0", MagicMock(return_value=mock_mem))
 
-        asyncio.get_event_loop().run_until_complete(
-            client_mod.get_all_memories("user123", limit=50)
-        )
+        await client_mod.get_all_memories("user123", limit=50)
         mock_mem.get_all.assert_called_once_with(user_id="user123", limit=50)
 
-    def test_no_limit_kwarg_when_none(self, monkeypatch):
+    async def test_no_limit_kwarg_when_none(self, monkeypatch):
         mock_mem = MagicMock()
         mock_mem.get_all = MagicMock(return_value={"results": []})
         monkeypatch.setattr(client_mod, "_get_mem0", MagicMock(return_value=mock_mem))
 
-        asyncio.get_event_loop().run_until_complete(
-            client_mod.get_all_memories("user123", limit=None)
-        )
+        await client_mod.get_all_memories("user123", limit=None)
         call_kwargs = mock_mem.get_all.call_args[1]
         assert "limit" not in call_kwargs
 
-    def test_returns_empty_when_result_is_unexpected_type(self, monkeypatch):
+    async def test_returns_empty_when_result_is_unexpected_type(self, monkeypatch):
         mock_mem = MagicMock()
         mock_mem.get_all = MagicMock(return_value=42)
         monkeypatch.setattr(client_mod, "_get_mem0", MagicMock(return_value=mock_mem))
 
-        result = asyncio.get_event_loop().run_until_complete(
-            client_mod.get_all_memories("user123")
-        )
+        result = await client_mod.get_all_memories("user123")
         assert result == []
 
 
@@ -351,42 +422,34 @@ class TestGetAllMemories:
 # ---------------------------------------------------------------------------
 
 class TestDeleteMemory:
-    def test_returns_true_on_success(self, monkeypatch):
+    async def test_returns_true_on_success(self, monkeypatch):
         mock_mem = MagicMock()
         mock_mem.delete = MagicMock(return_value=None)
         monkeypatch.setattr(client_mod, "_get_mem0", MagicMock(return_value=mock_mem))
 
-        result = asyncio.get_event_loop().run_until_complete(
-            client_mod.delete_memory("mem-id-123")
-        )
+        result = await client_mod.delete_memory("mem-id-123")
         assert result is True
 
-    def test_returns_false_when_mem0_is_none(self, monkeypatch):
+    async def test_returns_false_when_mem0_is_none(self, monkeypatch):
         monkeypatch.setattr(client_mod, "_get_mem0", MagicMock(return_value=None))
 
-        result = asyncio.get_event_loop().run_until_complete(
-            client_mod.delete_memory("mem-id-123")
-        )
+        result = await client_mod.delete_memory("mem-id-123")
         assert result is False
 
-    def test_returns_false_on_exception(self, monkeypatch):
+    async def test_returns_false_on_exception(self, monkeypatch):
         mock_mem = MagicMock()
         mock_mem.delete = MagicMock(side_effect=RuntimeError("delete fail"))
         monkeypatch.setattr(client_mod, "_get_mem0", MagicMock(return_value=mock_mem))
 
-        result = asyncio.get_event_loop().run_until_complete(
-            client_mod.delete_memory("mem-id-123")
-        )
+        result = await client_mod.delete_memory("mem-id-123")
         assert result is False
 
-    def test_calls_delete_with_correct_id(self, monkeypatch):
+    async def test_calls_delete_with_correct_id(self, monkeypatch):
         mock_mem = MagicMock()
         mock_mem.delete = MagicMock(return_value=None)
         monkeypatch.setattr(client_mod, "_get_mem0", MagicMock(return_value=mock_mem))
 
-        asyncio.get_event_loop().run_until_complete(
-            client_mod.delete_memory("specific-mem-id")
-        )
+        await client_mod.delete_memory("specific-mem-id")
         mock_mem.delete.assert_called_once_with("specific-mem-id")
 
 
@@ -395,17 +458,15 @@ class TestDeleteMemory:
 # ---------------------------------------------------------------------------
 
 class TestGetAnthropicClient:
-    def test_returns_none_when_no_token(self, monkeypatch):
+    async def test_returns_none_when_no_token(self, monkeypatch):
         monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value=None))
         monkeypatch.setattr(client_mod, "ensure_valid_token", AsyncMock(return_value=None))
         monkeypatch.setattr(client_mod, "oauth_init", MagicMock(return_value=True))
 
-        result = asyncio.get_event_loop().run_until_complete(
-            client_mod.get_anthropic_client()
-        )
+        result = await client_mod.get_anthropic_client()
         assert result is None
 
-    def test_builds_client_on_first_call(self, monkeypatch):
+    async def test_builds_client_on_first_call(self, monkeypatch):
         monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value="tok-1"))
         monkeypatch.setattr(client_mod, "ensure_valid_token", AsyncMock(return_value=None))
         monkeypatch.setattr(client_mod, "oauth_init", MagicMock(return_value=True))
@@ -414,14 +475,12 @@ class TestGetAnthropicClient:
         mock_cls = MagicMock(return_value=mock_client)
 
         with patch.dict("sys.modules", {"anthropic": types.SimpleNamespace(AsyncAnthropic=mock_cls)}):
-            result = asyncio.get_event_loop().run_until_complete(
-                client_mod.get_anthropic_client()
-            )
+            result = await client_mod.get_anthropic_client()
 
         assert result is mock_client
-        mock_cls.assert_called_once_with(auth_token="tok-1")
+        mock_cls.assert_called_once_with(auth_token="tok-1", max_retries=0)
 
-    def test_returns_cached_client_on_same_token(self, monkeypatch):
+    async def test_returns_cached_client_on_same_token(self, monkeypatch):
         monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value="tok-same"))
         monkeypatch.setattr(client_mod, "ensure_valid_token", AsyncMock(return_value=None))
         monkeypatch.setattr(client_mod, "oauth_init", MagicMock(return_value=True))
@@ -430,12 +489,10 @@ class TestGetAnthropicClient:
         client_mod._async_anthropic_client = mock_client
         client_mod._async_anthropic_token = "tok-same"
 
-        result = asyncio.get_event_loop().run_until_complete(
-            client_mod.get_anthropic_client()
-        )
+        result = await client_mod.get_anthropic_client()
         assert result is mock_client
 
-    def test_rebuilds_client_on_token_rotation(self, monkeypatch):
+    async def test_rebuilds_client_on_token_rotation(self, monkeypatch):
         monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value="tok-new"))
         monkeypatch.setattr(client_mod, "ensure_valid_token", AsyncMock(return_value=None))
         monkeypatch.setattr(client_mod, "oauth_init", MagicMock(return_value=True))
@@ -448,9 +505,7 @@ class TestGetAnthropicClient:
         mock_cls = MagicMock(return_value=new_client)
 
         with patch.dict("sys.modules", {"anthropic": types.SimpleNamespace(AsyncAnthropic=mock_cls)}):
-            result = asyncio.get_event_loop().run_until_complete(
-                client_mod.get_anthropic_client()
-            )
+            result = await client_mod.get_anthropic_client()
 
         assert result is new_client
         assert client_mod._async_anthropic_token == "tok-new"

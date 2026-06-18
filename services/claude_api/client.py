@@ -11,6 +11,8 @@ import logging
 import os
 import uuid
 
+from config import CLAUDE_EFFORT
+
 log = logging.getLogger(__name__)
 
 # === Auto-captured CLI identity block ===
@@ -18,7 +20,7 @@ log = logging.getLogger(__name__)
 # run daily). DO NOT edit between the marker comments; manual edits will be
 # clobbered on the next refresh run.
 # AUTO-CAPTURE-START
-CC_VERSION = "2.1.92"
+CC_VERSION = "2.1.170"
 CC_ENTRYPOINT = "sdk-cli"
 MODEL_BETAS = [
     "claude-code-20250219",
@@ -26,20 +28,88 @@ MODEL_BETAS = [
     "interleaved-thinking-2025-05-14",
     "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
+    "mid-conversation-system-2026-04-07",
     "advanced-tool-use-2025-11-20",
     "effort-2025-11-24",
+    "server-side-fallback-2026-06-01",
+    "fallback-credit-2026-06-01",
+    "extended-cache-ttl-2025-04-11",
 ]
 CLI_IDENTITY_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 # AUTO-CAPTURE-END
 
+# Supplementary betas appended OUTSIDE the auto-capture block so the daily
+# refresh_cli_identity.sh run doesn't clobber them. context-1m-2025-08-07
+# opens the 1M-token context window; without it the effective window is 200K
+# and the 500K compaction trigger (config.HISTORY_COMPACT_TRIGGER_TOKENS) would
+# overflow before compaction ever fires. Gated on CONTEXT_1M_ENABLED so it can
+# be turned off in one place if the subscription/model rejects the beta.
+_EXTRA_BETAS = []
+if os.environ.get("CONTEXT_1M_ENABLED", "1") not in ("0", "false", "False", ""):
+    _EXTRA_BETAS.append("context-1m-2025-08-07")
+for _b in _EXTRA_BETAS:
+    if _b not in MODEL_BETAS:
+        MODEL_BETAS.append(_b)
+
 USER_AGENT = f"claude-cli/{CC_VERSION} (external, {CC_ENTRYPOINT})"
 
-# Body fields the CLI always sends alongside the betas above.
+# Body fields the CLI always sends alongside the betas above. These are
+# pinned verbatim from the 2026-05-14 mitm capture of claude-cli 2.1.92
+# against /v1/messages so the bot's request byte-shape matches the
+# subscriber-tier identification path.
+#
+# - thinking.type = "adaptive": let the model spend as much thinking budget as
+#   it judges necessary (no fixed cap below max_tokens). Kept byte-identical to
+#   the real claude-cli, which sends {"type":"adaptive"} with no display field.
+#   (We briefly tried display="summarized" while debugging fable-5 refusals, but
+#   the real fix was output_config reaching the wire (ADR-0009), so we reverted
+#   to match the CLI exactly.)
+# - output_config.effort: defaults to "medium" (haroin's instruction — keep
+#   Fable 5 on the medium tier for predictable latency and token usage; the
+#   CLI's own default is "high"). Env-tunable via CLAUDE_EFFORT /
+#   CLAUDE_CODE_EFFORT_LEVEL so the dial is a config knob, not a buried
+#   constant (audit #4).
+# - context_management.clear_thinking_20251015 with keep="all": the
+#   server-side bookkeeping the CLI requests for the new
+#   advanced-tool-use beta. Mirroring it keeps overage-cohort routing
+#   working under sustained load.
 THINKING_CONFIG = {"type": "adaptive"}
-OUTPUT_CONFIG = {"effort": "medium"}
-CLAUDE_MAX_TOKENS_OPUS = 64000
+OUTPUT_CONFIG = {"effort": CLAUDE_EFFORT}
+CONTEXT_MANAGEMENT_CONFIG = {
+    "edits": [
+        {"type": "clear_thinking_20251015", "keep": "all"},
+        # ADR-0010 phase 2: server-side auto-compaction of old tool results.
+        # Fires only once the request is already heavy (Fable 5 starts
+        # refusing around ~240k input tokens; 150k leaves headroom), so the
+        # prompt-cache prefix is NOT rewritten on normal-sized turns. Every
+        # clear invalidates the cache prefix, so we only pay that cost when
+        # it frees a meaningful chunk (clear_at_least). Keeps the 5 most
+        # recent tool uses so mid-workflow context survives. Note: this
+        # compacts tool results only — plain long conversations are handled
+        # by the sticky fallback-model pinning in entry.py, not by this edit.
+        {
+            "type": "clear_tool_uses_20250919",
+            "trigger": {"type": "input_tokens", "value": 150000},
+            "keep": {"type": "tool_uses", "value": 5},
+            "clear_at_least": {"type": "input_tokens", "value": 20000},
+        },
+    ],
+}
+CLAUDE_MAX_TOKENS_OPUS = 32000  # matched to real claude-cli request (2026-06-10)
 
 _session_id = str(uuid.uuid4())
+
+
+def supports_adaptive_thinking(model: str) -> bool:
+    """Whether ``model`` accepts ``thinking.type=adaptive``.
+
+    Haiku returns HTTP 400 when adaptive thinking is requested, which was
+    silently failing-open every Mem0 helper (query-expansion / dedup /
+    rerank — all default to Haiku) and falling through to their except
+    branches. Exclude Haiku (and any future small model carrying "haiku"
+    in its id); Opus / Sonnet support adaptive thinking.
+    """
+    return "haiku" not in (model or "").lower()
 
 
 def _load_cli_default_system_prompt() -> str:
@@ -114,12 +184,14 @@ def get_metadata() -> dict:
     account = _read_claude_user_account()
     # The order matters: CLI sends device_id first, then account_uuid, then
     # session_id. We construct an OrderedDict-equivalent via insertion order.
-    payload: dict[str, str] = {}
-    if account.get("device_id"):
-        payload["device_id"] = account["device_id"]
-    if account.get("account_uuid"):
-        payload["account_uuid"] = account["account_uuid"]
-    payload["session_id"] = _session_id
+    # Free-code always includes device_id and account_uuid (even if empty
+    # string). Omitting them changes the JSON shape and may affect server-
+    # side subscriber identification.
+    payload: dict[str, str] = {
+        "device_id": account.get("device_id", ""),
+        "account_uuid": account.get("account_uuid", ""),
+        "session_id": _session_id,
+    }
     return {"user_id": json.dumps(payload, separators=(",", ":"))}
 
 
@@ -179,6 +251,20 @@ def _first_user_text(messages: list[dict]) -> str:
     return fallback
 
 
+def _generate_cch() -> str:
+    """Return the cch=00000 placeholder for attestation.
+
+    The real Claude Code CLI (Bun binary) computes xxHash64 of the full
+    serialized request body and replaces this placeholder at the native
+    HTTP layer. Our Python implementation does the same via an httpx
+    event hook in attestation.py:cch_request_hook().
+
+    Returning "00000" here means the system prompt carries the correct
+    placeholder that the hook will patch before the request is sent.
+    """
+    return "00000"
+
+
 def get_attribution_header_value(messages: list[dict] | None = None) -> str:
     """Build the full ``x-anthropic-billing-header: ...`` string.
 
@@ -187,18 +273,21 @@ def get_attribution_header_value(messages: list[dict] | None = None) -> str:
         first_text = first user message's text content (HBY-filtered)
         picks = first_text[4] + first_text[7] + first_text[20] ("0" if absent)
         suffix = sha256(SALT + picks + VERSION).hex[:3]
+        cch = xxHash64(body, seed) & 0xFFFFF  // computed by Bun/Zig nativeFetch
 
-    The CLI also embeds this string verbatim as ``system[0]`` INCLUDING
+    We emit cch=00000 here; attestation.py:cch_request_hook() patches
+    it with the real xxHash64 value before the request leaves the process.
+
+    The CLI embeds this string verbatim as ``system[0]`` INCLUDING
     the ``x-anthropic-billing-header: `` prefix (mitmproxy capture
-    2026-05-13: system[0].text starts with that literal). Stripping the
-    prefix was leaving a 52-char block where the CLI sends 80, byte
-    diff against the expected subscriber-tier signature.
+    2026-05-14: system[0].text starts with that literal).
     """
     text = _first_user_text(messages or [])
     picks = "".join((text[i] if len(text) > i else "0") for i in (4, 7, 20))
     raw = f"{_BILLING_SALT}{picks}{CC_VERSION}"
     suffix = hashlib.sha256(raw.encode()).hexdigest()[:3]
+    cch = _generate_cch()
     return (
         f"x-anthropic-billing-header: cc_version={CC_VERSION}.{suffix}; "
-        f"cc_entrypoint={CC_ENTRYPOINT}; cch=00000;"
+        f"cc_entrypoint={CC_ENTRYPOINT}; cch={cch};"
     )

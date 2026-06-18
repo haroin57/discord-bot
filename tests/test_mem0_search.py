@@ -333,6 +333,24 @@ class TestSearchMemoriesSmart:
             AsyncMock(return_value=[]),
         )
 
+    @pytest.fixture(autouse=True)
+    def _stub_hyde(self, monkeypatch):
+        """HyDE talks to Anthropic; stub to empty string by default so
+        smart-pipeline tests that focus on other behavior stay quiet."""
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._generate_hypothetical_fact",
+            AsyncMock(return_value=""),
+        )
+
+    @pytest.fixture(autouse=True)
+    def _stub_llm_keywords(self, monkeypatch):
+        """LLM keyword extraction also talks to Anthropic; stub to '' by
+        default so smart-pipeline tests stay deterministic."""
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._extract_keywords_via_llm",
+            AsyncMock(return_value=""),
+        )
+
     @pytest.mark.asyncio
     async def test_full_pipeline(self, monkeypatch):
         variants = ["kw1", "kw2"]
@@ -340,7 +358,7 @@ class TestSearchMemoriesSmart:
         reranked = merged[:3]
 
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=variants))
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", AsyncMock(return_value=merged))
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",AsyncMock(return_value=merged))
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=reranked))
 
         from services.mem0.search import search_memories_smart
@@ -357,7 +375,7 @@ class TestSearchMemoriesSmart:
         )
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
         multi_mock = AsyncMock(return_value=[])
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", multi_mock)
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",multi_mock)
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]))
 
         from services.mem0.search import search_memories_smart
@@ -374,7 +392,7 @@ class TestSearchMemoriesSmart:
         alias_mock = AsyncMock(return_value=["CLANNAD"])
         monkeypatch.setattr(f"{_PATCH_BASE}._expand_query_via_graph", alias_mock)
         multi_mock = AsyncMock(return_value=[])
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", multi_mock)
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",multi_mock)
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=["unused"]))
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]))
 
@@ -391,7 +409,7 @@ class TestSearchMemoriesSmart:
         multi_mock = AsyncMock(return_value=[])
         rewrite_mock = AsyncMock(return_value=["x"])
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", rewrite_mock)
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", multi_mock)
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",multi_mock)
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]))
 
         from services.mem0.search import search_memories_smart
@@ -405,7 +423,7 @@ class TestSearchMemoriesSmart:
     async def test_rerank_disabled(self, monkeypatch):
         mems = [_make_memory(str(i), 0.5) for i in range(10)]
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", AsyncMock(return_value=mems))
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",AsyncMock(return_value=mems))
         rerank_mock = AsyncMock(return_value=mems[:5])
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", rerank_mock)
 
@@ -418,7 +436,7 @@ class TestSearchMemoriesSmart:
         """If rewrite returns the same query, it should not be duplicated."""
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=["q", "other"]))
         multi_mock = AsyncMock(return_value=[])
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", multi_mock)
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",multi_mock)
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]))
 
         from services.mem0.search import search_memories_smart
@@ -439,14 +457,483 @@ class TestSearchMemoriesSmart:
 
     @pytest.mark.asyncio
     async def test_both_disabled_plain_search(self, monkeypatch):
-        mems = [_make_memory("x", 0.9)]
-        monkeypatch.setattr(f"{_PATCH_BASE}.search_memories_multi", AsyncMock(return_value=mems))
+        # ADR-0002: rerank=False path uses MEM0_RELEVANCE_MAX_DISTANCE
+        # (1.2) as the sanity gate. 0.4 is well under either threshold.
+        mems = [_make_memory("x", 0.4)]
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",AsyncMock(return_value=mems))
         monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock())
         monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock())
 
         from services.mem0.search import search_memories_smart
         result = await search_memories_smart("q", "u", limit=5, rewrite=False, rerank=False)
         assert result == mems
+
+
+# ---------------------------------------------------------------------------
+# HyDE (Phase B-1)
+# ---------------------------------------------------------------------------
+
+class TestHydeGeneration:
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_short_query(self):
+        from services.mem0.search import _generate_hypothetical_fact
+        assert await _generate_hypothetical_fact("") == ""
+        assert await _generate_hypothetical_fact("       ") == ""
+        assert await _generate_hypothetical_fact("short") == ""  # <8 chars
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_disabled(self, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "MEM0_HYDE_ENABLED", False, raising=False)
+        from services.mem0.search import _generate_hypothetical_fact
+        assert await _generate_hypothetical_fact("いぶきの髪色を覚えてる？") == ""
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_client_none(self, monkeypatch):
+        async def _no_client():
+            return None
+        monkeypatch.setattr("services.mem0.client.get_anthropic_client", _no_client)
+        from services.mem0.search import _generate_hypothetical_fact
+        assert await _generate_hypothetical_fact("先輩はいぶきが好き?") == ""
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_json_error(self, monkeypatch):
+        fake_client = AsyncMock()
+        fake_client.messages.create = AsyncMock(
+            return_value=_make_anthropic_resp("not json at all"),
+        )
+        monkeypatch.setattr(
+            "services.mem0.client.get_anthropic_client",
+            AsyncMock(return_value=fake_client),
+        )
+        from services.mem0.search import _generate_hypothetical_fact
+        result = await _generate_hypothetical_fact("先輩はいぶきが好き?")
+        assert result == ""
+
+    @pytest.mark.asyncio
+    async def test_extracts_hypothetical_from_json(self, monkeypatch):
+        fake_client = AsyncMock()
+        fake_client.messages.create = AsyncMock(
+            return_value=_make_anthropic_resp(
+                '{"hypothetical":"先輩は砺波いぶきが好き"}',
+            ),
+        )
+        monkeypatch.setattr(
+            "services.mem0.client.get_anthropic_client",
+            AsyncMock(return_value=fake_client),
+        )
+        from services.mem0.search import _generate_hypothetical_fact
+        result = await _generate_hypothetical_fact("先輩はいぶきが好き?")
+        assert result == "先輩は砺波いぶきが好き"
+
+    @pytest.mark.asyncio
+    async def test_strips_code_fence(self, monkeypatch):
+        fake_client = AsyncMock()
+        fake_client.messages.create = AsyncMock(
+            return_value=_make_anthropic_resp(
+                '```json\n{"hypothetical":"先輩はRustが好き"}\n```',
+            ),
+        )
+        monkeypatch.setattr(
+            "services.mem0.client.get_anthropic_client",
+            AsyncMock(return_value=fake_client),
+        )
+        from services.mem0.search import _generate_hypothetical_fact
+        result = await _generate_hypothetical_fact("先輩はRustの話してた?")
+        assert result == "先輩はRustが好き"
+
+
+class TestSmartSearchHydeIntegration:
+    @pytest.fixture(autouse=True)
+    def _stub_alias_expand(self, monkeypatch):
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._expand_query_via_graph",
+            AsyncMock(return_value=[]),
+        )
+
+    @pytest.fixture(autouse=True)
+    def _stub_llm_keywords(self, monkeypatch):
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._extract_keywords_via_llm",
+            AsyncMock(return_value=""),
+        )
+
+    @pytest.mark.asyncio
+    async def test_hyde_string_passed_to_multi_search(self, monkeypatch):
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._generate_hypothetical_fact",
+            AsyncMock(return_value="先輩は砺波いぶきが好き"),
+        )
+        multi_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid", multi_mock)
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]),
+        )
+        from services.mem0.search import search_memories_smart
+        await search_memories_smart("先輩はいぶきが好き?", "u")
+        queries = multi_mock.call_args.args[0]
+        assert "先輩は砺波いぶきが好き" in queries
+
+    @pytest.mark.asyncio
+    async def test_hyde_not_called_when_rewrite_disabled(self, monkeypatch):
+        rewrite_mock = AsyncMock(return_value=["unused"])
+        hyde_mock = AsyncMock(return_value="should_not_be_called")
+        monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", rewrite_mock)
+        monkeypatch.setattr(f"{_PATCH_BASE}._generate_hypothetical_fact", hyde_mock)
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._search_multi_hybrid", AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]),
+        )
+        from services.mem0.search import search_memories_smart
+        await search_memories_smart("先輩はいぶきが好き?", "u", rewrite=False)
+        rewrite_mock.assert_not_called()
+        hyde_mock.assert_not_called()
+
+
+class TestLlmKeywordExtraction:
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_short_query(self):
+        from services.mem0.search import _extract_keywords_via_llm
+        assert await _extract_keywords_via_llm("") == ""
+        assert await _extract_keywords_via_llm("short") == ""
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_client_none(self, monkeypatch):
+        async def _no_client():
+            return None
+        monkeypatch.setattr(
+            "services.mem0.client.get_anthropic_client", _no_client,
+        )
+        from services.mem0.search import _extract_keywords_via_llm
+        assert await _extract_keywords_via_llm("先輩は砺波いぶきが好きですか？") == ""
+
+    @pytest.mark.asyncio
+    async def test_extracts_keywords_and_aliases(self, monkeypatch):
+        fake_client = AsyncMock()
+        fake_client.messages.create = AsyncMock(
+            return_value=_make_anthropic_resp(
+                '{"keywords":["先輩","砺波いぶき","髪色"],'
+                '"aliases":["haroin"]}'
+            ),
+        )
+        monkeypatch.setattr(
+            "services.mem0.client.get_anthropic_client",
+            AsyncMock(return_value=fake_client),
+        )
+        from services.mem0.search import _extract_keywords_via_llm
+        result = await _extract_keywords_via_llm("先輩はいぶきの髪色覚えてる？")
+        parts = result.split()
+        assert "砺波いぶき" in parts
+        assert "haroin" in parts
+
+    @pytest.mark.asyncio
+    async def test_dedupes_keyword_and_alias_overlap(self, monkeypatch):
+        fake_client = AsyncMock()
+        fake_client.messages.create = AsyncMock(
+            return_value=_make_anthropic_resp(
+                '{"keywords":["砺波いぶき"],"aliases":["砺波いぶき","いぶき"]}'
+            ),
+        )
+        monkeypatch.setattr(
+            "services.mem0.client.get_anthropic_client",
+            AsyncMock(return_value=fake_client),
+        )
+        from services.mem0.search import _extract_keywords_via_llm
+        result = await _extract_keywords_via_llm("砺波いぶきの話覚えてる？")
+        parts = result.split()
+        assert parts.count("砺波いぶき") == 1
+        assert "いぶき" in parts
+
+    @pytest.mark.asyncio
+    async def test_fail_open_on_invalid_json(self, monkeypatch):
+        fake_client = AsyncMock()
+        fake_client.messages.create = AsyncMock(
+            return_value=_make_anthropic_resp("not json"),
+        )
+        monkeypatch.setattr(
+            "services.mem0.client.get_anthropic_client",
+            AsyncMock(return_value=fake_client),
+        )
+        from services.mem0.search import _extract_keywords_via_llm
+        assert await _extract_keywords_via_llm("先輩はいぶきが好きですか？") == ""
+
+
+class TestEpisodeBundle:
+    """Phase C-3: smart_search expands top-1 hit's episode_id into a
+    bundle of sibling facts."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_pipeline(self, monkeypatch):
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._expand_query_via_graph",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._generate_hypothetical_fact",
+            AsyncMock(return_value=""),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]),
+        )
+
+    @pytest.mark.asyncio
+    async def test_top_with_episode_pulls_siblings(self, monkeypatch):
+        top_hit = {
+            "id": "f1", "memory": "topic A fact",
+            "score": 0.1, "metadata": {"episode_id": "ep-42"},
+        }
+        sibling = {
+            "id": "f2", "memory": "more about A",
+            "score": None, "metadata": {"episode_id": "ep-42"},
+        }
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._search_multi_hybrid",
+            AsyncMock(return_value=[top_hit]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rerank_memories",
+            AsyncMock(return_value=[top_hit]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}.get_episode_facts",
+            AsyncMock(return_value=[sibling]),
+        )
+
+        from services.mem0.search import search_memories_smart
+        result = await search_memories_smart("q", "u", limit=5)
+        ids = [r["id"] for r in result]
+        assert "f1" in ids
+        assert "f2" in ids
+
+    @pytest.mark.asyncio
+    async def test_no_episode_skips_bundle(self, monkeypatch):
+        top_hit = {"id": "f1", "memory": "no episode", "score": 0.1, "metadata": {}}
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._search_multi_hybrid",
+            AsyncMock(return_value=[top_hit]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rerank_memories",
+            AsyncMock(return_value=[top_hit]),
+        )
+        bundle_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr(f"{_PATCH_BASE}.get_episode_facts", bundle_mock)
+
+        from services.mem0.search import search_memories_smart
+        result = await search_memories_smart("q", "u", limit=5)
+        bundle_mock.assert_not_called()
+        assert [r["id"] for r in result] == ["f1"]
+
+    @pytest.mark.asyncio
+    async def test_bundle_caps_at_limit(self, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "MEM0_EPISODE_BUNDLE_LIMIT", 2, raising=False)
+
+        top_hit = {
+            "id": "f1", "memory": "topic", "score": 0.1,
+            "metadata": {"episode_id": "ep-1"},
+        }
+        siblings = [
+            {"id": f"f{i}", "memory": "sib", "metadata": {"episode_id": "ep-1"}}
+            for i in range(2, 10)
+        ]
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._search_multi_hybrid",
+            AsyncMock(return_value=[top_hit]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rerank_memories",
+            AsyncMock(return_value=[top_hit]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}.get_episode_facts",
+            AsyncMock(return_value=siblings),
+        )
+
+        from services.mem0.search import search_memories_smart
+        result = await search_memories_smart("q", "u", limit=5)
+        # top-1 + cap (2) = 3 entries
+        assert len(result) == 3
+
+    @pytest.mark.asyncio
+    async def test_bundle_disabled_via_flag(self, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "MEM0_EPISODE_BUNDLE_ENABLED", False, raising=False)
+
+        top_hit = {
+            "id": "f1", "memory": "topic", "score": 0.1,
+            "metadata": {"episode_id": "ep-1"},
+        }
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._search_multi_hybrid",
+            AsyncMock(return_value=[top_hit]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rerank_memories",
+            AsyncMock(return_value=[top_hit]),
+        )
+        bundle_mock = AsyncMock(return_value=[{"id": "f2"}])
+        monkeypatch.setattr(f"{_PATCH_BASE}.get_episode_facts", bundle_mock)
+
+        from services.mem0.search import search_memories_smart
+        result = await search_memories_smart("q", "u", limit=5)
+        bundle_mock.assert_not_called()
+        assert [r["id"] for r in result] == ["f1"]
+
+
+class TestGetEpisodeFacts:
+    @pytest.mark.asyncio
+    async def test_uses_filters_kwarg_when_supported(self, monkeypatch):
+        mem = MagicMock()
+        mem.get_all.return_value = {
+            "results": [
+                {"id": "f1", "memory": "x", "metadata": {"episode_id": "ep-1"}},
+            ],
+        }
+        monkeypatch.setattr(f"{_PATCH_BASE}._get_mem0", lambda: mem)
+        from services.mem0.search import get_episode_facts
+        out = await get_episode_facts("ep-1", "u")
+        assert [r["id"] for r in out] == ["f1"]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_when_filters_unsupported(self, monkeypatch):
+        mem = MagicMock()
+        # First call (with filters kwarg) raises TypeError → fallback path.
+        first_call = {"counter": 0}
+
+        def _get_all(*args, **kwargs):
+            first_call["counter"] += 1
+            if "filters" in kwargs:
+                raise TypeError("unexpected kwarg 'filters'")
+            return {"results": [
+                {"id": "f1", "memory": "x",
+                 "metadata": {"episode_id": "ep-1"}},
+                {"id": "f2", "memory": "y",
+                 "metadata": {"episode_id": "ep-OTHER"}},
+            ]}
+        mem.get_all = _get_all
+        monkeypatch.setattr(f"{_PATCH_BASE}._get_mem0", lambda: mem)
+        from services.mem0.search import get_episode_facts
+        out = await get_episode_facts("ep-1", "u")
+        # Python-side filter discards ep-OTHER.
+        assert [r["id"] for r in out] == ["f1"]
+
+
+class TestMem0MetricsLog:
+    """Phase B-3: smart_search must emit one [MEM0_METRICS ...] line per call."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_alias_and_hyde(self, monkeypatch):
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._expand_query_via_graph",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._generate_hypothetical_fact",
+            AsyncMock(return_value=""),
+        )
+
+    @pytest.mark.asyncio
+    async def test_metric_emitted_on_rerank_path(self, monkeypatch, caplog):
+        import logging as _logging
+        caplog.set_level(_logging.INFO, logger="services.mem0.search")
+
+        mems = [_make_memory(str(i), 0.3) for i in range(5)]
+        monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._search_multi_hybrid",
+            AsyncMock(return_value=mems),
+        )
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._rerank_memories",
+            AsyncMock(return_value=mems[:3]),
+        )
+        from services.mem0.search import search_memories_smart
+        await search_memories_smart("query string", "u", limit=3)
+        joined = "\n".join(r.message for r in caplog.records)
+        assert "MEM0_METRICS" in joined
+        assert "kept=3" in joined
+        assert "rerank=on" in joined
+
+    @pytest.mark.asyncio
+    async def test_metric_emitted_on_plain_path(self, monkeypatch, caplog):
+        import logging as _logging
+        caplog.set_level(_logging.INFO, logger="services.mem0.search")
+
+        mems = [_make_memory(str(i), 0.3) for i in range(5)]
+        monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            f"{_PATCH_BASE}._search_multi_hybrid",
+            AsyncMock(return_value=mems),
+        )
+        from services.mem0.search import search_memories_smart
+        await search_memories_smart("query string", "u", limit=3, rerank=False)
+        joined = "\n".join(r.message for r in caplog.records)
+        assert "MEM0_METRICS" in joined
+        assert "rerank=off" in joined
+
+
+class TestPostRerankGateRedesign:
+    """ADR-0002: post-rerank cosine gate is removed; LLM rerank is final.
+
+    Regression coverage for incident 2026-05-19 (rid=10c036ee) where the
+    legacy 0.65 gate silently dropped every Japanese conversational query.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rerank_path_returns_high_distance_results(self, monkeypatch):
+        # The incident replay: every candidate has score >> 0.65 because
+        # cosine distance on a 30-char conversational query never lands
+        # in that band. Rerank LLM accepted them, so smart search must
+        # return them verbatim.
+        candidates = [_make_memory("上伊那ぼたん 漫画", 0.92)]
+        reranked = list(candidates)
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",AsyncMock(return_value=candidates))
+        monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
+        monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=reranked))
+
+        from services.mem0.search import search_memories_smart
+        result = await search_memories_smart(
+            "まあまあ、上伊那ぼたんのFAでも見て落ち着きなよ", "u",
+            limit=5, rewrite=False, rerank=True,
+        )
+        assert result == reranked
+        assert result[0]["score"] == 0.92
+
+    @pytest.mark.asyncio
+    async def test_rerank_path_passes_through_empty_rerank(self, monkeypatch):
+        # If the LLM judges nothing relevant, return empty — not the raw
+        # candidate set.
+        candidates = [_make_memory("x", 0.4), _make_memory("y", 0.5)]
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",AsyncMock(return_value=candidates))
+        monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock(return_value=[]))
+        monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock(return_value=[]))
+
+        from services.mem0.search import search_memories_smart
+        result = await search_memories_smart("q", "u", limit=5, rewrite=False, rerank=True)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_plain_path_applies_sanity_gate_at_1_2(self, monkeypatch):
+        # rerank=False has no LLM judge, so the sanity gate stays — but
+        # at the loose MEM0_RELEVANCE_MAX_DISTANCE (1.2), not the legacy
+        # 0.65. Score 0.9 passes here; score 1.3 does not.
+        mems = [
+            _make_memory("kept-id", 0.9, text="kept"),
+            _make_memory("dropped-id", 1.3, text="dropped"),
+        ]
+        monkeypatch.setattr(f"{_PATCH_BASE}._search_multi_hybrid",AsyncMock(return_value=mems))
+        monkeypatch.setattr(f"{_PATCH_BASE}._rewrite_query", AsyncMock())
+        monkeypatch.setattr(f"{_PATCH_BASE}._rerank_memories", AsyncMock())
+
+        from services.mem0.search import search_memories_smart
+        result = await search_memories_smart("q", "u", limit=5, rewrite=False, rerank=False)
+        assert [r.get("memory") for r in result] == ["kept"]
 
 
 # ---------------------------------------------------------------------------
@@ -551,3 +1038,32 @@ def test_rerank_brace_injection_in_candidate():
 
     result = asyncio.run(run())
     assert isinstance(result, list)
+
+
+class TestApplyReinforcementBoost:
+    """Per-user recency/engagement ordering, now applied on the plain path too
+    (not just the rerank=True recall-intent path)."""
+
+    def test_high_mention_count_sorts_ahead(self):
+        from services.mem0.search import _apply_reinforcement_boost
+        mems = [
+            {"id": "cold", "score": 0.50, "metadata": {"mention_count": 1}},
+            {"id": "hot", "score": 0.50, "metadata": {"mention_count": 50}},
+        ]
+        _apply_reinforcement_boost(mems)
+        # the frequently-reinforced fact gets its distance shrunk → sorts first
+        assert mems[0]["id"] == "hot"
+        assert mems[0]["score"] < 0.50
+
+    def test_no_metadata_is_noop_and_safe(self):
+        from services.mem0.search import _apply_reinforcement_boost
+        mems = [{"id": "a", "score": 0.3}, {"id": "b", "score": 0.1}]
+        _apply_reinforcement_boost(mems)  # must not raise
+        # sorted ascending by distance regardless
+        assert [m["id"] for m in mems] == ["b", "a"]
+
+    def test_empty_list_safe(self):
+        from services.mem0.search import _apply_reinforcement_boost
+        empty = []
+        _apply_reinforcement_boost(empty)
+        assert empty == []

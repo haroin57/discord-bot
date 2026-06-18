@@ -59,8 +59,64 @@ def check_daily_quota(discord_id: str, is_admin: bool) -> tuple[bool, int]:
         return True, RESTRICTED_DAILY_QUOTA - len(bucket)
 
 
+def daily_quota_reset_seconds(discord_id: str, is_admin: bool) -> int:
+    """Return seconds until this user's current daily quota window opens."""
+    if is_admin or RESTRICTED_DAILY_QUOTA <= 0:
+        return 0
+    with _lock:
+        now = time.time()
+        bucket = [t for t in _daily_quota.get(discord_id, []) if now - t < _QUOTA_WINDOW_S]
+        if not bucket:
+            return 0
+        return max(0, int(_QUOTA_WINDOW_S - (now - min(bucket))))
+
+
 def reset_for_tests() -> None:
     """Test helper. Do not call from production code."""
     with _lock:
         _cooldowns.clear()
         _daily_quota.clear()
+
+
+# ---------------------------------------------------------------------------
+# runtime_state persistence hooks (機能2)
+# ---------------------------------------------------------------------------
+# Both ledgers already use wall-clock (time.time()), so persisting and
+# restoring them carries cooldown / daily-quota state across a bot restart
+# instead of letting a restart reset every user's rate limit.
+def dump_state() -> dict:
+    with _lock:
+        return {
+            "cooldowns": dict(_cooldowns),
+            "daily_quota": {k: list(v) for k, v in _daily_quota.items()},
+        }
+
+
+def load_state(data: dict) -> None:
+    now = time.time()
+    with _lock:
+        # Cooldowns older than the longest cooldown window are already expired;
+        # drop them so we don't reload stale noise (bounded by MAX_COOLDOWN_ENTRIES).
+        max_cd = max(COOLDOWN_SECONDS, RESTRICTED_COOLDOWN_SECONDS)
+        for k, v in (data.get("cooldowns") or {}).items():
+            try:
+                ts = float(v)
+            except (TypeError, ValueError):
+                continue
+            if now - ts < max_cd:
+                _cooldowns[k] = ts
+        while len(_cooldowns) > MAX_COOLDOWN_ENTRIES:
+            _cooldowns.popitem(last=False)
+        for k, lst in (data.get("daily_quota") or {}).items():
+            bucket = []
+            for t in lst or []:
+                try:
+                    ft = float(t)
+                except (TypeError, ValueError):
+                    continue
+                if now - ft < _QUOTA_WINDOW_S:
+                    bucket.append(ft)
+            if bucket:
+                _daily_quota[k] = bucket
+        while len(_daily_quota) > MAX_COOLDOWN_ENTRIES:
+            _daily_quota.popitem(last=False)

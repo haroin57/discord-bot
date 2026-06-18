@@ -1,0 +1,22 @@
+[Unit]
+Description=Shared MCP: realestate (streamable HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/realestate-mcp
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.volta/tools/image/node/24.14.1/bin:/home/ubuntu/.volta/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-/home/ubuntu/discord-bot/.env
+ExecStart=/bin/bash -lc 'export REALESTATE_ALLOWED_USER_IDS="$${REALESTATE_ALLOWED_USER_IDS:-$${ADMIN_USER_IDS:-}}"; exec /home/ubuntu/.volta/tools/image/node/24.14.1/bin/supergateway --stdio "/home/ubuntu/realestate-mcp/.venv/bin/python /home/ubuntu/realestate-mcp/server.py" --port 8024 --outputTransport streamableHttp --streamableHttpPath /mcp'
+Restart=on-failure
+RestartSec=10s
+MemoryHigh=220M
+MemoryMax=320M
+LimitNOFILE=2048
+
+[Install]
+WantedBy=multi-user.target

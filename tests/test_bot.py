@@ -271,7 +271,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=12345)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("response text", "sess-1")), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("response text", "sess-1", False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -294,7 +294,7 @@ class TestOnMessage:
         msg.mentions = [mock_bot_user]
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -319,7 +319,7 @@ class TestOnMessage:
         msg.role_mentions = [role_mock]
 
         with patch("bot.strip_mention", return_value="hey"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hey"), \
@@ -414,7 +414,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=12345)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=(long_text, None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=(long_text, None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -436,7 +436,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=12345)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("chunk1", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("chunk1", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -459,7 +459,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=12345)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("c1c2", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("c1c2", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -478,6 +478,10 @@ class TestOnMessage:
         import bot
 
         msg = _make_message(content="かなえ hello", author_id=12345)
+        # status_msg (the intake reply) must be awaitable so the error path
+        # can edit a short explanation onto it instead of deleting it.
+        status_msg = AsyncMock()
+        msg.reply = AsyncMock(return_value=status_msg)
 
         with patch("bot.strip_mention", return_value="hello"), \
              patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=RuntimeError("boom")), \
@@ -490,9 +494,11 @@ class TestOnMessage:
              patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
             await self._dispatch(msg)
 
-            calls = msg.reply.call_args_list
-            error_replied = any("❌" in str(c) for c in calls)
-            assert error_replied
+            # Error surfaces as an edit of the status message (P0: errors keep
+            # a short explanation rather than vanishing).
+            edit_calls = status_msg.edit.call_args_list
+            error_shown = any("❌" in str(c) for c in edit_calls)
+            assert error_shown
 
     @pytest.mark.asyncio
     async def test_channel_busy_cleared_after_success(self, monkeypatch):
@@ -501,7 +507,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=12345, channel_id=555)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -544,7 +550,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=77777)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -569,7 +575,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=3)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -590,7 +596,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=12345)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", "new-sess-id")), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", "new-sess-id", True)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -611,7 +617,7 @@ class TestOnMessage:
         msg = _make_message(content="かなえ hello", author_id=12345)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -632,7 +638,7 @@ class TestOnMessage:
 
         msg = _make_message(content="hello", is_dm=True, author_id=12345)
 
-        with patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("hi", None)), \
+        with patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("hi", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -653,7 +659,7 @@ class TestOnMessage:
         msg.add_reaction = AsyncMock(side_effect=discord.errors.Forbidden(MagicMock(), "no perms"))
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -678,7 +684,7 @@ class TestOnMessage:
         async def capture_call_with_tools(prompt, *args, **kwargs):
             nonlocal captured_prompt
             captured_prompt = prompt
-            return ("ok", None)
+            return ("ok", None, False)
 
         with patch("bot.strip_mention", return_value="hello"), \
              patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call_with_tools), \
@@ -709,7 +715,7 @@ class TestOnMessage:
         async def capture_call_with_tools(prompt, *args, **kwargs):
             nonlocal captured_prompt
             captured_prompt = prompt
-            return ("ok", None)
+            return ("ok", None, False)
 
         with patch("bot.strip_mention", return_value="hello"), \
              patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call_with_tools), \
@@ -727,6 +733,56 @@ class TestOnMessage:
             # Admin prompt must use the trusted-context header, not the strict-mode header
             assert "Trusted context" in captured_prompt
             assert "external untrusted user" not in captured_prompt
+
+    @pytest.mark.asyncio
+    async def test_lean_resume_prompt_declares_current_speaker(self, monkeypatch):
+        # Continued (lean) turns omit the full trusted header. Without the
+        # speaker line the prompt never states who is speaking now, which let
+        # the model mislabel haroin vs b0nchichi. Verify the lean path now
+        # declares the current speaker.
+        import bot
+        from services.session import SessionInfo
+        monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345})
+
+        cid = 99999
+        # 機能1: will_resume now checks the composite (channel, user) session
+        # via get_session, and _is_session_fresh takes user_id too.
+        monkeypatch.setattr(
+            "bot.get_session",
+            lambda _cid, _uid=None: SessionInfo(session_id="sess-abc"),
+        )
+        monkeypatch.setattr("bot._is_session_fresh", lambda _cid, _uid=None: True)
+
+        msg = _make_message(content="かなえ hello", author_id=12345, channel_id=cid)
+
+        captured_prompt = None
+
+        async def capture_call_with_tools(prompt, *args, **kwargs):
+            nonlocal captured_prompt
+            captured_prompt = prompt
+            return ("ok", None, True)
+
+        try:
+            with patch("bot.strip_mention", return_value="hello"), \
+                 patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call_with_tools), \
+                 patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+                 patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+                 patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
+                 patch("bot.extract_image_paths", return_value=[]), \
+                 patch("bot.split_message", return_value=["ok"]), \
+                 patch("bot.cleanup_attachments"), \
+                 patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+                 patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+                await self._dispatch(msg)
+
+            assert captured_prompt is not None
+            # Lean path declares the current speaker...
+            assert "[現在の発言者:" in captured_prompt
+            assert "TestUser" in captured_prompt
+            # ...but does NOT carry the heavyweight full-path header.
+            assert "All tools are allowed" not in captured_prompt
+        finally:
+            bot.sessions.pop(cid, None)
 
     @pytest.mark.asyncio
     async def test_reply_context_fetched(self, monkeypatch):
@@ -750,7 +806,7 @@ class TestOnMessage:
         async def capture_call(prompt, *args, **kwargs):
             nonlocal captured_prompt
             captured_prompt = prompt
-            return ("ok", None)
+            return ("ok", None, False)
 
         with patch("bot.strip_mention", return_value="hello"), \
              patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
@@ -768,6 +824,295 @@ class TestOnMessage:
             # Implementation wraps reply context in <replied_to_message> XML tag
             assert "replied_to_message" in captured_prompt
             assert "ReplyAuthor" in captured_prompt
+            # An external (untrusted) reply must sit OUTSIDE the admin caller's
+            # <trusted_user_input> wrapper — its untrusted text must never land
+            # inside a first-party trusted block.
+            # Match the real wrapper opening (the admin header text also
+            # mentions the literal "<trusted_user_input>", so anchor on the
+            # newline that only the actual wrapper has).
+            wrapper_open = captured_prompt.index("<trusted_user_input>\n")
+            tag_pos = captured_prompt.index("<replied_to_message")
+            assert tag_pos < wrapper_open
+
+    @pytest.mark.asyncio
+    async def test_admin_reply_to_bot_uses_trusted_tag_outside_wrapper(self, monkeypatch):
+        """admin が bot 自身のメッセージにリプライ → trusted扱い (<replied_to_trusted_message>)."""
+        import bot
+
+        ref = MagicMock()
+        ref.message_id = 222
+        ref.cached_message = None
+
+        ref_msg = AsyncMock()
+        ref_msg.author = MagicMock()
+        # Match the bot.user.id set in _reset_bot_state fixture (99900)
+        ref_msg.author.id = 99900
+        ref_msg.author.display_name = "かなえ"
+        ref_msg.content = "私の過去発言"
+        ref_msg.attachments = []
+
+        msg = _make_message(content="かなえ followup", author_id=12345, reference=ref)
+        msg.channel.fetch_message = AsyncMock(return_value=ref_msg)
+
+        captured_prompt = None
+
+        async def capture_call(prompt, *args, **kwargs):
+            nonlocal captured_prompt
+            captured_prompt = prompt
+            return ("ok", None, False)
+
+        with patch("bot.strip_mention", return_value="followup"), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="followup"), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+
+            assert captured_prompt is not None
+            assert "<replied_to_trusted_message" in captured_prompt
+            assert "かなえ" in captured_prompt
+            assert "私の過去発言" in captured_prompt
+            assert "<replied_to_message" not in captured_prompt
+            tag_pos = captured_prompt.index("<replied_to_trusted_message")
+            # Match the real wrapper opening (the admin header text also
+            # mentions the literal "<trusted_user_input>", so anchor on the
+            # newline that only the actual wrapper has).
+            wrapper_open = captured_prompt.index("<trusted_user_input>\n")
+            assert tag_pos < wrapper_open
+
+    @pytest.mark.asyncio
+    async def test_admin_reply_to_admin_uses_trusted_tag(self, monkeypatch):
+        """admin が他のadmin authoredメッセージにリプライ → trusted扱い."""
+        import bot
+        # Add a second admin (b0nchichi-like)
+        monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345, 22222})
+
+        ref = MagicMock()
+        ref.message_id = 333
+        ref.cached_message = None
+
+        ref_msg = AsyncMock()
+        ref_msg.author = MagicMock()
+        ref_msg.author.id = 22222  # second admin
+        ref_msg.author.display_name = "b0nchichi"
+        ref_msg.content = "お父さんからのコメント"
+        ref_msg.attachments = []
+
+        msg = _make_message(content="かなえ check this", author_id=12345, reference=ref)
+        msg.channel.fetch_message = AsyncMock(return_value=ref_msg)
+
+        captured_prompt = None
+
+        async def capture_call(prompt, *args, **kwargs):
+            nonlocal captured_prompt
+            captured_prompt = prompt
+            return ("ok", None, False)
+
+        with patch("bot.strip_mention", return_value="check this"), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="check this"), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+
+            assert captured_prompt is not None
+            assert "<replied_to_trusted_message" in captured_prompt
+            assert "b0nchichi" in captured_prompt
+            assert "お父さんからのコメント" in captured_prompt
+            tag_pos = captured_prompt.index("<replied_to_trusted_message")
+            # Match the real wrapper opening (the admin header text also
+            # mentions the literal "<trusted_user_input>", so anchor on the
+            # newline that only the actual wrapper has).
+            wrapper_open = captured_prompt.index("<trusted_user_input>\n")
+            assert tag_pos < wrapper_open
+
+    @pytest.mark.asyncio
+    async def test_admin_reply_to_external_user_stays_untrusted(self, monkeypatch):
+        """admin が外部ユーザー（非admin）authoredメッセージにリプライ → untrusted扱い維持."""
+        import bot
+
+        ref = MagicMock()
+        ref.message_id = 444
+        ref.cached_message = None
+
+        ref_msg = AsyncMock()
+        ref_msg.author = MagicMock()
+        ref_msg.author.id = 88888  # not in ADMIN_USER_IDS, not bot.user.id
+        ref_msg.author.display_name = "ExternalUser"
+        ref_msg.content = "外部ユーザーの発言"
+        ref_msg.attachments = []
+
+        msg = _make_message(content="かなえ hi", author_id=12345, reference=ref)
+        msg.channel.fetch_message = AsyncMock(return_value=ref_msg)
+
+        captured_prompt = None
+
+        async def capture_call(prompt, *args, **kwargs):
+            nonlocal captured_prompt
+            captured_prompt = prompt
+            return ("ok", None, False)
+
+        with patch("bot.strip_mention", return_value="hi"), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hi"), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+
+            assert captured_prompt is not None
+            # External author keeps the non-trusted tag AND sits OUTSIDE the
+            # admin caller's trusted wrapper — untrusted reply text must never
+            # be embedded inside <trusted_user_input>.
+            assert "<replied_to_message" in captured_prompt
+            assert "<replied_to_trusted_message" not in captured_prompt
+            tag_pos = captured_prompt.index("<replied_to_message")
+            # Match the real wrapper opening (the admin header text also
+            # mentions the literal "<trusted_user_input>", so anchor on the
+            # newline that only the actual wrapper has).
+            wrapper_open = captured_prompt.index("<trusted_user_input>\n")
+            assert tag_pos < wrapper_open
+
+    @pytest.mark.asyncio
+    async def test_history_search_injected_for_admin(self, monkeypatch):
+        """admin + long query → <history_search> block injected with the hit."""
+        import bot
+        from services.mem0 import history_index
+
+        long_text = "東洋水産の株について前に話したのを覚えてる？教えて"
+        monkeypatch.setattr("bot.MEM0_HISTORY_SEARCH_ENABLED", True)
+        monkeypatch.setattr(
+            history_index, "search_history",
+            MagicMock(return_value=[
+                {"role": "user", "memory": "東洋水産の株を買った", "ts": "t", "rank": 1},
+            ]),
+        )
+
+        msg = _make_message(content=f"かなえ {long_text}", author_id=12345)
+        captured_prompt = None
+
+        async def capture_call(prompt, *args, **kwargs):
+            nonlocal captured_prompt
+            captured_prompt = prompt
+            return ("ok", None, False)
+
+        with patch("bot.strip_mention", return_value=long_text), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value=long_text), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.search_memories_smart", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+
+            assert captured_prompt is not None
+            assert "<history_search" in captured_prompt
+            assert "東洋水産の株を買った" in captured_prompt
+
+    @pytest.mark.asyncio
+    async def test_history_search_skipped_when_flag_off(self, monkeypatch):
+        """MEM0_HISTORY_SEARCH_ENABLED=False → search_history never called."""
+        import bot
+        from services.mem0 import history_index
+
+        long_text = "東洋水産の株について前に話したのを覚えてる？教えて"
+        monkeypatch.setattr("bot.MEM0_HISTORY_SEARCH_ENABLED", False)
+        spy = MagicMock(return_value=[])
+        monkeypatch.setattr(history_index, "search_history", spy)
+
+        msg = _make_message(content=f"かなえ {long_text}", author_id=12345)
+
+        with patch("bot.strip_mention", return_value=long_text), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value=long_text), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.search_memories_smart", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+            spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_nonmention_message_indexed_as_channel(self, monkeypatch):
+        """A guild message that doesn't address the bot is persisted+indexed
+        as role="channel" (for later history_search), and gets no reply."""
+        import bot
+        monkeypatch.setattr("bot.MEM0_HISTORY_SEARCH_ENABLED", True)
+
+        captured = {}
+
+        def fake_append(channel_id, entry):
+            captured["channel_id"] = channel_id
+            captured["entry"] = entry
+
+        # Non-mention message: no keyword, no mention.
+        msg = _make_message(content="東洋水産の決算きた", author_id=55555)
+        msg.author.display_name = "b0nchichi"
+
+        with patch("services.session.append_jsonl", side_effect=fake_append), \
+             patch("bot.call_with_tools", new_callable=AsyncMock) as mock_cwt:
+            await self._dispatch(msg)
+            # Let the fire-and-forget _track_task run.
+            await asyncio.sleep(0.05)
+
+        # No reply / no agent call for a non-mention message.
+        mock_cwt.assert_not_called()
+        msg.reply.assert_not_called()
+        # It was persisted as a channel row with the author.
+        assert captured.get("entry", {}).get("role") == "channel"
+        assert captured["entry"]["content"] == "東洋水産の決算きた"
+        assert captured["entry"]["author"] == "b0nchichi"
+
+    @pytest.mark.asyncio
+    async def test_history_search_skipped_for_nonadmin(self, monkeypatch):
+        """Non-admin caller → history search never runs (privacy: JSONL has no author id)."""
+        import bot
+        from services.mem0 import history_index
+
+        long_text = "東洋水産の株について前に話したのを覚えてる？教えて"
+        # Make 12345 a non-admin while keeping the guild mention gate satisfied.
+        monkeypatch.setattr("bot.ADMIN_USER_IDS", {99999})
+        monkeypatch.setattr("bot.MEM0_HISTORY_SEARCH_ENABLED", True)
+        spy = MagicMock(return_value=[])
+        monkeypatch.setattr(history_index, "search_history", spy)
+
+        msg = _make_message(content=f"かなえ {long_text}", author_id=12345)
+
+        with patch("bot.strip_mention", return_value=long_text), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value=long_text), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.search_memories_smart", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+            spy.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_response_images_attached(self, monkeypatch):
@@ -783,7 +1128,7 @@ class TestOnMessage:
             msg = _make_message(content="かなえ hello", author_id=12345)
 
             with patch("bot.strip_mention", return_value="hello"), \
-                 patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("check " + tmp_path, None)), \
+                 patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("check " + tmp_path, None, False)), \
                  patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
                  patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
                  patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -810,7 +1155,7 @@ class TestOnMessage:
         msg.reply = AsyncMock(return_value=status_msg)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -838,7 +1183,7 @@ class TestOnMessage:
         async def capture_call(prompt, *args, **kwargs):
             nonlocal captured_prompt
             captured_prompt = prompt
-            return ("ok", None)
+            return ("ok", None, False)
 
         with patch("bot.strip_mention", return_value="hello"), \
              patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
@@ -1161,7 +1506,9 @@ async def test_tree_sync_only_runs_once():
     import bot
 
     bot._tree_synced = False
-    bot._cleanup_scheduled = True  # skip cleanup branch
+    # Pre-set the cleanup guard so on_ready short-circuits its background
+    # task spawns. Otherwise long-running loops leak into subsequent tests.
+    bot._cleanup_scheduled = True
 
     mock_tree_sync = AsyncMock(return_value=[MagicMock(), MagicMock()])
     mock_tree = MagicMock()
@@ -1258,7 +1605,9 @@ class TestOnMessageAdminAndQuota:
 
     @pytest.mark.asyncio
     async def test_delete_command_non_admin_rejected(self, monkeypatch):
-        """Non-admin sending delete command gets access denied."""
+        """Non-admin DM is silently dropped at the DM admin gate
+        (bot.py: ``if is_dm and not is_admin: return``) before the delete
+        handler runs. Silent drop IS the security contract — no reply."""
         import bot
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {99999})  # 12345 is NOT admin
 
@@ -1271,8 +1620,7 @@ class TestOnMessageAdminAndQuota:
 
         await self._dispatch(msg)
 
-        calls = msg.reply.call_args_list
-        assert any("admin" in str(c).lower() or "❌" in str(c) for c in calls)
+        msg.reply.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_delete_command_admin_success(self, monkeypatch):
@@ -1327,7 +1675,7 @@ class TestOnMessageAdminAndQuota:
             msg = _make_message(content="かなえ hello", author_id=12345)
 
             with patch("bot.strip_mention", return_value="hello"), \
-                 patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("see " + tmp_path, None)), \
+                 patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("see " + tmp_path, None, False)), \
                  patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
                  patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
                  patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
@@ -1357,7 +1705,7 @@ class TestOnMessageAdminAndQuota:
         async def capture_call(prompt, *args, **kwargs):
             nonlocal captured_prompt
             captured_prompt = prompt
-            return ("ok", None)
+            return ("ok", None, False)
 
         with patch("bot.strip_mention", return_value="hello"), \
              patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
@@ -1388,7 +1736,7 @@ class TestOnMessageAdminAndQuota:
         msg = _make_message(content="かなえ hello", author_id=400)
 
         with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None)), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
              patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
              patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
              patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \

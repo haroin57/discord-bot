@@ -15,10 +15,12 @@ substring scan as services/claude_sdk.py (``_MCP_CMDLINE_PATTERNS``).
 """
 
 import asyncio
+import json
 import logging
 import os
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 try:
@@ -28,6 +30,14 @@ except ImportError:  # pragma: no cover
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+
+# SSE transport is still supported for remote MCP servers that expose it.
+try:
+    from mcp.client.sse import sse_client  # type: ignore
+    _HAS_SSE_TRANSPORT = True
+except ImportError:  # pragma: no cover
+    sse_client = None  # type: ignore
+    _HAS_SSE_TRANSPORT = False
 
 # streamable_http is optional / version-dependent — guard the import.
 try:
@@ -53,6 +63,8 @@ _MCP_CMDLINE_PATTERNS = (
     "x-scraper/mcp_server.py",
     "scholarly-mcp/server.py",
     "news-curator/mcp_server.py",
+    "nikkei-indexes/mcp_server.py",
+    "yfj-quote/mcp_server.py",
     "papermcp",
     "tavily-mcp",
 )
@@ -73,7 +85,21 @@ async def _spawn_one(
     cfg: dict,
 ) -> McpServerHandle:
     """Open transport, initialize session, list tools. Registers exits in stack."""
-    if cfg.get("type") == "http":
+    transport = cfg.get("type")
+    if transport == "sse":
+        if not _HAS_SSE_TRANSPORT:
+            raise RuntimeError(
+                f"MCP SSE transport not available, cannot spawn '{name}'",
+            )
+        read, write = await stack.enter_async_context(
+            sse_client(  # type: ignore[misc]
+                cfg["url"],
+                headers=cfg.get("headers") or {},
+                timeout=cfg.get("timeout", 5),
+                sse_read_timeout=cfg.get("sse_read_timeout", 300),
+            )
+        )
+    elif transport == "http":
         if not _HAS_HTTP_TRANSPORT:
             raise RuntimeError(
                 f"MCP HTTP transport not available, cannot spawn '{name}'",
@@ -131,6 +157,99 @@ def mcp_tools_to_anthropic(handles: dict[str, McpServerHandle]) -> list[dict]:
                     or {"type": "object", "properties": {}}
                 ),
             })
+    return out
+
+
+# Static MCP tool schemas that we advertise on every admin API request even
+# when the upstream MCP process isn't spawned yet. The actual process is
+# spawned lazily by McpPool.call_tool() when Claude emits a tool_use for
+# one of these names. Mem0 sits here so Kanae can record durable facts
+# without selector heuristics having to detect "I should remember this"
+# first; the WEB-tier servers (x-scraper / news-curator / brave-search)
+# were added 2026-05-16 after a turn-30 exhaustion incident where
+# pick_mcp_servers() dropped WEB tier on a short follow-up message, the
+# tools fell out of advertised_tools, and Kanae burned the whole loop
+# searching for tools that no longer existed in her schema list.
+STATIC_MCP_TOOL_SCHEMAS: dict[str, list[dict]] = {
+    "mem0": [
+        {
+            "name": "mcp__mem0__search",
+            "description": "Search shared Mem0 long-term memory.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "default": 5},
+                    "user_id": {"type": "string"},
+                    "smart": {"type": "boolean", "default": False},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "mcp__mem0__add",
+            "description": "Store a conversation turn so Mem0 can extract durable long-term facts.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "user_message": {"type": "string"},
+                    "assistant_message": {"type": "string"},
+                    "user_id": {"type": "string"},
+                    "context": {"type": "string"},
+                },
+                "required": ["user_message", "assistant_message"],
+            },
+        },
+    ],
+}
+
+
+_STATIC_SCHEMA_JSON = Path(__file__).with_name("static_mcp_schemas.json")
+
+
+def _load_static_schemas_from_disk() -> None:
+    """Merge the on-disk WEB-tier schema dump into STATIC_MCP_TOOL_SCHEMAS.
+
+    The dump is produced by scripts/dump_mcp_tool_schemas.py against the
+    live MCP servers, so the in-Python source of truth doesn't have to
+    hand-mirror multi-hundred-line enum schemas (brave-search alone is
+    ~800 lines). Missing or malformed dump is non-fatal: those servers
+    just won't be statically advertised, matching pre-2026-05-16
+    behavior.
+    """
+    if not _STATIC_SCHEMA_JSON.is_file():
+        return
+    try:
+        with _STATIC_SCHEMA_JSON.open(encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning(
+            "static_mcp_schemas.json load failed (%s); WEB MCP tools "
+            "will fall back to keyword-gated advertisement", exc,
+        )
+        return
+    if not isinstance(payload, dict):
+        log.warning("static_mcp_schemas.json: expected dict at top level")
+        return
+    for server_key, tools in payload.items():
+        if not isinstance(tools, list):
+            continue
+        STATIC_MCP_TOOL_SCHEMAS.setdefault(server_key, []).extend(tools)
+
+
+_load_static_schemas_from_disk()
+
+
+def static_mcp_tools_to_anthropic(keys) -> list[dict]:
+    """Return Anthropic tool schemas for the given static MCP keys.
+
+    Unlike ``mcp_tools_to_anthropic``, this does not require the MCP
+    server to be spawned — the schemas are baked in. Spawn happens at
+    tool_use time via ``McpPool.call_tool()``.
+    """
+    out: list[dict] = []
+    for key in keys:
+        out.extend(dict(tool) for tool in STATIC_MCP_TOOL_SCHEMAS.get(key, []))
     return out
 
 

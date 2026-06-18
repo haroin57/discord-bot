@@ -1,0 +1,9 @@
+# /etc/cron.d/mem0-backup — daily ChromaDB state backup at 03:00 JST
+# (= 18:00 UTC). Requirements §3.4.3, 7-day retention.
+#
+# Runs as root so it can systemctl stop/start chromadb-server.service
+# without needing a sudoers exception.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+0 18 * * * root /home/ubuntu/discord-bot/scripts/backup_mem0.sh >> /var/log/mem0_backup.log 2>&1

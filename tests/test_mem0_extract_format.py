@@ -391,6 +391,66 @@ class TestExtractFactsForSelf:
 
         assert len(result) == 1
 
+    @pytest.mark.asyncio
+    async def test_known_entities_block_injected_when_user_id_present(self):
+        """§5a: get_top_entities output must land inside the <known_entities> block."""
+        captured = {}
+
+        async def capture_create(**kwargs):
+            captured["content"] = kwargs["messages"][0]["content"]
+            return _make_resp('{"facts":[]}')
+
+        mock_client = MagicMock()
+        mock_client.messages.create = capture_create
+
+        with patch("services.mem0.client.get_anthropic_client", AsyncMock(return_value=mock_client)), \
+             patch("config.MEM0_GATE_MODEL", "claude-haiku-4-5-20251001"), \
+             patch("services.mem0.graph.get_top_entities", return_value=["Rust", "Namitape"]):
+            await extract_facts_for_self("test", "test", user_id="uid-1")
+
+        content = captured["content"]
+        assert "<known_entities>" in content
+        assert "- Rust" in content
+        assert "- Namitape" in content
+
+    @pytest.mark.asyncio
+    async def test_known_entities_falls_back_to_none_without_user_id(self):
+        captured = {}
+
+        async def capture_create(**kwargs):
+            captured["content"] = kwargs["messages"][0]["content"]
+            return _make_resp('{"facts":[]}')
+
+        mock_client = MagicMock()
+        mock_client.messages.create = capture_create
+
+        with patch("services.mem0.client.get_anthropic_client", AsyncMock(return_value=mock_client)), \
+             patch("config.MEM0_GATE_MODEL", "claude-haiku-4-5-20251001"):
+            await extract_facts_for_self("test", "test")
+
+        content = captured["content"]
+        assert "<known_entities>\n(none)\n</known_entities>" in content
+
+    @pytest.mark.asyncio
+    async def test_known_entities_swallows_graph_failure(self):
+        """graph lookup failures must not break extraction."""
+        captured = {}
+
+        async def capture_create(**kwargs):
+            captured["content"] = kwargs["messages"][0]["content"]
+            return _make_resp('{"facts":[]}')
+
+        mock_client = MagicMock()
+        mock_client.messages.create = capture_create
+
+        with patch("services.mem0.client.get_anthropic_client", AsyncMock(return_value=mock_client)), \
+             patch("config.MEM0_GATE_MODEL", "claude-haiku-4-5-20251001"), \
+             patch("services.mem0.graph.get_top_entities", side_effect=RuntimeError("db down")):
+            result = await extract_facts_for_self("test", "test", user_id="uid-1")
+
+        assert result == []
+        assert "<known_entities>\n(none)\n</known_entities>" in captured["content"]
+
 
 # ===========================================================================
 # _scrub_fact_text

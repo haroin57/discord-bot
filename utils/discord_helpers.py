@@ -12,7 +12,6 @@ from utils.cache import TTLLRUCache
 from config import (
     ADMIN_USER_IDS,
     ALLOWED_ATTACHMENT_HOSTS,
-    BOT_KEYWORDS,
     BOT_ROLE_IDS,
     CROSS_THREAD_CONTEXT_MESSAGES,
     MAX_CROSS_THREAD_CHARS,
@@ -44,46 +43,108 @@ def _cache_set(key: tuple[int, int], text: str) -> None:
 # ---------------------------------------------------------------------------
 # Mention stripping (pre-compiled regex cache)
 # ---------------------------------------------------------------------------
+# NOTE: BOT_KEYWORDS ("かなえ" 等) は意図的に strip しない。キーワード除去は
+# 本文途中の「かなえ」(例:「かなえちゃんによると」)にマッチして後続を食い、
+# 本文を破壊する事故源だった (2026-06-08, ADR-0003)。呼びかけキーワードは
+# prompt 本文に残し、Claude 側に自然な文脈として渡す。strip するのは機械的な
+# メンショントークン (<@id> / <@&role>) のみ。
 _mention_re_cache: re.Pattern | None = None
-_keyword_re_cache: list[re.Pattern] = []
 
 
 def build_mention_regex(user_id: int) -> None:
-    """Pre-compile mention/keyword regex patterns. Called once after on_ready."""
-    global _mention_re_cache, _keyword_re_cache
+    """Pre-compile the bot's mention/role-mention regex. Called once after on_ready."""
+    global _mention_re_cache
     parts = [rf"<@!?{user_id}>"]
     for role_id in BOT_ROLE_IDS:
         parts.append(rf"<@&{role_id}>")
     _mention_re_cache = re.compile(r"(?:" + "|".join(parts) + r")\s*")
-    _keyword_re_cache = [re.compile(rf"(?i){re.escape(kw)}[,、]?\s*") for kw in BOT_KEYWORDS]
 
 
 def strip_mention(content: str, user_id: int) -> str:
-    """Remove the bot's direct mentions, role mentions, and keywords."""
+    """Remove the bot's direct mentions and role mentions. Keywords are preserved."""
     text = _mention_re_cache.sub("", content) if _mention_re_cache else content
-    for pat in _keyword_re_cache:
-        text = pat.sub("", text, count=1)
     return text.strip()
 
 
 # ---------------------------------------------------------------------------
 # Message splitting
 # ---------------------------------------------------------------------------
-def split_message(text: str, limit: int = 2000) -> list[str]:
-    """Split text into chunks that fit within Discord's message limit."""
+# A fence line: up to 3 leading spaces, ``` (or longer), optional language tag.
+_FENCE_RE = re.compile(r"^\s{0,3}(`{3,})(\S*)\s*$")
+# Room reserved per chunk for the "\n-# (xx/xx)" part marker.
+_PART_MARKER_RESERVE = 12
+
+
+def split_message(text: str, limit: int = 2000, *, numbered: bool = True) -> list[str]:
+    """Split text into chunks that fit within Discord's message limit.
+
+    Code-fence aware: a chunk never ends inside an unbalanced ``` fence.
+    When a fence has to span chunks it is closed at the end of the current
+    chunk and reopened (same language tag) at the start of the next, so
+    every chunk renders correctly on its own. With ``numbered`` (default),
+    multi-chunk output gets a small ``-# (i/n)`` subtext marker appended to
+    each chunk; single-chunk output is returned untouched.
+    """
     if len(text) <= limit:
         return [text]
+    reserve = _PART_MARKER_RESERVE if numbered else 0
+    chunks = _split_fence_aware(text, max(limit - reserve, 64))
+    if numbered and len(chunks) > 1:
+        total = len(chunks)
+        chunks = [f"{c}\n-# ({i}/{total})" for i, c in enumerate(chunks, 1)]
+    return chunks
+
+
+def _split_fence_aware(text: str, limit: int) -> list[str]:
+    """Line-based splitter that keeps ``` fences balanced per chunk."""
+    # Pre-split any single line longer than a chunk (space-preferring, then
+    # hard) so the main loop only ever handles lines that fit. The -8 margin
+    # leaves room for a "\n```" fence close on fenced chunks.
+    line_cap = limit - 8
+    lines: list[str] = []
+    for raw in text.split("\n"):
+        while len(raw) > line_cap:
+            cut = raw.rfind(" ", 0, line_cap)
+            if cut <= 0:
+                cut = line_cap
+            lines.append(raw[:cut])
+            raw = raw[cut:].lstrip(" ")
+        lines.append(raw)
+
     chunks: list[str] = []
-    while len(text) > limit:
-        split_at = text.rfind("\n", 0, limit)
-        if split_at == -1:
-            split_at = text.rfind(" ", 0, limit)
-        if split_at == -1:
-            split_at = limit
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip("\n")
-    if text:
-        chunks.append(text)
+    cur: list[str] = []
+    cur_len = 0  # == len("\n".join(cur))
+    fence_open: str | None = None  # opening fence line, e.g. "```python"
+
+    def flush() -> None:
+        nonlocal cur, cur_len
+        if not cur:
+            return
+        body = "\n".join(cur)
+        if fence_open:
+            body += "\n```"
+        chunks.append(body)
+        cur = []
+        cur_len = 0
+        if fence_open:
+            cur.append(fence_open)
+            cur_len = len(fence_open)
+
+    for line in lines:
+        sep = 1 if cur else 0
+        close_margin = 4 if fence_open else 0  # "\n```"
+        if cur_len + sep + len(line) + close_margin > limit:
+            flush()
+            sep = 1 if cur else 0
+        cur.append(line)
+        cur_len += sep + len(line)
+        if _FENCE_RE.match(line):
+            fence_open = None if fence_open else (line.strip() or "```")
+
+    # Final chunk: emitted as-is — if the source text itself left a fence
+    # unclosed, that is the author's content, not a split artifact.
+    if cur:
+        chunks.append("\n".join(cur))
     return chunks
 
 
@@ -109,8 +170,8 @@ def format_embed(embed: discord.Embed) -> str:
 MAX_CONTEXT_CHARS = 20000
 
 # 3-layer context hierarchy
-LAYER1_COUNT = 15      # Recent messages: full text
-LAYER2_COUNT = 10      # Earlier messages: summarized
+LAYER1_COUNT = 25      # Recent messages: full text
+LAYER2_COUNT = 15      # Earlier messages: summarized
 LAYER2_MAX_CHARS = 150 # Max chars per Layer 2 message
 
 
@@ -247,7 +308,7 @@ async def fetch_thread_context(
     return result
 
 
-CHANNEL_CONTEXT_LIMIT = LAYER1_COUNT + LAYER2_COUNT  # 15
+CHANNEL_CONTEXT_LIMIT = LAYER1_COUNT + LAYER2_COUNT  # 40
 
 
 async def fetch_channel_context(

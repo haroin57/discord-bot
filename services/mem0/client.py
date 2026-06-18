@@ -3,23 +3,43 @@
 import asyncio
 import logging
 import os
+import time
 
 from services.oauth_manager import ensure_valid_token, get_access_token, init as oauth_init
 
 log = logging.getLogger(__name__)
 
 # Mem0's Chroma adapter returns ``score = distance`` (small = similar; see
-# services/mem0/dedup.py header). Filter out anything past this distance —
-# rerank handles fine-grained quality, so this only needs to drop obvious
-# garbage, not borderline matches.
-MEM0_RELEVANCE_MAX_DISTANCE = 1.0
+# services/mem0/dedup.py header).
+# Pre-rerank gate: applied inside search_memories() to drop candidates
+# that are physically too far before the LLM rerank ever sees them. Also
+# used as the sanity gate for the rerank=False path in
+# search_memories_smart.
+MEM0_RELEVANCE_MAX_DISTANCE = float(
+    os.environ.get("MEM0_RELEVANCE_MAX_DISTANCE", "1.2")
+)
+# DEPRECATED 2026-05-19 (ADR-0002). Previously gated the output of
+# search_memories_smart at 0.65 — but cosine distance is a poor judge
+# after an LLM rerank has already accepted the fact, and 0.65 was
+# pessimistic enough to silently kill every Japanese conversational
+# query. search_memories_smart no longer references this on the
+# rerank=True path. Kept so env config that sets the var still imports.
+MEM0_FINAL_RELEVANCE_MAX_DISTANCE = float(
+    os.environ.get("MEM0_FINAL_RELEVANCE_MAX_DISTANCE", "0.65")
+)
 # Back-compat alias for any caller still importing the old name. DO NOT use
 # in new code — the semantic flipped from "min similarity" to "max distance"
 # on 2026-05-14 when we discovered the codebase was filtering backwards.
 MEM0_RELEVANCE_THRESHOLD = MEM0_RELEVANCE_MAX_DISTANCE
 
 _mem0_instance = None
-_init_attempted = False
+# Last init failure timestamp (monotonic seconds). When set, _get_mem0()
+# returns None without re-trying until _INIT_RETRY_COOLDOWN_SEC has elapsed.
+# This replaces the old "_init_attempted = True" latch that permanently
+# disabled Mem0 after the first failure — preventing automatic recovery
+# when ChromaDB systemd-restarts.
+_init_failed_at: float | None = None
+_INIT_RETRY_COOLDOWN_SEC = 60.0
 _last_token: str | None = None
 
 # Shared AsyncAnthropic client for Haiku-backed extraction / rewrite / rerank
@@ -36,37 +56,54 @@ _async_anthropic_lock = asyncio.Lock()
 
 
 async def get_anthropic_client():
-    """Return a singleton AsyncAnthropic client, refreshing only on token change.
+    """Return a singleton LLM client for extraction/rewrite/rerank.
 
-    Returns None if the OAuth token cannot be obtained — callers must handle
-    that as a soft failure and fall back to their best-effort behavior.
+    Primary: AsyncAnthropic with OAuth token. When the OAuth token is
+    unavailable (expired / missing), falls back to an OpenAI-compatible
+    client pointed at OpenRouter with DeepSeek V4 Flash.
+
+    Returns None only when neither auth method is available.
     """
     global _async_anthropic_client, _async_anthropic_token
     oauth_init()  # idempotent
     await ensure_valid_token()
     token = get_access_token()
-    if not token:
-        return None
-    # Fast path: no rebuild needed.
-    if _async_anthropic_client is not None and token == _async_anthropic_token:
+
+    # OAuth token available — use Anthropic directly.
+    if token:
+        # Fast path: no rebuild needed.
+        if _async_anthropic_client is not None and token == _async_anthropic_token:
+            return _async_anthropic_client
+        # Slow path: build (or rebuild after token rotation) under a lock.
+        async with _async_anthropic_lock:
+            if _async_anthropic_client is None or token != _async_anthropic_token:
+                from anthropic import AsyncAnthropic
+                _async_anthropic_client = AsyncAnthropic(
+                    auth_token=token, max_retries=0,
+                )
+                _async_anthropic_token = token
         return _async_anthropic_client
-    # Slow path: build (or rebuild after token rotation) under a lock so two
-    # concurrent callers cannot both construct a fresh client.
-    async with _async_anthropic_lock:
-        # Re-check after acquiring the lock — another coroutine may have
-        # already built the right client while we were waiting.
-        if _async_anthropic_client is None or token != _async_anthropic_token:
-            from anthropic import AsyncAnthropic
-            # max_retries=0 — Mem0 ingest treats any 429 as fail-open, and
-            # the SDK's default 5x retry on rate-limit-error turns one burst
-            # into 5 wasted calls, ratcheting the per-minute limiter for the
-            # next caller. Bumped from default 2 to 0 on 2026-05-14 after
-            # the channel-history ingest saturated the account.
-            _async_anthropic_client = AsyncAnthropic(
-                auth_token=token, max_retries=0,
-            )
-            _async_anthropic_token = token
-    return _async_anthropic_client
+
+    # OAuth unavailable — fall back to DeepSeek V4 Flash.
+    # Tier 1: OpenRouter (explicit key). Tier 2: OpenCode Zen (free key).
+    if _OPENROUTER_API_KEY:
+        log.warning("get_anthropic_client: OAuth unavailable, using OpenRouter fallback (%s)", _DEEPSEEK_V4_FLASH)
+        from openai import AsyncOpenAI
+        return AsyncOpenAI(
+            api_key=_OPENROUTER_API_KEY,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={"HTTP-Referer": "https://discord-bot.kanae.local"},
+        )
+    if _OPENCODE_API_KEY:
+        log.warning("get_anthropic_client: OAuth unavailable, using OpenCode Zen fallback (%s)", _DEEPSEEK_V4_FLASH)
+        from openai import AsyncOpenAI
+        return AsyncOpenAI(
+            api_key=_OPENCODE_API_KEY,
+            base_url="https://api.opencode.ai/v1",
+        )
+
+    # No auth at all.
+    return None
 
 
 def _refresh_mem0_client_token() -> None:
@@ -86,29 +123,139 @@ def _refresh_mem0_client_token() -> None:
             log.debug("Failed to refresh Mem0 client token: %s", e)
 
 
+def _has_oauth_token() -> bool:
+    """Check whether Anthropic OAuth is available (not expired).
+
+    Returns True if the credentials file exists and contains a non-expired
+    access token, or if ANTHROPIC_API_KEY is set. Returns False when the
+    only auth mechanism is OAuth and the token has expired.
+    """
+    # Direct API key always works.
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return True
+    # Try reading the OAuth credentials file that discord-bot maintains.
+    try:
+        from config import CREDENTIALS_PATH
+        import json
+        if os.path.isfile(CREDENTIALS_PATH):
+            with open(CREDENTIALS_PATH, encoding="utf-8") as f:
+                creds = json.load(f)
+            expires = creds.get("expiresAt", 0)
+            # Add 60s buffer so we don't start a request with a token that
+            # expires mid-flight.
+            if expires and (expires / 1000) > (time.time() + 60):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+# Fallback LLM config (used when Anthropic OAuth is unavailable).
+# Two fallback tiers:
+#   1. OPENROUTER_API_KEY → DeepSeek V4 Flash via OpenRouter
+#   2. OPENCODE_API_KEY   → DeepSeek V4 Flash via OpenCode Zen API (free tier)
+# DeepSeek V4 Flash is fast, cheap, and multilingual. It replaces Haiku for
+# Mem0 extraction/rewrite/rerank when the primary Anthropic auth is down.
+_OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+_OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY", "")
+_DEEPSEEK_V4_FLASH = "deepseek/deepseek-chat-v4-flash"
+
+
 def _build_config() -> dict:
-    """Build Mem0 configuration from env vars."""
+    """Build Mem0 configuration from env vars.
+
+    CHROMA_MODE=server (default since 2026-05-16): connect to chromadb HTTP
+    server at CHROMA_HOST:CHROMA_PORT. This prevents the multi-process
+    write race that corrupted the HNSW index during the SEGV incident.
+
+    CHROMA_MODE=embedded: legacy direct file access (kept for rollback).
+
+    LLM fallback: when Anthropic OAuth is unavailable (expired / missing)
+    and OPENROUTER_API_KEY is set, the LLM provider falls back to
+    DeepSeek V4 Flash via OpenRouter. This keeps Mem0 functional during
+    OAuth outages at slightly lower extraction quality.
+    """
     from config import STATE_DIR
 
-    db_path = os.path.join(STATE_DIR, "mem0_db")
-    os.makedirs(db_path, exist_ok=True)
+    chroma_mode = os.environ.get("CHROMA_MODE", "server")
+    chroma_host = os.environ.get("CHROMA_HOST", "127.0.0.1")
+    chroma_port = int(os.environ.get("CHROMA_PORT", "8765"))
+    # 2026-05-16 incident: rebuilt data lives in `kanae_memories_safe`
+    # (infer=False verbatim). Once `kanae_memories_infer` rebuild finishes,
+    # swap by setting MEM0_COLLECTION_NAME=kanae_memories_infer in .env
+    # and restarting the bot. No code change required.
+    collection_name = os.environ.get("MEM0_COLLECTION_NAME", "kanae_memories_safe")
+
+    if chroma_mode == "server":
+        vector_cfg = {
+            "collection_name": collection_name,
+            "host": chroma_host,
+            "port": chroma_port,
+        }
+    else:
+        db_path = os.path.join(STATE_DIR, "mem0_db")
+        os.makedirs(db_path, exist_ok=True)
+        vector_cfg = {
+            "collection_name": collection_name,
+            "path": db_path,
+        }
+
+    # Determine LLM provider: primary=Anthropic OAuth, fallback=OpenRouter
+    llm_provider = os.environ.get("MEM0_LLM_PROVIDER", "anthropic")
+    llm_model = os.environ.get("MEM0_LLM_MODEL", "claude-haiku-4-5-20251001")
+    llm_config = {
+        "model": llm_model,
+        "temperature": 0.1,
+        "max_tokens": 2000,
+    }
+
+    if llm_provider == "anthropic" and not _has_oauth_token():
+        if _OPENROUTER_API_KEY:
+            log.warning(
+                "Anthropic OAuth unavailable — falling back to %s via OpenRouter",
+                _DEEPSEEK_V4_FLASH,
+            )
+            llm_provider = "openrouter"
+            llm_model = _DEEPSEEK_V4_FLASH
+            llm_config = {
+                "model": _DEEPSEEK_V4_FLASH,
+                "temperature": 0.1,
+                "max_tokens": 2000,
+            }
+        elif _OPENCODE_API_KEY:
+            log.warning(
+                "Anthropic OAuth unavailable — falling back to %s via OpenCode Zen",
+                _DEEPSEEK_V4_FLASH,
+            )
+            # OpenCode Zen speaks OpenAI-compatible API at api.opencode.ai
+            llm_provider = "openai"
+            llm_model = _DEEPSEEK_V4_FLASH
+            llm_config = {
+                "model": _DEEPSEEK_V4_FLASH,
+                "temperature": 0.1,
+                "max_tokens": 2000,
+                "openai_api_key": _OPENCODE_API_KEY,
+                "openai_base_url": "https://api.opencode.ai/v1",
+            }
+        else:
+            log.error(
+                "Anthropic OAuth unavailable and no fallback key configured "
+                "(OPENROUTER_API_KEY / OPENCODE_API_KEY) — Mem0 LLM calls will fail"
+            )
+
+    if llm_provider == "openrouter":
+        # Mem0's openrouter provider wraps the OpenAI-compatible API.
+        llm_config["openai_api_key"] = _OPENROUTER_API_KEY
+        llm_config["openai_base_url"] = "https://openrouter.ai/api/v1"
 
     config: dict = {
         "llm": {
-            "provider": os.environ.get("MEM0_LLM_PROVIDER", "anthropic"),
-            "config": {
-                "model": os.environ.get("MEM0_LLM_MODEL", "claude-haiku-4-5-20251001"),
-                "temperature": 0.1,
-                "max_tokens": 2000,
-                # api_key intentionally omitted — OAuth via ANTHROPIC_AUTH_TOKEN
-            },
+            "provider": llm_provider,
+            "config": llm_config,
         },
         "vector_store": {
             "provider": "chroma",
-            "config": {
-                "collection_name": "kanae_memories",
-                "path": db_path,
-            },
+            "config": vector_cfg,
         },
         "version": "v1.1",
     }
@@ -126,32 +273,58 @@ def _build_config() -> dict:
     return config
 
 
-def _get_mem0():
-    """Lazy-init singleton Mem0 instance."""
-    global _mem0_instance, _init_attempted
+def _ping_chromadb_if_server_mode() -> None:
+    """When CHROMA_MODE=server, verify the ChromaDB HTTP server is reachable.
 
-    if _init_attempted:
+    Raises an exception on failure so the caller can mark init as failed
+    and trigger the cooldown-based retry path.
+    """
+    if os.environ.get("CHROMA_MODE", "server") != "server":
+        return
+    host = os.environ.get("CHROMA_HOST", "127.0.0.1")
+    port = int(os.environ.get("CHROMA_PORT", "8765"))
+    import requests
+    r = requests.get(f"http://{host}:{port}/api/v2/heartbeat", timeout=5)
+    r.raise_for_status()
+
+
+def _get_mem0():
+    """Lazy-init singleton Mem0 instance with cooldown-based retry.
+
+    On init failure, sets _init_failed_at and returns None for the next
+    _INIT_RETRY_COOLDOWN_SEC seconds before retrying. This allows
+    automatic recovery after ChromaDB systemd-restarts.
+    """
+    global _mem0_instance, _init_failed_at
+
+    if _mem0_instance is not None:
         return _mem0_instance
-    _init_attempted = True
+    if _init_failed_at is not None and (time.monotonic() - _init_failed_at) < _INIT_RETRY_COOLDOWN_SEC:
+        return None
 
     # Initialize OAuth BEFORE creating any Anthropic clients
     if not oauth_init():
         log.error("OAuth init failed — Mem0 LLM calls will not work")
 
     try:
+        _ping_chromadb_if_server_mode()
         from mem0 import Memory
 
         cfg = _build_config()
         _mem0_instance = Memory.from_config(cfg)
+        _init_failed_at = None
+        vs_cfg = cfg["vector_store"]["config"]
+        store_id = vs_cfg.get("path") or f'{vs_cfg.get("host")}:{vs_cfg.get("port")}'
         log.info(
             "Mem0 ready — llm=%s (OAuth) embedder=%s store=chroma(%s)",
             cfg["llm"]["config"]["model"],
             cfg["embedder"]["config"]["model"],
-            cfg["vector_store"]["config"]["path"],
+            store_id,
         )
     except Exception as exc:
         log.error("Mem0 init failed: %s", exc, exc_info=True)
         _mem0_instance = None
+        _init_failed_at = time.monotonic()
 
     return _mem0_instance
 

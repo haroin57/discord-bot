@@ -6,6 +6,7 @@ security/phase2-unification (SRE4) replaces it with true LRU — we keep parity
 with master here and will sync when that branch is merged.
 """
 
+import random
 import time
 
 from config import (
@@ -48,6 +49,55 @@ def check_and_record_retry_budget(channel_id: int) -> bool:
     return True
 
 
-def compute_backoff(attempt: int) -> float:
-    """Exponential backoff: BASE * 2**attempt, capped at MAX_BACKOFF_S."""
-    return min(BASE_BACKOFF_S * (2 ** attempt), MAX_BACKOFF_S)
+def retry_after_from_headers(headers) -> float | None:
+    """Server-requested wait in seconds from a ``retry-after`` header, or None.
+
+    Accepts any mapping (httpx.Headers / dict); both the delta-seconds and
+    HTTP-date forms are handled. Used by entry.py so the backoff sleep honors
+    the server's request instead of hammering the same wall every ~3-6s
+    (audit #5 — the CLI computes max(retryAfter*1000, computedBackoff)).
+    """
+    if headers is None:
+        return None
+    value = None
+    try:
+        for k, v in headers.items():
+            if str(k).lower() == "retry-after":
+                value = str(v)
+                break
+    except AttributeError:
+        return None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    from datetime import datetime, timezone
+    from email.utils import parsedate_to_datetime
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+
+
+def compute_backoff(attempt: int, *, jitter: bool = True) -> float:
+    """Exponential backoff: BASE * 2**attempt, capped at MAX_BACKOFF_S.
+
+    With ``jitter=True`` (default) an *equal jitter* scheme is applied:
+    half the capped delay is fixed and half is uniformly random in
+    ``[0, capped/2]``. This breaks up synchronized retries so repeated
+    overloaded/rate-limit failures don't all re-enter at the same instant
+    (thundering herd) and keep colliding with the server's recovery window.
+
+    ``jitter=False`` returns the deterministic capped delay — used by tests
+    asserting exact values and by any caller that needs reproducibility.
+    """
+    capped = min(BASE_BACKOFF_S * (2 ** attempt), MAX_BACKOFF_S)
+    if not jitter:
+        return capped
+    half = capped / 2
+    return half + random.uniform(0, half)

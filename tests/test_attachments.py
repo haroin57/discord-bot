@@ -689,3 +689,137 @@ class TestReDoSGuards:
         text = big_prefix + f" {img} "
         paths = extract_image_paths(text)
         assert str(img) not in paths
+
+
+class TestDownloadArbitraryAttachments:
+    """Coverage for the admin-only binary downloader.
+
+    Targets the gap surfaced by the .als incident on 2026-05-19:
+    image / text downloaders silently dropped the .als payload, and bot.py
+    had no way to surface it to kanae.
+    """
+
+    def _make_att(self, *, content_type=None, size=1000, filename="Zero Gravity.als", att_id=42):
+        from unittest.mock import MagicMock
+        att = MagicMock()
+        att.content_type = content_type
+        att.size = size
+        att.filename = filename
+        att.id = att_id
+        att.url = f"https://cdn.discordapp.com/attachments/fake/{att_id}/{filename}"
+        return att
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_for_non_admin(self, tmp_attachment_dir):
+        from utils.attachments import download_arbitrary_attachments
+        att = self._make_att(content_type="application/octet-stream")
+        session = MagicMock()
+        result = await download_arbitrary_attachments(
+            session, [att], caller_is_admin=False,
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_skips_image_and_text_types(self, tmp_attachment_dir):
+        from utils.attachments import download_arbitrary_attachments
+        atts = [
+            self._make_att(content_type="image/png", filename="x.png", att_id=1),
+            self._make_att(content_type="text/plain", filename="x.txt", att_id=2),
+            self._make_att(content_type="application/json", filename="x.json", att_id=3),
+        ]
+        session = MagicMock()
+        result = await download_arbitrary_attachments(
+            session, atts, caller_is_admin=True,
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_downloads_unknown_mime(self, tmp_attachment_dir):
+        from utils.attachments import download_arbitrary_attachments
+        att = self._make_att(content_type=None, filename="Zero Gravity.als")
+
+        # Mock the streaming body so we don't hit the network.
+        class _StreamCtx:
+            status = 200
+            class content:
+                @staticmethod
+                async def iter_chunked(_n):
+                    for chunk in [b"PK\x03\x04", b"fake-als-body" * 10]:
+                        yield chunk
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+        session = MagicMock()
+        session.get = MagicMock(return_value=_StreamCtx())
+
+        result = await download_arbitrary_attachments(
+            session, [att], caller_is_admin=True,
+        )
+        assert len(result) == 1
+        meta = result[0]
+        assert meta["filename"] == "Zero Gravity.als"
+        assert meta["mime"] == "application/octet-stream"  # null → default
+        assert meta["size"] > 0
+        assert os.path.isfile(meta["path"])
+        # Filename safe: starts with att.id prefix, ends with sanitized .als
+        assert meta["path"].endswith(".als")
+        assert "42-" in os.path.basename(meta["path"])
+
+    @pytest.mark.asyncio
+    async def test_rejects_oversized_size_hint(self, tmp_attachment_dir):
+        from utils.attachments import (
+            download_arbitrary_attachments,
+            MAX_ARBITRARY_ATTACHMENT_BYTES,
+        )
+        att = self._make_att(
+            content_type="application/octet-stream",
+            size=MAX_ARBITRARY_ATTACHMENT_BYTES + 1,
+        )
+        session = MagicMock()
+        result = await download_arbitrary_attachments(
+            session, [att], caller_is_admin=True,
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_rejects_denylisted_extension(self, tmp_attachment_dir):
+        from utils.attachments import download_arbitrary_attachments
+        att = self._make_att(
+            content_type="application/octet-stream",
+            filename="payload.exe",
+        )
+        session = MagicMock()
+        result = await download_arbitrary_attachments(
+            session, [att], caller_is_admin=True,
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_rejects_non_discord_host(self, tmp_attachment_dir):
+        from utils.attachments import download_arbitrary_attachments
+        att = self._make_att(content_type="application/octet-stream")
+        att.url = "https://evil.example.com/payload.bin"
+        session = MagicMock()
+        result = await download_arbitrary_attachments(
+            session, [att], caller_is_admin=True,
+        )
+        assert result == []
+
+    def test_sanitize_basename_strips_path_separators(self):
+        from utils.attachments import _sanitize_basename
+        # Forward slash is stripped by os.path.basename, '\' is replaced
+        # by the regex on POSIX. Either way no path-component separator
+        # survives, which is what the realpath guard relies on.
+        assert "/" not in _sanitize_basename("../../etc/passwd")
+        assert "\\" not in _sanitize_basename("..\\..\\windows\\system32")
+
+    def test_sanitize_basename_preserves_japanese(self):
+        from utils.attachments import _sanitize_basename
+        # Japanese chars are \w under re.UNICODE so they survive.
+        assert _sanitize_basename("耳コピ.als") == "耳コピ.als"
+
+    def test_sanitize_basename_caps_length(self):
+        from utils.attachments import _sanitize_basename
+        long_name = "a" * 200 + ".als"
+        result = _sanitize_basename(long_name)
+        assert len(result) <= 80

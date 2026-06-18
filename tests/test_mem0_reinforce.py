@@ -138,16 +138,61 @@ class TestReinforcementBoost:
         b = reinforcement_boost({"mention_count": "bogus"})
         assert b == 0.0
 
+    # ----- Phase A-2: temporal age decay -----
+
+    def test_age_decay_recent_fact_has_higher_boost(self):
+        now = int(time.time())
+        recent = reinforcement_boost({"timestamp": now - 60})
+        old = reinforcement_boost({"timestamp": now - 365 * 86400})
+        # Both should be > 0 but recent should outweigh old.
+        assert recent > old > 0.0
+
+    def test_age_decay_zero_when_no_timestamp(self):
+        # No timestamp / created_at_unix → age component disabled.
+        b = reinforcement_boost({"mention_count": 1})
+        assert b == 0.0
+
+    def test_age_decay_uses_created_at_unix_when_present(self):
+        now = int(time.time())
+        # created_at_unix takes precedence over timestamp.
+        b1 = reinforcement_boost({"created_at_unix": now - 1})
+        b2 = reinforcement_boost({"timestamp": now - 1})
+        assert pytest.approx(b1, abs=1e-6) == b2
+
+    def test_age_decay_can_be_disabled_via_argument(self):
+        now = int(time.time())
+        # alpha_age=0 disables the age component, leaving only mention/recency.
+        b_off = reinforcement_boost(
+            {"timestamp": now - 60, "mention_count": 1}, alpha_age=0.0,
+        )
+        assert b_off == 0.0
+
+    def test_combined_boost_stays_within_reasonable_range(self):
+        # Heavy fact: 100 mentions, just reinforced, brand new.
+        now = int(time.time())
+        b = reinforcement_boost({
+            "mention_count": 100,
+            "last_reinforced_at": now,
+            "timestamp": now,
+        })
+        # Loose upper bound — three components, each capped by α coefficient.
+        # mention ≈ 0.10 * log(100) ≈ 0.46
+        # recency ≈ 0.05 * 1.0 = 0.05
+        # age ≈ 0.03 * 1.0 = 0.03
+        # → 0.54 ish. Asserting < 1.0 prevents future regressions where
+        # someone bumps α coefficients without thinking about totals.
+        assert 0.3 < b < 1.0
+
 
 class TestDedupSignatureChange:
-    """Smoke that check_near_dup returns 3-tuple including existing_id."""
+    """Smoke that check_near_dup returns the verdict tuple incl. existing_id."""
 
     @pytest.mark.asyncio
     async def test_hard_drop_returns_existing_id(self, monkeypatch):
         from services.mem0 import dedup
         # score is *distance* (small = similar). Hard drop when distance is
         # small enough that the texts are effectively identical.
-        is_dup, reason, existing_id = await dedup.check_near_dup(
+        is_dup, reason, existing_id, _conflict, _merged = await dedup.check_near_dup(
             "candidate text",
             "tech",
             [{"id": "existing-1", "memory": "duplicate", "score": 0.05,
@@ -161,7 +206,7 @@ class TestDedupSignatureChange:
     async def test_novel_returns_none(self):
         from services.mem0 import dedup
         # Large distance = unrelated = keep
-        is_dup, reason, existing_id = await dedup.check_near_dup(
+        is_dup, reason, existing_id, _conflict, _merged = await dedup.check_near_dup(
             "candidate text",
             "tech",
             [{"id": "x", "memory": "different", "score": 1.20}],
@@ -175,7 +220,7 @@ class TestDedupSignatureChange:
         from services.mem0 import dedup
         # Even at tiny distance (very similar text), cross-category mismatch
         # must be skipped by the category guard.
-        is_dup, reason, existing_id = await dedup.check_near_dup(
+        is_dup, reason, existing_id, _conflict, _merged = await dedup.check_near_dup(
             "candidate text",
             "tech",
             [{"id": "x", "memory": "near-identical but different category",

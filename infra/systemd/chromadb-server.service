@@ -1,0 +1,40 @@
+[Unit]
+Description=ChromaDB HTTP server (Mem0 backend)
+Documentation=file:///home/ubuntu/discord-bot/docs/chromadb-server-mode-requirements.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/discord-bot
+ExecStart=/home/ubuntu/discord-bot/.venv/bin/chroma run --host 127.0.0.1 --port 8765 --path /home/ubuntu/discord-bot/.state/mem0_db
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chromadb-server
+
+# Resource limits per requirements §3.1.4. MemoryHigh = soft cap (cgroup reclaim
+# pressure), MemoryMax = hard kill. Sized below the bot+MCP combined footprint
+# from the SEGV incident, leaving headroom on the 2GB host.
+MemoryHigh=512M
+MemoryMax=768M
+LimitNOFILE=4096
+
+# Light hardening — kept minimal because chromadb writes to a known path under
+# /home/ubuntu and we don't want to fight EROFS during recovery scenarios.
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

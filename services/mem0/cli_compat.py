@@ -27,6 +27,7 @@ from services.claude_api.client import (
     _session_id,
     get_attribution_header_value,
     get_metadata,
+    supports_adaptive_thinking,
 )
 
 
@@ -41,13 +42,13 @@ def cli_system(task_prompt: str) -> list[dict]:
         {
             "type": "text",
             "text": get_attribution_header_value([]),
-            "cache_control": {"type": "ephemeral", "scope": "global"},
+            "cache_control": {"type": "ephemeral", "ttl": "1h", "scope": "global"},
         },
         {"type": "text", "text": CLI_IDENTITY_TEXT},
         {
             "type": "text",
             "text": CLI_DEFAULT_SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral", "scope": "global"},
+            "cache_control": {"type": "ephemeral", "ttl": "1h", "scope": "global"},
         },
         {"type": "text", "text": task_prompt},
     ]
@@ -93,27 +94,46 @@ async def cli_messages_create(
     accepts identically.
     """
     headers = cli_headers()
-    headers["anthropic-beta"] = ",".join(MODEL_BETAS)
-    return await client.messages.create(
+    # 2026-06-17: filter MODEL_BETAS for Haiku — context-1m-2025-08-07 was
+    # added for Opus 4.7's 500K compaction window but Haiku models return
+    # 400 "long context beta is not yet available for this subscription"
+    # when they see it, which was silently failing-open every Mem0 rewrite/
+    # HyDE/rerank/dedup call (and the new invest_kb Haiku pipeline). Strip
+    # the long-context beta whenever the model is a Haiku.
+    is_haiku = "haiku" in (model or "").lower()
+    effective_betas = [
+        b for b in MODEL_BETAS
+        if not (is_haiku and b.startswith("context-1m-"))
+    ]
+    headers["anthropic-beta"] = ",".join(effective_betas)
+    kwargs = dict(
         model=model,
         max_tokens=max_tokens,
         system=cli_system(task_prompt),
         messages=[{"role": "user", "content": user_message}],
         metadata=get_metadata(),
-        thinking=THINKING_CONFIG,
         extra_headers=headers,
     )
+    # Only send adaptive thinking to models that support it. Haiku (every
+    # Mem0 helper's default) returns HTTP 400 on adaptive thinking, which was
+    # silently failing-open the entire query-expansion / dedup / conflict
+    # pipeline. Small Haiku extraction tasks don't need thinking anyway.
+    if supports_adaptive_thinking(model):
+        kwargs["thinking"] = THINKING_CONFIG
+    return await client.messages.create(**kwargs)
 
 
 def extract_text(resp) -> str:
     """Pull the first TextBlock out of a Claude API response.
 
-    With ``thinking=THINKING_CONFIG`` enabled (every Mem0 LLM call here), the
-    server prepends one or more ``ThinkingBlock``s before the visible
-    ``TextBlock``. Naively reading ``resp.content[0].text`` then raises
-    ``AttributeError`` on the leading ThinkingBlock and the whole call path
-    falls through to its except branch — observed in production as repeated
-    "rerank_memories failed: 'ThinkingBlock' object has no attribute 'text'".
+    When ``thinking`` is enabled (adaptive-thinking-capable models only — see
+    ``supports_adaptive_thinking``), the server prepends one or more
+    ``ThinkingBlock``s before the visible ``TextBlock``. Naively reading
+    ``resp.content[0].text`` then raises ``AttributeError`` on the leading
+    ThinkingBlock and the whole call path falls through to its except branch —
+    observed in production as repeated "rerank_memories failed: 'ThinkingBlock'
+    object has no attribute 'text'". Scanning for the first block with text
+    handles both the thinking-on (Opus) and thinking-off (Haiku) cases.
     """
     for block in getattr(resp, "content", []) or []:
         text = getattr(block, "text", None)

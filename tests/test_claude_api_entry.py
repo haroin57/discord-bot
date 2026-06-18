@@ -85,6 +85,12 @@ class TestExtractAttachedImageBlocks:
     def test_real_block_stripped(self, monkeypatch):
         with tempfile.TemporaryDirectory() as tmp:
             monkeypatch.setattr(image_processor_mod, "ATTACHMENT_DIR", tmp)
+            # Stub _maybe_resize_image so fake PNGs pass through Pillow check.
+            monkeypatch.setattr(
+                image_processor_mod,
+                "_maybe_resize_image",
+                lambda data, media_type, path_for_log: (data, media_type),
+            )
             p = os.path.join(tmp, "img.png")
             with open(p, "wb") as fh:
                 fh.write(b"\x89PNG\r\n\x1a\n_more_data")
@@ -118,6 +124,12 @@ class TestExtractAttachedImageBlocks:
         # latter is parsed.
         with tempfile.TemporaryDirectory() as tmp:
             monkeypatch.setattr(image_processor_mod, "ATTACHMENT_DIR", tmp)
+            # Stub _maybe_resize_image so fake JPEGs pass through Pillow check.
+            monkeypatch.setattr(
+                image_processor_mod,
+                "_maybe_resize_image",
+                lambda data, media_type, path_for_log: (data, media_type),
+            )
             p = os.path.join(tmp, "img.jpg")
             with open(p, "wb") as fh:
                 fh.write(b"\xff\xd8\xff\xe0_jpeg")
@@ -147,33 +159,46 @@ class TestResolveSession:
         assert sessions == {}
 
     def test_reuses_when_subset(self, monkeypatch):
+        # 機能1: session は composite (channel, user) store 経由。user_id=None
+        # の legacy bucket でセットアップする。
         from services.claude_api import session_store as ss
+        from services.session import set_session, get_session, clear_session
         ss._record_session_time(1)
         monkeypatch.setattr(
             entry_mod, "get_mcp_servers_by_keys",
             lambda keys: {k: {"command": "echo"} for k in keys},
         )
-        sessions = {1: SessionInfo(session_id="abc", mcp_server_keys=["brave-search", "x-scraper"])}
-        cfg, resumable = _resolve_session(sessions, 1, {"brave-search"})
+        set_session(1, None, SessionInfo(session_id="abc", mcp_server_keys=["brave-search", "x-scraper"]))
+        cfg, resumable = _resolve_session({}, 1, {"brave-search"})
         # Subset → stored full set is reused.
         assert set(cfg.keys()) == {"brave-search", "x-scraper"}
         assert resumable is True
-        assert 1 in sessions
+        assert get_session(1, None) is not None
+        clear_session(1, None)
         ss._clear_session_time(1)
 
-    def test_mismatch_drops_session(self, monkeypatch):
+    def test_mismatch_merges_keys(self, monkeypatch):
+        # 2026-05-16: MCP tier escalation no longer drops the session.
+        # Missing keys are merged into the stored set so old tool_use
+        # blocks in the JSONL transcript stay valid and the will_resume
+        # flag matches the actual resumable state. See entry.py:_resolve_session.
         from services.claude_api import session_store as ss
+        from services.session import set_session, get_session, clear_session
         ss._record_session_time(1)
         monkeypatch.setattr(
             entry_mod, "get_mcp_servers_by_keys",
             lambda keys: {k: {"command": "echo"} for k in keys},
         )
-        sessions = {1: SessionInfo(session_id="abc", mcp_server_keys=["brave-search"])}
-        cfg, resumable = _resolve_session(sessions, 1, {"x-scraper"})
-        # Needed key not in stored → session dropped, fresh set spawned.
-        assert sessions == {}
-        assert set(cfg.keys()) == {"x-scraper"}
-        assert resumable is False
+        set_session(1, None, SessionInfo(session_id="abc", mcp_server_keys=["brave-search"]))
+        cfg, resumable = _resolve_session({}, 1, {"x-scraper"})
+        # Merged: stored {'brave-search'} | needed {'x-scraper'} → both advertised,
+        # session preserved, resume still valid.
+        assert get_session(1, None) is not None
+        assert get_session(1, None).mcp_server_keys == ["brave-search", "x-scraper"]
+        assert set(cfg.keys()) == {"brave-search", "x-scraper"}
+        assert resumable is True
+        clear_session(1, None)
+        ss._clear_session_time(1)
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +221,7 @@ class TestDispatcher:
         from services import claude_sdk
         # Patch the api-side implementation so we can detect the call.
         called = {"n": 0}
-        def fake(channel_id):
+        def fake(channel_id, user_id=None):
             called["n"] += 1
             return False
         import services.claude_api
@@ -227,3 +252,63 @@ class TestDispatcher:
         total = claude_sdk.kill_orphan_claude_cli()
         assert total == 3
         assert legacy_calls["n"] == 1 and api_calls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit error details
+# ---------------------------------------------------------------------------
+class TestRateLimitErrorDetails:
+    def test_classified_rate_limit_message_includes_headers(self):
+        from unittest.mock import MagicMock
+
+        from services.claude_api.entry import _classified_error_message
+
+        exc = RuntimeError("rate limited")
+        exc.response = MagicMock(
+            headers={
+                "retry-after": "60",
+                "anthropic-ratelimit-tokens-limit": "40000",
+                "anthropic-ratelimit-tokens-remaining": "0",
+            },
+        )
+
+        msg = _classified_error_message("rate_limit", exc)
+
+        assert "レート制限" in msg
+        assert "解除目安" in msg
+        assert "総トークン: 40,000/40,000 使用" in msg
+
+
+# ---------------------------------------------------------------------------
+# Bare transport-error retry (ADR-0007)
+# ---------------------------------------------------------------------------
+class TestBareTransportErrorRetry:
+    """A mid-stream HTTP/2 disconnect surfaces as a *bare* httpx.RequestError
+    (e.g. RemoteProtocolError <ConnectionTerminated>) when it does NOT pass
+    through an MCP anyio TaskGroup. Before ADR-0007 entry.py only caught the
+    TaskGroup-wrapped (BaseExceptionGroup) form, so the bare exception escaped
+    to bot.py's generic except and returned "❌ エラー" without retrying a
+    transient, usually-recoverable failure."""
+
+    def test_remote_protocol_error_is_a_request_error(self):
+        # The whole fix hinges on this subclass relationship: if it ever stops
+        # holding, the `except httpx.RequestError` clause would miss GOAWAY.
+        import httpx
+        assert issubclass(httpx.RemoteProtocolError, httpx.RequestError)
+
+    def test_entry_has_bare_request_error_clause_before_exceptiongroup(self):
+        # Order matters: the bare `except httpx.RequestError` must precede
+        # `except BaseExceptionGroup` (and follow `except anthropic...`), or
+        # the bare transport error would never be caught here.
+        import inspect
+        from services.claude_api import entry as entry_mod
+
+        src = inspect.getsource(entry_mod.call_with_tools)
+        bare = src.index("except httpx.RequestError as exc:")
+        grp = src.index("except BaseExceptionGroup as eg:")
+        assert bare < grp, "bare httpx.RequestError clause must come first"
+        # And it must funnel into the same transient handling: exhaustion
+        # returns the overloaded message, not the unknown fallback.
+        after_bare = src[bare:grp]
+        assert '_error_message("overloaded")' in after_bare
+        assert "TRANSIENT_MAX_ATTEMPTS - 1" in after_bare

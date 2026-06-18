@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from services.claude_api import mcp_client as mcp_client_mod
 from services.claude_api.mcp_client import (
     McpPool,
     McpServerHandle,
@@ -104,6 +105,78 @@ class TestCallMcpTool:
 
 
 class TestSpawnServers:
+    @pytest.mark.asyncio
+    async def test_spawn_one_uses_sse_transport(self, monkeypatch):
+        calls: dict[str, object] = {}
+
+        class FakeSseTransport:
+            async def __aenter__(self):
+                calls["transport_entered"] = True
+                return ("read-stream", "write-stream")
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        def fake_sse_client(url, **kwargs):
+            calls["url"] = url
+            calls["kwargs"] = kwargs
+            return FakeSseTransport()
+
+        class FakeClientSession:
+            def __init__(self, read, write):
+                calls["session_streams"] = (read, write)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def initialize(self):
+                calls["initialized"] = True
+
+            async def list_tools(self):
+                return SimpleNamespace(tools=[_fake_tool("search")])
+
+        monkeypatch.setattr(mcp_client_mod, "_HAS_SSE_TRANSPORT", True)
+        monkeypatch.setattr(mcp_client_mod, "sse_client", fake_sse_client)
+        monkeypatch.setattr(mcp_client_mod, "ClientSession", FakeClientSession)
+
+        async with AsyncExitStack() as stack:
+            handle = await mcp_client_mod._spawn_one(
+                stack,
+                "shared",
+                {
+                    "type": "sse",
+                    "url": "http://127.0.0.1:8020/sse",
+                    "headers": {"X-Test": "1"},
+                    "timeout": 10,
+                    "sse_read_timeout": 20,
+                },
+            )
+
+        assert handle.key == "shared"
+        assert [tool.name for tool in handle.tools] == ["search"]
+        assert calls["url"] == "http://127.0.0.1:8020/sse"
+        assert calls["kwargs"] == {
+            "headers": {"X-Test": "1"},
+            "timeout": 10,
+            "sse_read_timeout": 20,
+        }
+        assert calls["session_streams"] == ("read-stream", "write-stream")
+        assert calls["initialized"] is True
+
+    @pytest.mark.asyncio
+    async def test_spawn_one_sse_requires_transport(self, monkeypatch):
+        monkeypatch.setattr(mcp_client_mod, "_HAS_SSE_TRANSPORT", False)
+        async with AsyncExitStack() as stack:
+            with pytest.raises(RuntimeError, match="MCP SSE transport not available"):
+                await mcp_client_mod._spawn_one(
+                    stack,
+                    "shared",
+                    {"type": "sse", "url": "http://127.0.0.1:8020/sse"},
+                )
+
     @pytest.mark.asyncio
     async def test_failure_does_not_abort_other_servers(self):
         async def _bad(stack, name, cfg):

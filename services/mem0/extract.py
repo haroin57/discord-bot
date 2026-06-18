@@ -134,6 +134,20 @@ _EXTRACT_PROMPT = """以下の会話ターンから、長期記憶として保�
 {assistant_text}
 </assistant_text>
 
+== 既存 entity 辞書 ==
+
+以下は既に記録されている canonical 表記です。**同じ概念を抽出する場合は完全一致でこれを使ってください** (新規に表記揺れを生まないため)。空の場合は通常通り canonical を判断:
+
+<known_entities>
+{known_entities}
+</known_entities>
+
+== 呼称解決 ==
+
+- 「先輩」は haroin (本人) を指す。entity 化する場合は canonical_name=haroin、aliases=["先輩"] とする
+- 「お父さん」「お父様」は b0nchichi を指す。canonical_name=b0nchichi、aliases=["お父さん"] 等
+- これら呼称をそのまま canonical にしないこと
+
 == 最重要ルール (これを破ったら抽出失敗扱い) ==
 
 1. **固有名詞を含む発話は必ず fact 化する** ― 知名度・あなたの認知の有無・発話の長さに関係なく抽出すること:
@@ -164,9 +178,22 @@ _EXTRACT_PROMPT = """以下の会話ターンから、長期記憶として保�
 - **知識・経験表明も拾う**: 「〜を知ってる」「〜やったことある」「〜読んだ」「〜見た」等
 - skip していいのは「うん」「そうだね」「了解」「ありがとう」のような content-free な相槌のみ。固有名詞 or 明確な感情/嗜好/行動が含まれていれば長さに関わらず skip しない
 - LLM自己言及・一般論は出力しない
+- **記憶システム自体への自己言及は fact 化しない** (Mem0 / 記憶グラフ / mention_count / co-occurrence weight / dedup / ベクトル検索 / FTS / BM25 / エンティティクラスタ 等、bot 内部の記憶ストアの状態に関する記述)。これらは fact ではなくシステムのメタ情報。
+   - ユーザー fact が記憶システムの言い回しで包まれている場合は、**システム言及を剥がしてユーザー fact だけ抽出する**:
+     - 「AbletonでDTMしている。Mem0のエンティティとして記録されており mention count 6」 → 「AbletonでDTMしている」(Mem0 部分は捨てる)
+     - 「CLANNADがMem0に22件言及されており主要エンティティ」 → 「CLANNADが好きでよく言及している」(weight/件数は捨てる)
+   - 純粋にシステム状態のみ (「記憶グラフが100ノードに成長」「Mem0のdedupを修正した」) なら fact ゼロで返す
 - importance < 2 は出力しない (ただし固有名詞 + 嗜好/行動/知識 はデフォルトで importance=2 以上で出すこと)
 - 1 fact は日本語 120字以内
 - category は personal/project/tech/science/hobby/invest/ops/meta のいずれか
+  - personal: 個人・関係性・健康・進路・家族
+  - project: 具体的開発プロジェクト(ashitabo/kanae-bot/free-code/happy-stack/chatqa等の固有名詞)
+  - tech: 技術関心・学習(言語/コンパイラ/Async/LLMアーキ/逆解析)
+  - science: 物理/数学/思想/哲学(コード書かない世界観)
+  - hobby: 趣味・音楽・読書・アニメ・酒・グルメ
+  - invest: 投資・株・暗号資産・経済テーマ
+  - ops: 運用・Git安全・設定・VPS・dev環境
+  - meta: LLM対話メタ・好み・スタイル・断片ログ
 
 == entities フィールド ==
 
@@ -175,33 +202,78 @@ _EXTRACT_PROMPT = """以下の会話ターンから、長期記憶として保�
 - type: person / project / tech / media / place / concept のいずれか
 - aliases: 表記揺れ (省略可)。["ナミテープ", "namitape"] のように同義表現
 
+== relations フィールド (Phase C-2) ==
+
+- ターン全体で示唆される **entity 間の関係** を 0〜3 個 (合計上限) 返す
+- src/dst は entities フィールドのどれかの canonical_name と一致させる (大文字小文字含めて完全一致)
+- rel_type は次のいずれか:
+  - loves        : 好意 / 嗜好 ("先輩 loves 砺波いぶき")
+  - dislikes     : 嫌悪
+  - knows        : 認知 ("先輩 knows ariiol")
+  - works_at     : 所属 ("先輩 works_at ARCRA")
+  - lives_in     : 居住 ("先輩 lives_in 長野市")
+  - made_by      : 制作 ("クラナド made_by KEY")
+  - is_about     : 題材 ("ぼたん is_about いぶき")
+  - friend_of    : 友人
+  - parent_of    : 親
+  - sibling_of   : 兄弟姉妹
+- 関係が明確に読み取れないなら relations は空配列のままにすること (推測で出さない)
+- 1 ターン内に複数あれば配列に追加 (例: loves + lives_in)
+
 == 出力フォーマット ==
 
 以下の JSON のみ返してください(説明・前置き・コードフェンス不要):
-{{"facts":[{{"speaker":"self","text":"<日本語fact、固有名詞そのまま>","importance":<2-5>,"category":"<one of 8>","subcategory":"<kebab-case>","tags":["<tag>"],"entities":[{{"name":"<canonical>","type":"<one of 6>","aliases":["<alias>"]}}]}}]}}
+{{"facts":[{{"speaker":"self","text":"<日本語fact、固有名詞そのまま>","importance":<2-5>,"category":"<one of 8>","subcategory":"<kebab-case>","tags":["<tag>"],"entities":[{{"name":"<canonical>","type":"<one of 6>","aliases":["<alias>"]}}]}}],"relations":[{{"src":"<canonical>","rel_type":"<one of 10>","dst":"<canonical>"}}]}}
 
 該当事実が無ければ facts は空配列で構いません。**ただし出力前に <user_text> を再走査し、カタカナ語・英大文字混じり・漢字熟語等の固有名詞が含まれていないか確認すること**。含まれていれば「知らない名前だから」を理由に skip してはならない。"""
 
 
-async def extract_facts_for_self(
-    user_text: str, assistant_text: str, context_hint: str = "",
-) -> list[dict]:
-    """Use Haiku 4.5 to extract senpai-only facts from one conversational turn.
+def _format_known_entities(user_id: str | None) -> str:
+    """Build the <known_entities> body for the extract prompt.
 
-    Returns a list of {speaker, text, importance, category, subcategory, tags}.
-    Empty list on any failure (caller should fall back to Mem0 standard path).
+    Returns ``(none)`` when we can't (or shouldn't) inject — empty string would
+    leave the prompt slot dangling. Failures are swallowed: a missing
+    dictionary should never break extraction.
     """
+    if not user_id:
+        return "(none)"
+    try:
+        from services.mem0 import graph
+        names = graph.get_top_entities(str(user_id), limit=30)
+    except Exception as exc:
+        log.warning("known_entities lookup failed (non-fatal): %s", exc)
+        return "(none)"
+    if not names:
+        return "(none)"
+    return "\n".join(f"- {n}" for n in names)
+
+
+async def extract_full_signals(
+    user_text: str, assistant_text: str, context_hint: str = "",
+    user_id: str | None = None,
+) -> dict:
+    """Phase C-2: extract self facts AND entity-entity relations in a single
+    Haiku call. Returns ``{"facts": [...], "relations": [...]}``.
+
+    On any failure returns the empty shape ``{"facts": [], "relations": []}``
+    — callers (ingest, the thin extract_facts_for_self wrapper) just see
+    "nothing to insert" and move on. Relations are pre-validated against
+    a fixed rel_type vocabulary so a hallucinated edge type is dropped at
+    parse time rather than poisoning the graph.
+    """
+    empty = {"facts": [], "relations": []}
+    _VALID_REL_TYPES = {
+        "loves", "dislikes", "knows", "works_at", "lives_in",
+        "made_by", "is_about", "friend_of", "parent_of", "sibling_of",
+    }
     try:
         from services.mem0.client import get_anthropic_client
         client = await get_anthropic_client()
         if client is None:
-            return []
-        from config import MEM0_GATE_MODEL  # local import to allow .env reload
+            return empty
+        from config import MEM0_GATE_MODEL
         from services.mem0.cli_compat import cli_messages_create, extract_text
-        # max_tokens=4000 — Sonnet 4.6 with adaptive thinking can spend several
-        # hundred tokens on the thinking block; 600 left the visible TextBlock
-        # truncated mid-JSON and the parse would silently bail to []. Generous
-        # cap is fine because Sonnet stops at end_turn well before this.
+        known_entities_body = _format_known_entities(user_id)
         resp = await cli_messages_create(
             client,
             model=MEM0_GATE_MODEL,
@@ -210,10 +282,11 @@ async def extract_facts_for_self(
                 context_hint=_strip_extract_breakout_tags(context_hint or "(none)")[:1000],
                 user_text=_strip_extract_breakout_tags(user_text or "")[:2000],
                 assistant_text=_strip_extract_breakout_tags(assistant_text or "")[:2000],
+                known_entities=known_entities_body,
             ),
             task_prompt=(
-                "You extract self-attributable facts from a Discord "
-                "conversation turn. Return JSON only."
+                "You extract self-attributable facts and entity-entity "
+                "relations from a Discord conversation turn. Return JSON only."
             ),
         )
         text = extract_text(resp).strip()
@@ -223,42 +296,69 @@ async def extract_facts_for_self(
                 text = text[4:]
             text = text.rsplit("```", 1)[0].strip()
         if not text:
-            # ThinkingBlock consumed all tokens / no TextBlock returned.
             log.warning(
-                "extract_facts_for_self: empty TextBlock (stop_reason=%s, "
+                "extract_full_signals: empty TextBlock (stop_reason=%s, "
                 "content_block_types=%s)",
                 getattr(resp, "stop_reason", "?"),
                 [type(b).__name__ for b in (getattr(resp, "content", []) or [])],
             )
-            return []
+            return empty
         import json as _json
         try:
             data = _json.loads(text)
         except _json.JSONDecodeError as exc:
-            # Log a preview so we can diagnose truncation / format drift.
             log.warning(
-                "extract_facts_for_self: JSON parse failed (%s); text_tail=%r",
+                "extract_full_signals: JSON parse failed (%s); text_tail=%r",
                 exc, text[-200:],
             )
-            return []
-        facts = data.get("facts", [])
-        # Diagnostic: when Sonnet returns {"facts":[]} despite a non-trivial
-        # user_text, log inputs + raw response so we can tell whether the
-        # extractor missed a proper noun, abstracted it away, or the user
-        # genuinely said nothing fact-worthy.
-        if not facts and (user_text or "").strip():
+            return empty
+        facts_raw = data.get("facts", [])
+        if not facts_raw and (user_text or "").strip():
             log.info(
-                "extract_facts_for_self: returned 0 facts "
+                "extract_full_signals: returned 0 facts "
                 "(user_text=%r, assistant_text=%r, raw_resp=%r)",
                 (user_text or "")[:160],
                 (assistant_text or "")[:160],
                 text[:400],
             )
-        # Double-defense: drop anything not marked self regardless of LLM claim
-        return [f for f in facts if isinstance(f, dict) and f.get("speaker") == "self" and f.get("text")]
+        facts = [
+            f for f in facts_raw
+            if isinstance(f, dict)
+            and f.get("speaker") == "self"
+            and f.get("text")
+        ]
+        relations_raw = data.get("relations") or []
+        # Validate + clamp at the caller — defense in depth.
+        relations: list[dict] = []
+        if isinstance(relations_raw, list):
+            for rel in relations_raw[:5]:  # hard cap, the prompt already says 0-3
+                if not isinstance(rel, dict):
+                    continue
+                src = (rel.get("src") or "").strip()
+                dst = (rel.get("dst") or "").strip()
+                rt = (rel.get("rel_type") or "").strip()
+                if src and dst and rt in _VALID_REL_TYPES and src != dst:
+                    relations.append({"src": src, "rel_type": rt, "dst": dst})
+        return {"facts": facts, "relations": relations}
     except Exception as exc:
-        log.warning("extract_facts_for_self failed: %s", exc)
-        return []
+        log.warning("extract_full_signals failed: %s", exc)
+        return empty
+
+
+async def extract_facts_for_self(
+    user_text: str, assistant_text: str, context_hint: str = "",
+    user_id: str | None = None,
+) -> list[dict]:
+    """Backward-compatible wrapper for callers that only need the facts.
+
+    Phase C-2 introduces ``extract_full_signals`` which returns both facts
+    and relations; this wrapper preserves the legacy ``list[dict]`` return
+    shape so kanae_daily / web_api / older test mocks keep working.
+    """
+    signals = await extract_full_signals(
+        user_text, assistant_text, context_hint, user_id,
+    )
+    return signals.get("facts", [])
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +368,7 @@ async def extract_facts_for_self(
 # from her own utterances. Stored under kanae's Mem0 user_id so retrieval at
 # chat time can inject her past statements / preferences and keep her
 # character consistent across sessions.
-_EXTRACT_KANAE_PROMPT = """以下の会話ターンから、長期記憶として保存すべき「かなえ (Discord bot 本人) に関する事実」だけを抽出してください。
+_EXTRACT_KANAE_PROMPT = """以下の会話ターンから、長期記憶として保存すべき「かなえ (Discord bot 本人) に関する事実」と、かなえが今関心を向けている topic を抽出してください。
 
 <context_hint>
 {context_hint}
@@ -281,6 +381,18 @@ _EXTRACT_KANAE_PROMPT = """以下の会話ターンから、長期記憶とし�
 <kanae_text>
 {kanae_text}
 </kanae_text>
+
+<kanae_emotion_state>
+{emotion_summary}
+</kanae_emotion_state>
+
+== 既存 entity 辞書 ==
+
+以下は既にかなえの記憶に記録されている canonical 表記です。**同じ概念を抽出する場合は完全一致でこれを使ってください**:
+
+<known_entities>
+{known_entities}
+</known_entities>
 
 == 最重要ルール (これを破ったら抽出失敗扱い) ==
 
@@ -327,29 +439,67 @@ _EXTRACT_KANAE_PROMPT = """以下の会話ターンから、長期記憶とし�
 - type: person / project / tech / media / place / concept
 - aliases: 表記揺れ (省略可)
 
+== 感情コンテキストの利用 ==
+
+- <kanae_emotion_state> はかなえの現在の内的状態（数値 + 派生ラベル）。抽出の判断材料として使う
+- 鬱状態や不安が高い中での深い考察は、importance を上げる
+- 感情状態と発話内容の乖離（鬱なのに明るく振る舞う等）があれば fact として抽出する
+- 感情ブロックが空でも正常に動作すること（後方互換）
+
+== interests フィールド (新設) ==
+
+- かなえが今このターンで関心・好奇心・好悪を向けた topic を 0〜3 個
+- topic は短い canonical 文字列 (lowercase、固有名詞は原綴維持): 例 "uk garage", "rust async", "クラナド"
+- 雑談の挨拶・相槌からは抽出しない (例: 「はい」「分かりました」のみのターン)
+- valence: -1.0〜+1.0, この topic に対する感情極性 (好きほど +、苦手・嫌悪ほど -)
+- arousal: 0.0〜1.0, この topic を扱う時の高揚度 (淡々なら低、興奮なら高)
+- 同じ意味の topic は 1 つにまとめる
+
+== episode フィールド (新設) ==
+
+- このターン全体を 1 行で要約 ("先輩から TAKU INOUE を勧められた" のように 60 字以内)
+- summary: 日本語 60 字以内、先輩視点ではなくかなえ視点で書く
+- topics: このターンの主要 topic を 0〜3 個 (interests と整合)
+- valence_delta: -1.0〜+1.0, このターンでかなえの気分が動いた量 (嬉しい方向 +、辛い方向 -)
+- importance: 1-5, 後で振り返るべき重要度 (1=日常的雑談, 5=コア出来事)
+- 雑談・相槌しか無い場合は summary を空文字列にしてスキップ可能
+
 == 出力フォーマット ==
 
 JSON のみ返してください (説明・前置き・コードフェンス不要):
-{{"facts":[{{"speaker":"self","text":"<日本語fact、固有名詞そのまま>","importance":<2-5>,"category":"<one of 8>","subcategory":"<kebab-case>","tags":["<tag>"],"entities":[{{"name":"<canonical>","type":"<one of 6>","aliases":["<alias>"]}}]}}]}}
+{{"facts":[{{"speaker":"self","text":"<日本語fact、固有名詞そのまま>","importance":<2-5>,"category":"<one of 8>","subcategory":"<kebab-case>","tags":["<tag>"],"entities":[{{"name":"<canonical>","type":"<one of 6>","aliases":["<alias>"]}}]}}],"interests":[{{"topic":"<canonical lowercase>","valence":<-1.0..1.0>,"arousal":<0.0..1.0>}}],"episode":{{"summary":"<60字以内 or 空文字列>","topics":["<canonical lowercase>"],"valence_delta":<-1.0..1.0>,"importance":<1-5>}}}}
 
-該当事実が無ければ facts は空配列で OK。"""
+該当事実 / topic / 出来事が無ければ該当配列は空で / episode は summary 空で OK。"""
 
 
-async def extract_facts_for_kanae(
-    senpai_text: str, kanae_text: str, context_hint: str = "",
-) -> list[dict]:
-    """Extract self-facts about Kanae (the bot) from one conversational turn.
+async def extract_kanae_signals(
+    senpai_text: str,
+    kanae_text: str,
+    context_hint: str = "",
+    emotion_summary: str = "",
+    user_id: str | None = None,
+) -> dict:
+    """Single-call extractor for kanae's facts + interests (+ future episode).
 
-    Mirrors extract_facts_for_self but inverts the subject: kanae_text is
-    the subject of extraction, senpai_text is context. ``speaker='self'``
-    in the returned JSON refers to *Kanae* in this call site, and the
-    caller should store these under kanae's Mem0 user_id.
+    Replaces the previous facts-only `extract_facts_for_kanae`. Returns:
+
+        {
+            "facts": [<fact dict>, ...],          # speaker=="self", text required
+            "interests": [{"topic", "valence", "arousal"}, ...],
+            # "episode": {...}  ← reserved for Phase 2
+        }
+
+    Always returns a dict with `facts`/`interests`/`episode` keys
+    (possibly empty/None) so callers can dispatch without None-checks.
+    Returns the empty shape on any failure — failures are logged at
+    WARNING and treated as best-effort.
     """
+    empty: dict = {"facts": [], "interests": [], "episode": None}
     try:
         from services.mem0.client import get_anthropic_client
         client = await get_anthropic_client()
         if client is None:
-            return []
+            return empty
         from config import MEM0_GATE_MODEL
         from services.mem0.cli_compat import cli_messages_create, extract_text
         resp = await cli_messages_create(
@@ -360,10 +510,12 @@ async def extract_facts_for_kanae(
                 context_hint=_strip_extract_breakout_tags(context_hint or "(none)")[:1000],
                 senpai_text=_strip_extract_breakout_tags(senpai_text or "")[:2000],
                 kanae_text=_strip_extract_breakout_tags(kanae_text or "")[:2000],
+                emotion_summary=_strip_extract_breakout_tags(emotion_summary or "(状態取得なし)")[:500],
+                known_entities=_format_known_entities(user_id),
             ),
             task_prompt=(
-                "You extract self-attributable facts about Kanae (the AI bot) "
-                "from her own utterances. Return JSON only."
+                "You extract self-attributable facts AND topical interests "
+                "about Kanae (the AI bot) from her own utterances. Return JSON only."
             ),
         )
         text = extract_text(resp).strip()
@@ -374,24 +526,90 @@ async def extract_facts_for_kanae(
             text = text.rsplit("```", 1)[0].strip()
         if not text:
             log.warning(
-                "extract_facts_for_kanae: empty TextBlock (stop_reason=%s)",
+                "extract_kanae_signals: empty TextBlock (stop_reason=%s)",
                 getattr(resp, "stop_reason", "?"),
             )
-            return []
+            return empty
         import json as _json
         try:
             data = _json.loads(text)
         except _json.JSONDecodeError as exc:
             log.warning(
-                "extract_facts_for_kanae: JSON parse failed (%s); tail=%r",
+                "extract_kanae_signals: JSON parse failed (%s); tail=%r",
                 exc, text[-200:],
             )
-            return []
-        facts = data.get("facts", [])
-        return [
-            f for f in facts
+            return empty
+        raw_facts = data.get("facts", []) if isinstance(data, dict) else []
+        facts = [
+            f for f in raw_facts
             if isinstance(f, dict) and f.get("speaker") == "self" and f.get("text")
         ]
+        raw_interests = data.get("interests", []) if isinstance(data, dict) else []
+        interests: list[dict] = []
+        for it in raw_interests if isinstance(raw_interests, list) else []:
+            if not isinstance(it, dict):
+                continue
+            topic = str(it.get("topic", "") or "").strip()
+            if not topic:
+                continue
+            try:
+                valence = float(it.get("valence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                valence = 0.0
+            try:
+                arousal = float(it.get("arousal", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                arousal = 0.0
+            interests.append({
+                "topic": topic,
+                "valence": max(-1.0, min(1.0, valence)),
+                "arousal": max(0.0, min(1.0, arousal)),
+            })
+        # Episode is optional. We accept it only when summary is non-empty;
+        # empty summary means "no notable event this turn" per the prompt.
+        episode_obj = data.get("episode") if isinstance(data, dict) else None
+        episode: dict | None = None
+        if isinstance(episode_obj, dict):
+            summary = str(episode_obj.get("summary", "") or "").strip()
+            if summary:
+                topics_raw = episode_obj.get("topics") or []
+                if not isinstance(topics_raw, list):
+                    topics_raw = []
+                try:
+                    valence_delta = float(episode_obj.get("valence_delta", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    valence_delta = 0.0
+                try:
+                    importance = int(episode_obj.get("importance", 1) or 1)
+                except (TypeError, ValueError):
+                    importance = 1
+                episode = {
+                    "summary": summary[:120],
+                    "topics": [
+                        str(t).strip().lower()
+                        for t in topics_raw if str(t).strip()
+                    ][:3],
+                    "valence_delta": max(-1.0, min(1.0, valence_delta)),
+                    "importance": max(1, min(5, importance)),
+                }
+        return {"facts": facts, "interests": interests[:3], "episode": episode}
     except Exception as exc:
-        log.warning("extract_facts_for_kanae failed: %s", exc)
-        return []
+        log.warning("extract_kanae_signals failed: %s", exc)
+        return empty
+
+
+async def extract_facts_for_kanae(
+    senpai_text: str, kanae_text: str, context_hint: str = "",
+    user_id: str | None = None,
+) -> list[dict]:
+    """Backward-compat shim — returns facts only.
+
+    Prefer `extract_kanae_signals` in new code so a single Haiku call
+    surfaces both facts and interests. Kept because `services.mem0.ingest`
+    still calls this directly when `subject="kanae"` and no caller has
+    pre-extracted signals.
+    """
+    signals = await extract_kanae_signals(
+        senpai_text, kanae_text, context_hint, user_id=user_id,
+    )
+    return signals.get("facts", [])

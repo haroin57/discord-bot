@@ -68,18 +68,21 @@ async def main() -> int:
     }
     client = make_async_oauth_client(default_headers=cli_headers)
 
-    # Minimal system layout matching tool_loop._build_cached_system.
+    # Minimal CLI-prefix system layout, mirroring services/mem0/cli_compat.py
+    # (system[0] + system[2] cached with ttl:1h scope:global; system[1]/[3]
+    # uncached). ttl:1h matches the cached blocks in the main bot path
+    # (tool_loop._build_cached_system) and the real CLI capture.
     system = [
         {
             "type": "text",
             "text": get_attribution_header_value([]),
-            "cache_control": {"type": "ephemeral", "scope": "global"},
+            "cache_control": {"type": "ephemeral", "ttl": "1h", "scope": "global"},
         },
         {"type": "text", "text": CLI_IDENTITY_TEXT},
         {
             "type": "text",
             "text": CLI_DEFAULT_SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral", "scope": "global"},
+            "cache_control": {"type": "ephemeral", "ttl": "1h", "scope": "global"},
         },
         {"type": "text", "text": SYSTEM_PROMPT},
     ]
@@ -87,7 +90,7 @@ async def main() -> int:
 
     try:
         resp = await client.beta.messages.create(
-            model="claude-opus-4-6",
+            model="claude-fable-5",
             max_tokens=32,
             system=system,
             messages=messages,

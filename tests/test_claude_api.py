@@ -12,11 +12,11 @@ import pytest
 
 from services.claude_api import (
     _build_cached_system,
-    _get_attribution_header,
-    _get_metadata,
     _inject_cache_breakpoints,
     _retry_backoff_base,
     _stream_once,
+    get_attribution_header_value,
+    get_metadata,
     normalize_messages,
 )
 
@@ -160,37 +160,46 @@ class TestGetClient:
         assert client is not old_client
 
 
+def _attr(text: str) -> str:
+    """Build the attribution header value from a single user-message string."""
+    return get_attribution_header_value([{"role": "user", "content": text}])
+
+
 class TestGetAttributionHeader:
     def test_returns_header_string(self):
-        result = _get_attribution_header("test messages")
+        result = _attr("test messages")
         assert result.startswith("x-anthropic-billing-header:")
         assert "cc_version=" in result
         assert "cc_entrypoint=" in result
 
-    def test_fingerprint_is_16_chars(self):
-        result = _get_attribution_header("test")
-        # format: "x-anthropic-billing-header: cc_version=VERSION.FINGERPRINT; ..."
+    def test_suffix_is_3_hex_chars(self):
+        # New CLI algorithm (KA7): cc_version=VERSION.SUFFIX where SUFFIX is
+        # sha256(salt + picks + version).hexdigest()[:3].
+        result = _attr("test")
         version_part = result.split("cc_version=")[1].split(";")[0]
-        fingerprint = version_part.split(".")[-1]
-        assert len(fingerprint) == 16
+        suffix = version_part.split(".")[-1]
+        assert len(suffix) == 3
+        assert all(c in "0123456789abcdef" for c in suffix)
 
-    def test_different_inputs_give_different_fingerprints(self):
-        r1 = _get_attribution_header("aaa")
-        r2 = _get_attribution_header("bbb")
+    def test_different_inputs_give_different_suffix(self):
+        # picks = first_user_text[4] + [7] + [20]; vary index 4 so the suffix
+        # actually changes (short strings all collapse to "000").
+        r1 = _attr("wwwwAwwwwwwwwwwwwwwwwww")
+        r2 = _attr("wwwwBwwwwwwwwwwwwwwwwww")
         assert r1 != r2
 
     def test_empty_input(self):
-        result = _get_attribution_header("")
+        result = get_attribution_header_value([])
         assert "cc_version=" in result
 
 
 class TestGetMetadata:
     def test_returns_dict_with_user_id(self):
-        meta = _get_metadata()
+        meta = get_metadata()
         assert "user_id" in meta
 
     def test_user_id_contains_session_id(self):
-        meta = _get_metadata()
+        meta = get_metadata()
         parsed = json.loads(meta["user_id"])
         assert "session_id" in parsed
 
@@ -213,17 +222,27 @@ class TestRetryBackoffBase:
 
 
 class TestBuildCachedSystem:
-    def test_returns_list_with_one_block(self):
-        result = _build_cached_system("hello system")
+    def test_returns_four_block_cli_system(self):
+        # New CLI-shaped system array: [0]=attribution, [1]=CLI identity,
+        # [2]=CLI default agent prompt, [3]=caller-supplied prompt.
+        result = _build_cached_system("hello system", [{"role": "user", "content": "hi"}])
         assert isinstance(result, list)
-        assert len(result) == 1
+        assert len(result) == 4
+        assert result[3]["type"] == "text"
+        assert result[3]["text"] == "hello system"
 
-    def test_block_has_cache_control(self):
-        result = _build_cached_system("prompt")
-        block = result[0]
-        assert block["type"] == "text"
-        assert block["text"] == "prompt"
-        assert block["cache_control"] == {"type": "ephemeral"}
+    def test_cache_control_on_default_prompt_block(self):
+        # Matches the real CLI request: system[2] (static CLI default prompt)
+        # carries {ephemeral, ttl:1h, scope:global}, and system[3] (persona
+        # prompt) carries {ephemeral, ttl:1h}. The volatile per-request blocks
+        # (attribution, identity) carry no cache_control.
+        result = _build_cached_system("prompt", [{"role": "user", "content": "hi"}])
+        assert result[2]["cache_control"] == {
+            "type": "ephemeral", "ttl": "1h", "scope": "global",
+        }
+        assert result[3]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+        assert "cache_control" not in result[0]
+        assert "cache_control" not in result[1]
 
 
 class TestInjectCacheBreakpoints:
@@ -257,7 +276,7 @@ class TestInjectCacheBreakpoints:
         # second-to-last user is index 2 ("second")
         modified = result[2]
         assert isinstance(modified["content"], list)
-        assert modified["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert modified["content"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
         assert modified["content"][0]["text"] == "second"
 
     def test_list_content_gets_cache_control_on_last_block(self):
@@ -271,7 +290,7 @@ class TestInjectCacheBreakpoints:
         result = _inject_cache_breakpoints(msgs)
         modified_content = result[2]["content"]
         assert isinstance(modified_content, list)
-        assert modified_content[-1]["cache_control"] == {"type": "ephemeral"}
+        assert modified_content[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
     def test_does_not_mutate_original(self):
         msgs = [
@@ -517,7 +536,14 @@ class TestCallDirect:
         def always_rate_limit(api_client, messages, system_prompt, response_chunks):
             raise anthropic.RateLimitError(
                 message="rate limited",
-                response=MagicMock(status_code=429, headers={}),
+                response=MagicMock(
+                    status_code=429,
+                    headers={
+                        "retry-after": "60",
+                        "anthropic-ratelimit-requests-limit": "10",
+                        "anthropic-ratelimit-requests-remaining": "0",
+                    },
+                ),
                 body={},
             )
 
@@ -527,7 +553,9 @@ class TestCallDirect:
 
         history = {}
         result = await api_mod.call_direct("hi", _CHAN_A, history)
-        assert "APIエラー" in result
+        assert "レート制限" in result
+        assert "解除目安" in result
+        assert "リクエスト: 10/10 使用" in result
 
     @pytest.mark.asyncio
     async def test_lru_eviction_with_ordered_dict(self, monkeypatch):
