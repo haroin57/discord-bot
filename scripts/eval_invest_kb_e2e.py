@@ -37,8 +37,8 @@ sys.path.insert(0, str(REPO_ROOT))
 
 log = logging.getLogger("e2e")
 
-ANSWER_MODEL = os.environ.get("INVEST_E2E_ANSWER_MODEL", "claude-opus-4-7")
-JUDGE_MODEL = os.environ.get("INVEST_E2E_JUDGE_MODEL", "claude-opus-4-7")
+ANSWER_MODEL = os.environ.get("INVEST_E2E_ANSWER_MODEL", "claude-opus-4-8")
+JUDGE_MODEL = os.environ.get("INVEST_E2E_JUDGE_MODEL", "claude-opus-4-8")
 
 
 _ANSWER_PROMPT_WITHOUT = """あなたは中立な投資の解説者として、相手の質問に的確に答えてください。

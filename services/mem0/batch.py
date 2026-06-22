@@ -72,6 +72,26 @@ def append_turn(
     return len(turns)
 
 
+def build_batch_summary(turns: list[dict], turn_chars: int | None = None) -> str:
+    """Render accumulated turns into the ``user: …\\nassistant: …`` summary fed
+    to the extractor. Each turn's user/assistant text is capped at
+    ``turn_chars`` (default ``MEM0_BATCH_TURN_CHARS``). Kept here, pure and
+    testable, instead of inline in bot.py so the truncation budget is one
+    documented knob rather than a magic ``[:300]``.
+    """
+    if turn_chars is None:
+        try:
+            from config import MEM0_BATCH_TURN_CHARS
+            turn_chars = MEM0_BATCH_TURN_CHARS
+        except Exception:
+            turn_chars = 600
+    return "\n".join(
+        f"user: {(t.get('user') or '')[:turn_chars]}\n"
+        f"assistant: {(t.get('assistant') or '')[:turn_chars]}"
+        for t in (turns or [])
+    )
+
+
 def append_kanae_facts(
     state_dir: str | os.PathLike,
     channel_id: int,

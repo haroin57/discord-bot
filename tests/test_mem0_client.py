@@ -462,6 +462,12 @@ class TestGetAnthropicClient:
         monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value=None))
         monkeypatch.setattr(client_mod, "ensure_valid_token", AsyncMock(return_value=None))
         monkeypatch.setattr(client_mod, "oauth_init", MagicMock(return_value=True))
+        # "No auth at all" means no OAuth token AND no fallback keys. The real
+        # .env ships an OPENCODE_API_KEY, so clear both module-level fallback
+        # keys to isolate this test from the environment (otherwise the
+        # OpenCode/OpenRouter fallback correctly returns an AsyncOpenAI).
+        monkeypatch.setattr(client_mod, "_OPENROUTER_API_KEY", "")
+        monkeypatch.setattr(client_mod, "_OPENCODE_API_KEY", "")
 
         result = await client_mod.get_anthropic_client()
         assert result is None

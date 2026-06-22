@@ -35,6 +35,9 @@ from config import (
     FABLE_REFUSAL_FALLBACK_ENABLED,
     FABLE_REFUSAL_FALLBACK_MODEL,
     HISTORY_COMPACT_TRIGGER_TOKENS,
+    MICROCOMPACT_ENABLED,
+    MICROCOMPACT_GAP_MIN,
+    MICROCOMPACT_KEEP_RECENT,
     RESTRICTED_CLAUDE_MAX_PARALLEL,
     RESTRICTED_SYSTEM_PROMPT,
     RETRY_AFTER_MAX_S,
@@ -43,10 +46,12 @@ from config import (
 )
 from services.claude_api.compaction import (
     compact_channel_history,
+    compact_threshold_tokens,
     estimate_replay_chars,
     record_proactive_compaction,
     reset_rapid_refill,
 )
+from services.claude_api.microcompact import microcompact_tool_results
 from services.mcp_selector import (
     get_mcp_servers_by_keys,
     pick_mcp_servers,
@@ -118,17 +123,17 @@ MODEL = CLAUDE_MODEL
 # The process is still spawned lazily via McpPool.call_tool() on first use.
 # Mem0 sits here so Kanae can record durable facts without selector
 # keywords having to detect a "remember this" intent first.
-# WEB tier (x-scraper / news-curator / brave-search) joined 2026-05-16
-# after a turn-30 exhaustion: pick_mcp_servers() dropped WEB on a short
-# follow-up, so the tools fell out of advertised_tools and Kanae burned
-# the whole agent loop hunting for tools that were no longer in her
-# schema list. Static-advertise + lazy-spawn matches the mem0 pattern.
+# WEB tier (x-scraper / brave-search) joined 2026-05-16 after a turn-30
+# exhaustion: pick_mcp_servers() dropped WEB on a short follow-up, so the
+# tools fell out of advertised_tools and Kanae burned the whole agent loop
+# hunting for tools that were no longer in her schema list. Static-advertise
+# + lazy-spawn matches the mem0 pattern. (news-curator removed 2026-06-19.)
 ALWAYS_ADVERTISED_MCP_KEYS = {
-    "mem0", "x-scraper", "news-curator", "brave-search",
+    "mem0", "x-scraper", "brave-search",
     # Market data (2026-06-13): replaces the Brave-search-the-finance-page
     # pattern for quotes, and feeds the VI strategy signal checks. Static
     # schemas + lazy spawn, same as the rest.
-    "nikkei-indexes", "yfj-quote",
+    "nikkei-indexes", "yfj-quote", "polymarket",
 }
 
 _SNAPSHOT_MAX_AGE_S = int(os.environ.get("SNAPSHOT_MAX_AGE_S", "900"))
@@ -245,6 +250,7 @@ async def call_with_tools(
     incremental_text_callback=None,
     text_stream_callback=None,
     tool_invocation_callback=None,
+    progress: "dict | None" = None,
     restricted: bool = False,
     raw_user_text: str = "",
     is_thread: bool = False,
@@ -354,6 +360,35 @@ async def call_with_tools(
                 # before the request goes out.
                 prior_history = loaded_history
 
+                # Time-based microcompact (ported from CLI $F_/wF_): on an idle
+                # gap, clear OLD tool_result bodies (cheap, no LLM) before the
+                # costly full compaction below. Gap is measured from the freshest
+                # replayed snapshot timestamp; older tool outputs become a short
+                # placeholder while the last KEEP_RECENT are kept verbatim.
+                if MICROCOMPACT_ENABLED and prior_history and loaded_snapshot_ts:
+                    try:
+                        from datetime import datetime, timezone
+                        _sdt = datetime.fromisoformat(loaded_snapshot_ts)
+                        if _sdt.tzinfo is None:
+                            _sdt = _sdt.replace(tzinfo=timezone.utc)
+                        _gap_min = (
+                            datetime.now(timezone.utc) - _sdt
+                        ).total_seconds() / 60.0
+                        prior_history, _mc_saved = microcompact_tool_results(
+                            prior_history,
+                            gap_minutes=_gap_min,
+                            gap_threshold_min=MICROCOMPACT_GAP_MIN,
+                            keep_recent=MICROCOMPACT_KEEP_RECENT,
+                        )
+                        if _mc_saved > 0:
+                            log.info(
+                                "[ch=%d] microcompact: gap=%.0fmin, cleared old "
+                                "tool_results (~%d tokens reclaimed)",
+                                channel_id, _gap_min, _mc_saved,
+                            )
+                    except (ValueError, TypeError):
+                        pass
+
         # 5. Per-call settings
         if restricted:
             system_prompt = RESTRICTED_SYSTEM_PROMPT
@@ -426,15 +461,20 @@ async def call_with_tools(
                     # the very next turn reports usage and the gate becomes
                     # authoritative. In-loop proactive compaction (ADR-0012)
                     # still catches a runaway turn mid-stream.
+                    # Model-window-based trigger (CLI et6(K) port): fire near
+                    # the effective window minus reserves, not a flat constant.
+                    # HISTORY_COMPACT_PCT_OVERRIDE dials it (e.g. 50 = old 500K-
+                    # on-1M behaviour). Bounds/floor are handled in the helper.
+                    _compact_trigger = compact_threshold_tokens()
                     _last_tokens = get_last_context_tokens(channel_id)
-                    over_tokens = _last_tokens > HISTORY_COMPACT_TRIGGER_TOKENS
+                    over_tokens = _last_tokens > _compact_trigger
                     if over_tokens:
                         log.info(
                             "[ch=%d] boundary compaction trigger: "
                             "last_context_tokens=%d (trigger=%d) force=True",
                             channel_id,
                             _last_tokens,
-                            HISTORY_COMPACT_TRIGGER_TOKENS,
+                            _compact_trigger,
                         )
                     if (
                         over_tokens
@@ -576,6 +616,7 @@ async def call_with_tools(
                             incremental_text_callback=incremental_text_callback,
                             text_stream_callback=text_stream_callback,
                             tool_invocation_callback=tool_invocation_callback,
+                            progress=progress,
                             max_turns=max_turns,
                             stall_watchdog=watchdog,
                             api_client=api_client,
@@ -705,8 +746,13 @@ async def call_with_tools(
                             return _classified_error_message(category, exc), None, resumable
                         if not _is_transient(category):
                             # Permanent errors (api_exit, invalid_request,
-                            # unknown) — retrying won't help. Return
+                            # unknown, billing) — retrying won't help. Return
                             # immediately to avoid wasting API calls.
+                            if category == "billing":
+                                log.warning(
+                                    "[ch=%d] billing/credit limit hit — not retrying",
+                                    channel_id,
+                                )
                             return _classified_error_message(category, exc), None, resumable
                         # Transient (overloaded / rate_limit): the loop runs
                         # `range(TRANSIENT_MAX_ATTEMPTS)`, so the final attempt

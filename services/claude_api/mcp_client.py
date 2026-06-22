@@ -62,7 +62,6 @@ _MCP_CMDLINE_PATTERNS = (
     "context7-mcp",
     "x-scraper/mcp_server.py",
     "scholarly-mcp/server.py",
-    "news-curator/mcp_server.py",
     "nikkei-indexes/mcp_server.py",
     "yfj-quote/mcp_server.py",
     "papermcp",
@@ -165,8 +164,8 @@ def mcp_tools_to_anthropic(handles: dict[str, McpServerHandle]) -> list[dict]:
 # spawned lazily by McpPool.call_tool() when Claude emits a tool_use for
 # one of these names. Mem0 sits here so Kanae can record durable facts
 # without selector heuristics having to detect "I should remember this"
-# first; the WEB-tier servers (x-scraper / news-curator / brave-search)
-# were added 2026-05-16 after a turn-30 exhaustion incident where
+# first; the WEB-tier servers (x-scraper / brave-search) were added
+# 2026-05-16 after a turn-30 exhaustion incident where
 # pick_mcp_servers() dropped WEB tier on a short follow-up message, the
 # tools fell out of advertised_tools, and Kanae burned the whole loop
 # searching for tools that no longer existed in her schema list.

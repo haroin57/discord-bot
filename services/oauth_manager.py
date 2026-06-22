@@ -85,6 +85,11 @@ EXPIRY_BUFFER_MS = 5 * 60 * 1000
 _refresh_failure_count = 0
 _REFRESH_FAILURE_ALERT_THRESHOLD = 3
 
+# True when the last refresh failure was a permanent one (invalid_grant).
+# In this state ensure_valid_token() raises OAuthRefreshFailed immediately
+# on the next expired-token check rather than waiting for N failures.
+_refresh_permanent: bool = False
+
 
 def _record_refresh_failure(err):
     global _refresh_failure_count
@@ -101,10 +106,11 @@ def _record_refresh_failure(err):
 
 
 def _record_refresh_success():
-    global _refresh_failure_count
+    global _refresh_failure_count, _refresh_permanent
     if _refresh_failure_count > 0:
         log.info("OAuth refresh recovered after %d failures", _refresh_failure_count)
     _refresh_failure_count = 0
+    _refresh_permanent = False
 
 
 def is_oauth_healthy() -> bool:
@@ -234,6 +240,27 @@ async def refresh_token() -> bool:
         ) as resp:
             if resp.status != 200:
                 text = await resp.text()
+                # Detect permanent failure (invalid_grant = refresh token
+                # revoked/expired): retrying cannot recover it, and
+                # ensure_valid_token() will raise OAuthRefreshFailed
+                # immediately on the next expired-token check.
+                is_permanent = False
+                try:
+                    data_err = json.loads(text)
+                    if data_err.get("error") == "invalid_grant":
+                        is_permanent = True
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                if "invalid_grant" in text:
+                    is_permanent = True
+                if is_permanent:
+                    global _refresh_permanent
+                    _refresh_permanent = True
+                    log.error(
+                        "OAuth refresh token invalid (invalid_grant) — "
+                        "re-login required: %s",
+                        text,
+                    )
                 _record_refresh_failure(f"HTTP {resp.status}: {text}")
                 return False
 
@@ -292,6 +319,11 @@ async def ensure_valid_token() -> str | None:
         return _access_token
 
     if _is_expired() and _refresh_token:
+        # Permanent failure (invalid_grant): raise immediately without retrying.
+        if _refresh_permanent:
+            raise OAuthRefreshFailed(
+                "refresh token invalid (invalid_grant) — re-login required"
+            )
         log.info("OAuth token expired or expiring soon, refreshing")
         if await refresh_token():
             return _access_token

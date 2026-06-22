@@ -31,7 +31,7 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
-JUDGE_MODEL = os.environ.get("INVEST_EVAL_JUDGE_MODEL", "claude-opus-4-7")
+JUDGE_MODEL = os.environ.get("INVEST_EVAL_JUDGE_MODEL", "claude-opus-4-8")
 
 
 _MCQ_PROMPT = """以下は金融資格試験の選択問題です。最も正しい選択肢の id（数字のみ）で答えてください。

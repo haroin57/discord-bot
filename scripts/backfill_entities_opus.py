@@ -177,7 +177,7 @@ async def analyze_fact(text: str, *, use_web: bool = True) -> dict:
         safe_web = (web_ctx or "(none)")[:1500].replace("{", "{{").replace("}", "}}")
         resp = await cli_messages_create(
             client,
-            model="claude-opus-4-7",
+            model="claude-opus-4-8",
             max_tokens=2500,
             user_message=_PROMPT.format(
                 text=safe, web_context=safe_web, genres=GENRES_STR,

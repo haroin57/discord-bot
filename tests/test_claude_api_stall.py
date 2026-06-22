@@ -26,7 +26,7 @@ async def test_no_stall_no_callback():
 
 
 @pytest.mark.asyncio
-async def test_stall_threshold_invokes_callback():
+async def test_stall_threshold_sets_warned_flag():
     calls: list[str] = []
 
     async def cb(msg):
@@ -35,15 +35,17 @@ async def test_stall_threshold_invokes_callback():
     async with StallWatchdog(
         channel_id=1, status_callback=cb,
         stall_threshold_s=0.1, idle_timeout_s=10.0, poll_interval_s=0.05,
-    ):
+    ) as wd:
         await asyncio.sleep(0.5)
-    # Expect at least one "⏳" callback, but not the cancel one.
-    assert any("⏳" in c for c in calls)
+        # Stall warning is log-only now (the bot.py spinner already shows
+        # liveness): the flag flips, but no user-facing callback fires.
+        assert wd._warned is True
+    assert all("⏳" not in c for c in calls)
     assert all("⏰" not in c for c in calls)
 
 
 @pytest.mark.asyncio
-async def test_stall_only_warns_once_per_idle_period():
+async def test_stall_warns_once_per_idle_period():
     calls: list[str] = []
 
     async def cb(msg):
@@ -52,11 +54,11 @@ async def test_stall_only_warns_once_per_idle_period():
     async with StallWatchdog(
         channel_id=1, status_callback=cb,
         stall_threshold_s=0.05, idle_timeout_s=10.0, poll_interval_s=0.02,
-    ):
+    ) as wd:
         await asyncio.sleep(0.3)
-    # Same idle period — should warn once, not many times.
-    warn_count = sum(1 for c in calls if "⏳" in c)
-    assert warn_count == 1
+        # Warning is deduped via _warned (log-only); no callback spam.
+        assert wd._warned is True
+    assert all("⏳" not in c for c in calls)
 
 
 @pytest.mark.asyncio
@@ -108,17 +110,13 @@ async def test_cancel_event_triggers_cancel():
 
 @pytest.mark.asyncio
 async def test_heartbeat_resets_warned_flag():
-    calls: list[str] = []
-
-    async def cb(msg):
-        calls.append(msg)
-
     async with StallWatchdog(
-        channel_id=1, status_callback=cb,
+        channel_id=1, status_callback=None,
         stall_threshold_s=0.05, idle_timeout_s=10.0, poll_interval_s=0.02,
     ) as wd:
-        await asyncio.sleep(0.2)  # one warn
+        await asyncio.sleep(0.2)
+        assert wd._warned is True    # first stall detected (log-only)
         wd.heartbeat()
-        await asyncio.sleep(0.2)  # second warn after reset
-    warns = sum(1 for c in calls if "⏳" in c)
-    assert warns >= 2
+        assert wd._warned is False   # heartbeat clears the warned flag
+        await asyncio.sleep(0.2)
+        assert wd._warned is True    # warns again after the reset

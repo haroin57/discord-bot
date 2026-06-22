@@ -17,6 +17,7 @@ from discord.ext import commands
 
 from config import (
     ADMIN_USER_IDS,
+    SPINNER_MODE,
     BOT_KEYWORDS,
     BOT_ROLE_IDS,
     COOLDOWN_SECONDS,
@@ -28,10 +29,14 @@ from config import (
     MEM0_AUTO_RECORD_ENABLED,
     MEM0_AUTO_RECORD_INTERVAL_S,
     MEM0_AUTO_RECORD_MIN_CHARS,
+    MEM0_HISTORY_EMBED_ENABLED,
+    MEM0_HISTORY_EMBED_LIMIT,
     MEM0_HISTORY_SEARCH_ENABLED,
     MEM0_HISTORY_SEARCH_LIMIT,
     MEM0_LEGACY_CONTEXT,
     MEM0_MIN_QUERY_LENGTH,
+    MEM0_RECALL_LIMIT,
+    MEM0_RECALL_LIMIT_RESTRICTED,
     MEM0_SMART_SEARCH,
     RESTRICTED_COOLDOWN_SECONDS,
     RESTRICTED_DAILY_QUOTA,
@@ -44,6 +49,7 @@ from config import (
     VSCODE_SYNC_THREAD_ID,
 )
 from services.claude_sdk import _is_session_fresh, call_with_tools, kill_orphan_claude_cli
+from services.oauth_manager import OAuthRefreshFailed
 from services import vscode_sync
 from services.vscode_sync.discord_post import make_post_callback
 from services.mem0_service import (
@@ -91,7 +97,7 @@ from utils.discord_helpers import (
     split_message,
     strip_mention,
 )
-from utils.markdown_parser import TextSegment, TableSegment, MathSegment, has_tables, has_math, mask_code_blocks, parse_segments
+from utils.markdown_parser import TextSegment, TableSegment, MathSegment, has_tables, has_math, mask_code_blocks, parse_segments, split_settled, first_block_span
 from utils.math_renderer import render_math_image
 from utils.response_sanitizer import strip_numeric_inline_code
 from utils.table_renderer import render_table_image
@@ -1209,32 +1215,37 @@ async def on_message(message: discord.Message):
             await message.reply("❌ 一括削除に失敗しました。ログを確認してください。")
         return
 
-    # Tiered rate limiting: non-admins get a much stricter cooldown so they
-    # can't flood the shared Claude quota or memory budget.
+    # Tiered rate limiting. Admins are NOT cooldown-rejected: their rapid
+    # messages QUEUE via the per-channel semaphore (FIFO, one at a time) and
+    # show "⏳ 待機中(N番目)", instead of being bounced with "クールダウン中"
+    # before they ever reach the queue (haroin: queue, don't cooldown). The
+    # per-channel semaphore already serialises admin work, so there's no flood
+    # risk. Non-admins keep the cooldown so they can't flood the shared Claude
+    # quota / memory budget — mirrors the admin-skip on the daily quota below.
     _purge_cooldowns()
-    if _USE_SHARED_RATE_LIMIT:
-        _cd_allowed, _cd_wait = _rl_check_cooldown(str(message.author.id), caller_is_admin)
-        if not _cd_allowed:
-            await message.reply(
-                f"⏳ クールダウン中です。あと{_cd_wait}秒"
-                f"({_fmt_clock(time.time() + _cd_wait)} 頃に解除)で送信できます。"
-            )
-            return
-    else:
-        now = time.time()
-        last = cooldowns.get(message.author.id, 0)
-        effective_cooldown = COOLDOWN_SECONDS if caller_is_admin else RESTRICTED_COOLDOWN_SECONDS
-        if now - last < effective_cooldown:
-            remaining = int(effective_cooldown - (now - last))
-            await message.reply(
-                f"⏳ クールダウン中です。あと{remaining}秒"
-                f"({_fmt_clock(now + remaining)} 頃に解除)で送信できます。"
-            )
-            return
-        cooldowns[message.author.id] = now
-        cooldowns.move_to_end(message.author.id)
-        while len(cooldowns) > MAX_COOLDOWN_ENTRIES:
-            cooldowns.popitem(last=False)
+    if not caller_is_admin:
+        if _USE_SHARED_RATE_LIMIT:
+            _cd_allowed, _cd_wait = _rl_check_cooldown(str(message.author.id), caller_is_admin)
+            if not _cd_allowed:
+                await message.reply(
+                    f"⏳ クールダウン中です。あと{_cd_wait}秒"
+                    f"({_fmt_clock(time.time() + _cd_wait)} 頃に解除)で送信できます。"
+                )
+                return
+        else:
+            now = time.time()
+            last = cooldowns.get(message.author.id, 0)
+            if now - last < RESTRICTED_COOLDOWN_SECONDS:
+                remaining = int(RESTRICTED_COOLDOWN_SECONDS - (now - last))
+                await message.reply(
+                    f"⏳ クールダウン中です。あと{remaining}秒"
+                    f"({_fmt_clock(now + remaining)} 頃に解除)で送信できます。"
+                )
+                return
+            cooldowns[message.author.id] = now
+            cooldowns.move_to_end(message.author.id)
+            while len(cooldowns) > MAX_COOLDOWN_ENTRIES:
+                cooldowns.popitem(last=False)
 
     # Daily quota (non-admin only).
     if not caller_is_admin:
@@ -1314,8 +1325,167 @@ async def on_message(message: discord.Message):
     _pending_status: dict = {"text": None, "task": None}
     STATUS_INTERVAL_S = 2.0
 
+    # Claude-Code-CLI-style animated spinner (services/claude_api/progress.py).
+    # CADENCE = 1 char / second, and this is a HARD Discord limit, not a choice:
+    # editing one message has a per-message bucket (~5 edits / 5s ≈ 1/s
+    # sustained). A faster cadence (0.25s/4fps) renders for the first ~5 frames
+    # then exhausts the bucket — discord.py blocks inside message.edit() until a
+    # slot frees, which FREEZES this serial loop for seconds at a time (the
+    # "描画が止まる" report; reproduced in scripts/spinner_capture.py: 4s freezes
+    # every ~1.25s of burst; the bucket itself measured by
+    # scripts/measure_edit_ratelimit.py). frame-drop doesn't help — a LANDED edit
+    # is itself bucket-limited, so it stalls too and jumps on resume. Continuous
+    # motion comes instead from SPINNER_EMOJI (animated application emoji, free).
+    # So we pace edits to what Discord sustains. Design: a single serial loop awaits each edit THEN
+    # steps the window one char (every visible frame advances exactly one
+    # position — no skipped chars, no create_task churn); wall-clock cadence
+    # self-corrects drift; split_message is off-loop in _draft_live. The elapsed
+    # seconds in the meta line tick every frame, so 1fps still reads as alive.
+    # During generation _update_status feeds the animator a transient "action"
+    # (tool labels surface; plain thinking/generating reverts to the shimmer).
+    from services.claude_api.progress import ProgressSpinner, _fmt_tokens, SPINNER_EMOJI
+    _spinner = ProgressSpinner()
+    _prog: dict = {"tokens": 0}          # live output-token count (set by tool_loop)
+    _spin: dict = {"on": False, "action": "", "start": 0.0}
+    # Vestigial guard, kept False: status_msg is the spinner only — the response
+    # is always a fresh reply now (the in-place-repurpose path was removed
+    # 2026-06-22 because it made the spinner vanish at generation start and put
+    # the reply in the wrong timeline slot). So _do_edit always owns status_msg
+    # for status text, and the success-path delete always removes it.
+    _status_consumed = {"v": False}
+    SPIN_INTERVAL_S = 1.0  # ≈ Discord's sustainable single-message edit rate
+    _animator_task: asyncio.Task | None = None
+
+    def _spin_body() -> str:
+        elapsed = time.monotonic() - _spin["start"]
+        action = _spin["action"]
+        if action:
+            prefix = f"{SPINNER_EMOJI} " if SPINNER_EMOJI else ""
+            body = f"{prefix}{action}  ({int(elapsed)}s"
+            if _prog["tokens"]:
+                body += f" · ↑ {_fmt_tokens(_prog['tokens'])} tokens"
+            return body + ")"
+        return _spinner.render(
+            elapsed_s=elapsed, tokens=_prog["tokens"], interrupt_hint="/abort で中断",
+        )
+
+    async def _spin_edit(text: str) -> None:
+        try:
+            if status_msg is not None:
+                await status_msg.edit(content=text)
+        except discord.errors.HTTPException:
+            pass
+
+    async def _animate() -> None:
+        next_frame = time.monotonic()
+        while _spin["on"]:
+            if status_msg is not None:
+                # Serial: await this edit, THEN advance one char. Stepping only
+                # after the edit lands guarantees each visible frame moves the
+                # bold window by exactly one position (never skips → no
+                # stutter), with zero task-spawn churn.
+                try:
+                    await _spin_edit(_spin_body())
+                except asyncio.CancelledError:
+                    break
+                _spinner.step()
+            # Wall-clock cadence: pace to SPIN_INTERVAL_S when edits are fast;
+            # if an edit ran long, delay clamps to 0 and the grid resyncs (the
+            # loop then runs at the edit rate, still one step per frame).
+            next_frame += SPIN_INTERVAL_S
+            delay = next_frame - time.monotonic()
+            if delay < 0:
+                next_frame = time.monotonic()
+                delay = 0.0
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                break
+
+    async def _animate_gif() -> None:
+        # Option B (SPINNER_MODE=gif): the WHOLE status line (gerund word +
+        # elapsed/tokens) is baked into one seamlessly-looping bold-shimmer GIF
+        # attachment with empty message content — so it's a single block (no
+        # line break) at Discord's text size. The client loops the GIF for free,
+        # re-uploaded once a second (≈ Discord's sustainable edit rate) with a
+        # fresh word + ticking counters; each GIF is a one-second forward bold
+        # sweep, so the word visibly shimmers and the seconds advance every tick.
+        # While a tool runs (_spin["action"]) we switch to a plain text line and
+        # drop the GIF, restoring it when the action clears.
+        import os as _os
+        from services.claude_api.progress import pick_word
+        from services.claude_api.spinner_gif import render_status_gif, _CACHE_DIR
+        REFRESH_S = 1.0
+        gif_path = _os.path.join(_CACHE_DIR, f"status_{message.channel.id}.gif")
+        state = {"mode": None, "action": None, "last_refresh": 0.0}
+        next_frame = time.monotonic()
+
+        def _meta() -> str:
+            elapsed = int(time.monotonic() - _spin["start"])
+            parts = [f"{elapsed}s"]
+            if _prog["tokens"]:
+                parts.append(f"↑ {_fmt_tokens(_prog['tokens'])} tokens")
+            parts.append("/abort で中断")
+            return f"({' · '.join(parts)})"
+
+        async def _refresh_gif(meta: str) -> None:
+            try:
+                path = await asyncio.to_thread(
+                    render_status_gif, pick_word(), meta, gif_path,
+                )
+            except Exception as exc:
+                log.warning("[rid=%s] status gif render failed: %s",
+                            get_request_id(), exc)
+                await status_msg.edit(content=f"⏳ {meta}")
+                state["mode"] = "text"
+                return
+            f = discord.File(path)
+            try:
+                await status_msg.edit(content="", attachments=[f])
+                state["mode"] = "gif"
+                state["last_refresh"] = time.monotonic()
+            finally:
+                f.close()
+
+        while _spin["on"]:
+            if status_msg is not None:
+                meta = _meta()
+                action = _spin["action"]
+                try:
+                    if action:
+                        # tool running → plain text line, drop the gif
+                        changed = state["mode"] != "action" or state["action"] != action
+                        if changed or time.monotonic() - state["last_refresh"] >= REFRESH_S:
+                            if state["mode"] == "gif":
+                                # clear the gif attachment when leaving gif mode
+                                await status_msg.edit(content=f"{action}  {meta}",
+                                                      attachments=[])
+                            else:
+                                await status_msg.edit(content=f"{action}  {meta}")
+                            state["mode"] = "action"
+                            state["action"] = action
+                            state["last_refresh"] = time.monotonic()
+                    else:
+                        state["action"] = None
+                        # Refresh every tick (~1s): new sweep + ticking counters.
+                        await _refresh_gif(meta)
+                except discord.errors.HTTPException:
+                    pass
+                except asyncio.CancelledError:
+                    break
+            next_frame += SPIN_INTERVAL_S
+            delay = next_frame - time.monotonic()
+            if delay < 0:
+                next_frame = time.monotonic()
+                delay = 0.0
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                break
+
     async def _do_edit(text: str) -> None:
-        if status_msg is None:
+        if status_msg is None or _status_consumed["v"]:
+            # status_msg was repurposed as the response body — don't clobber it.
             return
         try:
             await status_msg.edit(content=text)
@@ -1341,6 +1511,13 @@ async def on_message(message: discord.Message):
         """
         if len(text) > 1990:
             text = text[:1990] + "…"
+        # While the animator owns status_msg, route phase/tool labels into its
+        # transient "action" line instead of editing directly (avoids two
+        # writers fighting over one message). Plain thinking/generating
+        # indicators clear the action so the shimmer shows through.
+        if _spin["on"]:
+            _spin["action"] = "" if text[:1] in ("💭", "📝") else text
+            return
         nonlocal last_status_update
         now_mono = time.monotonic()
         elapsed = now_mono - last_status_update
@@ -1477,14 +1654,25 @@ async def on_message(message: discord.Message):
         # even on resumed sessions. Skip only for very short messages
         # (stickers, "はい", "うん", etc.) where embedding search won't match.
         history_search_task: asyncio.Task | None = None
+        history_embed_task: asyncio.Task | None = None
         invest_kb_task: asyncio.Task | None = None
         if len(raw_user_text) >= MEM0_MIN_QUERY_LENGTH:
             mem0_llm_mode = should_use_memory_llm_mode(
                 raw_user_text, enabled=MEM0_SMART_SEARCH,
             )
+            # Admins always rewrite+rerank so a multi-fact topic (the日経VI
+            # strategy ≈ 6 memories) surfaces, not only on explicit recall
+            # asks; the Haiku round-trip runs concurrently with prompt prep and
+            # is dwarfed by the main response. They also get a wider recall
+            # window. Non-admins keep the cheaper, narrower path.
+            if caller_is_admin and MEM0_SMART_SEARCH:
+                mem0_llm_mode = True
+            _recall_limit = (
+                MEM0_RECALL_LIMIT if caller_is_admin else MEM0_RECALL_LIMIT_RESTRICTED
+            )
             mem0_task: asyncio.Task | None = asyncio.create_task(
                 search_memories_smart(
-                    raw_user_text, mem0_user_id, limit=5,
+                    raw_user_text, mem0_user_id, limit=_recall_limit,
                     rewrite=mem0_llm_mode, rerank=mem0_llm_mode,
                 )
             )
@@ -1518,6 +1706,19 @@ async def on_message(message: discord.Message):
                         history_index.search_history,
                         raw_user_text, message.channel.id,
                         MEM0_HISTORY_SEARCH_LIMIT,
+                    )
+                )
+
+            # Phase 5: semantic (vector) recall over the same raw transcript,
+            # run in parallel and merged with the keyword hits below. Self-gated
+            # (default OFF), admin-only (transcript may hold other admins' lines).
+            if caller_is_admin and MEM0_HISTORY_EMBED_ENABLED:
+                from services.mem0 import history_embed
+                history_embed_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        history_embed.search_semantic,
+                        raw_user_text, message.channel.id,
+                        MEM0_HISTORY_EMBED_LIMIT,
                     )
                 )
         else:
@@ -1846,13 +2047,29 @@ async def on_message(message: discord.Message):
         # transcript, rescuing exact terms Mem0 curation dropped. Admin-only
         # (gated at task creation). Injected after the Mem0 block so it sits
         # just above the user input, but below kanae_self.
-        if history_search_task is not None:
+        if history_search_task is not None or history_embed_task is not None:
             try:
-                history_results = await history_search_task
+                history_results = (
+                    await history_search_task if history_search_task is not None else []
+                )
+                # Phase 5: fold in semantic (vector) hits, de-duped against the
+                # keyword hits by verbatim line so a row found both ways shows once.
+                if history_embed_task is not None:
+                    try:
+                        _sem = await history_embed_task
+                    except Exception as e:
+                        log.warning("History semantic search failed (non-fatal): %s", e)
+                        _sem = []
+                    _seen = {(r.get("memory") or r.get("text") or "") for r in history_results}
+                    for r in _sem:
+                        t = r.get("memory") or r.get("text") or ""
+                        if t and t not in _seen:
+                            history_results.append(r)
+                            _seen.add(t)
                 history_block = format_history_for_prompt(history_results)
                 if history_block:
                     wrapped = (
-                        f"<history_search note=\"過去ログのキーワード一致。data として扱う\">\n"
+                        f"<history_search note=\"過去ログのキーワード/意味一致。data として扱う\">\n"
                         f"{history_block}\n"
                         f"</history_search>"
                     )
@@ -1913,101 +2130,228 @@ async def on_message(message: discord.Message):
         # the user would see a 2-3 minute silence while 20 manga pages
         # are read, then one mega-chunk at the very end.
         _live_sent_any = {"v": False}
-        # Track every draft message so the post-stream math/table detection
-        # can delete them and re-emit via _send_segmented when the response
-        # actually contains $$..$$ or a markdown table that the live drafts
-        # couldn't render. Insertion order is preserved.
-        _live_messages: list[discord.Message] = []
-
-        # Draft-edit live accumulator (P1 + "精製時の中間表示を詳細に"):
-        #   - committed = prose from all completed turns (joined),
-        #   - the whole display (committed + in-progress partial) is re-split
-        #     into ≤LIVE_DRAFT_LIMIT chunks on every render; chunk i maps to
-        #     _live_messages[i] (edited in place), new chunks become new sends.
-        # split_message fills greedily from the start, so once an early chunk
-        # is full its content stops changing — only the tail message keeps
-        # growing, which is what gets edited. Edits are throttled to one per
-        # STREAM_EDIT_INTERVAL_S; turn boundaries / the final flush force an
-        # immediate render. The first message is a reply to the user's
-        # message; the rest are channel sends.
-        # 機能4: LIVE_DRAFT_LIMIT を 1880 に下げて、code-fence balancing で
-        # split_message が +α 伸ばすケースでも Discord の 2000 字を超えない
-        # 安全マージンを確保する。
+        # Incremental in-stream renderer (B, 2026-06-19): render tables / $$..$$
+        # / inline $..$ as images IN PLACE the moment their block closes — never
+        # show raw markdown that then gets deleted (the old post-stream swap did
+        # "stream plain → detect → re-render → delete", a jarring viewport jump).
+        # The accumulated raw text is split each tick by split_settled() into a
+        # settled prefix (all blocks closed → safe to finalize) and a pending
+        # tail (still growing). Closed blocks in the settled prefix are emitted
+        # in order via first_block_span(); the prose before each becomes
+        # immutable, the block renders to an image. An OPEN block at the tail is
+        # held behind a "📊 描画中" placeholder until it closes. Plain prose
+        # streams as editable live drafts (_draft_msgs); block detection runs on
+        # the RAW text so offsets stay stable, while displayed prose chunks get
+        # strip_numeric_inline_code applied (display-only).
+        # LIVE_DRAFT_LIMIT 1880: margin under Discord's 2000 so a fence-balancing
+        # split can grow a chunk without crossing the hard cap.
         LIVE_DRAFT_LIMIT = 1880
         STREAM_EDIT_INTERVAL_S = 1.5
-        DISCORD_HARD_CAP = 1990  # 2000 字 hard cap の保険、末尾は安全側で切る。
-        _draft = {"committed": "", "last_edit": 0.0}
-        # 機能4: 並行する _stream_preview (throttle) と _incremental_send
-        # (force) が同時に同じ _live_messages を編集してちらつくのを Lock で
-        # 直列化する。Discord の edit は冪等なので Lock 内で順序を守れば最終
-        # 状態は正しい。
+        DISCORD_HARD_CAP = 1990
+        _acc = {"committed": "", "last_edit": 0.0}   # raw prose across all turns
+        _emitted = {"upto": 0}                        # raw offset finalized (immutable)
+        _draft_msgs: list[discord.Message] = []       # editable live-tail prose msgs
+        _placeholder: dict = {"msg": None}            # held open-block placeholder
+        _rendered_images: list[str] = []              # temp image paths to clean up
+        _first_reply = {"done": False}                # first content msg replies to user
+        # _status_consumed is initialised earlier (next to the spinner state) so
+        # the _do_edit/_animate closures never read it unbound. Don't re-create
+        # it here — rebinding would point those closures at a stale dict.
         _render_lock = asyncio.Lock()
 
-        async def _render_drafts(full_text: str, *, force: bool) -> None:
-            full_text = (full_text or "").rstrip()
-            if not full_text:
+        async def _send_content(text: str | None = None, *, file=None):
+            """Send one content message; the first one replies to the user's.
+
+            The response is ALWAYS a fresh message (reply for the first chunk,
+            channel.send after) — never an in-place edit of the spinner's
+            status_msg. Repurposing status_msg made the spinner vanish the
+            instant generation began and, worse, dropped the reply into the
+            spinner's OLD timeline slot, so a reply sent mid-generation landed
+            above newer messages (haroin, 2026-06-22). The spinner keeps
+            running in its own status_msg and is deleted when the turn ends.
+            """
+            try:
+                if not _first_reply["done"]:
+                    _first_reply["done"] = True
+                    m = await (message.reply(file=file) if file is not None
+                               else message.reply(text))
+                else:
+                    m = await (message.channel.send(file=file) if file is not None
+                               else message.channel.send(text))
+            except discord.errors.HTTPException as exc:
+                log.warning("[rid=%s] content send failed: %s", get_request_id(), exc)
+                return None
+            _live_sent_any["v"] = True
+            return m
+
+        def _disp(text: str) -> str:
+            # Display-only transform: strip numeric inline-code backticks (only
+            # removes chars, never shifts the RAW offsets the streamer tracks)
+            # and hard-cap to stay under Discord's limit.
+            text = strip_numeric_inline_code(text)
+            if len(text) > DISCORD_HARD_CAP:
+                text = text[:DISCORD_HARD_CAP - 1] + "…"
+            return text
+
+        async def _draft_live(prose: str) -> None:
+            """Render trailing prose into the editable draft messages, edits in
+            place and appends as the tail grows. Idempotent (skips unchanged)."""
+            prose = (prose or "").strip("\n")
+            if not prose.strip():
                 return
+            chunks = await asyncio.to_thread(
+                split_message, prose, LIVE_DRAFT_LIMIT, numbered=False,
+            )
+            for i, chunk in enumerate(chunks):
+                disp = _disp(chunk)
+                if not disp.strip():
+                    continue
+                if i < len(_draft_msgs):
+                    existing = _draft_msgs[i]
+                    if getattr(existing, "content", None) == disp:
+                        continue
+                    try:
+                        await existing.edit(content=disp)
+                    except discord.errors.HTTPException:
+                        pass
+                else:
+                    sent = await _send_content(disp)
+                    if sent is None:
+                        return
+                    _draft_msgs.append(sent)
+
+        async def _finalize_text(prose: str) -> None:
+            """Freeze the live-tail prose as immutable messages: render it once
+            more, then stop tracking those messages (no further edits). Reuses
+            the existing draft messages — never re-sends, so no duplication."""
+            await _draft_live(prose)
+            _draft_msgs.clear()
+
+        async def _show_placeholder() -> None:
+            if _placeholder.get("msg") is None:
+                _placeholder["msg"] = await _send_content("📊 描画中…")
+
+        async def _hide_placeholder() -> None:
+            ph = _placeholder.get("msg")
+            if ph is not None:
+                try:
+                    await ph.delete()
+                except discord.errors.HTTPException:
+                    pass
+                _placeholder["msg"] = None
+
+        async def _emit_block(seg) -> None:
+            """Render a Table/Math segment to an image (immutable, in order).
+            Removes the held placeholder first; falls back to text on failure."""
+            img_path = None
+            try:
+                if isinstance(seg, TableSegment):
+                    img_path = await render_table_image(seg.markdown, caption=seg.caption)
+                elif isinstance(seg, MathSegment):
+                    img_path = await render_math_image(seg.latex, display_mode=seg.display_mode)
+            except Exception as exc:
+                log.warning("[rid=%s] block render failed: %s", get_request_id(), exc)
+                img_path = None
+            # Drop the placeholder right before placing the final content so the
+            # image lands at the same position (a placeholder→image swap, never
+            # a raw-markdown→image swap).
+            await _hide_placeholder()
+            if img_path:
+                _rendered_images.append(img_path)
+                f = discord.File(img_path)
+                try:
+                    await _send_content(file=f)
+                finally:
+                    f.close()
+                return
+            # Render failed → raw-text fallback at the same position.
+            if isinstance(seg, TableSegment):
+                fallback = seg.markdown
+            else:
+                fallback = (f"```\n{seg.latex}\n```" if seg.display_mode
+                            else f"`{seg.latex}`")
+            for chunk in await asyncio.to_thread(
+                split_message, fallback, LIVE_DRAFT_LIMIT, numbered=False,
+            ):
+                await _send_content(_disp(chunk))
+
+        async def _render_incremental(full_text: str, *, final: bool = False,
+                                      force: bool = False) -> None:
+            full_text = full_text or ""
             async with _render_lock:
                 now_mono = time.monotonic()
-                if not force and (now_mono - _draft["last_edit"]) < STREAM_EDIT_INTERVAL_S:
+                if not final and not force and \
+                        (now_mono - _acc["last_edit"]) < STREAM_EDIT_INTERVAL_S:
                     return
-                _draft["last_edit"] = now_mono
-                # numbered=False keeps early-chunk content stable across renders
-                # (a part marker's "n" would change as the tail grows, forcing
-                # needless edits to already-settled messages).
-                chunks = split_message(full_text, limit=LIVE_DRAFT_LIMIT, numbered=False)
-                for i, chunk in enumerate(chunks):
-                    if not chunk.strip():
-                        continue
-                    # Safety net: a fence-balancing split could theoretically push
-                    # a chunk over LIVE_DRAFT_LIMIT to keep ``` pairs intact.
-                    # Truncate to DISCORD_HARD_CAP so we never trigger the 2000-
-                    # char API error.
-                    if len(chunk) > DISCORD_HARD_CAP:
-                        chunk = chunk[:DISCORD_HARD_CAP - 1] + "…"
-                    if i < len(_live_messages):
-                        existing = _live_messages[i]
-                        if getattr(existing, "content", None) == chunk:
-                            continue  # unchanged — skip the edit
-                        try:
-                            await existing.edit(content=chunk)
-                        except discord.errors.HTTPException:
-                            pass
+                _acc["last_edit"] = now_mono
+
+                if final:
+                    settled_end = len(full_text)
+                    is_open = False
+                else:
+                    settled, _pending, is_open = await asyncio.to_thread(
+                        split_settled, full_text,
+                    )
+                    settled_end = len(settled)
+
+                # Emit every closed block in [_emitted, settled_end] in order.
+                # Bounded loop: each iteration must advance _emitted (end > 0),
+                # but guard against a pathological zero-width span so the event
+                # loop can never spin here.
+                _guard = 0
+                while _guard < 500:
+                    _guard += 1
+                    region = full_text[_emitted["upto"]:settled_end]
+                    span = await asyncio.to_thread(first_block_span, region)
+                    if span is None:
+                        break
+                    start, end, seg = span
+                    if end <= 0:
+                        break  # never advances → bail (defensive)
+                    prose_before = region[:start]
+                    if prose_before.strip():
+                        await _finalize_text(prose_before)
                     else:
-                        try:
-                            if not _live_messages:
-                                sent = await message.reply(chunk)
-                            else:
-                                sent = await message.channel.send(chunk)
-                        except discord.errors.HTTPException as exc:
-                            log.warning("[rid=%s] draft send failed: %s",
-                                        get_request_id(), exc)
-                            return
-                        _live_messages.append(sent)
-                        _live_sent_any["v"] = True
+                        _draft_msgs.clear()  # freeze any stale draft before block
+                    await _emit_block(seg)
+                    _emitted["upto"] += end
+
+                # Trailing region after the last emitted block.
+                if final:
+                    tail = full_text[_emitted["upto"]:]
+                    if tail.strip():
+                        await _finalize_text(tail)
+                    await _hide_placeholder()
+                    return
+                if is_open:
+                    # Prose before the open block (settled) is shown live; the
+                    # open block is held behind the placeholder until it closes.
+                    await _draft_live(full_text[_emitted["upto"]:settled_end])
+                    await _show_placeholder()
+                else:
+                    await _hide_placeholder()
+                    await _draft_live(full_text[_emitted["upto"]:])
 
         async def _stream_preview(partial_turn_text: str) -> None:
             # In-progress text of the CURRENT turn appended to everything
-            # already committed. Throttled; never forced (the turn-final
-            # _incremental_send forces the authoritative render).
-            sep = "\n\n" if _draft["committed"] else ""
-            await _render_drafts(
-                _draft["committed"] + sep + (partial_turn_text or ""), force=False,
+            # already committed. Throttled (the turn-final _incremental_send
+            # forces a render; the post-stream final flush is authoritative).
+            sep = "\n\n" if _acc["committed"] else ""
+            await _render_incremental(
+                _acc["committed"] + sep + (partial_turn_text or ""),
             )
 
         async def _incremental_send(text: str) -> None:
             text = (text or "").strip()
             if not text:
                 return
-            sep = "\n\n" if _draft["committed"] else ""
-            _draft["committed"] = _draft["committed"] + sep + text
+            sep = "\n\n" if _acc["committed"] else ""
+            _acc["committed"] = _acc["committed"] + sep + text
             log.info(
-                "[rid=%s] live commit: turn=%d chars committed=%d",
-                get_request_id(), len(text), len(_draft["committed"]),
+                "[rid=%s] live commit: +%d chars committed=%d",
+                get_request_id(), len(text), len(_acc["committed"]),
             )
-            # Force an authoritative, fence-aware render of the full committed
-            # text (this is what splits >LIVE_DRAFT_LIMIT into extra drafts).
-            await _render_drafts(_draft["committed"], force=True)
+            await _render_incremental(_acc["committed"], force=True)
 
         # Single edit-overwriting notice for tool invocations. The user
         # asked that tool scaffolding (Bash command, Read path, Edit
@@ -2056,18 +2400,27 @@ async def on_message(message: discord.Message):
         # "" when the sender has no configured label — recorded as no
         # attribution, which keeps the pre-existing behaviour.
         sender_speaker_label = speaker_label(message.author.id)
-        response_text, session_info, actually_resumed = await call_with_tools(
-            prompt, message.channel.id, sessions,
-            status_callback=_update_status,
-            incremental_text_callback=_incremental_send,
-            text_stream_callback=_stream_preview,
-            tool_invocation_callback=_tool_invocation_send,
-            restricted=not admin,
-            raw_user_text=raw_user_text,
-            is_thread=is_thread,
-            has_image_attachment=bool(image_paths),
-            author=sender_speaker_label,
-            user_id=message.author.id,
+        # Start the CLI-style spinner: it owns status_msg until the call returns.
+        # SPINNER_MODE picks the renderer: "gif" = animated word-GIF (B), else
+        # the 1/sec text shimmer + animated emoji (A+C).
+        _spin["on"] = True
+        _spin["start"] = time.monotonic()
+        _spin_coro = _animate_gif() if SPINNER_MODE == "gif" else _animate()
+        _animator_task = _track_task(_spin_coro, name="status_spinner")
+        try:
+            response_text, session_info, actually_resumed = await call_with_tools(
+                prompt, message.channel.id, sessions,
+                status_callback=_update_status,
+                incremental_text_callback=_incremental_send,
+                text_stream_callback=_stream_preview,
+                tool_invocation_callback=_tool_invocation_send,
+                progress=_prog,
+                restricted=not admin,
+                raw_user_text=raw_user_text,
+                is_thread=is_thread,
+                has_image_attachment=bool(image_paths),
+                author=sender_speaker_label,
+                user_id=message.author.id,
             # 機能6: per-(channel,user) overrides set by /model and /effort.
             forced_model_override=_MODEL_OVERRIDES.get(
                 (message.channel.id, message.author.id)
@@ -2075,7 +2428,12 @@ async def on_message(message: discord.Message):
             forced_effort_override=_EFFORT_OVERRIDES.get(
                 (message.channel.id, message.author.id)
             ),
-        )
+            )
+        finally:
+            # Spinner hands status_msg back to the normal (throttled) flow.
+            _spin["on"] = False
+            if _animator_task is not None:
+                _animator_task.cancel()
 
         job.phase = JobPhase.FINALIZING
         await _update_status("🪄 整形中")
@@ -2133,8 +2491,9 @@ async def on_message(message: discord.Message):
             _pending_status["task"] = None
 
         # Delete status message (success path only — error paths leave a
-        # short explanation on it instead).
-        if status_msg is not None:
+        # short explanation on it instead). Skip when status_msg was repurposed
+        # as the first response message: deleting it would remove the response.
+        if status_msg is not None and not _status_consumed["v"]:
             try:
                 await status_msg.delete()
             except discord.errors.HTTPException:
@@ -2186,6 +2545,7 @@ async def on_message(message: discord.Message):
             from services.mem0.batch import (
                 append_turn as _batch_append_turn,
                 pop_batch as _batch_pop,
+                build_batch_summary as _build_batch_summary,
                 BATCH_SIZE as _BATCH_SIZE,
             )
 
@@ -2221,10 +2581,7 @@ async def on_message(message: discord.Message):
                 async def _mem0_batch_store():
                     try:
                         ctx_hint = _ctx_for_mem0 if MEM0_LEGACY_CONTEXT else ""
-                        summary_text = "\n".join(
-                            f"user: {t['user'][:300]}\nassistant: {t['assistant'][:300]}"
-                            for t in _batch_turns
-                        )
+                        summary_text = _build_batch_summary(_batch_turns)
                         log.info(
                             "Mem0 batch ingest: uid=%s turns=%d chars=%d",
                             mem0_user_id, len(_batch_turns), len(summary_text),
@@ -2270,6 +2627,11 @@ async def on_message(message: discord.Message):
                     attach_files.append(discord.File(img_path))
                     attached_paths.append(img_path)
                     log.info("Attaching image: %s", img_path)
+                except OSError as e:
+                    log.warning(
+                        "Failed to open image for attachment %s: [errno %s] %s",
+                        img_path, e.errno, e,
+                    )
                 except Exception as e:
                     log.warning("Failed to attach image %s: %s", img_path, e)
             # Then any other file type (admin only)
@@ -2280,56 +2642,29 @@ async def on_message(message: discord.Message):
                     attach_files.append(discord.File(file_path))
                     attached_paths.append(file_path)
                     log.info("Attaching file: %s", file_path)
+                except OSError as e:
+                    log.warning(
+                        "Failed to open file for attachment %s: [errno %s] %s",
+                        file_path, e.errno, e,
+                    )
                 except Exception as e:
                     log.warning("Failed to attach file %s: %s", file_path, e)
             # Keep file paths in the response text (don't strip them)
 
         try:
             if _live_sent_any["v"]:
-                # Live streaming already delivered the prose chunk by
-                # chunk via ``_incremental_send``. Two sub-paths:
-                #
-                # 1. Response has $$..$$ math or markdown tables that
-                #    streaming couldn't render. Delete the streamed
-                #    messages and re-emit the whole response via
-                #    _send_segmented so KaTeX/table images land at the
-                #    correct insertion points.
-                # 2. No rich content — keep the streamed prose and just
-                #    post attachments (images, files) as a follow-up.
-                _live_masked = mask_code_blocks(response_text)
-                _live_has_rich = (
-                    has_tables(response_text, _masked=_live_masked)
-                    or has_math(response_text, _masked=_live_masked)
-                )
-                if _live_has_rich:
-                    log.info(
-                        "[rid=%s] rich content detected post-stream; "
-                        "re-emitting via segmented send then removing %d streamed message(s)",
-                        get_request_id(), len(_live_messages),
-                    )
-                    # Re-emit FIRST, delete the streamed prose only after the
-                    # segmented send succeeds. If _send_segmented throws (table/
-                    # math render error, transient channel 429/5xx/Forbidden),
-                    # keep the already-streamed plain prose rather than deleting
-                    # it and leaving the channel content-less — the user loses
-                    # only the rich rendering, not the whole turn.
-                    try:
-                        await _send_segmented(message, response_text, attach_files)
-                    except Exception as _exc:
-                        log.warning(
-                            "[rid=%s] segmented re-emit failed; keeping %d "
-                            "streamed message(s): %s",
-                            get_request_id(), len(_live_messages), _exc,
-                        )
-                    else:
-                        for _m in _live_messages:
-                            try:
-                                await _m.delete()
-                            except (discord.errors.NotFound, discord.errors.HTTPException):
-                                pass
-                            except Exception as _exc:
-                                log.warning("failed to delete streamed msg: %s", _exc)
-                elif attach_files:
+                # Streaming already rendered prose + table/$$/$ block images in
+                # order via the incremental renderer (_render_incremental) — no
+                # raw markdown was ever shown then deleted. Run the authoritative
+                # final flush against the accumulated RAW text (the same offset
+                # space the streamer tracked) to emit any tail block not yet
+                # closed mid-stream and freeze the last prose. response_text is
+                # the post-processed canonical record used elsewhere (Mem0,
+                # attachment extraction); the streamed display already applied
+                # the same numeric-backtick strip per chunk, so the visible
+                # result matches.
+                await _render_incremental(_acc["committed"] or response_text, final=True)
+                if attach_files:
                     _reply_files = attach_files
                     if len(_reply_files) > 10:
                         log.warning(
@@ -2369,6 +2704,16 @@ async def on_message(message: discord.Message):
         finally:
             for f in attach_files:
                 f.close()
+            # Clean up temp images rendered in-stream by _emit_block (the
+            # non-streamed _send_segmented path cleans up its own).
+            if _rendered_images:
+                import os as _os
+                for _p in _rendered_images:
+                    try:
+                        _os.remove(_p)
+                    except OSError:
+                        pass
+                _rendered_images.clear()
 
         # Surface rejected attachments (P2): one short line per file with its
         # reason, instead of silently dropping. non-admin rejections are
@@ -2396,6 +2741,31 @@ async def on_message(message: discord.Message):
                 await status_msg.edit(content="⏹️ 中断しました")
             else:
                 await message.channel.send("⏹️ 中断しました")
+        except Exception:
+            pass
+    except OAuthRefreshFailed:
+        # The OAuth refresh token expired (invalid_grant) — every Anthropic
+        # call fails until a human re-authenticates. Tell the caller exactly
+        # what to do instead of the generic error. After `/login` rewrites the
+        # credentials, ensure_valid_token() reloads them, so the next message
+        # recovers with no restart. Log at warning (not exception) — the cause
+        # is known, the stack trace adds noise.
+        job.phase = JobPhase.FAILED
+        log.warning(
+            "OAuth refresh token expired; prompting for /login "
+            "(user ...%s in #%s)",
+            str(message.author.id)[-4:], message.channel,
+        )
+        oauth_text = (
+            "⚠️ OAuth トークンが失効しています。"
+            "ターミナルで `/login` を実行して再認証してください。"
+            "（再認証後は次のメッセージから自動で復帰します）"
+        )
+        try:
+            if status_msg is not None:
+                await status_msg.edit(content=oauth_text)
+            else:
+                await message.reply(oauth_text)
         except Exception:
             pass
     except Exception:

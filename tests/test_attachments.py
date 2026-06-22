@@ -111,6 +111,71 @@ class TestExtractImagePaths:
         paths = extract_image_paths(f"see {img}")
         assert paths == []
 
+    def test_path_with_space_in_backtick(self, allowed_tmp):
+        """Backtick-enclosed path containing a space must be extracted."""
+        img = allowed_tmp / "出力 (1).png"
+        img.write_bytes(_MAGIC["png"])
+        text = f"result: `{img}`"
+        paths = extract_image_paths(text)
+        assert str(img) in paths
+
+    def test_path_with_space_in_double_quote(self, allowed_tmp):
+        """Double-quote-enclosed path containing a space must be extracted."""
+        img = allowed_tmp / "my chart (final).png"
+        img.write_bytes(_MAGIC["png"])
+        text = f'see "{img}" here'
+        paths = extract_image_paths(text)
+        assert str(img) in paths
+
+    def test_path_with_space_in_single_quote(self, allowed_tmp):
+        """Single-quote-enclosed path containing a space must be extracted."""
+        img = allowed_tmp / "graph (v2).png"
+        img.write_bytes(_MAGIC["png"])
+        text = f"see '{img}' here"
+        paths = extract_image_paths(text)
+        assert str(img) in paths
+
+    def test_path_in_markdown_link(self, allowed_tmp):
+        """Markdown link [label](path) syntax must be extracted."""
+        img = allowed_tmp / "nikkei225 butterfly.png"
+        img.write_bytes(_MAGIC["png"])
+        text = f"[チャート]({img})"
+        paths = extract_image_paths(text)
+        assert str(img) in paths
+
+    def test_japanese_filename_no_space(self, allowed_tmp):
+        """Japanese filename without spaces (\\w-covered) must still work."""
+        img = allowed_tmp / "チャート解析.png"
+        img.write_bytes(_MAGIC["png"])
+        text = f"ファイル: {img} です"
+        paths = extract_image_paths(text)
+        assert str(img) in paths
+
+    def test_trailing_japanese_punctuation(self, allowed_tmp):
+        """Path ending immediately before Japanese punctuation must be extracted.
+
+        The standard IMAGE_PATH_RE accepts 。、,. as trailing delimiters.
+        A preceding space (after 'こちらが') acts as the leading delimiter.
+        """
+        img = allowed_tmp / "result.png"
+        img.write_bytes(_MAGIC["png"])
+        # Space before the path acts as leading delimiter; 。 acts as trailing.
+        text = f"こちらが {img}。"
+        paths = extract_image_paths(text)
+        assert str(img) in paths
+
+    def test_unenclosed_space_path_not_extracted(self, allowed_tmp):
+        """A path with spaces NOT enclosed by delimiters must NOT be extracted
+        to avoid false positives from prose text."""
+        img = allowed_tmp / "no space extraction.png"
+        img.write_bytes(_MAGIC["png"])
+        # No backtick, quote, or markdown link — bare text with space
+        text = f"check {img} done"
+        # The standard pattern won't match because of the space;
+        # the quoted pattern won't match because there's no delimiter.
+        paths = extract_image_paths(text)
+        assert str(img) not in paths
+
 
 class TestCleanupAttachments:
     def test_removes_files(self, tmp_path):
@@ -485,6 +550,42 @@ class TestExtractFilePathsExtra:
         text = f"see {f} and also {f}"
         result = extract_file_paths(text)
         assert len(result) == 1
+
+    def test_file_path_with_space_in_backtick(self, tmp_path, monkeypatch):
+        """Backtick-enclosed file path containing a space must be extracted."""
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        f = tmp_path / "report (final).csv"
+        f.write_text("a,b\n1,2\n")
+        text = f"output: `{f}`"
+        result = extract_file_paths(text)
+        assert str(f) in result
+
+    def test_file_path_with_space_in_double_quote(self, tmp_path, monkeypatch):
+        """Double-quote-enclosed file path containing a space must be extracted."""
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        f = tmp_path / "data export (2026).csv"
+        f.write_text("a,b\n")
+        text = f'see "{f}"'
+        result = extract_file_paths(text)
+        assert str(f) in result
+
+    def test_file_path_with_space_in_markdown_link(self, tmp_path, monkeypatch):
+        """Markdown link syntax with space in path must be extracted."""
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        f = tmp_path / "result (v2).txt"
+        f.write_text("hello\n")
+        text = f"[download]({f})"
+        result = extract_file_paths(text)
+        assert str(f) in result
+
+    def test_file_unenclosed_space_not_extracted(self, tmp_path, monkeypatch):
+        """A file path with spaces NOT enclosed must NOT be extracted."""
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        f = tmp_path / "no extract.csv"
+        f.write_text("a,b\n")
+        text = f"check {f} done"
+        result = extract_file_paths(text)
+        assert str(f) not in result
 
 
 class TestCleanupAttachmentsAsync:

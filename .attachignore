@@ -2,8 +2,25 @@
 # Supports glob patterns (fnmatch) and matches against both full path and basename.
 # One pattern per line. Lines starting with # are comments.
 
-# Discord Bot
-/home/ubuntu/discord-bot/*
+# Discord Bot — block source/config/secret files but allow render outputs.
+# CLAUDE.md states "admin images: /home/ubuntu/ subdirs are OK to attach",
+# so a blanket /home/ubuntu/discord-bot/* block contradicts that policy.
+# We keep source code, env files, and caches blocked; render artefacts
+# (e.g. /tmp/*) are already outside this tree and need no entry here.
+/home/ubuntu/discord-bot/*.py
+/home/ubuntu/discord-bot/*.sh
+/home/ubuntu/discord-bot/*.json
+/home/ubuntu/discord-bot/*.yml
+/home/ubuntu/discord-bot/*.yaml
+/home/ubuntu/discord-bot/*.toml
+/home/ubuntu/discord-bot/.env*
+/home/ubuntu/discord-bot/services/*
+/home/ubuntu/discord-bot/utils/*
+/home/ubuntu/discord-bot/tests/*
+/home/ubuntu/discord-bot/scripts/*
+/home/ubuntu/discord-bot/.claude/*
+/home/ubuntu/discord-bot/.venv/*
+/home/ubuntu/discord-bot/__pycache__/*
 
 # News Curator
 /home/ubuntu/news-curator/*

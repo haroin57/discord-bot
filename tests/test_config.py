@@ -248,11 +248,13 @@ class TestModuleLevelEnvBranches:
         return config
 
     def test_brave_api_key_adds_server(self, monkeypatch):
+        # ADR-0022: direct stdio (bot-owned, self-reaping), not supergateway HTTP.
         cfg = self._reload_config(monkeypatch, {"BRAVE_API_KEY": "test-brave-key"})
         assert "brave-search" in cfg.MCP_SERVERS_WEB
-        assert cfg.MCP_SERVERS_WEB["brave-search"]["type"] == "http"
-        assert cfg.MCP_SERVERS_WEB["brave-search"]["url"] == "http://127.0.0.1:8012/mcp"
-        assert "env" not in cfg.MCP_SERVERS_WEB["brave-search"]
+        entry = cfg.MCP_SERVERS_WEB["brave-search"]
+        assert entry["command"] == "npx"
+        assert any("@brave/brave-search-mcp-server@" in a for a in entry["args"])
+        assert entry["env"]["BRAVE_API_KEY"] == "test-brave-key"
 
     def test_tavily_api_key_adds_server(self, monkeypatch):
         cfg = self._reload_config(monkeypatch, {"TAVILY_API_KEY": "test-tavily-key"})
@@ -264,12 +266,14 @@ class TestModuleLevelEnvBranches:
         assert "github" in cfg.MCP_SERVERS
         assert "ghp_test" in cfg.MCP_SERVERS["github"]["headers"]["Authorization"]
 
-    def test_google_maps_api_key_uses_shared_http(self, monkeypatch):
+    def test_google_maps_api_key_adds_stdio_server(self, monkeypatch):
+        # ADR-0022: direct stdio (bot-owned, self-reaping), not supergateway HTTP.
         cfg = self._reload_config(monkeypatch, {"GOOGLE_MAPS_API_KEY": "test-google-key"})
         assert "google-maps" in cfg.MCP_SERVERS_WEB
-        assert cfg.MCP_SERVERS_WEB["google-maps"]["type"] == "http"
-        assert cfg.MCP_SERVERS_WEB["google-maps"]["url"] == "http://127.0.0.1:8025/mcp"
-        assert "env" not in cfg.MCP_SERVERS_WEB["google-maps"]
+        entry = cfg.MCP_SERVERS_WEB["google-maps"]
+        assert entry["command"] == "npx"
+        assert any("server-google-maps@" in a for a in entry["args"])
+        assert entry["env"]["GOOGLE_MAPS_API_KEY"] == "test-google-key"
 
     def test_admin_user_ids_invalid_raises(self, monkeypatch):
         monkeypatch.setenv("ADMIN_USER_IDS", "notanumber,alsoinvalid")

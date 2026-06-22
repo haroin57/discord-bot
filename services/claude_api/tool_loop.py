@@ -1661,6 +1661,10 @@ async def run_agent_loop(
         # in-loop turn to ride straight into a Fable refusal. When the last
         # turn's real context footprint crossed the floor, replace the prior
         # window with the freshly compacted one and continue the same loop.
+        # Model-window-based trigger (CLI et6(K) port), unified with the
+        # boundary trigger so the in-loop fold doesn't pre-empt it at a lower
+        # flat constant. HISTORY_COMPACT_PCT_OVERRIDE dials both.
+        from services.claude_api.compaction import compact_threshold_tokens
         if (
             PROACTIVE_COMPACT_ENABLED
             and proactive_compact is not None
@@ -1668,7 +1672,7 @@ async def run_agent_loop(
             and _context_tokens({
                 f: _usage_number(getattr(final_msg, "usage", None), f)
                 for f in _USAGE_FIELDS
-            }) > PROACTIVE_COMPACT_TRIGGER_TOKENS
+            }) > compact_threshold_tokens()
         ):
             try:
                 new_prior = await proactive_compact()

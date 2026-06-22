@@ -35,6 +35,7 @@ from config import (
     ADMIN_MAX_TURNS as _CONFIG_ADMIN_MAX_TURNS,
     ATTACHMENT_DIR,
     CLAUDE_CLI_ENV,
+    CLAUDE_MODEL,
     CLAUDE_MAX_ATTEMPTS,
     CLAUDE_MAX_BACKOFF_S,
     CLAUDE_MAX_PARALLEL,
@@ -81,7 +82,10 @@ _RESTRICTED_DENY_LIST = [
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
-MODEL = "claude-fable-5"
+# Sourced from config (env CLAUDE_MODEL, default claude-opus-4-8) — was a live
+# hardcoded "claude-fable-5" that 404s server-side ("use Opus 4.8"). Keep it
+# config-driven so reverting to Fable is a one-line .env flip.
+MODEL = CLAUDE_MODEL
 
 # ---------------------------------------------------------------------------
 # Timeout / turns
@@ -259,7 +263,6 @@ _MCP_CMDLINE_PATTERNS = (
     "context7-mcp",
     "x-scraper/mcp_server.py",
     "scholarly-mcp/server.py",
-    "news-curator/mcp_server.py",
     "papermcp",
     "tavily-mcp",
 )

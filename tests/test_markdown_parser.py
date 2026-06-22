@@ -6,10 +6,12 @@ from utils.markdown_parser import (
     MathSegment,
     TableSegment,
     TextSegment,
+    first_block_span,
     has_math,
     has_tables,
     mask_code_blocks,
     parse_segments,
+    split_settled,
 )
 
 
@@ -95,7 +97,16 @@ class TestHasMath:
         assert has_math(text) is True
 
     def test_inline_math_detected(self):
-        assert has_math("The value is $x + 1$ here.") is True
+        # inline math now requires a LaTeX marker (= \ ^ _ { }) so currency
+        # like "$50" isn't matched; use "=" here.
+        assert has_math("The value is $x = 1$ here.") is True
+
+    def test_inline_currency_not_detected(self):
+        # Regression: plain currency must NOT be treated as inline math.
+        assert has_math("価格は$50、送料$10") is False
+        assert has_math("$5から$10です") is False
+        assert has_math("$100-$200") is False
+        assert has_math("from $5 to $10") is False
 
     def test_no_math(self):
         assert has_math("just plain text") is False
@@ -208,11 +219,11 @@ class TestParseSegmentsMath:
         assert "$$" not in ms.latex
 
     def test_inline_math_extracted(self):
-        segs = parse_segments("Value is $x+1$ here.")
+        segs = parse_segments("Value is $x=1$ here.")
         assert any(isinstance(s, MathSegment) and not s.display_mode for s in segs)
 
     def test_inline_math_latex_stripped_of_delimiters(self):
-        segs = parse_segments("Value is $x+1$ here.")
+        segs = parse_segments("Value is $x=1$ here.")
         ms = next(s for s in segs if isinstance(s, MathSegment))
         assert "$" not in ms.latex
 
@@ -235,7 +246,7 @@ class TestParseSegmentsMath:
         assert ms_list[0].display_mode is True
 
     def test_multiple_inline_math(self):
-        text = "Let $a$ and $b$ be integers."
+        text = "Let $a=1$ and $b=2$ be integers."
         segs = parse_segments(text)
         math_segs = [s for s in segs if isinstance(s, MathSegment)]
         assert len(math_segs) == 2
@@ -274,3 +285,336 @@ class TestParseSegmentsCombined:
         segs = parse_segments(text)
         texts = " ".join(s.content for s in segs if isinstance(s, TextSegment))
         assert texts.count("Unique text") == 1
+
+
+# ---------------------------------------------------------------------------
+# split_settled — incremental streaming split (B)
+# ---------------------------------------------------------------------------
+
+class TestSplitSettled:
+    TABLE = "| X | Y |\n|---|---|\n| 1 | 2 |\n"
+
+    def test_invariant_settled_plus_pending_equals_text(self):
+        for text in ("", "hello", "a $$x$$ b", "row\n" + self.TABLE,
+                     "open $$x", "open $y", "```py\ncode"):
+            settled, pending, _ = split_settled(text)
+            assert settled + pending == text
+
+    def test_empty(self):
+        assert split_settled("") == ("", "", False)
+
+    def test_plain_prose_is_all_pending_prose(self):
+        # No blocks → nothing settled, the whole thing streams live as prose.
+        settled, pending, is_open = split_settled("just some prose being typed")
+        assert settled == ""
+        assert pending == "just some prose being typed"
+        assert is_open is False
+
+    def test_closed_display_math_is_settled(self):
+        text = "before\n\n$$x = y$$\n\nafter prose"
+        settled, pending, is_open = split_settled(text)
+        # The closed $$ and the text before it are settled; trailing prose pends.
+        assert "$$x = y$$" in settled
+        assert pending.strip() == "after prose"
+        assert is_open is False
+
+    def test_open_display_math_is_held(self):
+        text = "intro text\n\n$$x = "
+        settled, pending, is_open = split_settled(text)
+        assert settled == "intro text\n\n"
+        assert pending == "$$x = "
+        assert is_open is True
+
+    def test_open_inline_math_is_held(self):
+        text = "the value $x = "
+        settled, pending, is_open = split_settled(text)
+        assert settled == "the value "
+        assert pending == "$x = "
+        assert is_open is True
+
+    def test_closed_inline_math_is_settled(self):
+        text = "the value $x=y$ is set, and more"
+        settled, pending, is_open = split_settled(text)
+        assert "$x=y$" in settled
+        assert "and more" in pending
+        assert is_open is False
+
+    def test_lone_dollar_with_newline_not_held(self):
+        # A price like "$5\n..." is a literal $, not open inline math.
+        text = "it costs $5 today\nand tomorrow too"
+        settled, pending, is_open = split_settled(text)
+        assert is_open is False
+        # Everything streams as prose (no hold).
+        assert settled == ""
+        assert pending == text
+
+    def test_even_dollars_not_held(self):
+        text = "from $5 to $10 range"  # two literal $ → even → no hold
+        _, _, is_open = split_settled(text)
+        assert is_open is False
+
+    def test_growing_table_is_held_from_its_start(self):
+        # Header + separator + one row, nothing after → table may still grow.
+        text = "Here is data:\n\n" + self.TABLE
+        settled, pending, is_open = split_settled(text)
+        assert settled == "Here is data:\n\n"
+        assert pending == self.TABLE
+        assert is_open is True
+
+    def test_table_followed_by_prose_is_settled(self):
+        text = "intro\n\n" + self.TABLE + "\nconclusion line"
+        settled, pending, is_open = split_settled(text)
+        assert self.TABLE.strip() in settled
+        assert "conclusion line" in pending
+        assert is_open is False
+
+    def test_trailing_prose_after_block_is_pending(self):
+        # The growing prose run after a closed block must NOT be settled — it's
+        # the live draft and still accepts more characters.
+        text = "lead\n\n$$x$$\n\nthis tail is still being typed"
+        settled, pending, is_open = split_settled(text)
+        assert "$$x$$" in settled
+        assert "still being typed" in pending
+        assert is_open is False
+
+    def test_partial_table_header_only_is_held(self):
+        # Just the header line typed so far — hold before the raw row flashes.
+        text = "data:\n\n| A | B |\n"
+        settled, pending, is_open = split_settled(text)
+        assert settled == "data:\n\n"
+        assert pending == "| A | B |\n"
+        assert is_open is True
+
+    def test_partial_table_header_and_separator_held(self):
+        text = "data:\n\n| A | B |\n|---|---|\n"
+        settled, pending, is_open = split_settled(text)
+        assert settled == "data:\n\n"
+        assert is_open is True
+
+    def test_table_then_blank_line_is_settled(self):
+        # A blank line terminates the table → settled even with no prose after.
+        text = "x\n\n" + self.TABLE + "\n"
+        settled, pending, is_open = split_settled(text)
+        assert self.TABLE.strip() in settled
+        assert is_open is False
+
+    def test_open_code_fence_is_prose_not_block(self):
+        # Code being typed streams live as text, not held as a render block.
+        # With no closed render block before it, the whole thing is one live
+        # prose run (settled empty).
+        text = "explanation\n\n```python\nx = 1\n"
+        settled, pending, is_open = split_settled(text)
+        assert is_open is False
+        assert "```python" in pending
+        assert settled == ""
+
+    def test_dollar_inside_closed_code_not_counted(self):
+        # A $ inside a CLOSED code block must not look like open inline math.
+        # No real render block → all one live prose run, no hold.
+        text = "```bash\necho $HOME\n```\nplain tail"
+        settled, pending, is_open = split_settled(text)
+        assert is_open is False
+        assert pending == text
+
+    def test_dollar_inside_open_code_fence_not_counted(self):
+        # $ inside an OPEN code fence is code being typed, not open math.
+        text = "intro\n\n```bash\necho $HOME"
+        settled, pending, is_open = split_settled(text)
+        assert is_open is False
+        assert "```bash" in pending
+
+    def test_table_inside_code_not_held(self):
+        # Pipes inside a closed code block aren't a table → no hold.
+        text = "```\n| not | a | table |\n```\nreal tail"
+        settled, pending, is_open = split_settled(text)
+        assert is_open is False
+        assert pending == text
+
+    def test_two_closed_blocks_both_settled(self):
+        text = "a\n\n$$p$$\n\nb\n\n" + self.TABLE + "\ntail"
+        settled, pending, is_open = split_settled(text)
+        assert "$$p$$" in settled
+        assert self.TABLE.strip() in settled
+        assert "tail" in pending
+        assert is_open is False
+
+    def test_settled_prefix_grows_monotonically(self):
+        # As the stream grows, the settled prefix never shrinks (stable
+        # finalization — earlier settled content stays settled).
+        steps = [
+            "Intro ",
+            "Intro text.\n\n$$a+b",
+            "Intro text.\n\n$$a+b$$\n\n",
+            "Intro text.\n\n$$a+b$$\n\nmore prose",
+            "Intro text.\n\n$$a+b$$\n\nmore prose\n\n" + self.TABLE,
+        ]
+        prev_len = 0
+        for s in steps:
+            settled, _, _ = split_settled(s)
+            assert len(settled) >= prev_len
+            prev_len = len(settled)
+
+    def test_settled_is_parseable_into_closed_segments(self):
+        # Whatever lands in `settled` must round-trip through parse_segments
+        # with all math/tables closed (the finalize step relies on this).
+        text = "lead $a=1$ mid\n\n$$Q$$\n\n" + self.TABLE + "\nopen $$z"
+        settled, pending, is_open = split_settled(text)
+        assert pending == "$$z"
+        assert is_open is True
+        segs = parse_segments(settled)
+        # The two math + one table closed in `settled` are detected.
+        assert any(isinstance(s, TableSegment) for s in segs)
+        assert sum(isinstance(s, MathSegment) for s in segs) >= 2
+
+
+# ---------------------------------------------------------------------------
+# first_block_span — leftmost closed block for the incremental streamer (B)
+# ---------------------------------------------------------------------------
+
+class TestFirstBlockSpan:
+    TABLE = "| X | Y |\n|---|---|\n| 1 | 2 |\n"
+
+    def test_none_when_no_block(self):
+        assert first_block_span("just plain prose, no blocks") is None
+
+    def test_finds_display_math_with_offsets(self):
+        text = "lead in $$E=mc^2$$ trailing"
+        span = first_block_span(text)
+        assert span is not None
+        start, end, seg = span
+        assert text[start:end] == "$$E=mc^2$$"
+        assert isinstance(seg, MathSegment)
+        assert seg.display_mode is True
+        assert seg.latex == "E=mc^2"
+
+    def test_finds_inline_math(self):
+        text = "value $a=b$ here"
+        start, end, seg = first_block_span(text)
+        assert text[start:end] == "$a=b$"
+        assert isinstance(seg, MathSegment)
+        assert seg.display_mode is False
+        assert seg.latex == "a=b"
+
+    def test_finds_table_with_offsets(self):
+        text = "before\n\n" + self.TABLE + "\nafter"
+        start, end, seg = first_block_span(text)
+        assert isinstance(seg, TableSegment)
+        assert text[start:end].strip().startswith("| X | Y |")
+
+    def test_leftmost_block_wins(self):
+        text = "x $a=1$ then\n\n" + self.TABLE
+        start, end, seg = first_block_span(text)
+        # The inline math comes before the table → it's returned first.
+        assert isinstance(seg, MathSegment)
+        assert text[start:end] == "$a=1$"
+
+    def test_table_absorbs_preceding_heading_as_caption(self):
+        text = "intro\n\n### My Caption\n" + self.TABLE
+        start, end, seg = first_block_span(text)
+        assert isinstance(seg, TableSegment)
+        assert seg.caption == "My Caption"
+        # The heading is folded into the span (not left as dangling prose).
+        assert "### My Caption" in text[start:end]
+        # Prose before the span is just the intro.
+        assert text[:start].strip() == "intro"
+
+    def test_ignores_block_inside_code_fence(self):
+        text = "```\n$$not math$$\n```\nreal $x=1$ here"
+        start, end, seg = first_block_span(text)
+        # The $$ inside the code fence is masked; the real inline $x=1$ wins.
+        assert text[start:end] == "$x=1$"
+
+
+# ---------------------------------------------------------------------------
+# Streaming composition: replay split_settled + first_block_span over growing
+# prefixes the way bot.py's incremental renderer does, and assert the two
+# guarantees the renderer relies on:
+#   1. Every block is emitted exactly once, in order (== parse_segments).
+#   2. A raw block NEVER leaks into the live-prose region (no flash-then-delete).
+# ---------------------------------------------------------------------------
+
+def _replay_stream(full_text: str, step: int):
+    """Mirror _render_incremental's block-emission + live-prose logic."""
+    emitted = 0
+    blocks: list = []
+    live_snapshots: list[str] = []
+    n = len(full_text)
+    cut = step
+    while True:
+        final = cut >= n
+        prefix = full_text[:n if final else cut]
+        if final:
+            settled_end, is_open = len(prefix), False
+        else:
+            settled, _pending, is_open = split_settled(prefix)
+            settled_end = len(settled)
+        # emit every closed block in [emitted, settled_end]
+        guard = 0
+        while guard < 1000:
+            guard += 1
+            region = prefix[emitted:settled_end]
+            span = first_block_span(region)
+            if span is None:
+                break
+            start, end, seg = span
+            blocks.append(seg)
+            emitted += end
+        if final:
+            break
+        live = prefix[emitted:settled_end] if is_open else prefix[emitted:]
+        live_snapshots.append(live)
+        cut += step
+    return blocks, live_snapshots
+
+
+class TestStreamingComposition:
+    TABLE = "| X | Y |\n|---|---|\n| 1 | 2 |\n"
+    CASES = [
+        "Just plain prose with no blocks at all, streamed in.",
+        "Intro text.\n\n$$E = mc^2$$\n\nThen a closing remark.",
+        "Lead.\n\nHere is $a + b$ inline and more prose after it.",
+        "See the data:\n\n" + TABLE + "\nThat concludes the table.",
+        "Mix: $x$ then\n\n$$y=1$$\n\n" + TABLE + "\n\nfinal words.",
+        "### Caption\n" + TABLE + "\nafter caption table.",
+        "Cost is $5 today, around $10 tomorrow — no math here.",
+        "```python\nx = '$$ not math $$'\n| not | table |\n```\nreal tail.",
+    ]
+
+    def _expected_blocks(self, text):
+        return [
+            (type(s).__name__,
+             getattr(s, "latex", getattr(s, "markdown", "")).strip())
+            for s in parse_segments(text)
+            if isinstance(s, (TableSegment, MathSegment))
+        ]
+
+    def test_all_blocks_emitted_in_order(self):
+        for text in self.CASES:
+            for step in (1, 3, 7, 50):
+                blocks, _ = _replay_stream(text, step)
+                got = [
+                    (type(s).__name__,
+                     getattr(s, "latex", getattr(s, "markdown", "")).strip())
+                    for s in blocks
+                ]
+                assert got == self._expected_blocks(text), (text, step, got)
+
+    def test_no_raw_block_leaks_into_live_prose(self):
+        # The live-prose region the renderer drafts must never contain a block
+        # that split_settled considers EMITTABLE (a closed table/math outside an
+        # open code fence) — that's the flash-then-delete the rewrite removes.
+        # (has_math/has_tables would false-positive on $$ typed inside an open
+        # code fence, which is legitimate raw code, not a render block — so we
+        # use the fence-aware split_settled to define "emittable".)
+        for text in self.CASES:
+            for step in (1, 3, 7, 50):
+                _, snapshots = _replay_stream(text, step)
+                for snap in snapshots:
+                    settled_part = split_settled(snap)[0]
+                    assert first_block_span(settled_part) is None, (text, step, snap)
+
+    def test_blocks_emitted_once_no_duplicates(self):
+        text = "a\n\n$$p$$\n\nb\n\n" + self.TABLE + "\n\nc $q$ d"
+        for step in (1, 2, 5, 13):
+            blocks, _ = _replay_stream(text, step)
+            assert len(blocks) == len(self._expected_blocks(text))

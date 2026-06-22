@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 # run daily). DO NOT edit between the marker comments; manual edits will be
 # clobbered on the next refresh run.
 # AUTO-CAPTURE-START
-CC_VERSION = "2.1.170"
+CC_VERSION = "2.1.177"
 CC_ENTRYPOINT = "sdk-cli"
 MODEL_BETAS = [
     "claude-code-20250219",
@@ -31,8 +31,6 @@ MODEL_BETAS = [
     "mid-conversation-system-2026-04-07",
     "advanced-tool-use-2025-11-20",
     "effort-2025-11-24",
-    "server-side-fallback-2026-06-01",
-    "fallback-credit-2026-06-01",
     "extended-cache-ttl-2025-04-11",
 ]
 CLI_IDENTITY_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
@@ -47,16 +45,23 @@ CLI_IDENTITY_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent S
 _EXTRA_BETAS = []
 if os.environ.get("CONTEXT_1M_ENABLED", "1") not in ("0", "false", "False", ""):
     _EXTRA_BETAS.append("context-1m-2025-08-07")
+# Server-side model fallback betas (ADR-0015). A minimal `claude -p` capture
+# does NOT emit these (no fallback configured in that ping), so they live OUTSIDE
+# the AUTO-CAPTURE block — otherwise a refresh would strip them and break the
+# server-side `fallbacks` body field used for the (kept) Fable refusal fallback.
+_EXTRA_BETAS.append("server-side-fallback-2026-06-01")
+_EXTRA_BETAS.append("fallback-credit-2026-06-01")
 for _b in _EXTRA_BETAS:
     if _b not in MODEL_BETAS:
         MODEL_BETAS.append(_b)
 
 USER_AGENT = f"claude-cli/{CC_VERSION} (external, {CC_ENTRYPOINT})"
 
-# Body fields the CLI always sends alongside the betas above. These are
-# pinned verbatim from the 2026-05-14 mitm capture of claude-cli 2.1.92
-# against /v1/messages so the bot's request byte-shape matches the
-# subscriber-tier identification path.
+# Body fields the CLI always sends alongside the betas above. These stay
+# hand-pinned (the AUTO-CAPTURE block above tracks CC_VERSION/betas/identity
+# from the live capture, but these body fields are not auto-extracted) to match
+# the live claude-cli request byte-shape on the subscriber-tier identification
+# path.
 #
 # - thinking.type = "adaptive": let the model spend as much thinking budget as
 #   it judges necessary (no fixed cap below max_tokens). Kept byte-identical to
@@ -64,11 +69,10 @@ USER_AGENT = f"claude-cli/{CC_VERSION} (external, {CC_ENTRYPOINT})"
 #   (We briefly tried display="summarized" while debugging fable-5 refusals, but
 #   the real fix was output_config reaching the wire (ADR-0009), so we reverted
 #   to match the CLI exactly.)
-# - output_config.effort: defaults to "medium" (haroin's instruction — keep
-#   Fable 5 on the medium tier for predictable latency and token usage; the
-#   CLI's own default is "high"). Env-tunable via CLAUDE_EFFORT /
-#   CLAUDE_CODE_EFFORT_LEVEL so the dial is a config knob, not a buried
-#   constant (audit #4).
+# - output_config.effort: env-driven via CLAUDE_EFFORT (.env pins "max" for
+#   Opus 4.8 — haroin 2026-06-20). Valid tiers: low|medium|high|xhigh|max;
+#   opus-4-8 accepts "max" (verified by a live HTTP 200). The CLI's own 4.8
+#   default is "high". CLAUDE_CODE_EFFORT_LEVEL is also honored.
 # - context_management.clear_thinking_20251015 with keep="all": the
 #   server-side bookkeeping the CLI requests for the new
 #   advanced-tool-use beta. Mirroring it keeps overage-cohort routing
@@ -76,26 +80,18 @@ USER_AGENT = f"claude-cli/{CC_VERSION} (external, {CC_ENTRYPOINT})"
 THINKING_CONFIG = {"type": "adaptive"}
 OUTPUT_CONFIG = {"effort": CLAUDE_EFFORT}
 CONTEXT_MANAGEMENT_CONFIG = {
+    # CLI parity (2026-06-20): the real claude-cli 2.1.177 sends ONLY
+    # clear_thinking_20251015 keep:all — it sends NO clear_tool_uses edit. The
+    # previous clear_tool_uses_20250919 block (trigger 150k, keep 5) was a
+    # bot-only extension and a request-shape divergence (possible ratelimit-
+    # cohort difference), so it was removed for strict CLI byte-parity. Old
+    # tool-result bloat is handled by context-1m (1M window) + history
+    # compaction (config.HISTORY_COMPACT_*), not by a server-side edit.
     "edits": [
         {"type": "clear_thinking_20251015", "keep": "all"},
-        # ADR-0010 phase 2: server-side auto-compaction of old tool results.
-        # Fires only once the request is already heavy (Fable 5 starts
-        # refusing around ~240k input tokens; 150k leaves headroom), so the
-        # prompt-cache prefix is NOT rewritten on normal-sized turns. Every
-        # clear invalidates the cache prefix, so we only pay that cost when
-        # it frees a meaningful chunk (clear_at_least). Keeps the 5 most
-        # recent tool uses so mid-workflow context survives. Note: this
-        # compacts tool results only — plain long conversations are handled
-        # by the sticky fallback-model pinning in entry.py, not by this edit.
-        {
-            "type": "clear_tool_uses_20250919",
-            "trigger": {"type": "input_tokens", "value": 150000},
-            "keep": {"type": "tool_uses", "value": 5},
-            "clear_at_least": {"type": "input_tokens", "value": 20000},
-        },
     ],
 }
-CLAUDE_MAX_TOKENS_OPUS = 32000  # matched to real claude-cli request (2026-06-10)
+CLAUDE_MAX_TOKENS_OPUS = 64000  # claude-cli opus-4-8 default (2026-06-20)
 
 _session_id = str(uuid.uuid4())
 
@@ -113,13 +109,15 @@ def supports_adaptive_thinking(model: str) -> bool:
 
 
 def _load_cli_default_system_prompt() -> str:
-    """The CLI's default agent system prompt (system[2] in mitm capture).
+    """The CLI's default agent system prompt (system[2] in the mitm capture).
 
-    Pinned verbatim from the real claude-cli 2.1.92 against /v1/messages
-    on model=claude-opus-4-6. Sending this block at system[2] (with
-    ``cache_control={"type":"ephemeral","scope":"global"}``) appears to
-    be required for subscriber-tier identification — without it the
-    server returns 429 with zero ratelimit-unified headers.
+    Auto-refreshed from a LIVE claude-cli /v1/messages capture by
+    scripts/apply_cli_identity.py (last: 2.1.177 / claude-opus-4-8, 2026-06-20;
+    replaced a hand-fabricated stand-in). Sending this block at system[2] (with
+    ``cache_control={"type":"ephemeral","scope":"global"}``) is part of the
+    subscriber-tier identification path — without it the server returns 429 with
+    zero ratelimit-unified headers. Do NOT hand-edit cli_default_system_prompt.txt;
+    the refresh overwrites it.
     """
     import os as _os
     path = _os.path.join(_os.path.dirname(__file__),

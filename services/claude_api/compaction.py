@@ -78,6 +78,35 @@ _compact_blocked_until: dict[int, float] = {}
 MAX_CONSECUTIVE_RAPID_REFILLS = 3
 _rapid_refills: dict[int, int] = {}
 
+# Boundary auto-compaction trigger, modelled on the CLI's et6(K)=ZQ(K)-Pe1.
+# Fire near the effective context window minus the model's output budget and a
+# headroom buffer for the compaction summary turn itself (≈ CLI Pe1).
+_COMPACT_HEADROOM_TOKENS = 45_000
+_COMPACT_FLOOR_TOKENS = 20_000
+
+
+def effective_context_window() -> int:
+    """Model context window in tokens: 1M with the context-1m beta, else 200K."""
+    import config
+    return 1_000_000 if config.CONTEXT_1M_ENABLED else 200_000
+
+
+def compact_threshold_tokens() -> int:
+    """Tokens at which boundary auto-compaction fires (CLI et6(K) port).
+
+    Default: ``effective_window − CLAUDE_MAX_TOKENS − headroom`` (near-full, like
+    the CLI). ``HISTORY_COMPACT_PCT_OVERRIDE`` (percent of the window) forces a
+    flat ratio instead — set 50 to keep the old fixed 500K-on-1M behaviour when
+    per-turn cost matters more than retained context.
+    """
+    import config
+    win = effective_context_window()
+    pct = getattr(config, "HISTORY_COMPACT_PCT_OVERRIDE", 0) or 0
+    if pct > 0:
+        return max(_COMPACT_FLOOR_TOKENS, int(win * pct / 100.0))
+    reserve = int(getattr(config, "CLAUDE_MAX_TOKENS", 64000)) + _COMPACT_HEADROOM_TOKENS
+    return max(_COMPACT_FLOOR_TOKENS, min(win - reserve, win - 1000))
+
 
 def record_proactive_compaction(channel_id: int) -> None:
     """Note that an in-loop proactive compaction fired for this request."""
@@ -106,7 +135,14 @@ COMPACT_SYSTEM_PROMPT = (
 # Verbatim official-CLI compact instruction template (claude.exe, 2026-06-12),
 # with one bot-specific "Additional Instructions" block appended — the
 # template itself invites those.
-COMPACT_INSTRUCTIONS = """Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
+COMPACT_INSTRUCTIONS = """CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+
+- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
+- You already have all the context you need in the conversation above.
+- Tool calls will be REJECTED and will waste your only turn — you will fail the task.
+- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
+
+Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
 This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.
 
 Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts and ensure you've covered all necessary points. In your analysis process:

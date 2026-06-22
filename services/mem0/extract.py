@@ -2,10 +2,75 @@
 
 import logging
 import os
+import re
 
 from services.oauth_manager import ensure_valid_token, get_access_token, init as oauth_init
 
 log = logging.getLogger(__name__)
+
+
+def _salvage_json_objects(text: str, array_key: str) -> list[dict]:
+    """Recover every *complete* top-level object from a (possibly truncated)
+    JSON array bound to ``array_key`` — e.g. ``'"facts":[ {..}, {..}, {.. <cut>'``.
+
+    The extractor's response is sometimes cut off mid-generation (max_tokens or
+    a degraded-token stream), which makes ``json.loads`` reject the *entire*
+    payload and silently drop a whole batch of facts. This walks the array with
+    a brace/bracket depth counter that is string- and escape-aware, json.loads
+    each balanced ``{...}`` element individually, and drops only the trailing
+    element that was cut. Returns ``[]`` if the key/array isn't present.
+    """
+    if not text:
+        return []
+    import json as _json
+    m = re.search(r'"' + re.escape(array_key) + r'"\s*:\s*\[', text)
+    if not m:
+        return []
+    i = m.end()  # index just past the opening '['
+    objs: list[dict] = []
+    depth = 0
+    start: int | None = None
+    in_str = False
+    esc = False
+    while i < len(text):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    obj = _json.loads(text[start:i + 1])
+                    if isinstance(obj, dict):
+                        objs.append(obj)
+                except _json.JSONDecodeError:
+                    pass
+                start = None
+        elif ch == "]" and depth == 0:
+            break  # array closed cleanly
+        i += 1
+    return objs
+
+
+def _salvage_facts(text: str) -> dict:
+    """Best-effort recovery of ``{"facts": [...], "relations": [...]}`` from a
+    truncated extractor response. Each array is salvaged independently so a cut
+    in ``relations`` never costs us the ``facts`` recovered before it."""
+    return {
+        "facts": _salvage_json_objects(text, "facts"),
+        "relations": _salvage_json_objects(text, "relations"),
+    }
 
 # ---------------------------------------------------------------------------
 # Ingestion-time LLM classification (P2)
@@ -266,51 +331,79 @@ async def extract_full_signals(
         "loves", "dislikes", "knows", "works_at", "lives_in",
         "made_by", "is_about", "friend_of", "parent_of", "sibling_of",
     }
+    import json as _json
     try:
         from services.mem0.client import get_anthropic_client
         client = await get_anthropic_client()
         if client is None:
             return empty
-        from config import MEM0_GATE_MODEL
+        from config import (
+            MEM0_GATE_MODEL, MEM0_EXTRACT_MAX_TOKENS, MEM0_EXTRACT_INPUT_CHARS,
+        )
         from services.mem0.cli_compat import cli_messages_create, extract_text
         known_entities_body = _format_known_entities(user_id)
-        resp = await cli_messages_create(
-            client,
-            model=MEM0_GATE_MODEL,
-            max_tokens=4000,
-            user_message=_EXTRACT_PROMPT.format(
-                context_hint=_strip_extract_breakout_tags(context_hint or "(none)")[:1000],
-                user_text=_strip_extract_breakout_tags(user_text or "")[:2000],
-                assistant_text=_strip_extract_breakout_tags(assistant_text or "")[:2000],
-                known_entities=known_entities_body,
-            ),
-            task_prompt=(
-                "You extract self-attributable facts and entity-entity "
-                "relations from a Discord conversation turn. Return JSON only."
-            ),
+        user_message = _EXTRACT_PROMPT.format(
+            context_hint=_strip_extract_breakout_tags(context_hint or "(none)")[:1000],
+            user_text=_strip_extract_breakout_tags(user_text or "")[:MEM0_EXTRACT_INPUT_CHARS],
+            assistant_text=_strip_extract_breakout_tags(assistant_text or "")[:2000],
+            known_entities=known_entities_body,
         )
-        text = extract_text(resp).strip()
-        if text.startswith("```"):
-            text = text.split("```", 2)[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.rsplit("```", 1)[0].strip()
-        if not text:
-            log.warning(
-                "extract_full_signals: empty TextBlock (stop_reason=%s, "
-                "content_block_types=%s)",
-                getattr(resp, "stop_reason", "?"),
-                [type(b).__name__ for b in (getattr(resp, "content", []) or [])],
+        task_prompt = (
+            "You extract self-attributable facts and entity-entity "
+            "relations from a Discord conversation turn. Return JSON only."
+        )
+
+        # The extractor occasionally returns JSON cut off mid-stream (max_tokens
+        # or a degraded-token response). Rather than drop the whole batch we
+        # (1) salvage every complete fact object from the partial JSON, and
+        # (2) if nothing is salvageable, retry once with a fresh call. Only when
+        # both fail do we give up. Pinned by tests/test_mem0_extract_salvage.py.
+        data = None
+        _MAX_ATTEMPTS = 2
+        for attempt in range(_MAX_ATTEMPTS):
+            resp = await cli_messages_create(
+                client,
+                model=MEM0_GATE_MODEL,
+                max_tokens=MEM0_EXTRACT_MAX_TOKENS,
+                user_message=user_message,
+                task_prompt=task_prompt,
             )
-            return empty
-        import json as _json
-        try:
-            data = _json.loads(text)
-        except _json.JSONDecodeError as exc:
-            log.warning(
-                "extract_full_signals: JSON parse failed (%s); text_tail=%r",
-                exc, text[-200:],
-            )
+            text = extract_text(resp).strip()
+            if text.startswith("```"):
+                text = text.split("```", 2)[1]
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.rsplit("```", 1)[0].strip()
+            stop_reason = getattr(resp, "stop_reason", "?")
+            if not text:
+                log.warning(
+                    "extract_full_signals: empty TextBlock (stop_reason=%s, "
+                    "content_block_types=%s, attempt=%d)",
+                    stop_reason,
+                    [type(b).__name__ for b in (getattr(resp, "content", []) or [])],
+                    attempt + 1,
+                )
+                continue  # retry on an empty response
+            try:
+                data = _json.loads(text)
+                break  # clean parse — done
+            except _json.JSONDecodeError as exc:
+                salvaged = _salvage_facts(text)
+                if salvaged["facts"]:
+                    log.warning(
+                        "extract_full_signals: JSON truncated (%s, stop_reason=%s) "
+                        "— salvaged %d facts",
+                        exc, stop_reason, len(salvaged["facts"]),
+                    )
+                    data = salvaged
+                    break
+                log.warning(
+                    "extract_full_signals: JSON parse failed (%s, stop_reason=%s, "
+                    "attempt=%d); text_tail=%r",
+                    exc, stop_reason, attempt + 1, text[-200:],
+                )
+                continue  # nothing salvageable — retry
+        if data is None:
             return empty
         facts_raw = data.get("facts", [])
         if not facts_raw and (user_text or "").strip():

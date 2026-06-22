@@ -74,10 +74,59 @@ IMAGE_PATH_RE = re.compile(
     re.MULTILINE,
 )
 
+# Supplementary pattern: image paths enclosed in quotes or Markdown link syntax.
+# Only when surrounded by a clear delimiter do we allow spaces and parens inside
+# the path (to catch e.g. `/tmp/出力 (1).png`). The outer delimiters ensure we
+# don't greedily consume prose text.
+_IMAGE_PATH_QUOTED_RE = re.compile(
+    r"""(?x)
+    (?:
+        # Backtick-enclosed: `path`  — allows spaces and parens inside
+        `(\/[^`\n]{1,512}?\.(?:png|jpg|jpeg|gif|webp|svg))`
+        |
+        # Double-quote-enclosed: "path"
+        \"(\/[^\"\n]{1,512}?\.(?:png|jpg|jpeg|gif|webp|svg))\"
+        |
+        # Single-quote-enclosed: 'path'
+        \'(\/[^\'\n]{1,512}?\.(?:png|jpg|jpeg|gif|webp|svg))\'
+        |
+        # Markdown link: [text](path)
+        # The path may contain parens (e.g. "(1)" in filenames); we match
+        # lazily up to the extension, then accept the closing ')' that
+        # immediately follows the extension — NOT any ')' inside the path.
+        \[[^\]]{0,200}\]\((\/[^"\'\`\n]{1,512}?\.(?:png|jpg|jpeg|gif|webp|svg))\)
+    )
+    """,
+    re.MULTILINE,
+)
+
 # Matches any absolute file path in response text (for admin file attachment).
 # Looks for paths like /home/ubuntu/foo.txt or /tmp/bar.csv
 FILE_PATH_RE = re.compile(
     r"(?:^|\s|`|\()(\/[\w./_-]{1,512}\.[\w]{1,16})(?:\s|$|`|[)}\]]|[。、,.])",
+    re.MULTILINE,
+)
+
+# Supplementary pattern: non-image file paths enclosed in quotes or Markdown links.
+# Allows spaces and parens inside the path only when clear delimiters are present.
+_FILE_PATH_QUOTED_RE = re.compile(
+    r"""(?x)
+    (?:
+        # Backtick-enclosed: `path`  — allows spaces and parens inside
+        `(\/[^`\n]{1,512}?\.[\w]{1,16})`
+        |
+        # Double-quote-enclosed: "path"
+        \"(\/[^\"\n]{1,512}?\.[\w]{1,16})\"
+        |
+        # Single-quote-enclosed: 'path'
+        \'(\/[^\'\n]{1,512}?\.[\w]{1,16})\'
+        |
+        # Markdown link: [text](path)
+        # The path may contain parens in the filename; match lazily up to
+        # the extension, then require the closing ')' immediately after.
+        \[[^\]]{0,200}\]\((\/[^"\'\`\n]{1,512}?\.[\w]{1,16})\)
+    )
+    """,
     re.MULTILINE,
 )
 
@@ -246,21 +295,36 @@ def extract_image_paths(text: str, *, admin: bool = False) -> list[str]:
     allowed_real = tuple(os.path.realpath(d) for d in dirs)
     paths: list[str] = []
     seen: set[str] = set()
+
+    # Collect raw candidates from both the standard pattern and the
+    # quoted/enclosed supplementary pattern (handles spaces + parens in paths).
+    raw_candidates: list[str] = []
     for m in IMAGE_PATH_RE.finditer(text):
+        raw_candidates.append(m.group(1))
+    for m in _IMAGE_PATH_QUOTED_RE.finditer(text):
+        # The quoted RE has 4 groups; exactly one will be non-None per match.
+        raw = next(g for g in m.groups() if g is not None)
+        raw_candidates.append(raw)
+
+    if not raw_candidates:
+        log.debug("extract_image_paths: no regex candidates found in text (len=%d)", len(text))
+
+    for raw in raw_candidates:
         if len(paths) >= MAX_RESPONSE_IMAGES:
             break
-        raw = m.group(1)
         if raw in seen:
             continue
         seen.add(raw)
         try:
             real = os.path.realpath(raw)
         except (OSError, ValueError):
+            log.debug("extract_image_paths: realpath failed for candidate: %r", raw)
             continue
         if not any(real == d or real.startswith(d + os.sep) for d in allowed_real):
             log.warning("Rejecting image path outside allow-list: %s", raw)
             continue
         if not os.path.isfile(real):
+            log.debug("extract_image_paths: candidate does not exist on disk: %s", real)
             continue
         if not _has_image_magic(real):
             log.warning("Rejecting path with non-image content: %s", raw)
@@ -315,10 +379,22 @@ def extract_file_paths(text: str) -> list[str]:
     allowed_real = tuple(os.path.realpath(d) for d in ADMIN_FILE_DIRS)
     paths: list[str] = []
     seen: set[str] = set()
+
+    # Collect raw candidates from both the standard pattern and the
+    # quoted/enclosed supplementary pattern (handles spaces + parens in paths).
+    raw_candidates: list[str] = []
     for m in FILE_PATH_RE.finditer(text):
+        raw_candidates.append(m.group(1))
+    for m in _FILE_PATH_QUOTED_RE.finditer(text):
+        raw = next(g for g in m.groups() if g is not None)
+        raw_candidates.append(raw)
+
+    if not raw_candidates:
+        log.debug("extract_file_paths: no regex candidates found in text (len=%d)", len(text))
+
+    for raw in raw_candidates:
         if len(paths) >= MAX_FILE_ATTACHMENTS:
             break
-        raw = m.group(1)
         if raw in seen:
             continue
         seen.add(raw)
@@ -328,6 +404,7 @@ def extract_file_paths(text: str) -> list[str]:
         try:
             real = os.path.realpath(raw)
         except (OSError, ValueError):
+            log.debug("extract_file_paths: realpath failed for candidate: %r", raw)
             continue
         if not any(real == d or real.startswith(d + os.sep) for d in allowed_real):
             log.warning("Rejecting file path outside admin allow-list: %s", raw)
@@ -338,6 +415,7 @@ def extract_file_paths(text: str) -> list[str]:
         if is_attach_ignored(real):
             continue
         if not os.path.isfile(real):
+            log.debug("extract_file_paths: candidate does not exist on disk: %s", real)
             continue
         try:
             size = os.path.getsize(real)
@@ -673,6 +751,13 @@ def cleanup_stale_attachments() -> None:
 
     SRE-M1: extended to cover /tmp/{mermaid,table,math}_renders too — these
     are content-addressed PNGs/HTMLs that previously accumulated indefinitely.
+
+    The 1-hour threshold (3600 s) is intentionally generous relative to the
+    longest plausible Claude response latency (~60 s) plus Discord's CDN
+    re-fetch window. Raising this value reduces the chance of a
+    discord.File(path) raising FileNotFoundError between extract and send.
+    If a FileNotFound still occurs in bot.py the caller logs it with errno
+    via log.warning so it is diagnosable in the journal.
     """
     # Import lazily so monkeypatch in tests can override config.MERMAID_OUTPUT_DIR etc.
     import config as _cfg
@@ -683,6 +768,8 @@ def cleanup_stale_attachments() -> None:
         _cfg.MATH_RENDERS_DIR,
     ]
     now = time.time()
+    # 1 hour — must be >> longest response round-trip to avoid racing with
+    # an in-flight discord.File open in bot.py. Do not reduce below 600 s.
     threshold = 3600
     for d in dirs_to_clean:
         if not d or not os.path.isdir(d):
@@ -697,5 +784,12 @@ def cleanup_stale_attachments() -> None:
                 if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > threshold:
                     os.remove(fpath)
                     log.info("Cleaned up stale file: %s", fpath)
-            except OSError:
-                pass
+            except FileNotFoundError:
+                # Race: another coroutine (or a previous cleanup run) already
+                # removed the file between os.path.isfile() and os.remove().
+                log.debug("cleanup_stale_attachments: already gone: %s", fpath)
+            except OSError as exc:
+                log.warning(
+                    "cleanup_stale_attachments: failed to remove %s: [errno %s] %s",
+                    fpath, exc.errno, exc,
+                )

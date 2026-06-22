@@ -97,17 +97,20 @@ def speaker_label(user_id: int | str | None) -> str:
 # ---------------------------------------------------------------------------
 CWD = os.environ.get("BOT_CWD", "/home/ubuntu")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
-# Primary main-loop model. Pinned to Opus 4.7 (haroin request 2026-06-13).
-# Env-overridable via CLAUDE_MODEL.
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
-# Refusal fallback. Fable 5 has a content classifier (stop_reason=refusal,
-# category=None) that fires on some conversation content even though it is not
-# a real safety stop for this private 1:1 deployment, and it is NOT overridable
-# by the system prompt (verified by ablation). Opus 4.8 does not share that
-# classifier. When the primary model is Fable 5 and a turn refuses, the agent
-# loop retries the same request once on this fallback model and surfaces the
-# switch to the user (never silent). Set FABLE_REFUSAL_FALLBACK_ENABLED=0 to
-# disable.
+# Primary main-loop model. Opus 4.8 since 2026-06-20 (fable-5 went server-dead:
+# API 404s it -> "use Opus 4.8"). SSoT is the .env CLAUDE_MODEL line — flip that
+# one line back to claude-fable-5 to revert when Fable returns; the fable
+# refusal-fallback machinery below is kept intact for exactly that.
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
+# Refusal fallback (KEPT for one-line Fable revert — do not delete). Fable 5 has
+# a content classifier (stop_reason=refusal, category=None) that fires on some
+# conversation content even though it is not a real safety stop for this private
+# 1:1 deployment, and it is NOT overridable by the system prompt (verified by
+# ablation). Opus 4.8 does not share that classifier, so this leg is
+# INTENTIONALLY DORMANT while opus is primary — the `"fable" in model` guards in
+# entry.py keep it off for opus and auto-reactivate it the moment CLAUDE_MODEL
+# is set back to a fable model. The fallback target stays Opus 4.8. Set
+# FABLE_REFUSAL_FALLBACK_ENABLED=0 to disable.
 FABLE_REFUSAL_FALLBACK_MODEL = os.environ.get(
     "FABLE_REFUSAL_FALLBACK_MODEL", "claude-opus-4-8"
 )
@@ -181,6 +184,26 @@ PROACTIVE_COMPACT_ENABLED = os.environ.get(
 PROACTIVE_COMPACT_TRIGGER_TOKENS = int(
     os.environ.get("PROACTIVE_COMPACT_TRIGGER_TOKENS", "500000")
 )
+# Time-based microcompact (ported from Claude Code CLI $F_/wF_). On an idle
+# gap >= MICROCOMPACT_GAP_MIN minutes, the bodies of all but the last
+# MICROCOMPACT_KEEP_RECENT tool_result blocks in the replayed transcript are
+# replaced with a placeholder — a cheap, no-LLM token reclaim that runs before
+# the expensive full compaction. Message structure is preserved.
+MICROCOMPACT_ENABLED = os.environ.get(
+    "MICROCOMPACT_ENABLED", "1"
+) not in ("0", "false", "False", "")
+MICROCOMPACT_GAP_MIN = float(os.environ.get("MICROCOMPACT_GAP_MIN", "30"))
+MICROCOMPACT_KEEP_RECENT = int(os.environ.get("MICROCOMPACT_KEEP_RECENT", "3"))
+# Whether the context-1m beta is active (mirrors the gate in client.py). Drives
+# the model context window used by the model-window-based compaction threshold.
+CONTEXT_1M_ENABLED = os.environ.get(
+    "CONTEXT_1M_ENABLED", "1"
+) not in ("0", "false", "False", "")
+# Auto-compaction trigger as a PERCENT of the effective window (mirrors the
+# CLI's CLAUDE_AUTOCOMPACT_PCT_OVERRIDE). 0 = use the reserve-based formula
+# (window − output − headroom, ≈ CLI et6). Set e.g. 50 to fire at half-window
+# (the old fixed 500K-on-1M behaviour) if per-turn cost matters more.
+HISTORY_COMPACT_PCT_OVERRIDE = float(os.environ.get("HISTORY_COMPACT_PCT_OVERRIDE", "0"))
 # Main-loop effort dial (2026-06-13 audit #4). The CLI default is "high" and
 # env-tunable (CLAUDE_CODE_EFFORT_LEVEL); the bot deliberately defaults to
 # "medium" (haroin's instruction — predictable per-turn latency) but the value
@@ -195,16 +218,47 @@ RETRY_AFTER_MAX_S = float(os.environ.get("RETRY_AFTER_MAX_S", "120"))
 # Slow-first-byte detection (audit #16). Matches the CLI's
 # CLAUDE_SLOW_FIRST_BYTE_MS default of 30000.
 SLOW_FIRST_BYTE_MS = int(os.environ.get("CLAUDE_SLOW_FIRST_BYTE_MS", "30000"))
-# Per-turn output cap. Matched to the real claude-cli, which sends 32000 on
-# Fable 5 (mitm capture). Briefly raised to 128k, but reverted to 32000 to keep
-# the request byte-identical to the CLI while debugging fable-5 refusals — the
-# only large structural diff that remained between bot and CLI requests.
-CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "32000"))
+# Per-turn output cap. 64000 matches the real claude-cli opus-4-8 default
+# (2026-06-20; the prior 32000 was a Fable-5-capture artifact). The bot streams
+# via beta.messages.stream, so up to 128k is safe; Discord splits long output at
+# 2000 chars/message anyway. SSoT is .env CLAUDE_MAX_TOKENS.
+CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "64000"))
 # Per-request turn ceiling for admin (trusted) callers. Was hard-coded to 999
 # which let a single CLI invocation hold ~500MB of node/MCP child processes
 # for the full CLAUDE_TIMEOUT window. 100 covers heavy image-review workflows
 # (10+ slide screenshots, multi-file edits); bump via env when truly needed.
 ADMIN_MAX_TURNS = int(os.environ.get("ADMIN_MAX_TURNS", "100"))
+
+# ---------------------------------------------------------------------------
+# Tool-call recovery (2026-06-21). The model occasionally emits a tool call as
+# plain text (`<invoke …>`) instead of a real tool_use block, fails a tool and
+# gives up, or stalls on thinking-only turns — each dead-ends the reply. These
+# bound the recovery machinery in services/claude_api/tool_loop.py.
+# ---------------------------------------------------------------------------
+# Master switch for the text-form invoke RESCUE (parse the <invoke> and execute
+# it as a real tool_use). Off → pure corrective re-prompt (legacy behaviour).
+TEXT_INVOKE_RESCUE_ENABLED = os.environ.get(
+    "TEXT_INVOKE_RESCUE_ENABLED", "1"
+) not in ("0", "false", "False", "")
+# Per-loop cap on rescue executions (A). Bounds a model that only ever emits
+# text-form calls; max_turns is the outer backstop.
+MAX_TEXT_INVOKE_RESCUES = int(os.environ.get("MAX_TEXT_INVOKE_RESCUES", "3"))
+# Re-prompt fallback cap when rescue is impossible (relocated from tool_loop).
+MAX_TEXT_INVOKE_CORRECTIONS = int(os.environ.get("MAX_TEXT_INVOKE_CORRECTIONS", "1"))
+# (B) After a tool error, if the model gives up with an empty/near-empty reply,
+# nudge it once to recover or at least explain.
+MAX_TOOL_ERROR_NUDGES = int(os.environ.get("MAX_TOOL_ERROR_NUDGES", "1"))
+# Below this char count an end_turn reply right after a tool error counts as
+# "gave up" and is eligible for the B nudge. Default 1 → only a truly empty /
+# whitespace-only reply qualifies; even a terse "done"/"ok" is treated as a
+# real (if short) answer and left alone. Bump via env to catch near-empty
+# replies too.
+TOOL_ERROR_MIN_REPLY_CHARS = int(os.environ.get("TOOL_ERROR_MIN_REPLY_CHARS", "1"))
+# (C) Consecutive thinking-only pause turns before the loop stops nudging
+# (relocated from tool_loop). The empty-content 400 guard depends on this.
+MAX_CONSECUTIVE_EMPTY_TURNS = int(os.environ.get("MAX_CONSECUTIVE_EMPTY_TURNS", "2"))
+# (C) Last-ditch summary nudge before returning the "(no response)" sentinel.
+MAX_FINAL_EMPTY_NUDGES = int(os.environ.get("MAX_FINAL_EMPTY_NUDGES", "1"))
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -216,9 +270,11 @@ SESSIONS_PATH = os.path.join(STATE_DIR, "sessions.json")
 # Single source of truth for the session freshness window (機能2, 2026-06-17).
 # Previously split: claude_sdk.py read SESSION_TTL_S from env defaulting to 6h
 # (CLI legacy), while claude_api/session_store.py hard-coded 30m — so an env
-# override moved one but not the other. Both now import this. 30m matches the
-# Mem0-refetch-skip / resume window the API path actually wants.
-SESSION_TTL_S = int(os.environ.get("SESSION_TTL_S", str(30 * 60)))
+# override moved one but not the other. Both now import this. 60m (raised from
+# 30m on 2026-06-22, haroin) so a short break — lunch, a meeting — doesn't cold-
+# reset the session and re-fetch Mem0. This is the resume / Mem0-refetch-skip
+# window only; it does NOT change the replayed-tail size or per-turn token cost.
+SESSION_TTL_S = int(os.environ.get("SESSION_TTL_S", str(60 * 60)))
 # Where runtime_state.py persists in-memory state across restarts (機能2).
 RUNTIME_STATE_PATH = os.path.join(STATE_DIR, "runtime_state.json")
 # invest_kb (Phase A, 2026-06-17): LanceDB side-store for neutral investment
@@ -259,11 +315,14 @@ _ensure_mode_700(ATTACHMENT_DIR)
 MAX_SESSIONS = 100
 MAX_HISTORY = 50
 # Resume replays MAX_MESSAGES_PER_CHANNEL * 2 turns (load_api_replay_channel).
-# 50 → up to 100 turns of replayed context. Briefly raised to 200 (400 turns)
-# on 2026-06-10 but reverted to 100-turn replay (haroin request): the larger
-# tail ballooned cache_creation to ~226k tokens with no benefit while debugging
-# fable-5 refusals.
-MAX_MESSAGES_PER_CHANNEL = 50
+# Replayed context tail. The transcript is replayed on EVERY non-restricted
+# turn (ADR-0010 phase 3), so this directly sets per-turn cache_creation cost.
+# History: 50 (100 turns) → 200 (400 turns, ~226k tokens) reverted 2026-06-10
+# while on fable-5's 200K window. 2026-06-22 (haroin): raised to 125 → 250
+# replayed turns on Opus 4.8 + the 1M-context beta, where 250 turns (~140k
+# tokens) sits well under HISTORY_COMPACT_TRIGGER_TOKENS. Cross-day recall is
+# Mem0's job (ingest/recall hardened the same day), not this short-term tail.
+MAX_MESSAGES_PER_CHANNEL = int(os.environ.get("MAX_MESSAGES_PER_CHANNEL", "125"))
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 MAX_RESOLVED_LINKS = 5
 MAX_RESPONSE_IMAGES = 10
@@ -350,6 +409,20 @@ CLAUDE_MAX_BACKOFF_S = int(os.environ.get("CLAUDE_MAX_BACKOFF_S", "60"))
 # headroom without unbounded waits.
 STREAM_STALL_THRESHOLD_S = int(os.environ.get("STREAM_STALL_THRESHOLD_S", "30"))
 STREAM_IDLE_TIMEOUT_S = int(os.environ.get("STREAM_IDLE_TIMEOUT_S", "300"))
+
+# Status-spinner rendering mode (see services/claude_api/progress.py +
+# spinner_gif.py). "text" = 1 char/sec bold shimmer as message text + animated
+# application emoji (A+C); "gif" = render the gerund word as a ~14fps looping
+# bold-shimmer GIF attachment (B), with elapsed/tokens as the 1/sec message
+# content. Discord caps single-message edits at ~1/sec either way; "gif" beats
+# that for the word animation by letting the client play the loop locally.
+SPINNER_MODE = os.environ.get("SPINNER_MODE", "text").strip().lower()
+
+# Hard wall-clock cap on a single tool/MCP call inside the agent loop. A tool
+# that hangs (e.g. an unresponsive MCP server like onion-search) must not block
+# the turn forever — on timeout the loop gets an is_error tool_result and
+# continues, instead of the whole channel wedging behind a stuck await.
+TOOL_CALL_TIMEOUT_S = int(os.environ.get("TOOL_CALL_TIMEOUT_S", "240"))
 
 # OAuth (free-code: checkAndRefreshOAuthTokenIfNeeded)
 TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000
@@ -532,25 +605,44 @@ def _shared_mcp_http(port: int) -> dict:
 # Docs MCP (Upstash context7) — only spawn when the user message mentions
 # docs / library / API reference keywords.
 MCP_SERVERS_DOCS: dict = {
-    "context7": _shared_mcp_http(8022),
+    # Direct stdio (bot-owned, self-reaping) — ADR-0022.
+    "context7": {
+        "command": "npx",
+        "args": ["-y", f"@upstash/context7-mcp@{_MCP_NPX_PINS['context7']}"],
+    },
 }
 
 # Scholarly MCP (Google Scholar検索) — only connect when the user's text
 # actually mentions a paper-related keyword. Previously this was in BASE and
 # started on every admin request, adding 100-300ms unconditionally.
 MCP_SERVERS_PAPER: dict = {
-    "scholarly": _shared_mcp_http(8023),
+    # Direct stdio (bot-owned, self-reaping) — ADR-0022.
+    "scholarly": {
+        "command": "/home/ubuntu/scholarly-mcp/.venv/bin/python",
+        "args": ["/home/ubuntu/scholarly-mcp/server.py"],
+    },
 }
 
 MCP_SERVERS_WEB: dict = {
-    # X (Twitter) scraper MCP
-    "x-scraper": _shared_mcp_http(8021),
-    # Onion-search: anonymous DuckDuckGo via Tor Browser. Lazy spawned on
-    # first tool call (~30-60s Tor bootstrap on cold start, ~500MB RSS).
-    "onion-search": {
-        "command": "/home/ubuntu/onion-search-mcp/.venv/bin/python",
-        "args": ["/home/ubuntu/onion-search-mcp/server.py"],
+    # X (Twitter) scraper MCP. Direct stdio (bot-owned, self-reaping) instead
+    # of the shared supergateway-HTTP service: supergateway 3.4.3 leaked one
+    # stdio child per session (ppid=1, unreapable by the bot) → 95 procs /
+    # 1.7GB / swap thrash / stalls (ADR-0022). bot-exclusive, so no sharing lost.
+    "x-scraper": {
+        "command": "/home/ubuntu/free-code/x-scraper/.venv/bin/python",
+        "args": ["/home/ubuntu/free-code/x-scraper/mcp_server.py"],
     },
+    # Onion-search TEMPORARILY DISABLED (2026-06-19): its MCP tool call parks
+    # in an UNCANCELLABLE await — the bot's StallWatchdog (300s) and per-tool
+    # asyncio.wait_for (240s) both fail to interrupt it, wedging the channel
+    # for 70+ min (confirmed via py-spy: event loop idle, zombie task holding
+    # the channel semaphore). Re-enable only after server.py guarantees the
+    # get_sources handler always returns within a hard wall-clock budget so
+    # the client await can't park. See ADR / the onion-search hardening task.
+    # "onion-search": {
+    #     "command": "/home/ubuntu/onion-search-mcp/.venv/bin/python",
+    #     "args": ["/home/ubuntu/onion-search-mcp/server.py"],
+    # },
     # Market data (docs/2026-06-13_market_data_mcp_plan.md). Both are
     # always-advertised (static schemas) and lazy-spawned on first call.
     # nikkei-indexes: 日経公式CSV (日経VI/日経平均 日足OHLC + VI戦略シグナル判定)
@@ -563,12 +655,24 @@ MCP_SERVERS_WEB: dict = {
         "command": "/home/ubuntu/mcp-servers/yfj-quote/.venv/bin/python",
         "args": ["/home/ubuntu/mcp-servers/yfj-quote/mcp_server.py"],
     },
+    # polymarket: Polymarket 予測市場の確率 (地政学/マクロ事象の織り込み)。
+    # venv は yfj-quote と共用 (mcp/httpx 同依存)。mcp_server.py 実行で
+    # sys.path[0] が polymarket/ になり polymarket_parser を解決。
+    "polymarket": {
+        "command": "/home/ubuntu/mcp-servers/yfj-quote/.venv/bin/python",
+        "args": ["/home/ubuntu/mcp-servers/polymarket/mcp_server.py"],
+    },
 }
 
 # API key付きWEB MCPは .env にキーがある場合のみ追加
 _brave_key = os.environ.get("BRAVE_API_KEY")
 if _brave_key:
-    MCP_SERVERS_WEB["brave-search"] = _shared_mcp_http(8012)
+    # Direct stdio (bot-owned, self-reaping) — see x-scraper note / ADR-0022.
+    MCP_SERVERS_WEB["brave-search"] = {
+        "command": "npx",
+        "args": ["-y", f"@brave/brave-search-mcp-server@{_MCP_NPX_PINS['brave-search']}"],
+        "env": {"BRAVE_API_KEY": _brave_key},
+    }
 
 _tavily_key = os.environ.get("TAVILY_API_KEY")
 if _tavily_key:
@@ -583,7 +687,12 @@ if _tavily_key:
 # 暫定運用。SRE-H6 ルールに従い npx version は _MCP_NPX_PINS でピン留め。
 _google_maps_key = os.environ.get("GOOGLE_MAPS_API_KEY")
 if _google_maps_key:
-    MCP_SERVERS_WEB["google-maps"] = _shared_mcp_http(8025)
+    # Direct stdio (bot-owned, self-reaping) — ADR-0022.
+    MCP_SERVERS_WEB["google-maps"] = {
+        "command": "npx",
+        "args": ["-y", f"@modelcontextprotocol/server-google-maps@{_MCP_NPX_PINS['google-maps']}"],
+        "env": {"GOOGLE_MAPS_API_KEY": _google_maps_key},
+    }
 
 # HEAVY tier — chromium starts at ~500MB RSS, only load on explicit demand.
 MCP_SERVERS_HEAVY: dict = {
@@ -597,14 +706,30 @@ MCP_SERVERS_HEAVY: dict = {
 # ChromaDB + OpenAI embedding client init is ~100-200MB; only connect when the
 # user's text suggests Claude should actually recall/store memories.
 MCP_SERVERS_MEMORY: dict = {
-    "mem0": _shared_mcp_http(8020),
+    # Direct stdio (bot-owned, self-reaping) — see x-scraper note / ADR-0022.
+    "mem0": {
+        "command": "/home/ubuntu/discord-bot/.venv/bin/python",
+        "args": ["/home/ubuntu/discord-bot/mcp_mem0_server.py"],
+    },
 }
 
 # REALESTATE tier — SUUMO / HOMES property scraping MCP for haroin's Tokyo
 # housing search (院進後の物件探し). admin-only via mcp_selector + env-based
 # allowed_user_ids 二重ゲート. ADR-0020.
 MCP_SERVERS_REALESTATE: dict = {
-    "realestate": _shared_mcp_http(8024),
+    # Direct stdio (bot-owned, self-reaping) — ADR-0022. The old systemd
+    # wrapper defaulted REALESTATE_ALLOWED_USER_IDS to ADMIN_USER_IDS; replicate
+    # that here since server.py only reads REALESTATE_ALLOWED_USER_IDS.
+    "realestate": {
+        "command": "/home/ubuntu/realestate-mcp/.venv/bin/python",
+        "args": ["/home/ubuntu/realestate-mcp/server.py"],
+        "env": {
+            "REALESTATE_ALLOWED_USER_IDS": (
+                os.environ.get("REALESTATE_ALLOWED_USER_IDS")
+                or os.environ.get("ADMIN_USER_IDS", "")
+            ),
+        },
+    },
 }
 
 # Union (used as a default + by code paths that just need to know "all configured")
@@ -643,12 +768,42 @@ MEM0_LEGACY_CONTEXT = _bool_env("MEM0_LEGACY_CONTEXT", False)             # P1: 
 MEM0_GATE_ENABLED = _bool_env("MEM0_GATE_ENABLED", True)                   # P2: False で Mem0 標準抽出にフォールバック
 MEM0_GATE_MIN_IMPORTANCE = int(os.environ.get("MEM0_GATE_MIN_IMPORTANCE", "2"))
 MEM0_GATE_MODEL = os.environ.get("MEM0_GATE_MODEL", "claude-haiku-4-5-20251001")
+# Output budget for the single-call fact+relation extractor. 4000 was too
+# small for a 10-turn batch and truncated the JSON mid-string, dropping the
+# whole batch's facts (prod logs 2026-06-20/22). 12000 fits the realistic
+# fact count; the salvage+retry path in extract.py covers the rare overflow.
+MEM0_EXTRACT_MAX_TOKENS = int(os.environ.get("MEM0_EXTRACT_MAX_TOKENS", "12000"))
+# Per-turn char cap when building the batch summary fed to the extractor, and
+# the overall input cap inside the extractor. The old hard 300/2000 cut a
+# 10-turn batch down to ~half before the LLM saw it, dropping detail (e.g.
+# "ニッスイ株をホールド…"). Wider caps preserve more; tune down to cut cost.
+MEM0_BATCH_TURN_CHARS = int(os.environ.get("MEM0_BATCH_TURN_CHARS", "600"))
+MEM0_EXTRACT_INPUT_CHARS = int(os.environ.get("MEM0_EXTRACT_INPUT_CHARS", "6000"))
 MEM0_CLIENT_DEDUP_ENABLED = _bool_env("MEM0_CLIENT_DEDUP_ENABLED", True)   # P2.5
 MEM0_CLIENT_DEDUP_THRESHOLD = float(os.environ.get("MEM0_CLIENT_DEDUP_THRESHOLD", "0.85"))
 MEM0_DEDUP_TWO_STAGE = _bool_env("MEM0_DEDUP_TWO_STAGE", True)            # P4: 2段階dedup (LLM判定)
 MEM0_DEDUP_SEARCH_LIMIT = int(os.environ.get("MEM0_DEDUP_SEARCH_LIMIT", "5"))
 MEM0_DEDUP_DRY_RUN = _bool_env("MEM0_DEDUP_DRY_RUN", False)               # P4: dry-run (dropせずログのみ)
 MEM0_SMART_SEARCH = _bool_env("MEM0_SMART_SEARCH", True)                   # P3
+# Per-turn auto-recall fan-out. 5 was too thin against ~5k stored memories: a
+# topic spread over several facts (e.g. the日経VI strategy ≈ 6 memories) lost
+# the race for the 5 slots. Admins get a wider window; non-admins stay narrow.
+MEM0_RECALL_LIMIT = int(os.environ.get("MEM0_RECALL_LIMIT", "12"))
+MEM0_RECALL_LIMIT_RESTRICTED = int(os.environ.get("MEM0_RECALL_LIMIT_RESTRICTED", "5"))
+# Phase 5: semantic search over the RAW transcript. Each JSONL line is embedded
+# into a separate ChromaDB collection so paraphrased queries reach old raw
+# lines that Mem0 curation/keyword-FTS miss. OFF by default — it adds a
+# per-turn embedding call (cost); flip on (+ run scripts/backfill_history_embed.py)
+# to enable, then it augments history_index keyword recall with vector hits.
+MEM0_HISTORY_EMBED_ENABLED = os.environ.get(
+    "MEM0_HISTORY_EMBED_ENABLED", "0"
+) not in ("0", "false", "False", "")
+MEM0_HISTORY_EMBED_LIMIT = int(os.environ.get("MEM0_HISTORY_EMBED_LIMIT", "5"))
+# Per-line char cap before embedding. text-embedding-3-small rejects inputs
+# over 8192 tokens; a long line (big code block, long reply) blows past that.
+# 4000 chars stays safely under the limit even for kanji-dense text (~1.5
+# tok/char) while keeping enough head for semantic topic matching.
+MEM0_HISTORY_EMBED_MAX_CHARS = int(os.environ.get("MEM0_HISTORY_EMBED_MAX_CHARS", "4000"))
 
 # Offline cluster consolidation (ADR-0016, 2026-06-15). scripts/mem0_consolidate.py
 # finds clusters of related-but-separately-stored facts (which ingest-time
