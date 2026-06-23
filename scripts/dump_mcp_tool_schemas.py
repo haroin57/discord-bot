@@ -24,11 +24,6 @@ SERVERS = {
         "args": ["/home/ubuntu/free-code/x-scraper/mcp_server.py"],
         "env": {},
     },
-    "news-curator": {
-        "command": "/home/ubuntu/news-curator/.venv/bin/python",
-        "args": ["/home/ubuntu/news-curator/mcp_server.py"],
-        "env": {},
-    },
     "brave-search": {
         "command": "npx",
         "args": ["-y", "@brave/brave-search-mcp-server@2.0.80"],
@@ -42,6 +37,11 @@ SERVERS = {
     "yfj-quote": {
         "command": "/home/ubuntu/mcp-servers/yfj-quote/.venv/bin/python",
         "args": ["/home/ubuntu/mcp-servers/yfj-quote/mcp_server.py"],
+        "env": {},
+    },
+    "polymarket": {
+        "command": "/home/ubuntu/mcp-servers/yfj-quote/.venv/bin/python",
+        "args": ["/home/ubuntu/mcp-servers/polymarket/mcp_server.py"],
         "env": {},
     },
 }

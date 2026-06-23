@@ -28,8 +28,16 @@ LOG_FILE=/home/ubuntu/discord-bot/.state/refresh_cli_identity.log
 PY_VENV=/home/ubuntu/discord-bot/.venv/bin/python
 PY_MITM=/home/ubuntu/.local/share/pipx/venvs/mitmproxy/bin/python
 MITMDUMP=/home/ubuntu/.local/bin/mitmdump
-CLAUDE_BIN=/usr/local/bin/claude
+# Capture from the LIVE CLI on PATH (volta shim = 2.1.177), NOT the stale
+# /usr/local 2.1.170 wrapper, so the pinned fingerprint matches what `claude`
+# actually runs.
+CLAUDE_BIN=/home/ubuntu/.volta/bin/claude
 CA_CERT=/home/ubuntu/.mitmproxy/mitmproxy-ca-cert.pem
+# Capture-ping model read from .env (CLAUDE_MODEL) so it never drifts from the
+# bot's real model. Pinging a dead model (fable-5) is exactly what made past
+# refreshes silently no-op (the CLI 404'd before emitting a usable request).
+CAPTURE_MODEL=$(grep -E '^CLAUDE_MODEL=' "$REPO/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'")
+CAPTURE_MODEL=${CAPTURE_MODEL:-claude-opus-4-8}
 
 mkdir -p "$(dirname "$LOG_FILE")"
 exec >> "$LOG_FILE" 2>&1
@@ -71,7 +79,7 @@ PING_OUT=$(env -i \
     HTTPS_PROXY="http://127.0.0.1:$PORT" \
     HTTP_PROXY="http://127.0.0.1:$PORT" \
     NODE_EXTRA_CA_CERTS="$CA_CERT" \
-    "$CLAUDE_BIN" -p "1+1=" --model claude-fable-5 2>&1 || true)
+    "$CLAUDE_BIN" -p "1+1=" --model "$CAPTURE_MODEL" 2>&1 || true)
 log "CLI output (truncated): $(echo "$PING_OUT" | head -c 200)"
 
 # 3. stop mitmdump
@@ -85,18 +93,27 @@ if [[ ! -s "$DUMP" ]]; then
     exit 1
 fi
 
-# 4. Apply extraction → client.py. Snapshot HEAD first so we can roll back.
-log "snapshotting current client.py / entry.py / tool_loop.py for rollback"
+# 4. Apply extraction → client.py + cli_default_system_prompt.txt. Snapshot
+#    BOTH first (apply_cli_identity.py now also rewrites the system prompt) so
+#    rollback restores exactly what apply touches.
+log "snapshotting client.py + cli_default_system_prompt.txt for rollback"
 cd "$REPO"
 BACKUP="$WORKDIR/client.py.bak"
 cp services/claude_api/client.py "$BACKUP"
+PROMPT_FILE=services/claude_api/cli_default_system_prompt.txt
+PROMPT_BACKUP="$WORKDIR/cli_default_system_prompt.txt.bak"
+cp "$PROMPT_FILE" "$PROMPT_BACKUP" 2>/dev/null || true
+restore_backup() {
+    cp "$BACKUP" services/claude_api/client.py
+    [[ -f "$PROMPT_BACKUP" ]] && cp "$PROMPT_BACKUP" "$PROMPT_FILE"
+}
 
 log "running apply_cli_identity.py"
 APPLY_OUT=$("$PY_MITM" "$REPO/scripts/apply_cli_identity.py" "$DUMP" 2>&1 || true)
 log "apply result: $APPLY_OUT"
 if ! echo "$APPLY_OUT" | grep -q '"changed"'; then
     log "FAIL: apply produced no parseable result, rolling back"
-    cp "$BACKUP" services/claude_api/client.py
+    restore_backup
     exit 1
 fi
 
@@ -105,7 +122,7 @@ log "running pytest"
 if ! "$PY_VENV" -m pytest tests/test_claude_api_entry.py tests/test_session.py -q > "$WORKDIR/pytest.out" 2>&1; then
     log "FAIL: pytest, rolling back. tail:"
     tail -30 "$WORKDIR/pytest.out"
-    cp "$BACKUP" services/claude_api/client.py
+    restore_backup
     exit 1
 fi
 
@@ -115,18 +132,22 @@ sudo systemctl restart discord-bot
 sleep 8
 if ! systemctl is-active --quiet discord-bot; then
     log "FAIL: bot did not come up after restart, rolling back"
-    cp "$BACKUP" services/claude_api/client.py
+    restore_backup
     sudo systemctl restart discord-bot
     exit 1
 fi
 
 # 7. Verify HTTP 200 via verify_cli_identity.py
 log "verifying HTTP 200 with the new identity"
-VERIFY_OUT=$("$PY_VENV" "$REPO/scripts/verify_cli_identity.py" 2>&1 || true)
+# NB: NO `|| true` here — it would make $? always 0 and log every 404 as a
+# "HTTP 200" success (the bug that pinned a stale fable-5 identity for weeks and
+# defeated the 429 branch below). Capture the real exit code, then gate success
+# on the payload too (defense-in-depth against a future mis-return).
+VERIFY_OUT=$("$PY_VENV" "$REPO/scripts/verify_cli_identity.py" 2>&1)
 VERIFY_RC=$?
 log "verify exit=$VERIFY_RC out: $VERIFY_OUT"
 
-if [[ "$VERIFY_RC" -eq 0 ]]; then
+if [[ "$VERIFY_RC" -eq 0 ]] && echo "$VERIFY_OUT" | grep -q '"http_status": 200'; then
     log "OK: identity refresh succeeded (HTTP 200)"
 elif [[ "$VERIFY_RC" -eq 2 ]]; then
     # 429 is treated as non-fatal — quota may genuinely be exhausted but
@@ -134,7 +155,7 @@ elif [[ "$VERIFY_RC" -eq 2 ]]; then
     log "WARN: identity OK but rate-limited (429). Keeping new client.py."
 else
     log "FAIL: verify returned $VERIFY_RC, rolling back"
-    cp "$BACKUP" services/claude_api/client.py
+    restore_backup
     sudo systemctl restart discord-bot
     exit 1
 fi

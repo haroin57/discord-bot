@@ -335,12 +335,15 @@ class TestOnMessage:
     @pytest.mark.asyncio
     async def test_rate_limiting(self, monkeypatch):
         import bot
-        monkeypatch.setattr("bot.COOLDOWN_SECONDS", 60)
+        # Cooldown applies to NON-admins only (admins skip it so their rapid
+        # messages queue instead of being bounced — 2026-06-22). Use a non-admin
+        # author (12345 is the fixture's admin) to exercise the cooldown reply.
+        monkeypatch.setattr("bot.RESTRICTED_COOLDOWN_SECONDS", 60)
 
-        # Simulate a recent cooldown
-        bot.cooldowns[12345] = time.time()
+        # Simulate a recent cooldown for the non-admin sender
+        bot.cooldowns[88888] = time.time()
 
-        msg = _make_message(content="かなえ hello", author_id=12345)
+        msg = _make_message(content="かなえ hello", author_id=88888)
         await self._dispatch(msg)
 
         # Should get rate limit reply

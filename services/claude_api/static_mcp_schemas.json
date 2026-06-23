@@ -104,153 +104,6 @@
       }
     }
   ],
-  "news-curator": [
-    {
-      "name": "mcp__news-curator__curate_news",
-      "description": "Scrape news from multiple sources and curate with GPT.\n\nFull pipeline: scrape -> GPT query planning -> GPT curation.\nReturns curated news with summaries and relevance reasoning.\n\nArgs:\n    keywords: Optional search keywords (e.g. [\"AI\", \"半導体\"]). If None, fetches general news.\n    sources: Which sources to use: \"all\", \"yahoo\", \"x\", \"bloomberg\", \"reuters\"\n    days: How many days back to search (default: None = source default)\n    max_items: Maximum number of curated items to return (default: 10)\n\nReturns:\n    JSON with curated items (title, url, source, summary, reason) and overall_comment.\n",
-      "input_schema": {
-        "properties": {
-          "keywords": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Keywords"
-          },
-          "sources": {
-            "default": "all",
-            "title": "Sources",
-            "type": "string"
-          },
-          "days": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Days"
-          },
-          "max_items": {
-            "default": 10,
-            "title": "Max Items",
-            "type": "integer"
-          }
-        },
-        "title": "curate_newsArguments",
-        "type": "object"
-      }
-    },
-    {
-      "name": "mcp__news-curator__scrape_news",
-      "description": "Scrape raw news headlines without GPT curation.\n\nFast scraping from selected sources. Returns raw headlines with URLs and engagement metrics.\nUse this when you just need headlines, not full curation.\n\nArgs:\n    keywords: Optional search keywords. If None, fetches general/trending news.\n    sources: Which sources: \"all\", \"yahoo\", \"x\", \"bloomberg\", \"reuters\"\n    days: How many days back to search\n\nReturns:\n    JSON array of news items (title, url, source, category, engagement).\n",
-      "input_schema": {
-        "properties": {
-          "keywords": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Keywords"
-          },
-          "sources": {
-            "default": "all",
-            "title": "Sources",
-            "type": "string"
-          },
-          "days": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Days"
-          }
-        },
-        "title": "scrape_newsArguments",
-        "type": "object"
-      }
-    },
-    {
-      "name": "mcp__news-curator__rank_news",
-      "description": "Scrape news and rank headlines by importance/relevance (lightweight curation).\n\nFaster than full curate_news - uses GPT only for ranking, not full summarization.\nGood for quick \"what's important right now\" queries.\n\nArgs:\n    keywords: Optional search keywords for topic-focused ranking.\n    sources: Which sources: \"all\", \"yahoo\", \"x\", \"bloomberg\", \"reuters\"\n    days: How many days back to search\n    max_items: Max headlines to return (default: 10)\n\nReturns:\n    JSON array of ranked headlines with one-line comments.\n",
-      "input_schema": {
-        "properties": {
-          "keywords": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Keywords"
-          },
-          "sources": {
-            "default": "all",
-            "title": "Sources",
-            "type": "string"
-          },
-          "days": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Days"
-          },
-          "max_items": {
-            "default": 10,
-            "title": "Max Items",
-            "type": "integer"
-          }
-        },
-        "title": "rank_newsArguments",
-        "type": "object"
-      }
-    },
-    {
-      "name": "mcp__news-curator__list_sources",
-      "description": "List available news sources and their status.\n\nReturns:\n    JSON with available sources and whether X credentials are configured.\n",
-      "input_schema": {
-        "properties": {},
-        "title": "list_sourcesArguments",
-        "type": "object"
-      }
-    }
-  ],
   "brave-search": [
     {
       "name": "mcp__brave-search__brave_web_search",
@@ -1144,6 +997,64 @@
       "input_schema": {
         "properties": {},
         "title": "get_fisco_vi_newsArguments",
+        "type": "object"
+      }
+    }
+  ],
+  "polymarket": [
+    {
+      "name": "mcp__polymarket__search_markets",
+      "description": "キーワードで Polymarket の予測市場を検索する。\n\nArgs:\n    query: キーワード (例: \"iran\", \"taiwan\", \"fed rate\", \"hormuz\")。\n\nReturns:\n    JSON: {query, events:[{event_id, title, slug,\n           markets:[{question, slug, yes_price, volume, volume_24h,\n           liquidity, end_date, closed, active, clob_token_ids}...]}],\n           cache}\n    slug は get_market / get_market_history にそのまま渡せる。\n",
+      "input_schema": {
+        "properties": {
+          "query": {
+            "title": "Query",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "search_marketsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "mcp__polymarket__get_market",
+      "description": "slug で特定市場の現在の確率・出来高・流動性・期限・解決基準を取得する。\n\nArgs:\n    slug: 市場の slug (search_markets の結果から)。\n\nReturns:\n    JSON: {question, slug, yes_price(=Yes確率0-1), volume, volume_24h,\n           liquidity, end_date, closed, active, clob_token_ids,\n           resolution(=解決基準), source, cache}\n",
+      "input_schema": {
+        "properties": {
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug"
+        ],
+        "title": "get_marketArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "mcp__polymarket__get_market_history",
+      "description": "slug で Yes 確率の時系列を取得する（グラフ・変化検出用）。\n\nArgs:\n    slug: 市場の slug。\n    interval: 1h/6h/1d/1w/1m/max (既定 1m=1ヶ月)。\n\nReturns:\n    JSON: {slug, question, interval, count,\n           points:[{t(unix), date(iso), price(0-1)}...], source, cache}\n",
+      "input_schema": {
+        "properties": {
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          },
+          "interval": {
+            "default": "1m",
+            "title": "Interval",
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug"
+        ],
+        "title": "get_market_historyArguments",
         "type": "object"
       }
     }

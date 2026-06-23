@@ -29,11 +29,12 @@ import anthropic
 
 
 async def main() -> int:
-    from config import SYSTEM_PROMPT
+    from config import SYSTEM_PROMPT, CLAUDE_MODEL
     from services.claude_api.client import (
         CLI_DEFAULT_SYSTEM_PROMPT,
         CLI_IDENTITY_TEXT,
         MODEL_BETAS,
+        OUTPUT_CONFIG,
         THINKING_CONFIG,
         USER_AGENT,
         _session_id,
@@ -90,13 +91,14 @@ async def main() -> int:
 
     try:
         resp = await client.beta.messages.create(
-            model="claude-fable-5",
+            model=CLAUDE_MODEL,
             max_tokens=32,
             system=system,
             messages=messages,
             betas=MODEL_BETAS,
             metadata=get_metadata(),
             thinking=THINKING_CONFIG,
+            output_config=OUTPUT_CONFIG,
         )
         # If we got here, status was 200.
         text = ""

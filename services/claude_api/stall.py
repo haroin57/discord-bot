@@ -99,12 +99,10 @@ class StallWatchdog:
                 return
 
             if idle > self.stall_threshold_s and not self._warned:
+                # The bot.py spinner already shows liveness (shimmer + elapsed),
+                # so no user-facing "delayed" message — just log for ops.
                 log.warning(
                     "[ch=%d] stream stall: no message for %.0fs",
                     self.channel_id, idle,
-                )
-                await _safe_status(
-                    self.status_callback,
-                    f"⏳ 応答が遅延しています ({int(idle)}秒)",
                 )
                 self._warned = True

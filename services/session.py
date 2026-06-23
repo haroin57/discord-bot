@@ -236,6 +236,25 @@ def append_jsonl(channel_id: int, entry: dict) -> None:
     except Exception as exc:
         log.warning("history index update failed (non-fatal): %s", exc)
 
+    # Phase 5: also mirror into the semantic (vector) transcript index. The
+    # env flag is checked BEFORE importing so the default-OFF path adds zero
+    # work here (no import, no call) — append_jsonl is on the concurrent write
+    # path and any extra latency widens the BM25 write race above. Own try so a
+    # vector-store hiccup never affects the BM25 path.
+    try:
+        from config import MEM0_HISTORY_EMBED_ENABLED
+        if MEM0_HISTORY_EMBED_ENABLED:
+            role = entry.get("role")
+            content = entry.get("content")
+            if role and content:
+                from services.mem0 import history_embed
+                history_embed.index_line(
+                    channel_id, entry.get("timestamp", ""), role,
+                    entry.get("author", ""), content,
+                )
+    except Exception as exc:
+        log.warning("history embed update failed (non-fatal): %s", exc)
+
 
 _CONTEXT_BLOCK_RE = re.compile(
     r"<(?P<tag>retrieved_memories|kanae_self_memory)(?:\s[^>]*)?>.*?</(?P=tag)>",

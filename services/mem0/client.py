@@ -124,30 +124,23 @@ def _refresh_mem0_client_token() -> None:
 
 
 def _has_oauth_token() -> bool:
-    """Check whether Anthropic OAuth is available (not expired).
+    """Check whether Anthropic auth is available for Mem0's LLM.
 
-    Returns True if the credentials file exists and contains a non-expired
-    access token, or if ANTHROPIC_API_KEY is set. Returns False when the
-    only auth mechanism is OAuth and the token has expired.
+    Uses ``oauth_manager`` as the single source of truth. The old code
+    re-parsed ~/.claude/.credentials.json and read a TOP-LEVEL ``expiresAt``,
+    but that key is nested under ``claudeAiOauth`` — so it ALWAYS returned
+    False and Mem0 silently fell back to DeepSeek/OpenCode even with a valid
+    subscription token. oauth_manager.init() loads + validates the token
+    (idempotent) and get_access_token() returns it synchronously.
     """
     # Direct API key always works.
     if os.environ.get("ANTHROPIC_API_KEY"):
         return True
-    # Try reading the OAuth credentials file that discord-bot maintains.
     try:
-        from config import CREDENTIALS_PATH
-        import json
-        if os.path.isfile(CREDENTIALS_PATH):
-            with open(CREDENTIALS_PATH, encoding="utf-8") as f:
-                creds = json.load(f)
-            expires = creds.get("expiresAt", 0)
-            # Add 60s buffer so we don't start a request with a token that
-            # expires mid-flight.
-            if expires and (expires / 1000) > (time.time() + 60):
-                return True
+        oauth_init()  # idempotent; populates the cached access token
+        return bool(get_access_token())
     except Exception:
-        pass
-    return False
+        return False
 
 
 # Fallback LLM config (used when Anthropic OAuth is unavailable).
@@ -234,7 +227,9 @@ def _build_config() -> dict:
                 "model": _DEEPSEEK_V4_FLASH,
                 "temperature": 0.1,
                 "max_tokens": 2000,
-                "openai_api_key": _OPENCODE_API_KEY,
+                # mem0 1.0.11 OpenAIConfig uses `api_key` (not `openai_api_key`);
+                # `openai_base_url` is still accepted.
+                "api_key": _OPENCODE_API_KEY,
                 "openai_base_url": "https://api.opencode.ai/v1",
             }
         else:
@@ -245,7 +240,7 @@ def _build_config() -> dict:
 
     if llm_provider == "openrouter":
         # Mem0's openrouter provider wraps the OpenAI-compatible API.
-        llm_config["openai_api_key"] = _OPENROUTER_API_KEY
+        llm_config["api_key"] = _OPENROUTER_API_KEY
         llm_config["openai_base_url"] = "https://openrouter.ai/api/v1"
 
     config: dict = {

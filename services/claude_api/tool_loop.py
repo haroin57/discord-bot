@@ -30,10 +30,18 @@ import anthropic
 
 from config import (
     CLAUDE_MAX_TOKENS,
+    MAX_CONSECUTIVE_EMPTY_TURNS,
+    MAX_FINAL_EMPTY_NUDGES,
+    MAX_TEXT_INVOKE_CORRECTIONS,
+    MAX_TEXT_INVOKE_RESCUES,
+    MAX_TOOL_ERROR_NUDGES,
     PROACTIVE_COMPACT_ENABLED,
     PROACTIVE_COMPACT_TRIGGER_TOKENS,
     SERVER_SIDE_FALLBACK_ENABLED,
     SLOW_FIRST_BYTE_MS,
+    TEXT_INVOKE_RESCUE_ENABLED,
+    TOOL_CALL_TIMEOUT_S,
+    TOOL_ERROR_MIN_REPLY_CHARS,
 )
 
 from services.claude_api.client import (
@@ -48,8 +56,12 @@ from services.claude_api.client import (
 )
 from services.claude_api.errors import (
     classify_anthropic_error,
+    coerce_tool_input,
     contains_text_tool_call,
+    parse_text_tool_calls,
+    resolve_tool_name,
     strip_text_tool_call,
+    strip_degraded_opener_token,
 )
 from services.claude_api.mcp_client import kill_orphan_mcp_processes
 from services.claude_api.ratelimit import (
@@ -117,15 +129,24 @@ def _fallback_alert(model: str) -> str:
     )
 
 
-# Max corrective re-prompts when the model emits a tool call as plain text.
-MAX_TEXT_INVOKE_CORRECTIONS = 1
-# Corrective nudge appended as a user turn when a text-form tool call is seen.
+# MAX_TEXT_INVOKE_CORRECTIONS / MAX_TEXT_INVOKE_RESCUES / the nudge caps now
+# live in config.py (env-tunable). Corrective nudge appended as a user turn
+# when a text-form tool call could not be rescued.
 _TEXT_INVOKE_CORRECTION = (
     "⚠️ 直前のツール呼び出しが通常テキスト（<invoke …> の生 XML）として出力され、"
     "実行されませんでした。ツール呼び出しは地の文に書かず、正規の tool_use 形式で"
     "呼び出してください。ツール名は広告された完全名（例: "
     "mcp__brave-search__brave_news_search）を使ってください。同じツールを今すぐ"
     "正しい形式で呼び出し直してください。"
+)
+# (B) Nudge after a tool error when the model gives up with a thin reply.
+_TOOL_ERROR_NUDGE = (
+    "⚠️ 直前のツール実行がエラーになりました。エラー内容を踏まえて、別の方法で"
+    "続行するか、それが無理なら何が起きたのかを説明してください。"
+)
+# (C) Last-ditch nudge before returning the "(no response)" sentinel.
+_FINAL_EMPTY_NUDGE = (
+    "応答が空のようです。ここまでで分かったことだけでも要約して返してください。"
 )
 
 
@@ -439,31 +460,25 @@ def _format_tool_invocation_for_display(tool_name: str, tool_input: dict) -> str
         todos = tool_input.get("todos") or []
         if not isinstance(todos, list):
             return None
-        counts = {"pending": 0, "in_progress": 0, "completed": 0}
+        # CLI-aligned "Update Todos" block — mirrors Claude Code's terminal UI:
+        #   ☐ pending  /  ☐ **in-progress** (emphasized)  /  ☒ ~~completed~~
+        # The ☐/☒ glyphs are the exact ones the CLI binary uses; the checkbox
+        # column conveys progress at a glance, so no numbering / count summary
+        # (the CLI shows neither). For in-progress, prefer activeForm (the CLI
+        # surfaces the present-tense form for the active item). Cap to the inline
+        # budget so the Discord status message stays under 2000 chars.
+        lines = ["📝 **Update Todos**"]
         for t in todos:
-            if isinstance(t, dict):
-                s = t.get("status")
-                if s in counts:
-                    counts[s] += 1
-        header = (
-            f"📝 **TodoWrite** {len(todos)}件 "
-            f"(pending={counts['pending']} "
-            f"in_progress={counts['in_progress']} "
-            f"completed={counts['completed']})"
-        )
-        # Render the list with simple markers; cap to inline budget so the
-        # Discord status message stays under 2000 chars even with long todos.
-        lines = [header]
-        for i, t in enumerate(todos, 1):
             if not isinstance(t, dict):
                 continue
-            marker = {
-                "pending": "[ ]",
-                "in_progress": "[~]",
-                "completed": "[x]",
-            }.get(t.get("status"), "[?]")
-            content = str(t.get("content", ""))
-            lines.append(f"{i}. {marker} {content}")
+            status = t.get("status")
+            if status == "completed":
+                lines.append(f"  ☒ ~~{str(t.get('content', ''))}~~")
+            elif status == "in_progress":
+                active = t.get("activeForm") or t.get("content", "")
+                lines.append(f"  ☐ **{str(active)}**")
+            else:  # pending / unknown
+                lines.append(f"  ☐ {str(t.get('content', ''))}")
         body = "\n".join(lines)
         return _cap_inline(body, _TOOL_DETAIL_INLINE_CAP)
 
@@ -488,10 +503,10 @@ def _format_tool_invocation_for_display(tool_name: str, tool_input: dict) -> str
 # from resumed JSONL history that captured such a turn from an older run.
 _EMPTY_CONTENT_PLACEHOLDER = [{"type": "text", "text": "(続けてください)"}]
 
-# Max consecutive thinking-only "pause turns" (stop_reason==tool_use but zero
-# tool_use blocks) before the loop stops nudging and returns accumulated text.
-# Bounds the loop so a model that keeps thinking without acting can't spin.
-MAX_CONSECUTIVE_EMPTY_TURNS = 2
+# MAX_CONSECUTIVE_EMPTY_TURNS (max consecutive thinking-only "pause turns"
+# before the loop stops nudging) is imported from config.py above. It bounds a
+# model that keeps thinking without acting; the empty-content 400 guard relies
+# on it. Re-exported via this module so callers/tests can import it from here.
 
 
 def _normalize_history_for_api(history: list[dict]) -> list[dict]:
@@ -721,6 +736,233 @@ def _capture_refusal_request(channel_id, turn, model, cached_system, messages,
         log.debug("refusal capture failed: %s", exc)
 
 
+@dataclass
+class _RescuedToolUse:
+    """A lightweight stand-in for an anthropic tool_use block, minted when a
+    text-form ``<invoke>`` is rescued. ``_run_one_tool`` reads id/name/input via
+    getattr, so this duck-types as the real block on the execution path."""
+    id: str
+    name: str
+    input: dict
+    type: str = "tool_use"
+
+
+async def _run_one_tool(
+    block,
+    *,
+    can_use_tool,
+    execute_tool,
+    tool_schemas: dict,
+    status_callback,
+    tool_invocation_callback,
+    turn: int,
+) -> dict:
+    """Execute one tool_use block → a tool_result dict.
+
+    Shared by the normal tool-execution path and the text-form rescue path so
+    pre-dispatch validation, can_use_tool gating, the timeout cap, and error
+    shaping are identical for both. Was a nested closure in run_agent_loop;
+    hoisted to module scope (2026-06-21) so the rescue helper can reuse it.
+    """
+    tool_id = getattr(block, "id", "")
+    tool_name = getattr(block, "name", "")
+    tool_input = getattr(block, "input", None) or {}
+
+    # Notify the caller that a tool is about to run. bot.py renders this as a
+    # single edit-overwriting status message so the transcript stays clean.
+    if tool_invocation_callback is not None:
+        try:
+            await tool_invocation_callback(tool_name, tool_input)
+        except Exception as exc:
+            log.warning(
+                "tool_invocation_callback failed (tool=%s turn=%d): %s",
+                tool_name, turn, exc,
+            )
+
+    # Pre-dispatch schema validation (audit #11): a malformed call is answered
+    # in the CLI's <tool_use_error> shape, naming the field, so the model can
+    # fix it in one turn.
+    validation_error = _validate_tool_input(
+        tool_schemas.get(tool_name), tool_input,
+    )
+    if validation_error is not None:
+        log.info(
+            "tool %s input validation failed: %s",
+            tool_name, validation_error,
+        )
+        await _safe_status(status_callback, "❌ ツール入力エラー")
+        return {
+            "type": "tool_result",
+            "tool_use_id": tool_id,
+            "content": (
+                "<tool_use_error>InputValidationError: "
+                f"{validation_error}</tool_use_error>"
+            ),
+            "is_error": True,
+        }
+
+    allowed, reason = can_use_tool(tool_name, tool_input)
+    if not allowed:
+        await _safe_status(status_callback, "❌ ツール拒否")
+        return {
+            "type": "tool_result",
+            "tool_use_id": tool_id,
+            "content": f"Tool {tool_name} denied: {reason}",
+            "is_error": True,
+        }
+
+    try:
+        t0 = time.monotonic()
+        # Hard cap so a hung tool/MCP call can't wedge the turn (and the whole
+        # channel) forever. On timeout we return an is_error tool_result, so the
+        # loop can continue or wind down cleanly.
+        output = await asyncio.wait_for(
+            execute_tool(tool_name, tool_input),
+            timeout=TOOL_CALL_TIMEOUT_S,
+        )
+        dt = time.monotonic() - t0
+        # Anthropic tool_result content accepts either a string or a list of
+        # content blocks (text + image). The Read tool's image branch returns
+        # the latter; everything else returns a plain string. Anything weird
+        # falls back to str() so we never wedge the API call.
+        if isinstance(output, list):
+            result_content: "str | list[dict]" = output
+        elif isinstance(output, str):
+            result_content = output
+        else:
+            result_content = str(output)
+        await _safe_status(
+            status_callback,
+            f"📨 結果を受信 ({dt:.1f}s)",
+        )
+        return {
+            "type": "tool_result",
+            "tool_use_id": tool_id,
+            "content": result_content,
+        }
+    except (asyncio.TimeoutError, TimeoutError):
+        log.warning(
+            "tool %s timed out after %ds", tool_name, TOOL_CALL_TIMEOUT_S,
+        )
+        await _safe_status(status_callback, "⏰ ツールがタイムアウト")
+        return {
+            "type": "tool_result",
+            "tool_use_id": tool_id,
+            "content": (
+                f"<tool_use_error>Tool {tool_name} timed out after "
+                f"{TOOL_CALL_TIMEOUT_S}s and was aborted.</tool_use_error>"
+            ),
+            "is_error": True,
+        }
+    except Exception as exc:
+        log.warning("tool %s failed: %s", tool_name, exc)
+        await _safe_status(status_callback, "❌ ツールエラー")
+        return {
+            "type": "tool_result",
+            "tool_use_id": tool_id,
+            "content": f"<tool_use_error>{exc}</tool_use_error>",
+            "is_error": True,
+        }
+
+
+async def _attempt_text_invoke_rescue(
+    turn_text: str,
+    *,
+    history: list[dict],
+    tools_for_api: list[dict],
+    tool_schemas: dict,
+    can_use_tool,
+    execute_tool,
+    status_callback,
+    tool_invocation_callback,
+    channel_id: int,
+    turn: int,
+) -> "list[dict] | None":
+    """Rescue tool calls the model emitted as plain text.
+
+    Parses the ``<invoke>`` span(s) in ``turn_text``, resolves each name against
+    the advertised tools, and — only if EVERY call resolves — rewrites the
+    poisoned assistant turn in place to carry real tool_use blocks, executes
+    them, and appends the matching tool_result user turn. Returns the
+    tool_results on success, or ``None`` (nothing mutated beyond a no-op) when
+    rescue is impossible so the caller falls back to a corrective re-prompt.
+
+    All-or-nothing by design: a partially-rescued turn (one unresolved call)
+    would leave an orphan tool_use / unanswered result, which is worse than a
+    clean re-prompt.
+    """
+    parsed = parse_text_tool_calls(turn_text)
+    if not parsed:
+        return None
+    advertised = [
+        t.get("name") for t in (tools_for_api or [])
+        if isinstance(t, dict) and t.get("name")
+    ]
+    resolved: list[tuple[str, dict]] = []
+    for call in parsed:
+        real = resolve_tool_name(call["name"], advertised)
+        if real is None:
+            return None  # unresolved / ambiguous → abort the whole rescue
+        resolved.append((real, call["input"]))
+
+    pseudo_blocks = [
+        _RescuedToolUse(
+            id=f"toolu_rescue_{uuid.uuid4().hex[:24]}",
+            name=real,
+            input=coerce_tool_input(raw, tool_schemas.get(real)),
+        )
+        for real, raw in resolved
+    ]
+
+    # History surgery (400-avoidance core): replace the poisoned assistant turn
+    # in place so the raw <invoke> XML never persists and the turn legitimately
+    # ends in tool_use blocks. entry.py slices new turns from `history` for JSONL
+    # persistence, so replacing (not appending) keeps the XML off disk and avoids
+    # an orphan tool_use on resume.
+    clean_text = strip_text_tool_call(turn_text)
+    new_content: list[dict] = []
+    if clean_text.strip():
+        new_content.append({"type": "text", "text": clean_text})
+    new_content.extend(
+        {"type": "tool_use", "id": b.id, "name": b.name, "input": b.input}
+        for b in pseudo_blocks
+    )
+    if history and history[-1].get("role") == "assistant":
+        history[-1] = {"role": "assistant", "content": new_content}
+    else:  # defensive — the assistant turn was just appended by the caller
+        history.append({"role": "assistant", "content": new_content})
+
+    # Execute via the shared path. Read-only batches run concurrently (audit
+    # #12); anything else stays sequential.
+    if len(pseudo_blocks) > 1 and all(
+        b.name in CONCURRENCY_SAFE_TOOLS for b in pseudo_blocks
+    ):
+        tool_results = list(await asyncio.gather(*(
+            _run_one_tool(
+                b, can_use_tool=can_use_tool, execute_tool=execute_tool,
+                tool_schemas=tool_schemas, status_callback=status_callback,
+                tool_invocation_callback=tool_invocation_callback, turn=turn,
+            ) for b in pseudo_blocks
+        )))
+    else:
+        tool_results = [
+            await _run_one_tool(
+                b, can_use_tool=can_use_tool, execute_tool=execute_tool,
+                tool_schemas=tool_schemas, status_callback=status_callback,
+                tool_invocation_callback=tool_invocation_callback, turn=turn,
+            )
+            for b in pseudo_blocks
+        ]
+    # tool_result ids equal the tool_use ids written above → strict pairing.
+    history.append({"role": "user", "content": tool_results})
+    log.warning(
+        "[ch=%d] turn=%d rescued %d text-form tool call(s): %s",
+        channel_id, turn + 1, len(pseudo_blocks),
+        [b.name for b in pseudo_blocks],
+    )
+    return tool_results
+
+
 async def run_agent_loop(
     prompt: str,
     channel_id: int,
@@ -734,6 +976,7 @@ async def run_agent_loop(
     incremental_text_callback=None,   # async (text:str)->None  (per-turn final)
     text_stream_callback=None,        # async (partial_turn_text:str)->None
     tool_invocation_callback=None,    # async (name:str, args:dict)->None
+    progress=None,                    # mutable {"tokens": int} for the live spinner
     max_turns: int,
     stall_watchdog: StallWatchdog,
     api_client: anthropic.AsyncAnthropic,
@@ -801,6 +1044,16 @@ async def run_agent_loop(
     # once for a proper call before giving up (2026-06-13 poison, see
     # docs/2026-06-13_tool_call_text_invoke_poison.md).
     text_invoke_corrections = 0
+    # Text-form rescue counter (2026-06-21): each successful rescue (parse the
+    # text <invoke> and run it as a real tool_use) increments this; bounded by
+    # MAX_TEXT_INVOKE_RESCUES so a model that only ever text-forms can't spin.
+    text_invoke_rescues = 0
+    # (B) Did the most recently appended tool_results batch contain an error?
+    # Drives the one-shot recovery nudge when the model then gives up.
+    last_turn_had_tool_error = False
+    error_recovery_nudges = 0
+    # (C) Last-ditch summary nudge before returning "(no response)".
+    final_empty_nudges = 0
     # In-loop proactive compaction state (audit #3, ADR-0012). ``prior_len``
     # tracks how many leading history entries belong to the prior transcript;
     # a mid-loop compaction replaces history[:prior_len] with the collapsed
@@ -815,6 +1068,10 @@ async def run_agent_loop(
         for t in (tools_for_api or [])
         if isinstance(t, dict)
     }
+
+    # Running output-token total across completed turns, surfaced live to the
+    # bot.py spinner via the shared `progress` dict.
+    _tok_base = 0
 
     for turn in range(max_turns):
         messages = _normalize_history_for_api(history)
@@ -958,6 +1215,15 @@ async def run_agent_loop(
                             if hint:
                                 label += f" `{hint[:60]}`"
                             await _safe_status(status_callback, label)
+                    elif etype == "message_delta":
+                        # Live output-token count for the spinner: cumulative
+                        # for this stream + already-completed turns.
+                        if progress is not None:
+                            _u = getattr(event, "usage", None)
+                            if _u is not None:
+                                progress["tokens"] = _tok_base + _usage_number(
+                                    _u, "output_tokens",
+                                )
                     elif etype == "content_block_delta" and text_stream_callback is not None:
                         delta = getattr(event, "delta", None)
                         if getattr(delta, "type", None) == "text_delta":
@@ -990,6 +1256,13 @@ async def run_agent_loop(
                     ttft_ms=ttft_ms,
                     message_count=len(messages),
                 )
+                # Fold this turn's output into the running spinner total so the
+                # next turn's live count continues from here.
+                _tok_base += _usage_number(
+                    getattr(final_msg, "usage", None), "output_tokens",
+                )
+                if progress is not None:
+                    progress["tokens"] = _tok_base
                 if getattr(final_msg, "stop_reason", None) == "refusal":
                     try:
                         _resp = getattr(stream, "response", None)
@@ -1104,37 +1377,70 @@ async def run_agent_loop(
             turn=turn,
         )
 
-        # Text-form tool-call guard: the model wrote a tool call as plain text
-        # (`<invoke …>`) instead of a real tool_use block, so nothing ran. The
-        # assistant turn was just appended (above); leave it in place and add a
-        # corrective user turn so the model re-issues a real call. Bounded to
-        # one correction; the persist/replay chokepoints strip the raw XML so
-        # it never poisons the transcript even if the retry is exhausted.
-        if (
-            not fired_tools_this_turn
-            and contains_text_tool_call(turn_text)
-            and text_invoke_corrections < MAX_TEXT_INVOKE_CORRECTIONS
-        ):
-            text_invoke_corrections += 1
-            history.append({
-                "role": "user",
-                "content": [{"type": "text", "text": _TEXT_INVOKE_CORRECTION}],
-            })
-            consecutive_empty = 0
-            log.warning(
-                "[ch=%d] turn=%d text-form tool call emitted as text → "
-                "corrective re-prompt (%d/%d)",
-                channel_id, turn + 1, text_invoke_corrections,
-                MAX_TEXT_INVOKE_CORRECTIONS,
-            )
-            await _safe_status(status_callback, "🔧 ツール呼び出しをやり直し中")
-            continue
+        # Text-form tool-call handling: the model wrote a tool call as plain
+        # text (`<invoke …>`) instead of a real tool_use block, so nothing ran.
+        # FIRST try to RESCUE it — parse the <invoke>, resolve the (possibly
+        # abbreviated) tool name, rewrite this assistant turn in place to carry
+        # real tool_use blocks, and execute them. If the call can't be parsed
+        # or its name can't be resolved unambiguously, fall back to a corrective
+        # re-prompt (bounded by MAX_TEXT_INVOKE_CORRECTIONS). The persist/replay
+        # chokepoints strip the raw XML so it never poisons the transcript even
+        # if both paths are exhausted.
+        if not fired_tools_this_turn and contains_text_tool_call(turn_text):
+            rescued_results = None
+            if (
+                TEXT_INVOKE_RESCUE_ENABLED
+                and text_invoke_rescues < MAX_TEXT_INVOKE_RESCUES
+            ):
+                rescued_results = await _attempt_text_invoke_rescue(
+                    turn_text,
+                    history=history,
+                    tools_for_api=tools_for_api,
+                    tool_schemas=tool_schemas,
+                    can_use_tool=can_use_tool,
+                    execute_tool=execute_tool,
+                    status_callback=status_callback,
+                    tool_invocation_callback=tool_invocation_callback,
+                    channel_id=channel_id,
+                    turn=turn,
+                )
+            if rescued_results is not None:
+                text_invoke_rescues += 1
+                consecutive_empty = 0
+                last_turn_had_tool_error = any(
+                    r.get("is_error") for r in rescued_results
+                )
+                continue
+            if text_invoke_corrections < MAX_TEXT_INVOKE_CORRECTIONS:
+                text_invoke_corrections += 1
+                history.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": _TEXT_INVOKE_CORRECTION}],
+                })
+                consecutive_empty = 0
+                log.warning(
+                    "[ch=%d] turn=%d text-form tool call emitted as text → "
+                    "corrective re-prompt (%d/%d)",
+                    channel_id, turn + 1, text_invoke_corrections,
+                    MAX_TEXT_INVOKE_CORRECTIONS,
+                )
+                await _safe_status(status_callback, "🔧 ツール呼び出しをやり直し中")
+                continue
 
         # Belt-and-suspenders: if a text-form call slipped through (correction
         # budget exhausted), strip the raw XML so neither Discord nor the
         # accumulated answer shows it.
         if turn_text and contains_text_tool_call(turn_text):
             turn_text = strip_text_tool_call(turn_text)
+
+        # Degraded opener tokens (course/court/sit/…) can co-occur with a REAL
+        # tool_use block: then fired_tools_this_turn is non-empty and
+        # contains_text_tool_call is False, so neither the rescue path nor the
+        # strip above fires, and the bare token survives into Discord AND the
+        # transcript (self-poison seed). Strip a token left isolated on its own
+        # line, regardless of tool_use co-occurrence.
+        if turn_text:
+            turn_text = strip_degraded_opener_token(turn_text)
 
         if turn_text:
             if incremental_text_callback is not None:
@@ -1196,6 +1502,30 @@ async def run_agent_loop(
             continue
 
         if stop_reason in ("end_turn", "stop_sequence"):
+            # (B) The previous turn's tool(s) errored and the model gave up with
+            # an empty/near-empty reply — nudge once to recover or at least
+            # explain. Gated by the thin-reply length so a real apology/answer
+            # is never nudged.
+            if (
+                last_turn_had_tool_error
+                and error_recovery_nudges < MAX_TOOL_ERROR_NUDGES
+                and len("\n\n".join(text_across_turns).strip())
+                < TOOL_ERROR_MIN_REPLY_CHARS
+            ):
+                error_recovery_nudges += 1
+                last_turn_had_tool_error = False
+                history.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": _TOOL_ERROR_NUDGE}],
+                })
+                log.warning(
+                    "[ch=%d] turn=%d tool error + thin reply → recovery nudge "
+                    "(%d/%d)",
+                    channel_id, turn + 1, error_recovery_nudges,
+                    MAX_TOOL_ERROR_NUDGES,
+                )
+                await _safe_status(status_callback, "🔧 エラーから復帰を試行中")
+                continue
             last_text = "\n\n".join(text_across_turns)
             if fallback_used and not fallback_note_sent_live and last_text:
                 last_text = (
@@ -1231,96 +1561,20 @@ async def run_agent_loop(
                 usage_total=dict(usage_totals),
             )
 
-        # Execute every tool_use block in this turn.
-        async def _run_one_tool(block) -> dict:
-            tool_id = getattr(block, "id", "")
-            tool_name = getattr(block, "name", "")
-            tool_input = getattr(block, "input", None) or {}
-
-            # Notify the caller that a tool is about to run. bot.py
-            # renders this as a single edit-overwriting status message
-            # so the transcript stays clean — the final Discord history
-            # only retains the assistant's prose (incremental_text path)
-            # and is free of "🔧 Bash 実行 ..." scaffolding.
-            if tool_invocation_callback is not None:
-                try:
-                    await tool_invocation_callback(tool_name, tool_input)
-                except Exception as exc:
-                    log.warning(
-                        "tool_invocation_callback failed (tool=%s turn=%d): %s",
-                        tool_name, turn, exc,
-                    )
-
-            # Pre-dispatch schema validation (audit #11): a malformed call
-            # is answered in the CLI's <tool_use_error> shape, naming the
-            # field, so the model can fix it in one turn.
-            validation_error = _validate_tool_input(
-                tool_schemas.get(tool_name), tool_input,
-            )
-            if validation_error is not None:
-                log.info(
-                    "tool %s input validation failed: %s",
-                    tool_name, validation_error,
-                )
-                await _safe_status(status_callback, "❌ ツール入力エラー")
-                return {
-                    "type": "tool_result",
-                    "tool_use_id": tool_id,
-                    "content": (
-                        "<tool_use_error>InputValidationError: "
-                        f"{validation_error}</tool_use_error>"
-                    ),
-                    "is_error": True,
-                }
-
-            allowed, reason = can_use_tool(tool_name, tool_input)
-            if not allowed:
-                await _safe_status(status_callback, "❌ ツール拒否")
-                return {
-                    "type": "tool_result",
-                    "tool_use_id": tool_id,
-                    "content": f"Tool {tool_name} denied: {reason}",
-                    "is_error": True,
-                }
-
-            try:
-                t0 = time.monotonic()
-                output = await execute_tool(tool_name, tool_input)
-                dt = time.monotonic() - t0
-                # Anthropic tool_result content accepts either a string or
-                # a list of content blocks (text + image). The Read tool's
-                # image branch returns the latter; everything else still
-                # returns a plain string. Anything weird falls back to str()
-                # so we never wedge the API call.
-                if isinstance(output, list):
-                    result_content: "str | list[dict]" = output
-                elif isinstance(output, str):
-                    result_content = output
-                else:
-                    result_content = str(output)
-                await _safe_status(
-                    status_callback,
-                    f"📨 結果を受信 ({dt:.1f}s)",
-                )
-                return {
-                    "type": "tool_result",
-                    "tool_use_id": tool_id,
-                    "content": result_content,
-                }
-            except Exception as exc:
-                log.warning("tool %s failed: %s", tool_name, exc)
-                await _safe_status(status_callback, "❌ ツールエラー")
-                return {
-                    "type": "tool_result",
-                    "tool_use_id": tool_id,
-                    "content": f"<tool_use_error>{exc}</tool_use_error>",
-                    "is_error": True,
-                }
-
+        # Execute every tool_use block in this turn via the shared
+        # module-level _run_one_tool (also used by the text-form rescue path).
         tool_blocks = [
             b for b in (final_msg.content or [])
             if getattr(b, "type", None) == "tool_use"
         ]
+        _tool_kw = dict(
+            can_use_tool=can_use_tool,
+            execute_tool=execute_tool,
+            tool_schemas=tool_schemas,
+            status_callback=status_callback,
+            tool_invocation_callback=tool_invocation_callback,
+            turn=turn,
+        )
         # Read-only batches run concurrently (CLI isConcurrencySafe, audit
         # #12); tool_result order still follows tool_use order because
         # asyncio.gather preserves input order.
@@ -1329,10 +1583,12 @@ async def run_agent_loop(
             for b in tool_blocks
         ):
             tool_results = list(await asyncio.gather(
-                *(_run_one_tool(b) for b in tool_blocks)
+                *(_run_one_tool(b, **_tool_kw) for b in tool_blocks)
             ))
         else:
-            tool_results = [await _run_one_tool(b) for b in tool_blocks]
+            tool_results = [
+                await _run_one_tool(b, **_tool_kw) for b in tool_blocks
+            ]
 
         if not tool_results:
             # Pause turn: stop_reason was tool_use but the model emitted only
@@ -1350,6 +1606,26 @@ async def run_agent_loop(
                     "role": "user",
                     "content": [{"type": "text", "text": "続けてください。"}],
                 })
+                continue
+            # (C) Pause-turn budget exhausted. Before surrendering to
+            # "(no response)", make one last-ditch attempt to extract whatever
+            # the model has worked out so far.
+            if final_empty_nudges < MAX_FINAL_EMPTY_NUDGES:
+                final_empty_nudges += 1
+                # NB: consecutive_empty is deliberately NOT reset — if the model
+                # answers the nudge with text it returns normally next turn; if
+                # it only thinks again, consecutive_empty keeps climbing and the
+                # spent nudge budget routes straight to "(no response)".
+                history.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": _FINAL_EMPTY_NUDGE}],
+                })
+                log.warning(
+                    "[ch=%d] turn=%d pause limit → final summary nudge (%d/%d)",
+                    channel_id, turn + 1, final_empty_nudges,
+                    MAX_FINAL_EMPTY_NUDGES,
+                )
+                await _safe_status(status_callback, "📝 まとめを依頼中")
                 continue
             log.warning(
                 "pause turn limit reached ch=%d turn=%d consecutive=%d → "
@@ -1373,6 +1649,11 @@ async def run_agent_loop(
             )
         consecutive_empty = 0
         history.append({"role": "user", "content": tool_results})
+        # (B) Remember whether this batch errored so the end_turn branch can
+        # nudge once if the model then gives up with a thin reply.
+        last_turn_had_tool_error = any(
+            r.get("is_error") for r in tool_results
+        )
 
         # In-loop proactive compaction (audit #3, ADR-0012): the CLI folds the
         # conversation BEFORE it overflows (proactive floor with a 20% buffer);
@@ -1380,6 +1661,10 @@ async def run_agent_loop(
         # in-loop turn to ride straight into a Fable refusal. When the last
         # turn's real context footprint crossed the floor, replace the prior
         # window with the freshly compacted one and continue the same loop.
+        # Model-window-based trigger (CLI et6(K) port), unified with the
+        # boundary trigger so the in-loop fold doesn't pre-empt it at a lower
+        # flat constant. HISTORY_COMPACT_PCT_OVERRIDE dials both.
+        from services.claude_api.compaction import compact_threshold_tokens
         if (
             PROACTIVE_COMPACT_ENABLED
             and proactive_compact is not None
@@ -1387,7 +1672,7 @@ async def run_agent_loop(
             and _context_tokens({
                 f: _usage_number(getattr(final_msg, "usage", None), f)
                 for f in _USAGE_FIELDS
-            }) > PROACTIVE_COMPACT_TRIGGER_TOKENS
+            }) > compact_threshold_tokens()
         ):
             try:
                 new_prior = await proactive_compact()

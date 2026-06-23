@@ -94,17 +94,16 @@ async def cli_messages_create(
     accepts identically.
     """
     headers = cli_headers()
-    # 2026-06-17: filter MODEL_BETAS for Haiku — context-1m-2025-08-07 was
-    # added for Opus 4.7's 500K compaction window but Haiku models return
-    # 400 "long context beta is not yet available for this subscription"
-    # when they see it, which was silently failing-open every Mem0 rewrite/
-    # HyDE/rerank/dedup call (and the new invest_kb Haiku pipeline). Strip
-    # the long-context beta whenever the model is a Haiku.
-    is_haiku = "haiku" in (model or "").lower()
-    effective_betas = [
-        b for b in MODEL_BETAS
-        if not (is_haiku and b.startswith("context-1m-"))
-    ]
+    # Strip the long-context beta (context-1m-*) for ALL Mem0 helper calls.
+    # These tasks (extract / dedup / rewrite / HyDE / rerank / classify) send
+    # tiny prompts that never need the 1M window, and on this subscription only
+    # Opus is entitled to context-1m: Haiku returns 400 "long context beta not
+    # available", and Sonnet 4.6 returns 429 "Usage credits are required for
+    # long context requests". The guard used to be Haiku-only, so once the
+    # MEM0_*_MODEL env was switched to claude-sonnet-4-6 every classify/dedup
+    # 429'd silently (fail-open). mem0 helpers gain nothing from the beta, so
+    # drop it unconditionally — only the main bot path (Opus) keeps it.
+    effective_betas = [b for b in MODEL_BETAS if not b.startswith("context-1m-")]
     headers["anthropic-beta"] = ",".join(effective_betas)
     kwargs = dict(
         model=model,

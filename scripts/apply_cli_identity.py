@@ -25,6 +25,10 @@ from mitmproxy import io as mio
 
 
 CLIENT_PY = Path(__file__).resolve().parent.parent / "services" / "claude_api" / "client.py"
+# system[2] (the CLI default agent system prompt) lives in this file, NOT in
+# the AUTO-CAPTURE block. We refresh it from the live capture so the pinned
+# prompt is the real CLI one, not a hand-edited/fabricated stand-in.
+PROMPT_TXT = CLIENT_PY.parent / "cli_default_system_prompt.txt"
 MARKER_START = "# AUTO-CAPTURE-START"
 MARKER_END = "# AUTO-CAPTURE-END"
 
@@ -77,11 +81,19 @@ def _extract_fields(req, body: dict) -> dict:
             cc_version = re.sub(r"\.[0-9a-fA-F]+$", "", cc_version_full)
             cc_entrypoint = m.group("e")
 
+    # system[2] = the CLI default agent system prompt (system[0]=billing,
+    # system[1]=identity, system[2]=default prompt, system[3]=task). Captured
+    # so the pinned cli_default_system_prompt.txt stays the REAL CLI prompt.
+    system_default_prompt = ""
+    if len(system_blocks) >= 3:
+        system_default_prompt = system_blocks[2].get("text", "")
+
     return {
         "cc_version": cc_version,
         "cc_entrypoint": cc_entrypoint,
         "model_betas": betas,
         "cli_identity_text": identity_text,
+        "system_default_prompt": system_default_prompt,
     }
 
 
@@ -136,9 +148,24 @@ def main():
     new_block = render_block(fields)
     old, new = rewrite_client_py(new_block)
     changed = old != new
+
+    # Refresh system[2] = the CLI default system prompt (separate file).
+    # Best-effort: only overwrite when the capture actually carried it, so a
+    # degraded/short capture never blanks a working prompt.
+    raw_prompt = fields.get("system_default_prompt") or ""
+    prompt_written = False
+    if raw_prompt.strip():
+        current = PROMPT_TXT.read_text(encoding="utf-8") if PROMPT_TXT.exists() else ""
+        if current != raw_prompt:
+            PROMPT_TXT.write_text(raw_prompt, encoding="utf-8")
+            prompt_written = True
+
+    summary = dict(fields)
+    summary["system_default_prompt"] = f"<{len(raw_prompt)} chars>"
     print(json.dumps({
-        "changed": changed,
-        "extracted": fields,
+        "changed": changed or prompt_written,
+        "prompt_written": prompt_written,
+        "extracted": summary,
     }, ensure_ascii=False))
 
 

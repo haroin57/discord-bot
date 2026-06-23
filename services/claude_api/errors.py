@@ -14,6 +14,7 @@ Ported from services/claude_sdk.py:122-219. ``cli_exit`` was renamed
 key for backwards compat.
 """
 
+import json
 import re
 
 import anthropic
@@ -66,9 +67,57 @@ _TOOL_USE_MISMATCH_PATTERNS = (
 )
 
 
+_BILLING_SUBSTRINGS = (
+    "usage credits are required",
+    "credit balance",
+    "insufficient",
+    "quota",
+    "upgrade",
+    "long context",
+    "billing",
+)
+
+
+def _extract_fields(exc: BaseException) -> tuple["int | None", str, str, dict]:
+    """Extract (status, err_type, message, headers) from an anthropic SDK exception.
+
+    Reads exc.body (dict with error.type / error.message) and
+    exc.response.headers (lowercased).  Safe to call on any exception type —
+    returns sensible defaults when attributes are absent.
+    """
+    status: "int | None" = getattr(exc, "status_code", None)
+    body = getattr(exc, "body", None)
+    err_type = ""
+    body_text = ""
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            err_type = str(err.get("type", "")).lower()
+            body_text = str(err.get("message", ""))
+        else:
+            body_text = str(err or "")
+    else:
+        body_text = str(body or "")
+
+    resp = getattr(exc, "response", None)
+    raw_headers = getattr(resp, "headers", None) if resp is not None else None
+    headers: dict = {}
+    if raw_headers is not None:
+        try:
+            headers = {k.lower(): v for k, v in raw_headers.items()}
+        except Exception:
+            pass
+
+    return status, err_type, body_text, headers
+
+
 def classify_anthropic_error(exc: BaseException) -> str:
     """Primary classifier — maps anthropic SDK exceptions to retry categories."""
     if isinstance(exc, anthropic.RateLimitError):
+        # RateLimitError may still carry a credit-related message — check body.
+        _, _, body_text, _ = _extract_fields(exc)
+        if any(p in body_text.lower() for p in _BILLING_SUBSTRINGS):
+            return "billing"
         return "rate_limit"
     if isinstance(exc, anthropic.NotFoundError):
         # Model renamed/retired (audit #6) — entry.py escapes to the fallback
@@ -81,20 +130,9 @@ def classify_anthropic_error(exc: BaseException) -> str:
     if isinstance(exc, anthropic.APIConnectionError):
         return "overloaded"
     if isinstance(exc, anthropic.APIStatusError):
-        status = getattr(exc, "status_code", None)
-        body = getattr(exc, "body", None)
-        err_type = ""
-        body_text = ""
-        if isinstance(body, dict):
-            err = body.get("error")
-            if isinstance(err, dict):
-                err_type = str(err.get("type", "")).lower()
-                body_text = str(err.get("message", ""))
-            else:
-                body_text = str(err or "")
-        else:
-            body_text = str(body or "")
+        status, err_type, body_text, headers = _extract_fields(exc)
         body_lower = body_text.lower()
+        should_retry_hdr = headers.get("x-should-retry", "").lower()
         # Stream-internal error events ride the HTTP-200 connection, so the
         # SDK raises a bare APIStatusError(status_code=200) and the true kind
         # lives in body.error.type. Classify on error.type, not status alone:
@@ -102,7 +140,15 @@ def classify_anthropic_error(exc: BaseException) -> str:
         # never retried (the bug this fixes).
         if status == 529 or "overloaded" in err_type or "overloaded" in body_lower:
             return "overloaded"
+        # billing: credit-related substrings win even when error.type is
+        # rate_limit_error — retrying against a depleted credit pool wastes
+        # API calls and the budget doesn't recover under retry pressure.
+        if any(p in body_lower for p in _BILLING_SUBSTRINGS):
+            return "billing"
         if status == 429 or "rate_limit" in err_type:
+            # x-should-retry: false signals the server considers this permanent.
+            if should_retry_hdr == "false":
+                return "billing"
             return "rate_limit"
         # context-overflow must be checked BEFORE invalid_request so a 400 with
         # an "input too long" body stays context_overflow (existing behaviour).
@@ -129,6 +175,7 @@ def classify_anthropic_error(exc: BaseException) -> str:
 _ERROR_MESSAGE_TABLE = {
     "rate_limit": "⏳ APIのレート制限に達しました。少し待ってから再試行してください。",
     "overloaded": "🔄 サーバーが混雑しています。しばらく待ってから再試行してください。",
+    "billing": "⚠️ APIのクレジット枠を使い切ったか、課金が必要なリクエストです（長コンテキスト等）。`/effort` で effort を下げる、枠の回復を待つ、または管理者に課金確認を依頼してください。リトライしても直りません。",
     "auth": "🔑 認証エラーが発生しました。管理者に連絡してください。",
     "context_overflow": "📝 メッセージが長すぎます。短くして送り直してください。",
     "max_turns": "🔄 ターン上限に達しました。もう一度話しかけてください。",
@@ -225,5 +272,178 @@ def strip_text_tool_call(text: str) -> str:
     if m is None:
         return text
     head = text[: m.start()].rstrip()
-    head = re.sub(r"\b(?:course|function_calls)\s*$", "", head).rstrip()
+    # Trim a dangling degraded opener token left on the preceding line. The
+    # STRUCTURAL regex above is the real detector — this list is only cosmetic
+    # head-trimming and can ONLY fire on a token sitting immediately before a
+    # confirmed XML opener (contains_text_tool_call already matched), so even
+    # an over-broad entry here cannot strip ordinary prose. `course`/`court`
+    # are the corrupt `<function_calls>` tokens observed in production logs.
+    head = re.sub(
+        r"\b(?:course|courses|court|sit|antml|function_calls|tool_calls)\s*$",
+        "", head,
+    ).rstrip()
     return head
+
+
+# Degraded `<function_calls>`/`<invoke>` opener tokens (course/court/sit/…) can
+# appear as a BARE token isolated on its own line while the model ALSO emits a
+# genuine tool_use block. strip_text_tool_call can't catch that case (it needs
+# a following <invoke> XML span), so the bare token survives into Discord AND
+# the transcript — a self-poison seed (docs/2026-06-13_tool_call_text_invoke_poison).
+_DEGRADED_OPENER_KNOWN = "course|courses|court|sit|antml|function_calls|tool_calls"
+_DEGRADED_OPENER_LINE_RE = re.compile(
+    r"(?:\A|\n)[ \t]*(?:" + _DEGRADED_OPENER_KNOWN + r")[ \t]*(?=\n|\Z)",
+    re.IGNORECASE,
+)
+
+
+def strip_degraded_opener_token(text: str) -> str:
+    """Remove a degraded tool-call opener token left isolated on its own line.
+
+    Matches STRUCTURALLY: a known degraded token alone on a line (start- or
+    newline-bounded, with line-end / string-end ahead). Prose mentions keep
+    neighbours on the same line (``\u0060court\u0060`` inline, mid-sentence,
+    code-fenced) and are never touched, so this is safe to run unconditionally
+    on every assistant turn — independent of tool_use co-occurrence.
+    """
+    if not text:
+        return text
+    cleaned = _DEGRADED_OPENER_LINE_RE.sub("", text)
+    if cleaned != text:
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Text-form tool-call RESCUE (2026-06-21)
+# ---------------------------------------------------------------------------
+# When a model emits a tool call as plain text (`<invoke name="…">` with
+# `<parameter>` children) instead of a real tool_use block, the call never
+# runs and the turn dead-ends. Rather than only re-prompting, the tool loop
+# can RESCUE the call: parse it here, resolve the (possibly abbreviated) tool
+# name against the advertised set, and re-execute it as a genuine tool_use.
+# Parsing is best-effort and total — it never raises; an unparseable / ambiguous
+# call simply yields nothing so the caller falls back to the re-prompt path.
+_INVOKE_BLOCK_RE = re.compile(
+    r"<\s*(?:antml:)?invoke\s+name\s*=\s*\"(?P<name>[^\"]+)\"\s*>"
+    r"(?P<body>[\s\S]*?)"
+    r"(?:</\s*(?:antml:)?invoke\s*>|$)",
+    re.IGNORECASE,
+)
+_PARAM_RE = re.compile(
+    r"<\s*(?:antml:)?parameter\s+name\s*=\s*\"(?P<pname>[^\"]+)\"\s*>"
+    r"(?P<pval>[\s\S]*?)"
+    r"</\s*(?:antml:)?parameter\s*>",
+    re.IGNORECASE,
+)
+
+
+def parse_text_tool_calls(text: str) -> list[dict]:
+    """Extract text-form tool calls from prose.
+
+    Returns ``[{"name": str, "input": {param: str}}]`` — one entry per
+    ``<invoke>`` block in document order. Parameter values are RAW STRINGS
+    (no type coercion here; the caller applies schema-driven coercion). A
+    truncated trailing ``<invoke>`` with no closing tag still parses as long
+    as it has complete ``<parameter>`` children. Returns ``[]`` (never raises)
+    when nothing parseable is found.
+    """
+    if not text:
+        return []
+    out: list[dict] = []
+    for m in _INVOKE_BLOCK_RE.finditer(text):
+        name = (m.group("name") or "").strip()
+        if not name:
+            continue
+        body = m.group("body") or ""
+        params: dict[str, str] = {}
+        for pm in _PARAM_RE.finditer(body):
+            pname = (pm.group("pname") or "").strip()
+            if not pname:
+                continue
+            pval = pm.group("pval")
+            # Models routinely put the value on its own line. Drop ONE leading
+            # and ONE trailing newline, but keep significant indentation (Bash
+            # commands / Write payloads depend on it).
+            if pval.startswith("\r\n"):
+                pval = pval[2:]
+            elif pval.startswith("\n"):
+                pval = pval[1:]
+            if pval.endswith("\n"):
+                pval = pval[:-1]
+            params[pname] = pval
+        out.append({"name": name, "input": params})
+    return out
+
+
+def resolve_tool_name(emitted: str, advertised: list[str]) -> "str | None":
+    """Resolve a model-emitted tool name to a registered one.
+
+    1) exact match wins;
+    2) else suffix match on the final ``__``-delimited segment
+       (``brave_news_search`` → ``mcp__brave-search__brave_news_search``);
+    3) ``None`` on zero matches OR more than one (ambiguous) — the caller then
+       falls back to a corrective re-prompt rather than guess.
+    """
+    if not emitted:
+        return None
+    if emitted in advertised:
+        return emitted
+    candidates = [a for a in advertised if a.split("__")[-1] == emitted]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _coerce_value(value: str, ptype):
+    """Best-effort coerce one string value to ``ptype``; keep raw on failure."""
+    if ptype == "integer":
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return value
+    if ptype == "number":
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return value
+    if ptype == "boolean":
+        low = value.strip().lower()
+        if low in ("true", "1", "yes"):
+            return True
+        if low in ("false", "0", "no"):
+            return False
+        return value
+    if ptype in ("object", "array"):
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return value
+    return value
+
+
+def coerce_tool_input(raw: dict, schema: "dict | None") -> dict:
+    """Coerce string parameter values using the tool's input_schema.
+
+    Coerce ONLY when the schema unambiguously names a non-string type for that
+    property; on any failure the raw string is kept (``_validate_tool_input``
+    then surfaces a clean InputValidationError the model can self-correct —
+    strictly safer than dropping or guessing). Missing schema / unknown
+    property → value passed through as-is.
+    """
+    if not raw:
+        return {}
+    props = {}
+    if isinstance(schema, dict):
+        p = schema.get("properties")
+        if isinstance(p, dict):
+            props = p
+    out: dict = {}
+    for key, value in raw.items():
+        if not isinstance(value, str):
+            out[key] = value
+            continue
+        spec = props.get(key)
+        ptype = spec.get("type") if isinstance(spec, dict) else None
+        out[key] = _coerce_value(value, ptype)
+    return out

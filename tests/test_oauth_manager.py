@@ -59,6 +59,7 @@ def _reset_oauth_globals(monkeypatch):
     monkeypatch.setattr(real_mod, "_http_session", None)
     monkeypatch.setattr(real_mod, "_patched", False)
     monkeypatch.setattr(real_mod, "_refresh_failure_count", 0)
+    monkeypatch.setattr(real_mod, "_refresh_permanent", False)
 
     yield
 
@@ -772,3 +773,129 @@ class TestRefreshFailureCounter:
 
         with pytest.raises(om.OAuthRefreshFailed):
             await om.ensure_valid_token()
+
+
+# ---------------------------------------------------------------------------
+# invalid_grant permanent-failure handling
+# ---------------------------------------------------------------------------
+
+class TestInvalidGrant:
+    @pytest.mark.asyncio
+    async def test_invalid_grant_json_sets_permanent_flag(self, monkeypatch):
+        """Non-200 with JSON {"error": "invalid_grant"} sets _refresh_permanent=True."""
+        import services.oauth_manager as om
+
+        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
+        monkeypatch.setattr(om, "_refresh_permanent", False)
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 400
+        mock_resp.text = AsyncMock(return_value='{"error":"invalid_grant","error_description":"Token revoked"}')
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(return_value=mock_cm)
+
+        async def fake_get_session():
+            return mock_session
+
+        monkeypatch.setattr(om, "_get_session", fake_get_session)
+
+        result = await om.refresh_token()
+        assert result is False
+        assert om._refresh_permanent is True
+
+    @pytest.mark.asyncio
+    async def test_invalid_grant_substring_sets_permanent_flag(self, monkeypatch):
+        """Non-200 body containing 'invalid_grant' text sets _refresh_permanent=True."""
+        import services.oauth_manager as om
+
+        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
+        monkeypatch.setattr(om, "_refresh_permanent", False)
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 401
+        mock_resp.text = AsyncMock(return_value="error=invalid_grant&description=revoked")
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(return_value=mock_cm)
+
+        async def fake_get_session():
+            return mock_session
+
+        monkeypatch.setattr(om, "_get_session", fake_get_session)
+
+        result = await om.refresh_token()
+        assert result is False
+        assert om._refresh_permanent is True
+
+    @pytest.mark.asyncio
+    async def test_non_invalid_grant_error_does_not_set_permanent(self, monkeypatch):
+        """Transient HTTP error (e.g. 503) does NOT set _refresh_permanent."""
+        import services.oauth_manager as om
+
+        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
+        monkeypatch.setattr(om, "_refresh_permanent", False)
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 503
+        mock_resp.text = AsyncMock(return_value="Service Unavailable")
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(return_value=mock_cm)
+
+        async def fake_get_session():
+            return mock_session
+
+        monkeypatch.setattr(om, "_get_session", fake_get_session)
+
+        result = await om.refresh_token()
+        assert result is False
+        assert om._refresh_permanent is False
+
+    @pytest.mark.asyncio
+    async def test_ensure_valid_token_raises_immediately_on_permanent(self, monkeypatch):
+        """When _refresh_permanent is True, ensure_valid_token raises without retrying."""
+        import services.oauth_manager as om
+
+        monkeypatch.setattr(om, "_access_token", "stale-tok")
+        monkeypatch.setattr(om, "_expires_at", 0)  # expired
+        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
+        monkeypatch.setattr(om, "_refresh_permanent", True)
+        monkeypatch.setattr(om, "_refresh_failure_count", 0)  # count below threshold
+
+        refresh_called = []
+
+        async def fake_refresh():
+            refresh_called.append(True)
+            return False
+
+        monkeypatch.setattr(om, "refresh_token", fake_refresh)
+
+        with pytest.raises(om.OAuthRefreshFailed, match="invalid_grant"):
+            await om.ensure_valid_token()
+
+        # refresh_token() must NOT have been called
+        assert refresh_called == []
+
+    @pytest.mark.asyncio
+    async def test_record_refresh_success_clears_permanent_flag(self, monkeypatch):
+        """_record_refresh_success() resets _refresh_permanent to False."""
+        import services.oauth_manager as om
+
+        monkeypatch.setattr(om, "_refresh_permanent", True)
+        monkeypatch.setattr(om, "_refresh_failure_count", 0)
+
+        om._record_refresh_success()
+        assert om._refresh_permanent is False

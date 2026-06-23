@@ -241,12 +241,15 @@ class TestRunAgentLoop:
 
     @pytest.mark.asyncio
     async def test_thinking_only_pause_limit_cuts_off(self, watchdog):
-        # Two consecutive pause turns hit MAX_CONSECUTIVE_EMPTY_TURNS (=2)
-        # and the loop returns accumulated text instead of spinning forever.
+        # Two consecutive pause turns hit MAX_CONSECUTIVE_EMPTY_TURNS (=2);
+        # the loop then fires ONE final summary nudge (C) before surrendering.
+        # Here the model answers that nudge, so accumulated text is returned
+        # rather than spinning forever.
         assert MAX_CONSECUTIVE_EMPTY_TURNS == 2
         client = _make_client(
             ([], _final_msg([_block("text", text="partial"), _block("thinking", thinking="x")], "tool_use")),
             ([], _final_msg([_block("thinking", thinking="y")], "tool_use")),
+            ([], _final_msg([_block("text", text="まとめです")], "end_turn")),
         )
         history: list[dict] = []
         result = await run_agent_loop(
@@ -454,7 +457,7 @@ class TestHallucinationDetect:
 
 
 class TestTodoWriteDisplay:
-    def test_format_invocation_renders_counts(self):
+    def test_format_invocation_renders_cli_style_checkboxes(self):
         out = _format_tool_invocation_for_display(
             "TodoWrite",
             {"todos": [
@@ -464,13 +467,14 @@ class TestTodoWriteDisplay:
             ]},
         )
         assert out is not None
-        assert "TodoWrite" in out
-        assert "in_progress=1" in out
-        assert "pending=1" in out
-        assert "completed=1" in out
-        assert "[~] a" in out
-        assert "[ ] b" in out
-        assert "[x] c" in out
+        # CLI-aligned "Update Todos" block (Claude Code terminal UI parity).
+        assert "Update Todos" in out
+        assert "☐ **A**" in out      # in_progress: empty box + bold activeForm
+        assert "☐ b" in out          # pending: empty box + content
+        assert "☒ ~~c~~" in out      # completed: checked box + strikethrough
+        # CLI shows neither a count summary nor numbering.
+        assert "pending=" not in out
+        assert "1." not in out
 
 
 class TestEffortMedium:
@@ -745,6 +749,273 @@ class TestTextInvokeCorrection:
             api_client=client, model="claude-opus-4-8", extra_betas=[],
         )
         assert "完了" in result.text
+
+
+class TestTextInvokeRescue:
+    """A tool call emitted as plain text is RESCUED: parsed, name-resolved, and
+    executed as a real tool_use (2026-06-21)."""
+
+    _POISON = (
+        '初値、確認します。\n\ncourse\n<invoke name="brave_news_search">\n'
+        '<parameter name="query">SpaceX</parameter>\n</invoke>'
+    )
+
+    @staticmethod
+    def _counting_client(*responses):
+        calls = []
+        it = iter(responses)
+        client = MagicMock()
+
+        def factory(**kwargs):
+            calls.append(kwargs)
+            events, final = next(it)
+            return _FakeStream(events, final)
+
+        client.beta.messages.stream = factory
+        return client, calls
+
+    @pytest.mark.asyncio
+    async def test_rescue_executes_and_returns_clean_answer(self, watchdog):
+        client, calls = self._counting_client(
+            ([], _final_msg([_block("text", text=self._POISON)], "end_turn")),
+            ([], _final_msg([_block("text", text="検索結果です")], "end_turn")),
+        )
+        execute = AsyncMock(return_value="results")
+        result = await run_agent_loop(
+            "調べて", channel_id=1, history=[], system_prompt="sys",
+            tools_for_api=[{"name": "mcp__brave-search__brave_news_search"}],
+            can_use_tool=_allow_all, execute_tool=execute,
+            status_callback=_noop_status, max_turns=5, stall_watchdog=watchdog,
+            api_client=client, model="claude-opus-4-8", extra_betas=[],
+        )
+        # rescue ran the tool (resolved the abbreviated name), then turn 2 answered
+        execute.assert_awaited_once_with(
+            "mcp__brave-search__brave_news_search", {"query": "SpaceX"},
+        )
+        assert len(calls) == 2  # rescue + final answer, NO re-prompt round
+        assert "検索結果" in result.text
+        assert "<invoke" not in result.text
+
+    @pytest.mark.asyncio
+    async def test_rescue_history_pairing(self, watchdog):
+        client, _ = self._counting_client(
+            ([], _final_msg([_block("text", text=self._POISON)], "end_turn")),
+            ([], _final_msg([_block("text", text="done")], "end_turn")),
+        )
+        history: list[dict] = []
+        await run_agent_loop(
+            "調べて", channel_id=1, history=history, system_prompt="sys",
+            tools_for_api=[{"name": "mcp__brave-search__brave_news_search"}],
+            can_use_tool=_allow_all, execute_tool=AsyncMock(return_value="r"),
+            status_callback=_noop_status, max_turns=5, stall_watchdog=watchdog,
+            api_client=client, model="claude-opus-4-8", extra_betas=[],
+        )
+        # The rewritten assistant turn ends in a tool_use whose id matches the
+        # following user turn's tool_result.tool_use_id (strict pairing → no 400).
+        asst = history[1]
+        assert asst["role"] == "assistant"
+        tu = [b for b in asst["content"] if b["type"] == "tool_use"]
+        assert len(tu) == 1
+        user_tr = history[2]
+        assert user_tr["role"] == "user"
+        assert user_tr["content"][0]["tool_use_id"] == tu[0]["id"]
+        # the raw <invoke> XML is gone from the persisted assistant turn
+        text_blocks = [b for b in asst["content"] if b["type"] == "text"]
+        assert all("<invoke" not in b["text"] for b in text_blocks)
+
+    @pytest.mark.asyncio
+    async def test_unresolved_name_falls_back_to_reprompt(self, watchdog):
+        poison = (
+            'やります。\n<invoke name="totally_unknown_tool">\n'
+            '<parameter name="x">1</parameter>\n</invoke>'
+        )
+        client, calls = self._counting_client(
+            ([], _final_msg([_block("text", text=poison)], "end_turn")),
+            ([], _final_msg([_block("text", text="正しい答え")], "end_turn")),
+        )
+        execute = AsyncMock()
+        history: list[dict] = []
+        await run_agent_loop(
+            "調べて", channel_id=1, history=history, system_prompt="sys",
+            tools_for_api=[{"name": "Read"}], can_use_tool=_allow_all,
+            execute_tool=execute, status_callback=_noop_status, max_turns=5,
+            stall_watchdog=watchdog, api_client=client,
+            model="claude-opus-4-8", extra_betas=[],
+        )
+        execute.assert_not_awaited()  # nothing rescued
+        # corrective re-prompt was injected instead
+        assert any(
+            m["role"] == "user" and isinstance(m["content"], list)
+            and m["content"] and "正規の tool_use" in m["content"][0].get("text", "")
+            for m in history
+        )
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_name_falls_back_to_reprompt(self, watchdog):
+        poison = (
+            '検索。\n<invoke name="search">\n'
+            '<parameter name="q">x</parameter>\n</invoke>'
+        )
+        client, calls = self._counting_client(
+            ([], _final_msg([_block("text", text=poison)], "end_turn")),
+            ([], _final_msg([_block("text", text="答え")], "end_turn")),
+        )
+        execute = AsyncMock()
+        await run_agent_loop(
+            "調べて", channel_id=1, history=[], system_prompt="sys",
+            tools_for_api=[{"name": "mcp__a__search"}, {"name": "mcp__b__search"}],
+            can_use_tool=_allow_all, execute_tool=execute,
+            status_callback=_noop_status, max_turns=5, stall_watchdog=watchdog,
+            api_client=client, model="claude-opus-4-8", extra_betas=[],
+        )
+        execute.assert_not_awaited()  # ambiguous suffix → no rescue
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_rescue_respects_can_use_tool_denial(self, watchdog):
+        client, _ = self._counting_client(
+            ([], _final_msg([_block("text", text=self._POISON)], "end_turn")),
+            ([], _final_msg(
+                [_block("text", text="アクセスが拒否されました")], "end_turn")),
+        )
+        execute = AsyncMock()
+        history: list[dict] = []
+        result = await run_agent_loop(
+            "調べて", channel_id=1, history=history, system_prompt="sys",
+            tools_for_api=[{"name": "mcp__brave-search__brave_news_search"}],
+            can_use_tool=_deny_all, execute_tool=execute,
+            status_callback=_noop_status, max_turns=5, stall_watchdog=watchdog,
+            api_client=client, model="claude-opus-4-8", extra_betas=[],
+        )
+        execute.assert_not_awaited()
+        tr = history[2]["content"][0]
+        assert tr["is_error"] is True
+        assert "denied" in tr["content"]
+        assert "拒否されました" in result.text
+
+    @pytest.mark.asyncio
+    async def test_rescue_input_coercion(self, watchdog):
+        poison = (
+            '実行。\n<invoke name="counter">\n'
+            '<parameter name="n">5</parameter>\n</invoke>'
+        )
+        client, _ = self._counting_client(
+            ([], _final_msg([_block("text", text=poison)], "end_turn")),
+            ([], _final_msg([_block("text", text="ok")], "end_turn")),
+        )
+        execute = AsyncMock(return_value="r")
+        schema = {"type": "object", "properties": {"n": {"type": "integer"}}}
+        await run_agent_loop(
+            "go", channel_id=1, history=[], system_prompt="sys",
+            tools_for_api=[{"name": "counter", "input_schema": schema}],
+            can_use_tool=_allow_all, execute_tool=execute,
+            status_callback=_noop_status, max_turns=5, stall_watchdog=watchdog,
+            api_client=client, model="claude-opus-4-8", extra_betas=[],
+        )
+        execute.assert_awaited_once_with("counter", {"n": 5})  # int, not "5"
+
+    @pytest.mark.asyncio
+    async def test_rescue_disabled_falls_back_to_reprompt(self, watchdog, monkeypatch):
+        import services.claude_api.tool_loop as tl
+        monkeypatch.setattr(tl, "TEXT_INVOKE_RESCUE_ENABLED", False)
+        client, calls = self._counting_client(
+            ([], _final_msg([_block("text", text=self._POISON)], "end_turn")),
+            ([], _final_msg([_block("text", text="答え")], "end_turn")),
+        )
+        execute = AsyncMock()
+        await run_agent_loop(
+            "調べて", channel_id=1, history=[], system_prompt="sys",
+            tools_for_api=[{"name": "mcp__brave-search__brave_news_search"}],
+            can_use_tool=_allow_all, execute_tool=execute,
+            status_callback=_noop_status, max_turns=5, stall_watchdog=watchdog,
+            api_client=client, model="claude-opus-4-8", extra_betas=[],
+        )
+        execute.assert_not_awaited()  # rescue off → pure re-prompt
+        assert len(calls) == 2
+
+
+class TestToolErrorRecovery:
+    """(B) After a tool error, a thin give-up reply is nudged once."""
+
+    @pytest.mark.asyncio
+    async def test_error_then_thin_reply_nudges_once(self, watchdog):
+        client = _make_client(
+            ([], _final_msg(
+                [_block("tool_use", id="t1", name="Read", input={})], "tool_use")),
+            ([], _final_msg([_block("text", text="")], "end_turn")),  # gives up
+            ([], _final_msg([_block("text", text="代わりにこうします")], "end_turn")),
+        )
+        execute = AsyncMock(side_effect=RuntimeError("boom"))
+        history: list[dict] = []
+        result = await run_agent_loop(
+            "read", channel_id=1, history=history, system_prompt="sys",
+            tools_for_api=[{"name": "Read"}], can_use_tool=_allow_all,
+            execute_tool=execute, status_callback=_noop_status, max_turns=6,
+            stall_watchdog=watchdog, api_client=client,
+            model="claude-opus-4-8", extra_betas=[],
+        )
+        assert "代わりに" in result.text
+        # exactly one recovery nudge injected
+        nudges = [
+            m for m in history
+            if m["role"] == "user" and isinstance(m["content"], list)
+            and m["content"] and "別の方法で" in m["content"][0].get("text", "")
+        ]
+        assert len(nudges) == 1
+
+    @pytest.mark.asyncio
+    async def test_error_then_real_explanation_not_nudged(self, watchdog):
+        client = _make_client(
+            ([], _final_msg(
+                [_block("tool_use", id="t1", name="Read", input={})], "tool_use")),
+            ([], _final_msg(
+                [_block("text", text="ファイルが無くて読めませんでした")], "end_turn")),
+        )
+        execute = AsyncMock(side_effect=RuntimeError("boom"))
+        history: list[dict] = []
+        result = await run_agent_loop(
+            "read", channel_id=1, history=history, system_prompt="sys",
+            tools_for_api=[{"name": "Read"}], can_use_tool=_allow_all,
+            execute_tool=execute, status_callback=_noop_status, max_turns=6,
+            stall_watchdog=watchdog, api_client=client,
+            model="claude-opus-4-8", extra_betas=[],
+        )
+        assert "読めません" in result.text
+        assert not any(
+            m["role"] == "user" and isinstance(m["content"], list)
+            and m["content"] and "別の方法で" in m["content"][0].get("text", "")
+            for m in history
+        )
+
+
+class TestFinalEmptyNudge:
+    """(C) One last summary nudge before the "(no response)" sentinel."""
+
+    @pytest.mark.asyncio
+    async def test_pause_limit_nudges_before_no_response(self, watchdog):
+        # Pause turns exhaust the budget, the final nudge fires, and the model
+        # STILL only thinks → "(no response)" is returned (nudge budget spent).
+        client = _make_client(
+            ([], _final_msg([_block("thinking", thinking="a")], "tool_use")),
+            ([], _final_msg([_block("thinking", thinking="b")], "tool_use")),
+            ([], _final_msg([_block("thinking", thinking="c")], "tool_use")),
+        )
+        history: list[dict] = []
+        result = await run_agent_loop(
+            "hi", channel_id=1, history=history, system_prompt="sys",
+            tools_for_api=[], can_use_tool=_allow_all, execute_tool=AsyncMock(),
+            status_callback=_noop_status, max_turns=8, stall_watchdog=watchdog,
+            api_client=client, model="claude-opus-4-8", extra_betas=[],
+        )
+        assert result.text == "(no response)"
+        # the final summary nudge was injected exactly once
+        nudges = [
+            m for m in history
+            if m["role"] == "user" and isinstance(m["content"], list)
+            and m["content"] and "要約して" in m["content"][0].get("text", "")
+        ]
+        assert len(nudges) == 1
 
 
 class TestRefusalFallbackHeader:
@@ -1149,7 +1420,7 @@ class TestInLoopProactiveCompaction:
     async def test_compacts_and_rebases_prior_window(self, watchdog, monkeypatch):
         import services.claude_api.tool_loop as tl
         monkeypatch.setattr(tl, "PROACTIVE_COMPACT_ENABLED", True)
-        monkeypatch.setattr(tl, "PROACTIVE_COMPACT_TRIGGER_TOKENS", 100)
+        monkeypatch.setattr("services.claude_api.compaction.compact_threshold_tokens", lambda: 100)
         client = _make_client(*self._turns(self._usage(200)))
         prior = [
             {"role": "user", "content": "old q"},
@@ -1177,7 +1448,7 @@ class TestInLoopProactiveCompaction:
     async def test_below_floor_never_compacts(self, watchdog, monkeypatch):
         import services.claude_api.tool_loop as tl
         monkeypatch.setattr(tl, "PROACTIVE_COMPACT_ENABLED", True)
-        monkeypatch.setattr(tl, "PROACTIVE_COMPACT_TRIGGER_TOKENS", 10**9)
+        monkeypatch.setattr("services.claude_api.compaction.compact_threshold_tokens", lambda: 10**9)
         client = _make_client(*self._turns(self._usage(200)))
         compact_cb = AsyncMock()
         prior = [{"role": "user", "content": "old"}]
@@ -1198,7 +1469,7 @@ class TestInLoopProactiveCompaction:
     async def test_callback_failure_is_nonfatal(self, watchdog, monkeypatch):
         import services.claude_api.tool_loop as tl
         monkeypatch.setattr(tl, "PROACTIVE_COMPACT_ENABLED", True)
-        monkeypatch.setattr(tl, "PROACTIVE_COMPACT_TRIGGER_TOKENS", 100)
+        monkeypatch.setattr("services.claude_api.compaction.compact_threshold_tokens", lambda: 100)
         client = _make_client(*self._turns(self._usage(200)))
         compact_cb = AsyncMock(side_effect=RuntimeError("summary failed"))
         prior = [{"role": "user", "content": "old"}]

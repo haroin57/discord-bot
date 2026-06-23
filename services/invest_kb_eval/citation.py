@@ -21,7 +21,7 @@ import re
 log = logging.getLogger(__name__)
 
 
-JUDGE_MODEL = os.environ.get("INVEST_EVAL_CITATION_JUDGE_MODEL", "claude-opus-4-7")
+JUDGE_MODEL = os.environ.get("INVEST_EVAL_CITATION_JUDGE_MODEL", "claude-opus-4-8")
 
 
 _JUDGE_PROMPT = """個人投資家が中立な投資知識ベースで検索を行います。検索結果の品質を、
