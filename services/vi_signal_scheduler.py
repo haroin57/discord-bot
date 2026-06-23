@@ -40,6 +40,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 VI_SCRIPT = REPO_ROOT / "scripts" / "vi_signal_alert.py"
 VI_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 LOG_FILE = REPO_ROOT / ".state" / "vi_signal_alert.log"
+# fwd記録 (ADR-0026): 発火後5営業日の株価追跡を vi_fwd_record.py で記録する。
+# 発火判定 (run_vi_check) の直後に同じ18:00サイクルで走らせる。
+FWD_SCRIPT = REPO_ROOT / "scripts" / "vi_fwd_record.py"
+FWD_LOG_FILE = REPO_ROOT / ".state" / "vi_fwd_record.log"
 
 # 実行時刻: 18:00 JST (b0nchichi 確定, 2026-06-15)
 # 16:00 引け → 16:00 前後で日経公式CSV確報反映 → 18:00 で確実に取れる。
@@ -126,6 +130,53 @@ async def run_vi_check() -> int:
     return exit_code
 
 
+async def run_fwd_record() -> int:
+    """vi_fwd_record.py をサブプロセスで実行し、fwd記録を更新する (ADR-0026)。
+
+    run_vi_check と同じ作法。発火判定とは独立した責務 (発火後の追跡記録) なので
+    別スクリプト・別ログにする。戻り値: 終了コード (0=正常)。
+    """
+    if not FWD_SCRIPT.exists():
+        logger.error(f"fwd script not found: {FWD_SCRIPT}")
+        return 127
+    if not VI_PYTHON.exists():
+        logger.error(f"VI python not found: {VI_PYTHON}")
+        return 127
+
+    logger.info("VI fwd record: starting")
+    proc = await asyncio.create_subprocess_exec(
+        str(VI_PYTHON),
+        str(FWD_SCRIPT),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(REPO_ROOT),
+    )
+    stdout, stderr = await proc.communicate()
+    exit_code = proc.returncode or 0
+    logger.info(f"VI fwd record: exit={exit_code}")
+    stdout_text = stdout.decode("utf-8", errors="replace") if stdout else ""
+    stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
+    if stdout_text:
+        logger.info(f"VI fwd record stdout:\n{stdout_text}")
+    if stderr_text:
+        logger.warning(f"VI fwd record stderr:\n{stderr_text}")
+
+    FWD_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().isoformat()
+    try:
+        with FWD_LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"=== {timestamp} (exit={exit_code}) ===\n")
+            if stdout_text:
+                f.write(stdout_text)
+            if stderr_text:
+                f.write(stderr_text)
+            f.write("\n")
+    except OSError as e:
+        logger.warning(f"VI fwd record: failed to append log file: {e}")
+
+    return exit_code
+
+
 async def vi_signal_daemon() -> None:
     """毎営業日 18:00 に VI 発火判定を走らせる常駐タスク。
 
@@ -152,7 +203,16 @@ async def vi_signal_daemon() -> None:
             # 実行直前に再判定 (営業日でなかったらスキップ)
             today = date.today()
             if is_business_day(today):
-                await run_vi_check()
+                # 発火判定 → fwd記録 の順 (ADR-0026)。
+                # 個別 try/except で包み、片方の失敗が他方を巻き込まないようにする。
+                try:
+                    await run_vi_check()
+                except Exception as exc:
+                    logger.exception(f"run_vi_check failed: {exc}")
+                try:
+                    await run_fwd_record()
+                except Exception as exc:
+                    logger.exception(f"run_fwd_record failed: {exc}")
             else:
                 logger.info(f"VI daemon: skip (non-business day: {today})")
 
