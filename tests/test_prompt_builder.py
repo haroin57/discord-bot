@@ -329,6 +329,79 @@ class TestBuildTimeLine:
 
 
 # ---------------------------------------------------------------------------
+# build_sleep_directive (ADR-0032 早寝早起き Ulysses-pact hook)
+# ---------------------------------------------------------------------------
+class TestBuildSleepDirective:
+    HAROIN = 573489206240870410  # matches config.SLEEP_ENFORCE_USER_ID default
+
+    def _at(self, hour, minute=30):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        return datetime(2026, 7, 1, hour, minute, tzinfo=ZoneInfo("Asia/Tokyo"))
+
+    def _call(self, **kw):
+        base = dict(
+            sender_id=self.HAROIN, target_id=self.HAROIN, enabled=True,
+            start_hour=0, end_hour=5, now=self._at(2),
+        )
+        base.update(kw)
+        return PromptBuilder.build_sleep_directive(**base)
+
+    def test_fires_for_target_in_window(self):
+        out = self._call()
+        assert out
+        assert out.startswith("<sleep_enforcement")
+        assert out.rstrip().endswith("</sleep_enforcement>")
+
+    def test_directive_states_stakes_and_time(self):
+        out = self._call(now=self._at(2, 30))
+        assert "02:30" in out        # deterministic clock injected
+        assert "大学院入試" in out    # exam-stakes framing (haroin's reason)
+        assert "最優先" in out        # top-priority wording
+
+    def test_silent_for_non_target_sender(self):
+        # b0nchichi / any other admin must never be force-slept.
+        assert self._call(sender_id=12345) == ""
+
+    def test_silent_when_disabled(self):
+        assert self._call(enabled=False) == ""
+
+    def test_silent_when_no_target_configured(self):
+        assert self._call(target_id=None) == ""
+
+    def test_silent_when_sender_none(self):
+        assert self._call(sender_id=None) == ""
+
+    def test_silent_outside_window_daytime(self):
+        assert self._call(now=self._at(14)) == ""
+
+    def test_window_start_inclusive(self):
+        assert self._call(now=self._at(0, 0)) != ""
+
+    def test_window_end_exclusive(self):
+        # end_hour=5 → 05:00 is OUTSIDE (a plausible 早起き morning, not a
+        # still-awake night); 04:59 is still inside.
+        assert self._call(now=self._at(5, 0)) == ""
+        assert self._call(now=self._at(4, 59)) != ""
+
+    def test_wraparound_window(self):
+        # start=23, end=5 covers 23,0,1,2,3,4 across midnight.
+        assert self._call(start_hour=23, end_hour=5, now=self._at(23, 30)) != ""
+        assert self._call(start_hour=23, end_hour=5, now=self._at(2)) != ""
+        assert self._call(start_hour=23, end_hour=5, now=self._at(12)) == ""
+
+    def test_degenerate_window_never_fires(self):
+        # start == end must be empty (fail-safe), never "always".
+        assert self._call(start_hour=0, end_hour=0, now=self._at(3)) == ""
+
+    def test_non_jst_now_normalized(self):
+        # 2026-07-01 17:30 UTC == 2026-07-02 02:30 JST → inside the window.
+        from datetime import datetime, timezone
+        utc = datetime(2026, 7, 1, 17, 30, tzinfo=timezone.utc)
+        assert self._call(now=utc) != ""
+
+
+# ---------------------------------------------------------------------------
 # build_prompt (async)
 # ---------------------------------------------------------------------------
 

@@ -60,6 +60,14 @@ def _reset_oauth_globals(monkeypatch):
     monkeypatch.setattr(real_mod, "_patched", False)
     monkeypatch.setattr(real_mod, "_refresh_failure_count", 0)
     monkeypatch.setattr(real_mod, "_refresh_permanent", False)
+    # 2nd contamination vector: a sibling test (mcp_mem0_server path) sets
+    # OAUTH_NO_REFRESH=1 in the env, which oauth_manager reads at import time
+    # into a module-level bool (~line 137). The globals reset above misses it,
+    # so ensure_valid_token() silently no-ops and returns None under a full
+    # suite. Reset BOTH the env var and the already-bound constant (a reload
+    # may re-read the env).
+    monkeypatch.delenv("OAUTH_NO_REFRESH", raising=False)
+    monkeypatch.setattr(real_mod, "OAUTH_NO_REFRESH", False)
 
     yield
 

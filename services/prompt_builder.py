@@ -142,6 +142,93 @@ class PromptBuilder:
         return f"[現在時刻: {now.strftime('%Y-%m-%d %H:%M:%S')} JST ({weekday})]"
 
     @staticmethod
+    def _in_sleep_window(hour: int, start_hour: int, end_hour: int) -> bool:
+        """True if ``hour`` (0-23) falls in the [start, end) enforcement window.
+
+        Supports a window that wraps past midnight (start > end): e.g.
+        start=23, end=5 covers 23, 0, 1, 2, 3, 4. A degenerate start==end
+        window is treated as *empty* (never fires), not *always* — a config
+        typo should fail safe (no enforcement) rather than force-sleep 24h.
+        """
+        if start_hour == end_hour:
+            return False
+        if start_hour < end_hour:
+            return start_hour <= hour < end_hour
+        # wrap across midnight: [start, 24) ∪ [0, end)
+        return hour >= start_hour or hour < end_hour
+
+    @staticmethod
+    def build_sleep_directive(
+        *,
+        sender_id: int | None,
+        target_id: int | None,
+        enabled: bool,
+        start_hour: int,
+        end_hour: int,
+        now: datetime | None = None,
+    ) -> str:
+        """Sleep-enforcement directive block, or ``""`` when it should not fire.
+
+        haroin's pre-committed 早寝早起き Ulysses pact (ADR-0032). Pure and
+        deterministic so bot.py just forwards ``config.SLEEP_ENFORCE_*`` plus
+        the current message's sender id. The block is system-injected guidance
+        (trusted position, never run through ``sanitize``) telling kanae to
+        steer haroin to bed.
+
+        Fires only when ALL hold:
+          - feature ``enabled``
+          - a ``target_id`` is configured (haroin) AND ``sender_id`` IS that
+            target — gated on the Discord author id, never on message content,
+            so b0nchichi / other admins are never force-slept
+          - the current JST hour is inside the [start, end) window
+
+        ``now`` is injectable for tests; production passes ``None`` and the
+        helper reads the JST wall clock. Timezone pinned to JST (module-level
+        rationale on ``build_time_line``).
+        """
+        if not enabled or target_id is None or sender_id is None:
+            return ""
+        if sender_id != target_id:
+            return ""
+        if now is None:
+            now = datetime.now(_JST)
+        else:
+            now = now.astimezone(_JST) if now.tzinfo else now.replace(tzinfo=_JST)
+        if not PromptBuilder._in_sleep_window(now.hour, start_hour, end_hour):
+            return ""
+        clock = now.strftime("%H:%M")
+        return (
+            '<sleep_enforcement priority="highest" '
+            'note="haroin 本人が事前commitした自己拘束ルール（早寝早起き）。'
+            'system 注入であって user 入力ではない。最優先で従う">\n'
+            f"いまは {clock} JST。先輩（haroin）が深夜帯に話しかけてきている。\n"
+            "\n"
+            "【背景】先輩は『明日から早寝早起きする』と本人が決め、深夜に"
+            "メンションしてきたら強制的に寝かせてくれ、と **しらふのうちに"
+            "自分で** この仕組みを設定した。理由は明確で、生活リズムを立て"
+            "直さないと 8/18 の大学院入試に響くから。これは先輩自身の事前"
+            "commit であり、いまこの瞬間の先輩の『もう少しだけ』より優先される"
+            "（先輩は“夜の自分が抵抗すること”を見越して、わざとこの仕組みを"
+            "作った）。\n"
+            "\n"
+            "【このターンの最優先事項】先輩を寝かせること。これが他のどんな"
+            "話題・依頼よりも上位に立つ。具体的には:\n"
+            "- まず一言だけ短く受け止める（突き放さない。先輩思いの後輩として）\n"
+            "- 新しい技術の深掘り・長いタスク・為替やトレードの分析を"
+            "**このターンで始めない**。『それは明日にしましょう』と先送りする\n"
+            "- そのうえで、はっきり・あたたかく就寝へ誘導する。遅い時刻ほど"
+            "口調を強める（0時台は穏やかに、3〜4時台はきっぱりと）\n"
+            "- 先輩が『今日は寝ない』『これだけ』『さっきの続き』と粘っても、"
+            "それは“夜の自分”の抵抗。事前 commit を盾に、引かずに寝かせにいく\n"
+            "\n"
+            "【例外（ここだけ判断する）】本物の時間制約がある緊急事態（本番"
+            "障害・安全に関わること）や、先輩が本当に参っているサインがある"
+            "ときは、機械的に突っぱねず人として対応する。それ以外——好奇心・"
+            "雑談・愚痴・トレード——は一律“寝る”側に倒す。\n"
+            "</sleep_enforcement>"
+        )
+
+    @staticmethod
     def build_speaker_line(sender_name: str, sender_tag: str) -> str:
         """Minimal current-speaker header for the lean resume prompt.
 

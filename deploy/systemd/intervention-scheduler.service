@@ -1,0 +1,50 @@
+[Unit]
+Description=Kanae Intervention Alert Scheduler (30分ごとに為替介入スコアリング, ADR-0027)
+After=network-online.target
+Wants=network-online.target
+# crash-loop を 3回/60s で頭打ち (discord-bot.service / vi-signal-scheduler と同方針)
+StartLimitBurst=3
+StartLimitIntervalSec=60
+StartLimitAction=none
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/discord-bot
+EnvironmentFile=/home/ubuntu/discord-bot/.env
+# 30分境界・薄商い判定が datetime.now() 依存のため TZ を明示固定
+Environment=TZ=Asia/Tokyo
+ExecStart=/home/ubuntu/discord-bot/.venv/bin/python -m services.intervention_scheduler
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=intervention-scheduler
+
+# Security hardening (vi-signal-scheduler.service を踏襲)
+NoNewPrivileges=yes
+PrivateTmp=no
+ProtectSystem=strict
+ProtectHome=read-only
+# scheduler はリポジトリ配下 (.state/intervention_alert.log への追記) のみ書き込む
+ReadWritePaths=/home/ubuntu/discord-bot
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictRealtime=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+# 本体より軽量 (subprocess で intervention_alert.py を一瞬走らせるだけ)
+MemoryMax=256M
+MemoryHigh=200M
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

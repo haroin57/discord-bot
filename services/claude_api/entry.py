@@ -28,6 +28,7 @@ import httpx
 
 from config import (
     ADMIN_MAX_TURNS,
+    SUBAGENT_ENABLED,
     ATTACHMENT_DIR,
     CLAUDE_MAX_PARALLEL,
     CLAUDE_MODEL,
@@ -134,6 +135,8 @@ ALWAYS_ADVERTISED_MCP_KEYS = {
     # pattern for quotes, and feeds the VI strategy signal checks. Static
     # schemas + lazy spawn, same as the rest.
     "nikkei-indexes", "yfj-quote", "polymarket",
+    # みんかぶFX オーダーブック (注文/建玉の価格帯別分布)。2026-06-24。
+    "minkabu-fx",
 }
 
 _SNAPSHOT_MAX_AGE_S = int(os.environ.get("SNAPSHOT_MAX_AGE_S", "900"))
@@ -432,14 +435,46 @@ async def call_with_tools(
                 + static_mcp_tools_to_anthropic(always_advertised_mcp_keys)
                 + mcp_tools_to_anthropic(pool.handles)
             )
+            # Agent tool（メインパイプライン subagent。CLI 純正と足並み）。admin のみ。
+            if SUBAGENT_ENABLED and not restricted:
+                from services.claude_api.agent_tool import agent_tool_schema
+                advertised_tools = advertised_tools + [agent_tool_schema()]
+
+            # Agent tool（メインパイプライン subagent）の実行は api_client と
+            # effective_model に依存するが、どちらも _execute_tool が定義された後で
+            # 確定する。closure からは可変 dict 経由で参照する。
+            # parent_watchdog は subagent 実行中に親 StallWatchdog にハートビートを
+            # 送るための参照。これが無いと subagent 実行中の沈黙で親が idle_timeout
+            # で cancel され「subagent 完了前に親が exit」が起きる（haroin 2026-06-25）。
+            _agent_dispatch: dict = {"api_client": None, "model": None, "watchdog": None}
 
             async def _execute_tool(name: str, args: dict) -> str:
+                if name == "Agent" and SUBAGENT_ENABLED and not restricted:
+                    if _agent_dispatch["api_client"] is None:
+                        return "<tool_use_error>Agent: dispatcher not initialised</tool_use_error>"
+                    from services.claude_api.agent_tool import (
+                        AgentToolCtx,
+                        execute_agent_tool,
+                    )
+                    return await execute_agent_tool(
+                        args,
+                        AgentToolCtx(
+                            api_client=_agent_dispatch["api_client"],
+                            pool=pool,
+                            tools_for_api=advertised_tools,
+                            channel_id=channel_id,
+                            parent_model=_agent_dispatch["model"] or "",
+                            depth=0,
+                            parent_watchdog=_agent_dispatch["watchdog"],
+                        ),
+                    )
                 if name.startswith("mcp__"):
                     return await pool.call_tool(name, args)
                 return await execute_builtin_tool(name, args, tool_ctx)
 
             # 7. API client
             api_client = await _make_api_client(restricted)
+            _agent_dispatch["api_client"] = api_client
 
             # 7b. History compaction (ADR-0010 phase 3): when the replay
             # window has outgrown the Fable-safe budget, fold the older
@@ -546,6 +581,7 @@ async def call_with_tools(
                     return _error_message("unknown"), None, False
 
                 async with StallWatchdog(channel_id, status_callback) as watchdog:
+                    _agent_dispatch["watchdog"] = watchdog
                     try:
                         # Seed each attempt with a fresh copy of the prior
                         # transcript so a partial / failed retry does not
@@ -604,6 +640,8 @@ async def call_with_tools(
                             _get_sticky_model(channel_id, user_id) if not restricted else None
                         )
                         effective_model = forced_model or sticky_model or MODEL
+                        # Agent tool subagent はこの effective_model を継承する。
+                        _agent_dispatch["model"] = effective_model
                         result = await run_agent_loop(
                             user_content_for_loop,
                             channel_id,

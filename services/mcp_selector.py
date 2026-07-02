@@ -20,10 +20,12 @@ from config import (
     MCP_SERVERS_BASE,
     MCP_SERVERS_DOCS,
     MCP_SERVERS_HEAVY,
+    MCP_SERVERS_IOT,
     MCP_SERVERS_MEMORY,
     MCP_SERVERS_PAPER,
     MCP_SERVERS_REALESTATE,
     MCP_SERVERS_WEB,
+    NATURE_REMO_ALLOWED_USER_IDS,
 )
 
 __all__ = ["get_mcp_servers_by_keys", "pick_mcp_servers"]
@@ -43,6 +45,9 @@ _WEB_TRIGGERS = tuple(kw.lower() for kw in (
     # on "via", "vim", "review", …); 日経vi covers the real usage.
     "株価", "日経", "日経vi", "市場", "相場", "チャート", "銘柄",
     "vix", "ドル円", "為替", "topix", "指数",
+    # minkabu-fx オーダーブック (注文/建玉の価格帯別分布)。
+    "オーダーブック", "orderbook", "order book", "建玉", "売り壁", "買い指値",
+    "ショート", "ロング", "踏み上げ", "バタフライ", "板",
     # Google Maps tier — Places / Geocoding / Directions 系の質問で eager spawn.
     "地図", "マップ", "google maps", "googlemaps", "経路", "ルート", "道順",
     "最寄り駅", "近くの", "周辺の", "住所", "緯度", "経度", "ジオコー",
@@ -77,6 +82,16 @@ _DOCS_TRIGGERS = tuple(kw.lower() for kw in (
     "リファレンス", "ライブラリ", "library", "使い方", "how to use",
     "npm package", "pypi", "github.com/",
 ))
+# IOT tier — Nature Remo Cloud API。haroin 自宅の家電制御・センサー読み取り。admin-only、
+# 自宅 IoT 操作を語った時だけ spawn する。
+_IOT_TRIGGERS = tuple(kw.lower() for kw in (
+    "エアコン", "クーラー", "暖房", "冷房", "照明", "電気を", "テレビ", "tv ",
+    "リモコン", "remo", "nature remo", "家電", "リビング",
+    "室温", "気温", "湿度", "温湿度", "湿度計", "温度計",
+    "アプライアンス", "appliance", "アクテュエータ", "actuator",
+))
+
+
 # REALESTATE tier — SUUMO/HOMES 物件検索 MCP. admin-only かつ trigger 必須.
 # 一般ユーザーが trigger word を打っても user_id ゲートで弾かれる二重防御。
 # ADR-0020、realestate-mcp/IMPLEMENTATION_PLAN.md。
@@ -124,4 +139,12 @@ def pick_mcp_servers(raw_user_text: str, user_id: int | None = None) -> dict:
         and any(kw in text for kw in _REALESTATE_TRIGGERS)
     ):
         servers.update(MCP_SERVERS_REALESTATE)
+    # IOT は admin 全員ではなく **NATURE_REMO_ALLOWED_USER_IDS** だけ（個人 IoT の安全装置）。
+    # env が空なら fail-closed で誰も spawn できない。
+    if (
+        user_id is not None
+        and user_id in NATURE_REMO_ALLOWED_USER_IDS
+        and any(kw in text for kw in _IOT_TRIGGERS)
+    ):
+        servers.update(MCP_SERVERS_IOT)
     return servers

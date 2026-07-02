@@ -64,3 +64,33 @@ def _tool_input_hint(name: str, inp: dict | None) -> str:
         return ""
     except Exception:
         return ""
+
+
+_TOOL_EMOJI = {
+    "Bash": "💻", "BashOutput": "💻",
+    "Read": "📖", "Write": "✏️", "Edit": "✏️", "MultiEdit": "✏️",
+    "Glob": "🔎", "Grep": "🔎",
+    "WebFetch": "🌐", "navigate": "🌐",
+    "WebSearch": "🔍", "brave_web_search": "🔍", "brave_local_search": "🔍",
+    "brave_news_search": "📰", "tavily_search": "🔍", "tavily_extract": "🌐",
+    "search_x": "🐦", "get_tweet": "🐦", "get_x_trends": "📈",
+    "TodoWrite": "🗒️", "Agent": "🤖",
+}
+
+
+def tool_oneline(name: str, inp: dict | None) -> str:
+    """1行のツール呼び出し要約（並列ツール notice / Deep Research view 共用）。
+
+    emoji + 短いツール名 + 簡潔な inline-code ヒント（改行・バッククォートを無害化し
+    キャップ）。複数行で積み重ねて表示する箇所で各行が1行に収まることを保証する。
+    """
+    short = name.split("__")[-1] if "__" in name else name
+    line = f"{_TOOL_EMOJI.get(short, '🔧')} {short}"
+    hint = _tool_input_hint(name, inp)
+    if hint:
+        hint = hint.replace("`", "'").replace("\n", " ").strip()
+        if len(hint) > 120:
+            hint = hint[:120] + "…"
+        if hint:
+            line += f" `{hint}`"
+    return line

@@ -75,6 +75,50 @@ def clear_session(channel_id: int, user_id: int | None) -> None:
     _schedule_save()
 
 
+def clear_all_sessions_for_channel(channel_id: int) -> int:
+    """Drop every (channel_id, *) session. Returns the number dropped."""
+    drop = [k for k in _sessions_store if k[0] == channel_id]
+    for k in drop:
+        _sessions_store.pop(k, None)
+    if drop:
+        _schedule_save()
+    return len(drop)
+
+
+def clear_channel_context(channel_id: int) -> dict:
+    """Clear the channel's conversation context.
+
+    Two effects (both required for a true "fresh start"):
+      1. Rename the JSONL transcript to ``{channel_id}.jsonl.cleared-<ts>``
+         so replay-history load sees no prior turns. NOT deleted — kept for
+         audit / rollback (mv is atomic on the same filesystem, replay uses
+         only ``{channel_id}.jsonl``).
+      2. Drop every in-memory session keyed on this channel_id so the next
+         turn takes the cold-start path (no session_id, no resume flag).
+
+    Returns a small report dict for the caller to surface:
+      {archived_path: str|None, bytes: int, sessions_dropped: int}
+    """
+    _validate_channel_id(channel_id)
+    report = {"archived_path": None, "bytes": 0, "sessions_dropped": 0}
+    src = _history_file(channel_id)
+    try:
+        st = os.stat(src)
+        report["bytes"] = st.st_size
+        ts = time.strftime("%Y%m%dT%H%M%S")
+        dst = f"{src}.cleared-{ts}"
+        os.rename(src, dst)
+        try:
+            os.chmod(dst, 0o600)
+        except OSError:
+            pass
+        report["archived_path"] = dst
+    except FileNotFoundError:
+        pass   # 履歴が無いチャンネル: session drop だけやる
+    report["sessions_dropped"] = clear_all_sessions_for_channel(channel_id)
+    return report
+
+
 def _schedule_save() -> None:
     """Flush _sessions_store to disk, async if a loop is running."""
     flat = _flatten_sessions(_sessions_store)
