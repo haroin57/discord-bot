@@ -718,6 +718,7 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
             "type": "object",
             "properties": {"file_path": {"type": "string"}},
             "required": ["file_path"],
+            "additionalProperties": False,
         },
         handler=_tool_read,
     ),
@@ -735,6 +736,7 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
                 "content": {"type": "string"},
             },
             "required": ["file_path", "content"],
+            "additionalProperties": False,
         },
         handler=_tool_write,
     ),
@@ -754,6 +756,7 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
                 "replace_all": {"type": "boolean"},
             },
             "required": ["file_path", "old_string", "new_string"],
+            "additionalProperties": False,
         },
         handler=_tool_edit,
     ),
@@ -768,6 +771,10 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
+                # Claude Code 育ちのモデルは Bash に description を付けがち。
+                # additionalProperties: false で弾くと無駄な correction ターンに
+                # なるので、無害な optional として受けて無視する。
+                "description": {"type": "string"},
                 "timeout": {
                     "type": "number",
                     "description": (
@@ -779,6 +786,7 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
                 },
             },
             "required": ["command"],
+            "additionalProperties": False,
         },
         handler=_tool_bash,
     ),
@@ -796,6 +804,7 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
             "type": "object",
             "properties": {"pattern": {"type": "string"}},
             "required": ["pattern"],
+            "additionalProperties": False,
         },
         handler=_tool_glob,
     ),
@@ -813,6 +822,7 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
                 "glob": {"type": "string"},
             },
             "required": ["pattern"],
+            "additionalProperties": False,
         },
         handler=_tool_grep,
     ),
@@ -845,10 +855,12 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
                             "activeForm": {"type": "string"},
                         },
                         "required": ["content", "status", "activeForm"],
+                        "additionalProperties": False,
                     },
                 },
             },
             "required": ["todos"],
+            "additionalProperties": False,
         },
         handler=_tool_todo_write,
     ),

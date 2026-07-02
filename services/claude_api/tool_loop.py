@@ -35,6 +35,7 @@ from config import (
     MAX_TEXT_INVOKE_CORRECTIONS,
     MAX_TEXT_INVOKE_RESCUES,
     MAX_TOOL_ERROR_NUDGES,
+    MCP_TOOL_RESULT_CHARS,
     PROACTIVE_COMPACT_ENABLED,
     PROACTIVE_COMPACT_TRIGGER_TOKENS,
     SERVER_SIDE_FALLBACK_ENABLED,
@@ -239,9 +240,24 @@ def _inject_cache_breakpoints(messages: list[dict]) -> list[dict]:
     return messages
 
 
-def _block_to_dict(block) -> dict:
-    """Convert an anthropic content block (Pydantic model) to a serializable dict."""
+def _block_to_dict(block) -> dict | None:
+    """Convert an anthropic content block (Pydantic model) to a serializable dict.
+
+    Returns ``None`` for blocks that MUST NOT be echoed back to the API on the
+    next turn (server-side response metadata that would cause a 400 on replay).
+    Callers must ``filter(None, ...)`` before persisting to history.
+    """
     btype = getattr(block, "type", None)
+    if btype == "fallback":
+        # Server-side refusal fallback (ADR-0015): Anthropic includes a
+        # ``fallback`` metadata block in the response when it silently switched
+        # models mid-stream (Fable 5 refusal → Opus 4.8). This block carries
+        # {to:{model:...}, citations:[...]} — response-only metadata that the
+        # Messages API refuses on the way back ("messages.N.content.M.fallback
+        # .citations: Extra inputs are not permitted", HTTP 400). Drop it so
+        # the next turn's history replay doesn't poison the request.
+        # rid 0679af30 / haroin 2026-07-02: regression.
+        return None
     if btype == "text":
         return {"type": "text", "text": getattr(block, "text", "")}
     if btype == "tool_use":
@@ -388,6 +404,55 @@ def _cap_inline(text: str, cap: int) -> str:
     return text[:cap] + "\n...(truncated)"
 
 
+def _truncate_head_tail(text: str, cap: int) -> str:
+    """Middle-out truncation: keep the head and tail, drop the middle.
+
+    MCP 検索結果は先頭（上位ヒット）と末尾（ページネーション情報等）に価値が
+    寄りやすいので、head-only の ``_cap_inline`` ではなく中抜きにする。
+    """
+    if cap <= 0 or len(text) <= cap:
+        return text
+    half = max(1, cap // 2)
+    omitted = len(text) - cap
+    return (
+        text[:half]
+        + f"\n...[{omitted} chars omitted by MCP_TOOL_RESULT_CHARS cap]...\n"
+        + text[-half:]
+    )
+
+
+def _cap_mcp_result_content(
+    content: "str | list[dict]", cap: int,
+) -> "str | list[dict]":
+    """Apply the MCP result char cap to a tool_result content payload.
+
+    str はそのまま中抜き。list（text+image ブロック）は text ブロックにだけ
+    総量 cap を按分して適用する（image ブロックは対象外）。
+    """
+    if cap <= 0:
+        return content
+    if isinstance(content, str):
+        return _truncate_head_tail(content, cap)
+    if isinstance(content, list):
+        def _is_text(b: object) -> bool:
+            return (
+                isinstance(b, dict) and b.get("type") == "text"
+                and isinstance(b.get("text"), str)
+            )
+
+        n_text = sum(1 for b in content if _is_text(b))
+        total = sum(len(b["text"]) for b in content if _is_text(b))
+        if not n_text or total <= cap:
+            return content
+        per_block = max(1, cap // n_text)
+        return [
+            {**b, "text": _truncate_head_tail(b["text"], per_block)}
+            if _is_text(b) else b
+            for b in content
+        ]
+    return content
+
+
 def _format_tool_invocation_for_display(tool_name: str, tool_input: dict) -> str | None:
     """Build a Discord-friendly notice of an about-to-execute tool call.
 
@@ -509,6 +574,23 @@ _EMPTY_CONTENT_PLACEHOLDER = [{"type": "text", "text": "(続けてください)"
 # on it. Re-exported via this module so callers/tests can import it from here.
 
 
+def _sanitize_content_blocks(content):
+    """Drop content blocks that the Messages API rejects on replay.
+
+    ``fallback`` blocks are server-side response metadata (ADR-0015 refusal
+    fallback); the API returns them in responses but refuses them on the way
+    back with ``messages.N.content.M.fallback.citations: Extra inputs are not
+    permitted`` (HTTP 400). This is the single choke-point for both fresh
+    in-loop turns and JSONL-resumed history — anything that reaches the API
+    passes through ``_normalize_history_for_api``. Non-list content (a plain
+    string user turn) is returned unchanged.
+    rid 0679af30 / haroin 2026-07-02: regression.
+    """
+    if not isinstance(content, list):
+        return content
+    return [b for b in content if not (isinstance(b, dict) and b.get("type") == "fallback")]
+
+
 def _normalize_history_for_api(history: list[dict]) -> list[dict]:
     """Strip extra fields, leaving only {role, content} for the API.
 
@@ -522,7 +604,7 @@ def _normalize_history_for_api(history: list[dict]) -> list[dict]:
     """
     out: list[dict] = []
     for h in history:
-        content = h["content"]
+        content = _sanitize_content_blocks(h["content"])
         if content == "" or content == []:
             content = _EMPTY_CONTENT_PLACEHOLDER
         out.append({"role": h["role"], "content": content})
@@ -533,7 +615,14 @@ def _normalize_history_for_api(history: list[dict]) -> list[dict]:
 # isConcurrencySafe, audit #12). When a turn's tool_use blocks are ALL in
 # this set they are dispatched via asyncio.gather; anything else (writes,
 # Bash, MCP tools with unknown side effects) keeps the sequential path.
-CONCURRENCY_SAFE_TOOLS = frozenset({"Read", "Glob", "Grep"})
+#
+# Agent is concurrency-safe because each subagent runs in a fresh context
+# (history=[] inside run_subagent), takes no shared mutable state from the
+# parent, and is intentionally designed to be fanned out — matching the
+# CLI's Promise.all dispatch when the model fires multiple Agent() calls
+# in one turn. Per-process throttling lives in agent_tool._subagent_sema
+# (SUBAGENT_MAX_PARALLEL), not here.
+CONCURRENCY_SAFE_TOOLS = frozenset({"Read", "Glob", "Grep", "Agent"})
 
 
 def _validate_tool_input(schema, args: dict) -> str | None:
@@ -831,6 +920,12 @@ async def _run_one_tool(
             result_content = output
         else:
             result_content = str(output)
+        # MCP tool 結果のみ文字数 cap（builtin は各自の cap を持つ）。無制限だと
+        # brave 検索 1 回で数万 chars がコンテクストに直撃する。
+        if tool_name.startswith("mcp__"):
+            result_content = _cap_mcp_result_content(
+                result_content, MCP_TOOL_RESULT_CHARS,
+            )
         await _safe_status(
             status_callback,
             f"📨 結果を受信 ({dt:.1f}s)",
@@ -1351,7 +1446,11 @@ async def run_agent_loop(
             raise
 
         # Persist the assistant turn (in-memory only; disk write is caller's job)
-        assistant_blocks = [_block_to_dict(b) for b in (final_msg.content or [])]
+        # filter(None, ...): _block_to_dict returns None for server-only
+        # metadata blocks (e.g. ``fallback``) that would cause a 400 on replay.
+        assistant_blocks = [
+            d for d in (_block_to_dict(b) for b in (final_msg.content or [])) if d is not None
+        ]
         history.append({"role": "assistant", "content": assistant_blocks})
 
         # Capture any prose this turn emitted before deciding how to exit.

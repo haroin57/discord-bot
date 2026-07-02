@@ -611,3 +611,55 @@ def test_classify_strips_breakout_tags_and_escapes_braces():
     # Must not raise KeyError — result is a dict (possibly empty on parse error)
     assert isinstance(result, dict)
     # The important thing is no KeyError was raised during format() — test passed if we get here
+
+
+# ===========================================================================
+# format_memories_for_prompt — メタ付与（imp/tier/日付）と core 先頭固定
+# ===========================================================================
+
+class TestFormatMetaSuffix:
+    def test_meta_suffix_rendered(self):
+        # 2026-05-12 00:00 UTC
+        mems = [{
+            "memory": "先輩は信州大学の4年生",
+            "metadata": {"importance": 5, "tier": 0, "last_reinforced_at": 1778889600},
+        }]
+        result = format_memories_for_prompt(mems)
+        line = [l for l in result.split("\n") if l.startswith("- ")][0]
+        assert "[imp=5 Live]" in line
+        assert "[2026-05-16]" in line or "[2026-05-15]" in line  # tz非依存で日付が出ること
+
+    def test_tier_labels(self):
+        for tier, label in ((0, "Live"), (1, "Hot"), (2, "Warm"), (3, "Cold")):
+            result = format_memories_for_prompt(
+                [{"memory": "x", "metadata": {"importance": 3, "tier": tier}}]
+            )
+            assert f"[imp=3 {label}]" in result
+
+    def test_no_metadata_keeps_plain_line(self):
+        result = format_memories_for_prompt([{"memory": "メタ無しの古い事実"}])
+        line = [l for l in result.split("\n") if l.startswith("- ")][0]
+        assert line == "- メタ無しの古い事実"
+
+    def test_broken_epoch_is_ignored(self):
+        result = format_memories_for_prompt(
+            [{"memory": "x", "metadata": {"importance": 4, "tier": 1,
+                                          "last_reinforced_at": "not-a-number"}}]
+        )
+        line = [l for l in result.split("\n") if l.startswith("- ")][0]
+        assert "[imp=4 Hot]" in line
+        assert line.count("[") == 1  # 日付ブラケットは出ない
+
+    def test_legend_line_present(self):
+        result = format_memories_for_prompt([{"memory": "x"}])
+        assert "凡例" in result.split("\n")[1]
+
+    def test_core_memories_sorted_first(self):
+        mems = [
+            {"memory": "クエリ依存の事実"},
+            {"memory": "コア事実", "_core": True},
+        ]
+        result = format_memories_for_prompt(mems)
+        fact_lines = [l for l in result.split("\n") if l.startswith("- ")]
+        assert fact_lines[0].startswith("- コア事実")
+        assert fact_lines[1].startswith("- クエリ依存の事実")

@@ -336,7 +336,9 @@ async def get_all_memories(user_id: str, limit: int | None = None) -> list[dict]
     Pass None (default) to fetch all (used by the weekly housekeeping cron;
     avoid on hot paths).
     """
-    mem = _get_mem0()
+    # 初回 init は ChromaDB heartbeat (同期 requests) + Memory.from_config を
+    # 含むためイベントループから直接呼ばない（最大5秒のループ停止になる）。
+    mem = await asyncio.to_thread(_get_mem0)
     if not mem:
         return []
     try:
@@ -354,7 +356,9 @@ async def get_all_memories(user_id: str, limit: int | None = None) -> list[dict]
 
 async def delete_memory(memory_id: str) -> bool:
     """Delete a specific memory by ID."""
-    mem = _get_mem0()
+    # 初回 init は ChromaDB heartbeat (同期 requests) + Memory.from_config を
+    # 含むためイベントループから直接呼ばない（最大5秒のループ停止になる）。
+    mem = await asyncio.to_thread(_get_mem0)
     if not mem:
         return False
     try:

@@ -107,7 +107,7 @@
   "brave-search": [
     {
       "name": "mcp__brave-search__brave_web_search",
-      "description": "\n    Performs web searches using the Brave Search API and returns comprehensive search results with rich metadata.\n\n    When to use:\n        - General web searches for information, facts, or current topics\n        - Location-based queries (restaurants, businesses, points of interest)\n        - News searches for recent events or breaking stories\n        - Finding videos, discussions, or FAQ content\n        - Research requiring diverse result types (web pages, images, reviews, etc.)\n\n    Returns a JSON list of web results with title, description, and URL.\n    \n    When the \"results_filter\" parameter is empty, JSON results may also contain FAQ, Discussions, News, and Video results.\n",
+      "description": "\n    Performs web searches using the Brave Search API and returns comprehensive search results with rich metadata.\n\n    When to use:\n        - General web searches for information, facts, or current topics\n        - Location-based queries (restaurants, businesses, points of interest)\n        - News searches for recent events or breaking stories\n        - Finding videos, discussions, or FAQ content\n        - Research requiring diverse result types (web pages, images, reviews, etc.)\n\n    Returns a JSON list of web results with title, description, and URL.\n    \n    When the \"results_filter\" parameter is empty, JSON results may also contain FAQ, Discussions, News, and Video results. 日本語のクエリでは country='JP', search_lang='jp', ui_lang='ja-JP' を明示的に指定すること（省略するとUS/英語の検索結果になる）。",
       "input_schema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -118,7 +118,7 @@
             "description": "Search query (max 400 chars, 50 words)"
           },
           "country": {
-            "default": "US",
+            "default": "JP",
             "description": "Search query country, where the results come from. The country string is limited to 2 character country codes of supported countries.",
             "type": "string",
             "enum": [
@@ -162,7 +162,7 @@
             ]
           },
           "search_lang": {
-            "default": "en",
+            "default": "jp",
             "description": "Search language preference. The 2 or more character language code for which the search results are provided.",
             "type": "string",
             "enum": [
@@ -219,7 +219,7 @@
             ]
           },
           "ui_lang": {
-            "default": "en-US",
+            "default": "ja-JP",
             "description": "The language of the UI. The 2 or more character language code for which the search results are provided.",
             "type": "string",
             "enum": [
@@ -289,14 +289,8 @@
           },
           "freshness": {
             "type": "string",
-            "enum": [
-              "pd",
-              "pw",
-              "pm",
-              "py",
-              "YYYY-MM-DDtoYYYY-MM-DD"
-            ],
-            "description": "Filters search results by when they were discovered. The following values are supported: 'pd' - Discovered within the last 24 hours. 'pw' - Discovered within the last 7 days. 'pm' - Discovered within the last 31 days. 'py' - Discovered within the last 365 days. 'YYYY-MM-DDtoYYYY-MM-DD' - Timeframe is also supported by specifying the date range e.g. 2022-04-01to2022-07-30."
+            "description": "Filters search results by when they were discovered. The following values are supported: 'pd' - Discovered within the last 24 hours. 'pw' - Discovered within the last 7 days. 'pm' - Discovered within the last 31 days. 'py' - Discovered within the last 365 days. 'YYYY-MM-DDtoYYYY-MM-DD' - Timeframe is also supported by specifying the date range e.g. 2022-04-01to2022-07-30.",
+            "pattern": "^(pd|pw|pm|py|\\d{4}-\\d{2}-\\d{2}to\\d{4}-\\d{2}-\\d{2})$"
           },
           "text_decorations": {
             "default": true,
@@ -367,7 +361,7 @@
     },
     {
       "name": "mcp__brave-search__brave_local_search",
-      "description": "\n    Brave Local Search API provides enrichments for location search results. Access to this API is available only through the Brave Search API Pro plans; confirm the user's plan before using this tool (if the user does not have a Pro plan, use the brave_web_search tool). Searches for local businesses and places using Brave's Local Search API. Best for queries related to physical locations, businesses, restaurants, services, etc.\n    \n    Returns detailed information including:\n        - Business names and addresses\n        - Ratings and review counts\n        - Phone numbers and opening hours\n\n    Use this when the query implies 'near me', 'in my area', or mentions specific locations (e.g., 'in San Francisco'). This tool automatically falls back to brave_web_search if no local results are found.\n",
+      "description": "\n    Brave Local Search API provides enrichments for location search results. Access to this API is available only through the Brave Search API Pro plans; confirm the user's plan before using this tool (if the user does not have a Pro plan, use the brave_web_search tool). Searches for local businesses and places using Brave's Local Search API. Best for queries related to physical locations, businesses, restaurants, services, etc.\n    \n    Returns detailed information including:\n        - Business names and addresses\n        - Ratings and review counts\n        - Phone numbers and opening hours\n\n    Use this when the query implies 'near me', 'in my area', or mentions specific locations (e.g., 'in San Francisco'). This tool automatically falls back to brave_web_search if no local results are found. 日本語のクエリでは country='JP', search_lang='jp', ui_lang='ja-JP' を明示的に指定すること（省略するとUS/英語の検索結果になる）。",
       "input_schema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -378,7 +372,7 @@
             "description": "Search query (max 400 chars, 50 words)"
           },
           "country": {
-            "default": "US",
+            "default": "JP",
             "description": "Search query country, where the results come from. The country string is limited to 2 character country codes of supported countries.",
             "type": "string",
             "enum": [
@@ -422,7 +416,7 @@
             ]
           },
           "search_lang": {
-            "default": "en",
+            "default": "jp",
             "description": "Search language preference. The 2 or more character language code for which the search results are provided.",
             "type": "string",
             "enum": [
@@ -479,7 +473,7 @@
             ]
           },
           "ui_lang": {
-            "default": "en-US",
+            "default": "ja-JP",
             "description": "The language of the UI. The 2 or more character language code for which the search results are provided.",
             "type": "string",
             "enum": [
@@ -549,14 +543,8 @@
           },
           "freshness": {
             "type": "string",
-            "enum": [
-              "pd",
-              "pw",
-              "pm",
-              "py",
-              "YYYY-MM-DDtoYYYY-MM-DD"
-            ],
-            "description": "Filters search results by when they were discovered. The following values are supported: 'pd' - Discovered within the last 24 hours. 'pw' - Discovered within the last 7 days. 'pm' - Discovered within the last 31 days. 'py' - Discovered within the last 365 days. 'YYYY-MM-DDtoYYYY-MM-DD' - Timeframe is also supported by specifying the date range e.g. 2022-04-01to2022-07-30."
+            "description": "Filters search results by when they were discovered. The following values are supported: 'pd' - Discovered within the last 24 hours. 'pw' - Discovered within the last 7 days. 'pm' - Discovered within the last 31 days. 'py' - Discovered within the last 365 days. 'YYYY-MM-DDtoYYYY-MM-DD' - Timeframe is also supported by specifying the date range e.g. 2022-04-01to2022-07-30.",
+            "pattern": "^(pd|pw|pm|py|\\d{4}-\\d{2}-\\d{2}to\\d{4}-\\d{2}-\\d{2})$"
           },
           "text_decorations": {
             "default": true,
@@ -627,7 +615,7 @@
     },
     {
       "name": "mcp__brave-search__brave_video_search",
-      "description": "\n    Searches for videos using Brave's Video Search API and returns structured video results with metadata.\n\n    When to use:\n        - When you need to find videos related to a specific topic, keyword, or query.\n        - Useful for discovering video content, getting video metadata, or finding videos from specific creators/publishers.\n\n    Returns a JSON list of video-related results with title, url, description, duration, and thumbnail_url.\n",
+      "description": "\n    Searches for videos using Brave's Video Search API and returns structured video results with metadata.\n\n    When to use:\n        - When you need to find videos related to a specific topic, keyword, or query.\n        - Useful for discovering video content, getting video metadata, or finding videos from specific creators/publishers.\n\n    Returns a JSON list of video-related results with title, url, description, duration, and thumbnail_url. 日本語のクエリでは country='JP', search_lang='jp', ui_lang='ja-JP' を明示的に指定すること（省略するとUS/英語の検索結果になる）。",
       "input_schema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -639,17 +627,17 @@
             "description": "The user's search query. Query cannot be empty. Limited to 400 characters and 50 words."
           },
           "country": {
-            "default": "US",
+            "default": "JP",
             "description": "Search query country, where the results come from. The country string is limited to 2 character country codes of supported countries.",
             "type": "string"
           },
           "search_lang": {
-            "default": "en",
+            "default": "jp",
             "description": "Search language preference. The 2 or more character language code for which the search results are provided.",
             "type": "string"
           },
           "ui_lang": {
-            "default": "en-US",
+            "default": "ja-JP",
             "description": "User interface language preferred in response. Usually of the format <language_code>-<country_code>. For more, see RFC 9110.",
             "type": "string"
           },
@@ -722,7 +710,7 @@
     },
     {
       "name": "mcp__brave-search__brave_image_search",
-      "description": "\n    Performs an image search using the Brave Search API. Helpful for when you need pictures of people, places, things, graphic design ideas, art inspiration, and more. When relaying results in a markdown environment, it may be helpful to include images in the results (e.g., ![image.title](image.properties.url)).\n",
+      "description": "\n    Performs an image search using the Brave Search API. Helpful for when you need pictures of people, places, things, graphic design ideas, art inspiration, and more. When relaying results in a markdown environment, it may be helpful to include images in the results (e.g., ![image.title](image.properties.url)). 日本語のクエリでは country='JP', search_lang='jp', ui_lang='ja-JP' を明示的に指定すること（省略するとUS/英語の検索結果になる）。",
       "input_schema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -734,12 +722,12 @@
             "description": "The user's search query. Query cannot be empty. Limited to 400 characters and 50 words."
           },
           "country": {
-            "default": "US",
+            "default": "JP",
             "description": "Search query country, where the results come from. The country string is limited to 2 character country codes of supported countries.",
             "type": "string"
           },
           "search_lang": {
-            "default": "en",
+            "default": "jp",
             "description": "Search language preference. The 2 or more character language code for which the search results are provided.",
             "type": "string"
           },
@@ -777,7 +765,7 @@
     },
     {
       "name": "mcp__brave-search__brave_news_search",
-      "description": "\n    This tool searches for news articles using Brave's News Search API based on the user's query. Use it when you need current news information, breaking news updates, or articles about specific topics, events, or entities.\n    \n    When to use:\n        - Finding recent news articles on specific topics\n        - Getting breaking news updates\n        - Researching current events or trending stories\n        - Gathering news sources and headlines for analysis\n\n    Returns a JSON list of news-related results with title, url, and description. Some results may contain snippets of text from the article.\n    \n    When relaying results in markdown-supporting environments, always cite sources with hyperlinks.\n    \n    Examples:\n        - \"According to [Reuters](https://www.reuters.com/technology/china-bans/), China bans uncertified and recalled power banks on planes\".\n        - \"The [New York Times](https://www.nytimes.com/2025/06/27/us/technology/ev-sales.html) reports that Tesla's EV sales have increased by 20%\".\n        - \"According to [BBC News](https://www.bbc.com/news/world-europe-65910000), the UK government has announced a new policy to support renewable energy\".\n",
+      "description": "\n    This tool searches for news articles using Brave's News Search API based on the user's query. Use it when you need current news information, breaking news updates, or articles about specific topics, events, or entities.\n    \n    When to use:\n        - Finding recent news articles on specific topics\n        - Getting breaking news updates\n        - Researching current events or trending stories\n        - Gathering news sources and headlines for analysis\n\n    Returns a JSON list of news-related results with title, url, and description. Some results may contain snippets of text from the article.\n    \n    When relaying results in markdown-supporting environments, always cite sources with hyperlinks.\n    \n    Examples:\n        - \"According to [Reuters](https://www.reuters.com/technology/china-bans/), China bans uncertified and recalled power banks on planes\".\n        - \"The [New York Times](https://www.nytimes.com/2025/06/27/us/technology/ev-sales.html) reports that Tesla's EV sales have increased by 20%\".\n        - \"According to [BBC News](https://www.bbc.com/news/world-europe-65910000), the UK government has announced a new policy to support renewable energy\". 日本語のクエリでは country='JP', search_lang='jp', ui_lang='ja-JP' を明示的に指定すること（省略するとUS/英語の検索結果になる）。",
       "input_schema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -788,17 +776,17 @@
             "description": "Search query (max 400 chars, 50 words)"
           },
           "country": {
-            "default": "US",
+            "default": "JP",
             "description": "Search query country, where the results come from. The country string is limited to 2 character country codes of supported countries.",
             "type": "string"
           },
           "search_lang": {
-            "default": "en",
+            "default": "jp",
             "description": "Search language preference. The 2 or more character language code for which the search results are provided.",
             "type": "string"
           },
           "ui_lang": {
-            "default": "en-US",
+            "default": "ja-JP",
             "description": "User interface language preferred in response. Usually of the format <language_code>-<country_code>. For more, see RFC 9110.",
             "type": "string"
           },
@@ -884,7 +872,7 @@
     },
     {
       "name": "mcp__brave-search__brave_summarizer",
-      "description": "\n    Retrieves AI-generated summaries of web search results using Brave's Summarizer API. This tool processes search results to create concise, coherent summaries of information gathered from multiple sources.\n\n    When to use:\n\n    - When you need a concise overview of complex topics from multiple sources\n    - For quick fact-checking or getting key points without reading full articles\n    - When providing users with summarized information that synthesizes various perspectives\n    - For research tasks requiring distilled information from web searches\n\n    Returns a text summary that consolidates information from the search results. Optional features include inline references to source URLs and additional entity information.\n\n    Requirements: Must first perform a web search using brave_web_search with summary=true parameter. Requires a Pro AI subscription to access the summarizer functionality.\n",
+      "description": "\n    Retrieves AI-generated summaries of web search results using Brave's Summarizer API. This tool processes search results to create concise, coherent summaries of information gathered from multiple sources.\n\n    When to use:\n\n    - When you need a concise overview of complex topics from multiple sources\n    - For quick fact-checking or getting key points without reading full articles\n    - When providing users with summarized information that synthesizes various perspectives\n    - For research tasks requiring distilled information from web searches\n\n    Returns a text summary that consolidates information from the search results. Optional features include inline references to source URLs and additional entity information.\n\n    Requirements: Must first perform a web search using brave_web_search with summary=true parameter. Requires a Pro AI subscription to access the summarizer functionality. 日本語のクエリでは country='JP', search_lang='jp', ui_lang='ja-JP' を明示的に指定すること（省略するとUS/英語の検索結果になる）。",
       "input_schema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -1055,6 +1043,80 @@
           "slug"
         ],
         "title": "get_market_historyArguments",
+        "type": "object"
+      }
+    }
+  ],
+  "minkabu-fx": [
+    {
+      "name": "mcp__minkabu-fx__get_orderbook",
+      "description": "みんかぶFXから注文(指値/逆指値)の価格帯別分布を取得する。get_quote 相当。\n\n「未約定の注文がどの価格に溜まっているか」= 売り壁・買い指値の山の生データ。\n成行(price=0)と末尾センチネルは除去済み、価格昇順。解析済みの要約が欲しいなら\nanalyze_orderbook を使う。\n\nArgs:\n    instrument: 通貨ペア。例 \"USD_JPY\"(ドル円), \"EUR_USD\", \"XAU_USD\"(金)。\n                \"usdjpy\" / \"USD/JPY\" 表記も受け付ける。対応は list_instruments。\n\nReturns:\n    JSON: {instrument, type:\"order\", bucket_width, current_price,\n           last_update, long_percent, short_percent,\n           buckets:[{price, long_pct, short_pct}...], raw_count,\n           kept_count, source, cache}\n    非対応/データ無し: {error, detail, instrument, type, hint}\n",
+      "input_schema": {
+        "properties": {
+          "instrument": {
+            "title": "Instrument",
+            "type": "string"
+          }
+        },
+        "required": [
+          "instrument"
+        ],
+        "title": "get_orderbookArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "mcp__minkabu-fx__get_positions",
+      "description": "みんかぶFXから建玉(ロング/ショート)の価格帯別分布を取得する。\n\n「既存ポジションがどの価格に溜まっているか」= 踏み上げ/投げ売り燃料の生データ。\n建玉には現在値から遠い古い価格帯(例: ドル円の76〜78円台)が残るので、近辺だけ\n見たいなら analyze_orderbook (現在値±N にズーム) を使う。\n\nArgs:\n    instrument: 通貨ペア。例 \"USD_JPY\", \"EUR_JPY\"。list_instruments 参照。\n\nReturns:\n    JSON: {instrument, type:\"position\", bucket_width, current_price,\n           last_update, long_percent, short_percent,\n           buckets:[{price, long_pct, short_pct}...], raw_count,\n           kept_count, source, cache}\n",
+      "input_schema": {
+        "properties": {
+          "instrument": {
+            "title": "Instrument",
+            "type": "string"
+          }
+        },
+        "required": [
+          "instrument"
+        ],
+        "title": "get_positionsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "mcp__minkabu-fx__list_instruments",
+      "description": "みんかぶFXオーダーブックが対応する通貨ペア一覧を返す。\n\nハードコードした既知リスト (2026-06-24 実測)。NZD_JPY / CAD_JPY は非対応\n(HTTP 500)。XAU_USD(金) はルートはあるが時間帯によって空のことがある。\n\nReturns:\n    JSON: {instruments:[...], count, note}\n",
+      "input_schema": {
+        "properties": {},
+        "title": "list_instrumentsArguments",
+        "type": "object"
+      }
+    },
+    {
+      "name": "mcp__minkabu-fx__analyze_orderbook",
+      "description": "注文+建玉を現在値付近にズームし、売り壁/買いの山/踏み上げ燃料を構造化して返す。\n\n2026-06-24 に手作業でやったバタフライ分析のツール化。注文(order)と建玉\n(position)の両方を1発で取り、現在値 ±radius に絞ってピークを抽出する。\n「ドル円のショートどこに固まってる?」「162に売り壁ある?」に即答する用。\n\n解釈:\n  - order.above (上の short 指値/逆指値) = 売り壁・抵抗\n  - order.below (下の long 指値) = 買いの山・支持\n  - position.above (上の short 建玉) = 踏み上げ燃料 (上昇で買い戻しが入る)\n  - position.below (下の long 建玉) = 投げ売り燃料\ndistance は price - current_price (符号付き、正=現在値より上)。\n\nArgs:\n    instrument: 通貨ペア。例 \"USD_JPY\", \"XAU_USD\"。\n    radius: 現在値からのズーム半径(価格単位)。省略時は bucket_width*40 で自動\n            (ドル円なら ±2.0円程度)。広く見たいなら明示で渡す。\n\nReturns:\n    JSON: {instrument, current_price, last_update, bucket_width,\n           zoom_radius,\n           order:{long_percent, short_percent, above:[...], below:[...]},\n           position:{long_percent, short_percent, above:[...], below:[...]},\n           signals:[...], sources, cache}\n    order/position 片方が空でも、取れた方だけ返す (もう片方は null + reason)。\n",
+      "input_schema": {
+        "properties": {
+          "instrument": {
+            "title": "Instrument",
+            "type": "string"
+          },
+          "radius": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Radius"
+          }
+        },
+        "required": [
+          "instrument"
+        ],
+        "title": "analyze_orderbookArguments",
         "type": "object"
       }
     }

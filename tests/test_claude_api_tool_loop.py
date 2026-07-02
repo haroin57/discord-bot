@@ -1625,3 +1625,78 @@ class TestServerSideFallback:
         result = await self._run(client, watchdog=watchdog, max_turns=2)
         assert result.fallback_model == "claude-opus-4-8"
         assert "recovered" in result.text
+
+
+# ---------------------------------------------------------------------------
+# MCP tool result truncation (MCP_TOOL_RESULT_CHARS)
+# ---------------------------------------------------------------------------
+
+class TestMcpResultCap:
+    def test_truncate_head_tail_short_passthrough(self):
+        from services.claude_api.tool_loop import _truncate_head_tail
+        assert _truncate_head_tail("short", 100) == "short"
+
+    def test_truncate_head_tail_keeps_both_ends(self):
+        from services.claude_api.tool_loop import _truncate_head_tail
+        text = "H" * 100 + "M" * 1000 + "T" * 100
+        out = _truncate_head_tail(text, 200)
+        assert out.startswith("H" * 100)
+        assert out.endswith("T" * 100)
+        assert "omitted by MCP_TOOL_RESULT_CHARS cap" in out
+        assert "M" * 1000 not in out
+
+    def test_cap_zero_disables(self):
+        from services.claude_api.tool_loop import _truncate_head_tail
+        text = "x" * 5000
+        assert _truncate_head_tail(text, 0) == text
+
+    def test_cap_content_str(self):
+        from services.claude_api.tool_loop import _cap_mcp_result_content
+        out = _cap_mcp_result_content("y" * 500, 100)
+        assert isinstance(out, str) and len(out) < 500
+
+    def test_cap_content_list_truncates_text_blocks_only(self):
+        from services.claude_api.tool_loop import _cap_mcp_result_content
+        image = {"type": "image", "source": {"data": "z" * 9999}}
+        content = [
+            {"type": "text", "text": "a" * 300},
+            image,
+            {"type": "text", "text": "b" * 300},
+        ]
+        out = _cap_mcp_result_content(content, 200)
+        assert out[1] is image  # image ブロックは無傷
+        assert len(out[0]["text"]) < 300
+        assert len(out[2]["text"]) < 300
+
+    def test_cap_content_list_under_cap_passthrough(self):
+        from services.claude_api.tool_loop import _cap_mcp_result_content
+        content = [{"type": "text", "text": "ok"}]
+        assert _cap_mcp_result_content(content, 100) is content
+
+
+# ---------------------------------------------------------------------------
+# builtin tool schema — additionalProperties: false
+# ---------------------------------------------------------------------------
+
+class TestBuiltinSchemaStrictness:
+    def test_unknown_key_rejected(self):
+        from services.claude_api.tool_loop import _validate_tool_input
+        from services.claude_api.tools import BUILTIN_TOOLS
+        schema = BUILTIN_TOOLS["Read"].input_schema
+        err = _validate_tool_input(schema, {"file_path": "/tmp/x", "bogus": 1})
+        assert err is not None and "bogus" in err
+
+    def test_bash_description_field_tolerated(self):
+        # Claude Code 育ちのモデルが付けがちな description は無害に受ける。
+        from services.claude_api.tool_loop import _validate_tool_input
+        from services.claude_api.tools import BUILTIN_TOOLS
+        schema = BUILTIN_TOOLS["Bash"].input_schema
+        err = _validate_tool_input(
+            schema, {"command": "ls", "description": "List files"},
+        )
+        assert err is None
+
+    def test_all_builtin_schemas_are_strict(self):
+        from services.claude_api.tools import BUILTIN_TOOLS
+        for name, td in BUILTIN_TOOLS.items():
+            assert td.input_schema.get("additionalProperties") is False, name

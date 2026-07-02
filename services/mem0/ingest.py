@@ -87,7 +87,8 @@ async def add_memories(
     user_text = user_text or ""
     assistant_text = assistant_text or ""
 
-    mem = _get_mem0()
+    # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
+    mem = await asyncio.to_thread(_get_mem0)
     if not mem:
         return None
 

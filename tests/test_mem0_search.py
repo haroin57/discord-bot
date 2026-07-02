@@ -1067,3 +1067,133 @@ class TestApplyReinforcementBoost:
         empty = []
         _apply_reinforcement_boost(empty)
         assert empty == []
+
+
+# ---------------------------------------------------------------------------
+# apply_distance_filter（pre-rerank 距離ゲートのパラメータ化）
+# ---------------------------------------------------------------------------
+
+class TestDistanceFilterParam:
+    def _mem_client(self, results):
+        mem_client = MagicMock()
+        mem_client.search = MagicMock(return_value={"results": results})
+        return mem_client
+
+    @pytest.mark.asyncio
+    async def test_default_filters_far_hits(self, monkeypatch):
+        from services.mem0.search import search_memories
+        far = [{"id": "far", "score": 1.5, "memory": "遠い事実"}]
+        monkeypatch.setattr(f"{_PATCH_BASE}._get_mem0", lambda: self._mem_client(far))
+        monkeypatch.setattr(f"{_PATCH_BASE}.ensure_valid_token", AsyncMock())
+        monkeypatch.setattr(f"{_PATCH_BASE}._refresh_mem0_client_token", lambda: None)
+        monkeypatch.setattr(f"{_PATCH_BASE}.MEM0_RELEVANCE_MAX_DISTANCE", 1.2)
+        assert await search_memories("q", "u") == []
+
+    @pytest.mark.asyncio
+    async def test_filter_off_keeps_far_hits(self, monkeypatch):
+        from services.mem0.search import search_memories
+        far = [{"id": "far", "score": 1.5, "memory": "遠い事実"}]
+        monkeypatch.setattr(f"{_PATCH_BASE}._get_mem0", lambda: self._mem_client(far))
+        monkeypatch.setattr(f"{_PATCH_BASE}.ensure_valid_token", AsyncMock())
+        monkeypatch.setattr(f"{_PATCH_BASE}._refresh_mem0_client_token", lambda: None)
+        monkeypatch.setattr(f"{_PATCH_BASE}.MEM0_RELEVANCE_MAX_DISTANCE", 1.2)
+        result = await search_memories("q", "u", apply_distance_filter=False)
+        assert [r["id"] for r in result] == ["far"]
+
+    @pytest.mark.asyncio
+    async def test_filter_off_still_hides_archived(self, monkeypatch):
+        from services.mem0.search import search_memories
+        archived = [{
+            "id": "old", "score": 0.1, "memory": "アーカイブ済み",
+            "metadata": {"valid_to": 1},  # 過去に expire
+        }]
+        monkeypatch.setattr(f"{_PATCH_BASE}._get_mem0", lambda: self._mem_client(archived))
+        monkeypatch.setattr(f"{_PATCH_BASE}.ensure_valid_token", AsyncMock())
+        monkeypatch.setattr(f"{_PATCH_BASE}._refresh_mem0_client_token", lambda: None)
+        result = await search_memories("q", "u", apply_distance_filter=False)
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# core memory（常時注入枠）
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def _clear_core_cache():
+    from services.mem0 import search as search_mod
+    search_mod._CORE_CACHE.clear()
+    yield
+    search_mod._CORE_CACHE.clear()
+
+
+def _core_fact(fid, imp, tier, reinforced=0):
+    return {
+        "id": fid, "memory": f"fact-{fid}",
+        "metadata": {"importance": imp, "tier": tier,
+                     "last_reinforced_at": reinforced},
+    }
+
+
+class TestCoreMemories:
+    @pytest.mark.asyncio
+    async def test_filters_importance_and_tier(self, monkeypatch, _clear_core_cache):
+        from services.mem0.search import get_core_memories
+        all_mems = [
+            _core_fact("core-live", 5, 0),
+            _core_fact("core-hot", 5, 1),
+            _core_fact("warm", 5, 2),      # tier 対象外
+            _core_fact("low-imp", 4, 0),   # importance 対象外
+            {"id": "no-meta", "memory": "x"},
+        ]
+        monkeypatch.setattr(
+            "services.mem0.client.get_all_memories",
+            AsyncMock(return_value=all_mems),
+        )
+        result = await get_core_memories("u", max_items=5)
+        assert [r["id"] for r in result] == ["core-live", "core-hot"]
+        assert all(r.get("_core") for r in result)
+
+    @pytest.mark.asyncio
+    async def test_ttl_cache_avoids_refetch(self, monkeypatch, _clear_core_cache):
+        from services.mem0.search import get_core_memories
+        fetch = AsyncMock(return_value=[_core_fact("c1", 5, 0)])
+        monkeypatch.setattr("services.mem0.client.get_all_memories", fetch)
+        await get_core_memories("u")
+        await get_core_memories("u")
+        assert fetch.await_count == 1  # 2回目はキャッシュ命中
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_returns_empty(self, monkeypatch, _clear_core_cache):
+        from services.mem0.search import get_core_memories
+        monkeypatch.setattr(
+            "services.mem0.client.get_all_memories",
+            AsyncMock(side_effect=RuntimeError("chroma down")),
+        )
+        assert await get_core_memories("u") == []
+
+
+class TestMergeCoreFirst:
+    def test_core_first_dedup_and_limit(self):
+        from services.mem0.search import _merge_core_first
+        core = [{"id": "c1", "_core": True}, {"id": "c2", "_core": True}]
+        results = [
+            {"id": "c1"},          # core と重複 → 落ちる
+            {"id": "q1"}, {"id": "q2"}, {"id": "q3"},
+        ]
+        merged = _merge_core_first(core, results, limit=4)
+        assert [m["id"] for m in merged] == ["c1", "c2", "q1", "q2"]
+
+    def test_bundle_extras_survive_beyond_limit(self):
+        from services.mem0.search import _merge_core_first
+        core = [{"id": "c1", "_core": True}]
+        results = [
+            {"id": "q1"}, {"id": "q2"},
+            {"id": "b1", "_episode_bundle": True},
+        ]
+        merged = _merge_core_first(core, results, limit=2)
+        assert [m["id"] for m in merged] == ["c1", "q1", "b1"]
+
+    def test_no_core_is_passthrough(self):
+        from services.mem0.search import _merge_core_first
+        results = [{"id": "q1"}]
+        assert _merge_core_first([], results, limit=5) is results

@@ -1,6 +1,7 @@
 """Format retrieved Mem0 memories as a prompt-injection block."""
 
 import re
+from datetime import datetime, timezone
 
 from services.sentinel import POWER_PHRASE_RE
 
@@ -39,16 +40,69 @@ def _scrub_fact_text(text: str) -> str:
     return text
 
 
+_TIER_LABELS = {0: "Live", 1: "Hot", 2: "Warm", 3: "Cold"}
+
+
+def _format_epoch(ts) -> str | None:
+    """unix 秒を YYYY-MM-DD に。壊れた値は None（メタ無し扱い）。"""
+    try:
+        ts = int(ts)
+        if ts <= 0:
+            return None
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _fact_meta_suffix(m: dict) -> str:
+    """事実1行に付ける [imp=N Tier] [YYYY-MM-DD] サフィックス。
+
+    importance / tier / 日付をモデルに見せることで、重要度5のコア事実と
+    重要度2の断片、新しい状態と古い状態をモデルが区別できるようにする
+    （従来は全メタデータを捨てて全事実が等価に見えていた）。
+    メタが無い古いレコードは空文字を返し、従来表示のままになる。
+    """
+    md = m.get("metadata") or {}
+    if not isinstance(md, dict):
+        return ""
+    bits: list[str] = []
+    try:
+        imp = int(md.get("importance"))
+    except (TypeError, ValueError):
+        imp = None
+    tier_label = _TIER_LABELS.get(md.get("tier"))
+    inner = " ".join(
+        s for s in (f"imp={imp}" if imp is not None else "", tier_label or "")
+        if s
+    )
+    if inner:
+        bits.append(f"[{inner}]")
+    date_str = _format_epoch(
+        md.get("last_reinforced_at") or md.get("created_at_unix")
+        or md.get("timestamp")
+    )
+    if date_str:
+        bits.append(f"[{date_str}]")
+    return (" " + " ".join(bits)) if bits else ""
+
+
 def format_memories_for_prompt(memories: list[dict]) -> str:
     """Format retrieved memories as a prompt-injection block."""
     if not memories:
         return ""
 
-    lines = ["[Mem0 — この人についての長期記憶]"]
-    for m in memories:
+    lines = [
+        "[Mem0 — この人についての長期記憶]",
+        "(凡例: imp=重要度1-5 / Live>Hot>Warm>Cold=鮮度tier / [日付]=最終確認日)",
+    ]
+    # core memory（常時注入枠）を先頭に固定し、クエリ依存の recall と区別する。
+    ordered = sorted(
+        memories, key=lambda m: 0 if m.get("_core") else 1,
+    )
+    for m in ordered:
         text = m.get("memory", m.get("text", ""))
         if text:
-            lines.append(f"- {_scrub_fact_text(text)}")
+            lines.append(f"- {_scrub_fact_text(text)}{_fact_meta_suffix(m)}")
     lines.append("[End of Mem0 memories]")
     return "\n".join(lines)
 

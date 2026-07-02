@@ -231,7 +231,10 @@ def _load_static_schemas_from_disk() -> None:
         log.warning("static_mcp_schemas.json: expected dict at top level")
         return
     for server_key, tools in payload.items():
-        if not isinstance(tools, list):
+        # 空リストは「dump 失敗の残骸」でしかないので無視する。extend([]) でも
+        # 実害はないが、将来 setdefault 側の意味論が変わっても正常スキーマを
+        # 空で確定させないよう明示的に弾いておく。
+        if not isinstance(tools, list) or not tools:
             continue
         STATIC_MCP_TOOL_SCHEMAS.setdefault(server_key, []).extend(tools)
 

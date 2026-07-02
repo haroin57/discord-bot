@@ -280,3 +280,59 @@ class TestRapidRefillBreaker:
         _patch_rows(monkeypatch, [_row("user", 10**6)])
         client = _fake_client("<summary>x</summary>")
         assert await compact_channel_history(CHANNEL, client, force=True) is False
+
+
+class TestApiMessagesFallback:
+    """content 空のツール中心ターンでも api_messages から要約入力を復元する。"""
+
+    def _tool_heavy_row(self):
+        return {
+            "role": "assistant",
+            "content": "",  # 表示テキストなし（ツールだけ使ったターン）
+            "api_messages": [
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "ファイルを確認します"},
+                    {"type": "tool_use", "id": "t1", "name": "Read",
+                     "input": {"file_path": "/x"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1",
+                     "content": "みっしりしたツール出力"},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "確認完了、問題ありません"},
+                ]},
+            ],
+        }
+
+    def test_fallback_recovers_text_blocks(self):
+        text = comp._api_messages_text_fallback(self._tool_heavy_row())
+        assert "ファイルを確認します" in text
+        assert "確認完了" in text
+        # tool_use / tool_result の中身は bulk なので拾わない
+        assert "みっしりしたツール出力" not in text
+
+    def test_flatten_includes_fallback_content(self):
+        rows = [
+            {"role": "user", "content": "調べて"},
+            self._tool_heavy_row(),
+        ]
+        out = comp._flatten_rows_for_summary(rows, max_chars=10_000)
+        assert "調べて" in out
+        assert "ファイルを確認します" in out
+        assert "[assistant (かなえ)]" in out
+
+    def test_no_api_messages_still_skipped(self):
+        rows = [{"role": "assistant", "content": "", "api_messages": []}]
+        assert comp._flatten_rows_for_summary(rows, max_chars=1000) == ""
+
+    def test_fallback_is_capped(self):
+        row = {
+            "role": "assistant", "content": "",
+            "api_messages": [
+                {"role": "assistant",
+                 "content": [{"type": "text", "text": "長い" * 5000}]},
+            ],
+        }
+        text = comp._api_messages_text_fallback(row)
+        assert len(text) <= comp._API_MSG_FALLBACK_CHARS + 20  # cap + 省略記号

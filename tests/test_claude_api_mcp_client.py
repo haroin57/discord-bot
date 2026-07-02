@@ -348,3 +348,29 @@ class TestMcpPool:
                 await pool.spawn_eager(["bad", "good"])
         assert "good" in pool.handles
         assert "bad" not in pool.handles
+
+
+class TestStaticSchemaMergeGuard:
+    """dump 失敗の残骸（空リスト）で正常スキーマを空確定させない。"""
+
+    def test_empty_list_entries_are_skipped(self, tmp_path, monkeypatch):
+        import json as _json
+        from services.claude_api import mcp_client as mod
+
+        payload = {
+            "broken-server": [],  # dump 失敗の残骸
+            "good-server": [{"name": "mcp__good-server__t",
+                             "description": "d", "input_schema": {}}],
+            "not-a-list": {"oops": True},
+        }
+        p = tmp_path / "static.json"
+        p.write_text(_json.dumps(payload), encoding="utf-8")
+        monkeypatch.setattr(mod, "_STATIC_SCHEMA_JSON", p)
+        registry: dict = {}
+        monkeypatch.setattr(mod, "STATIC_MCP_TOOL_SCHEMAS", registry)
+
+        mod._load_static_schemas_from_disk()
+
+        assert "good-server" in registry
+        assert "broken-server" not in registry
+        assert "not-a-list" not in registry

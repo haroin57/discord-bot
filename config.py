@@ -92,6 +92,101 @@ def speaker_label(user_id: int | str | None) -> str:
         return ""
     return SPEAKER_LABELS.get(uid, "")
 
+
+# 佐藤かなえが Deep Research の最終回答で相手をどう呼ぶか（speaker_label → 呼称）。
+# 名前/呼称はリポジトリにハードコードせず env で持つ（SPEAKER_LABELS と同じ方針）。
+# 形式: KANAE_HONORIFICS="haroin:先輩,b0nchichi:お父さん"。未設定の相手は丁寧語で、
+# 特定の相手呼称（「先輩」等）は使わない。
+KANAE_HONORIFICS: dict[str, str] = {}
+_raw_honor = os.environ.get("KANAE_HONORIFICS", "")
+if _raw_honor:
+    for _pair in _raw_honor.split(","):
+        _pair = _pair.strip()
+        if ":" not in _pair:
+            continue
+        _lbl, _hon = _pair.split(":", 1)
+        _lbl, _hon = _lbl.strip(), _hon.strip()
+        if _lbl and _hon:
+            KANAE_HONORIFICS[_lbl] = _hon
+
+
+def kanae_honorific(user_id: int | str | None) -> str:
+    """リクエスト者の呼称（「先輩」「お父さん」等）。不明なら "" を返す（→丁寧語）。"""
+    label = speaker_label(user_id)
+    return KANAE_HONORIFICS.get(label, "") if label else ""
+
+
+# ---------------------------------------------------------------------------
+# Sleep-enforcement hook (ADR-0032) — 早寝早起き Ulysses pact before 院試 (8/18).
+#
+# haroin's own pre-committed self-binding rule (2026-07-01): when HE mentions
+# kanae during the "should be asleep" window (past midnight JST by default),
+# inject a top-priority directive into the prompt telling kanae to firmly,
+# warmly steer him to bed instead of engaging new late-night tangents. He set
+# this up *because* his in-the-moment self will rationalize staying up — the
+# pre-commitment is meant to outrank that impulse.
+#
+# Scope/safety (see ADR-0032):
+#   - targets ONLY haroin (not b0nchichi, not other admins) — gated on the
+#     Discord author id, never on message content
+#   - time-windowed (JST), deterministic, re-evaluated every turn
+#   - reversible at will: flip SLEEP_ENFORCE_ENABLED=false, or just tell kanae
+#     to stand down while clear-headed
+# Boolean parse: anything other than the falsy set below counts as enabled.
+_raw_sleep_enabled = os.environ.get("SLEEP_ENFORCE_ENABLED", "true").strip().lower()
+SLEEP_ENFORCE_ENABLED = _raw_sleep_enabled not in ("0", "false", "no", "off", "")
+
+# Target user. Defaults to whoever is labelled "haroin" in SPEAKER_LABELS so
+# the id stays out of source (same policy as ADMIN_USER_IDS). Override with an
+# explicit id via env if needed. None ⇒ feature is inert (no one to enforce).
+_raw_sleep_uid = os.environ.get("SLEEP_ENFORCE_USER_ID", "").strip()
+if _raw_sleep_uid.isdigit():
+    SLEEP_ENFORCE_USER_ID: int | None = int(_raw_sleep_uid)
+else:
+    SLEEP_ENFORCE_USER_ID = next(
+        (uid for uid, lbl in SPEAKER_LABELS.items() if lbl == "haroin"), None
+    )
+
+
+def _sleep_hour_env(name: str, default: int) -> int:
+    """Parse an hour-of-day env (0-23), clamping junk back to the default."""
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        h = int(raw)
+    except ValueError:
+        return default
+    return h if 0 <= h <= 23 else default
+
+
+# Enforcement window [start, end) in JST hours. Default 00:00–05:00:
+#   - start 0  → honors haroin's literal "12時を回ったら" (past midnight)
+#   - end   5  → a 05:00+ message is plausibly a genuine 早起き morning, not a
+#                still-awake night, so we stop nagging there
+# Set start=23 for a stricter 早寝 (force-sleep from 23:00). start>end wraps
+# across midnight (handled in PromptBuilder.build_sleep_directive).
+SLEEP_ENFORCE_START_HOUR = _sleep_hour_env("SLEEP_ENFORCE_START_HOUR", 0)
+SLEEP_ENFORCE_END_HOUR = _sleep_hour_env("SLEEP_ENFORCE_END_HOUR", 5)
+
+# ---------------------------------------------------------------------------
+# claude tag (:claude: リアクションでタスクをスレッド処理する — ADR-0027)
+#
+# admin が任意メッセージに :claude:（サーバー固有のカスタム絵文字）でリアクション
+# すると、そのメッセージをタスクとして整理し、スレッドを立てて Claude に処理させる。
+# 発火は admin のみ（services/claude_tag.passes_cheap_gate が ADMIN_USER_IDS で判定）。
+#
+# CLAUDE_TAG_EMOJI_ID は強く推奨: 絵文字を name だけで照合すると、bot が複数ギルドに
+# 居る場合に別ギルドの同名 :claude: でも発火してしまう。ギルド設定でアップロード済みの
+# :claude: の絵文字 ID を .env に転記すること（guild.emojis か管理画面で1回確認するだけ。
+# kanae_spin の Application Emoji とは別物 — :claude: はギルドのカスタム絵文字）。
+# 未設定時は name 一致にフォールバックし、on_ready で warning を出す。
+# ---------------------------------------------------------------------------
+CLAUDE_TAG_ENABLED = os.environ.get("CLAUDE_TAG_ENABLED", "true").lower() == "true"
+CLAUDE_TAG_EMOJI_NAME = os.environ.get("CLAUDE_TAG_EMOJI_NAME", "claude").strip()
+_raw_tag_emoji_id = os.environ.get("CLAUDE_TAG_EMOJI_ID", "").strip()
+CLAUDE_TAG_EMOJI_ID: int | None = (
+    int(_raw_tag_emoji_id) if _raw_tag_emoji_id.isdigit() else None
+)
+
 # ---------------------------------------------------------------------------
 # Claude
 # ---------------------------------------------------------------------------
@@ -228,6 +323,23 @@ CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "64000"))
 # for the full CLAUDE_TIMEOUT window. 100 covers heavy image-review workflows
 # (10+ slide screenshots, multi-file edits); bump via env when truly needed.
 ADMIN_MAX_TURNS = int(os.environ.get("ADMIN_MAX_TURNS", "100"))
+
+# ---------------------------------------------------------------------------
+# Agent tool（メインパイプラインの subagent。CLI 純正の Agent tool と足並みを揃える）
+# ---------------------------------------------------------------------------
+# admin の本ルートに Agent ツールを広告する。off で従来動作。
+SUBAGENT_ENABLED = os.environ.get("SUBAGENT_ENABLED", "true").lower() == "true"
+# 既定の subagent_type（CLI と同じ "general-purpose"）。
+SUBAGENT_DEFAULT_TYPE = os.environ.get("SUBAGENT_DEFAULT_TYPE", "general-purpose")
+# 1 親 agent_loop ターン内で同時に走らせる subagent 数の上限（model が Promise.all 風に
+# Agent() を複数撃った時の律速）。CLI 純正に近づけつつ subscriber bucket を圧迫しない値。
+SUBAGENT_MAX_PARALLEL = int(os.environ.get("SUBAGENT_MAX_PARALLEL", "4"))
+# 親→子→孫…の再帰深さ上限。これを超えたら Agent ツールを子の広告から外して止める。
+SUBAGENT_MAX_DEPTH = int(os.environ.get("SUBAGENT_MAX_DEPTH", "2"))
+# subagent 1 体の tool ループ turn 上限（CLI agent と同等の探索深度）。
+SUBAGENT_MAX_TURNS = int(os.environ.get("SUBAGENT_MAX_TURNS", "20"))
+# subagent の StallWatchdog idle timeout（長考も許容）。
+SUBAGENT_IDLE_TIMEOUT_S = int(os.environ.get("SUBAGENT_IDLE_TIMEOUT_S", "300"))
 
 # ---------------------------------------------------------------------------
 # Tool-call recovery (2026-06-21). The model occasionally emits a tool call as
@@ -423,6 +535,128 @@ SPINNER_MODE = os.environ.get("SPINNER_MODE", "text").strip().lower()
 # the turn forever — on timeout the loop gets an is_error tool_result and
 # continues, instead of the whole channel wedging behind a stuck await.
 TOOL_CALL_TIMEOUT_S = int(os.environ.get("TOOL_CALL_TIMEOUT_S", "240"))
+
+# 通常 chat 経路の MCP tool 結果の文字数上限（head+tail 中抜き切り詰め）。
+# Deep Research 経路には DEEP_RESEARCH_MAX_TOOL_RESULT_CHARS=20000 が既にあるが
+# メインの tool loop は無制限で、brave 検索 1 回で 30K-100K chars がコンテクスト
+# に直撃し得たため同水準の cap を入れる。builtin tools は各自の cap
+# (BASH_OUTPUT_CAP_BYTES 等) を持つので対象外。0 以下で無効化。
+MCP_TOOL_RESULT_CHARS = int(os.environ.get("MCP_TOOL_RESULT_CHARS", "20000"))
+
+# ---------------------------------------------------------------------------
+# Deep Research モード (/research — 多段 Web 調査で引用付きレポート、ADR-0028)
+#
+# 設計・機能要件の正本は docs/deep-research-mode.md。サブエージェントは
+# run_agent_loop を直接呼ぶ（claude_semaphore を通さず subscriber-shape を再利用、
+# session/JSONL を触らない）。Phase 0 は単一エージェント + 必須明確化で E2E。
+# default OFF（user 向け有効化は堅牢化フェーズ完了後）。
+# ---------------------------------------------------------------------------
+DEEP_RESEARCH_ENABLED = os.environ.get("DEEP_RESEARCH_ENABLED", "false").lower() == "true"
+# CLI 式 multi-agent（planner→並列searcher→synthesizer）を使うか。False で Phase 0 の
+# 単一エージェント反復型にフォールバック（低コスト・デバッグ用）。
+DEEP_RESEARCH_MULTI_AGENT = os.environ.get("DEEP_RESEARCH_MULTI_AGENT", "true").lower() == "true"
+# 並列サブエージェントの実走上限（Phase 1）。subscriber バケット保護のため小さく。
+DEEP_RESEARCH_MAX_PARALLEL = int(os.environ.get("DEEP_RESEARCH_MAX_PARALLEL", "2"))
+# 計画で生成するサブ質問の上限（Phase 1）。
+DEEP_RESEARCH_MAX_SUBAGENTS = int(os.environ.get("DEEP_RESEARCH_MAX_SUBAGENTS", "6"))
+# 計画で生成するサブ質問の **最低数**（haroin 2026-06-24: 探索段階で常に N 並列で
+# searcher を走らせたい）。planner にこの数を必須として要求し、足りない場合は明示的に
+# ログに残す。MIN > MAX_PARALLEL のときは並列度が天井になるが、サブ質問自体は MIN 出る。
+DEEP_RESEARCH_MIN_SUBAGENTS = int(os.environ.get("DEEP_RESEARCH_MIN_SUBAGENTS", "5"))
+# 各 searcher の検索ループ turn 上限（Phase 1）。
+DEEP_RESEARCH_MAX_SEARCHES_PER_AGENT = int(os.environ.get("DEEP_RESEARCH_MAX_SEARCHES_PER_AGENT", "4"))
+# Phase 0 の単一エージェントが回せる tool ループ turn 上限。
+DEEP_RESEARCH_SINGLE_AGENT_MAX_TURNS = int(os.environ.get("DEEP_RESEARCH_SINGLE_AGENT_MAX_TURNS", "12"))
+# 全体時間 / トークン上限（超過で degrade）。MAGI は「質優先・時間上限なし」なので
+# 時間は実質無効化（/abort で制御）、トークンは暴走防止の backstop のみ大きめに置く。
+DEEP_RESEARCH_TOTAL_TIME_BUDGET_S = int(os.environ.get("DEEP_RESEARCH_TOTAL_TIME_BUDGET_S", "86400"))
+DEEP_RESEARCH_TOTAL_TOKEN_BUDGET = int(os.environ.get("DEEP_RESEARCH_TOTAL_TOKEN_BUDGET", "8000000"))
+# 明確化質問の回答待ち時間。タイムアウトで既定スコープ続行。
+DEEP_RESEARCH_CLARIFY_TIMEOUT_S = int(os.environ.get("DEEP_RESEARCH_CLARIFY_TIMEOUT_S", "180"))
+# 中心的問い承認ゲートの訂正回数上限。到達時は最後の訂正を反映した問いで自動続行
+# する。無上限だと訂正を送り続けるだけで _research_busy を任意時間占有できる。
+DEEP_RESEARCH_MAX_CQ_CORRECTIONS = int(os.environ.get("DEEP_RESEARCH_MAX_CQ_CORRECTIONS", "5"))
+# 最終レポートへの adversarial verification。integrator 出力を critic（Sonnet・
+# ツール無し）が証拠ベースと突き合わせ、指摘があれば integrator を1回だけ再実行。
+# MAGI の懐疑レンズは証拠収集段の独立推論で、レポート本文自体は未検証だった。
+DEEP_RESEARCH_REPORT_CRITIC_ENABLED = (
+    os.environ.get("DEEP_RESEARCH_REPORT_CRITIC_ENABLED", "true").lower() == "true"
+)
+# モデル: lead/synthesizer は Opus、searcher は Sonnet（Phase 1）。Phase 0 は
+# Haiku の adaptive-thinking HTTP400 を避けるため全工程 LEAD_MODEL を使う。
+DEEP_RESEARCH_LEAD_MODEL = os.environ.get("DEEP_RESEARCH_LEAD_MODEL", CLAUDE_MODEL)
+DEEP_RESEARCH_SEARCHER_MODEL = os.environ.get("DEEP_RESEARCH_SEARCHER_MODEL", "claude-sonnet-4-6")
+# フェーズ別 idle timeout（StallWatchdog 誤発火対策）。
+DEEP_RESEARCH_SEARCHER_IDLE_TIMEOUT_S = int(os.environ.get("DEEP_RESEARCH_SEARCHER_IDLE_TIMEOUT_S", "240"))
+DEEP_RESEARCH_SYNTH_IDLE_TIMEOUT_S = int(os.environ.get("DEEP_RESEARCH_SYNTH_IDLE_TIMEOUT_S", "600"))
+# Deep Research が searcher に「横断的に」渡す MCP server key（Web + X + 金融 + 学術）。
+# env DEEP_RESEARCH_MCP_KEYS でカンマ区切り上書き可。playwright(RAM大)/mem0(個人記憶)/
+# realestate(admin専用データ)/google-maps/context7 は既定で除外（env で追加可能）。
+# 実装上、static_mcp_schemas.json に在るもの（brave/x-scraper/nikkei-indexes/yfj-quote/
+# polymarket）は「静的広告 + lazy spawn」（searcher が実際に呼んだ時だけ起動）で RAM を
+# 節約し、無いもの（tavily/scholarly）だけ eager spawn して live tool を広告する。
+_raw_dr_mcp = os.environ.get("DEEP_RESEARCH_MCP_KEYS", "")
+DEEP_RESEARCH_MCP_KEYS: tuple[str, ...] = tuple(
+    k.strip() for k in _raw_dr_mcp.split(",") if k.strip()
+) or (
+    "brave-search", "tavily",                    # 一般 Web
+    "x-scraper",                                  # X / リアルタイム
+    "nikkei-indexes", "yfj-quote", "polymarket", "minkabu-fx",  # 金融・市場
+    "scholarly",                                  # 学術論文
+)
+# 一般 Web 検索の前提条件。これらのいずれかが MCP_SERVERS_WEB に在ることを要求
+# （x-scraper は X 専用なので一般 Web 検索には数えない）。無ければ /research を拒否。
+DEEP_RESEARCH_REQUIRED_WEB_KEYS = ("brave-search", "tavily")
+
+# ---------------------------------------------------------------------------
+# MAGI 推論層（事実収集の後段に積む帰納的・一段上のレイヤー。docs/deep-research-magi.md）
+#
+# 科学(Melchior)/直観(Balthasar)/懐疑(Casper) の3レンズが中心的問いに独立回答し、
+# integrator が合意(BLUF テーゼ)+相違(本質的論点)を抽出する。各レンズは入れ子構成
+# （Sonnet 分解 → 並列 Sonnet ワーカー(検証検索) → Opus lead(effort=max, 難所だけ)）。
+# Opus は 3 lead + integrator の計4回のみ、検索・部品推論はすべて Sonnet に逃がす。
+# ---------------------------------------------------------------------------
+# kill switch（コスト/安全）。false で旧 synthesizer（事実統合のみ）にフォールバック。
+DEEP_RESEARCH_MAGI_ENABLED = os.environ.get("DEEP_RESEARCH_MAGI_ENABLED", "true").lower() == "true"
+# lead(c) と integrator に使う高思考モデル（既定 = LEAD = Opus）と effort。
+DEEP_RESEARCH_MAGI_MODEL = os.environ.get("DEEP_RESEARCH_MAGI_MODEL", DEEP_RESEARCH_LEAD_MODEL)
+DEEP_RESEARCH_MAGI_EFFORT = os.environ.get("DEEP_RESEARCH_MAGI_EFFORT", "max")
+# 分解(a)とワーカー(b)に使う安いモデル（既定 = SEARCHER = Sonnet）。
+DEEP_RESEARCH_MAGI_WORKER_MODEL = os.environ.get("DEEP_RESEARCH_MAGI_WORKER_MODEL", DEEP_RESEARCH_SEARCHER_MODEL)
+# レンズあたりの分解サブタスク上限（= 並列 Sonnet ワーカー数の上限）。
+DEEP_RESEARCH_MAGI_MAX_WORKERS = int(os.environ.get("DEEP_RESEARCH_MAGI_MAX_WORKERS", "4"))
+# ワーカー1体の検証検索（アブダクション）の turn 上限。
+DEEP_RESEARCH_MAGI_WORKER_MAX_SEARCHES = int(os.environ.get("DEEP_RESEARCH_MAGI_WORKER_MAX_SEARCHES", "5"))
+# lead / integrator は長考するので idle timeout を長めに（StallWatchdog 誤発火対策）。
+DEEP_RESEARCH_MAGI_IDLE_TIMEOUT_S = int(os.environ.get("DEEP_RESEARCH_MAGI_IDLE_TIMEOUT_S", "600"))
+# 中心的問いの承認ゲートのリアクション絵文字（これ以外でも承認扱い。表示用）。
+DEEP_RESEARCH_MAGI_APPROVE_HINT = os.environ.get("DEEP_RESEARCH_MAGI_APPROVE_HINT", "👍")
+
+# 1 回の MCP ツール結果をモデルの context に戻す際の上限文字数。通常chatは
+# microcompact / 履歴圧縮で 200k トークン以内に収め続けるが、deep research の
+# サブエージェントは fresh-context で圧縮機構を通らないため、巨大な MCP 戻り値
+# （tavily ページ全文・x 大量ツイート等）1 件で 200k を超え、context-1m 経由で
+# long-context 課金ティアに乗って 429（Usage credits required）を食らう。ソースは
+# parse_sources が全文から抽出済みなので、モデルに渡す本文だけを有界化する。
+DEEP_RESEARCH_MAX_TOOL_RESULT_CHARS = int(
+    os.environ.get("DEEP_RESEARCH_MAX_TOOL_RESULT_CHARS", "20000")
+)
+
+# subagent 1 リクエストの入力（system_prompt + briefing + history）の上界文字数。
+# Anthropic の通常 context window は 200K tokens（Claude Sonnet 4.6 / Opus 4.7-4.8）。
+# context-1m beta を送ると subscriber bucket の long-context credits を消費し、deep
+# research の多発リクエストでバケット枯渇→「Usage credits required」429 を引く。
+# subagent は context-1m を切って 200K 以内に厳格にバウンドする。char→token は保守的に
+# 1token≈3chars（日本語/英語混在）として、180K tokens 相当 = 540K chars を上界に。
+# rid 9e974424（haroin 2026-06-26）の searcher / magi_decompose 全滅 → degrade 対策。
+DEEP_RESEARCH_SUBAGENT_INPUT_BUDGET_CHARS = int(
+    os.environ.get("DEEP_RESEARCH_SUBAGENT_INPUT_BUDGET_CHARS", "540000")
+)
+# subagent に context-1m beta を渡さない（既定 on）。off にすると long-context request
+# として課金されるが 200K 超のリクエストも通る可能性がある。
+DEEP_RESEARCH_SUBAGENT_DISABLE_CONTEXT_1M = (
+    os.environ.get("DEEP_RESEARCH_SUBAGENT_DISABLE_CONTEXT_1M", "true").lower() == "true"
+)
 
 # OAuth (free-code: checkAndRefreshOAuthTokenIfNeeded)
 TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000
@@ -662,6 +896,14 @@ MCP_SERVERS_WEB: dict = {
         "command": "/home/ubuntu/mcp-servers/yfj-quote/.venv/bin/python",
         "args": ["/home/ubuntu/mcp-servers/polymarket/mcp_server.py"],
     },
+    # minkabu-fx: みんかぶFX(OANDA)為替オーダーブック (注文/建玉の価格帯別分布)。
+    # ドル円バタフライを株価感覚で fetch する (docs/2026-06-24_minkabu_fx_mcp_plan.md)。
+    # venv は yfj-quote と共用 (mcp/httpx 同依存)。mcp_server.py 実行で sys.path[0]
+    # が minkabu-fx/ になり minkabu_parser を解決。
+    "minkabu-fx": {
+        "command": "/home/ubuntu/mcp-servers/yfj-quote/.venv/bin/python",
+        "args": ["/home/ubuntu/mcp-servers/minkabu-fx/mcp_server.py"],
+    },
 }
 
 # API key付きWEB MCPは .env にキーがある場合のみ追加
@@ -732,6 +974,31 @@ MCP_SERVERS_REALESTATE: dict = {
     },
 }
 
+# IoT tier — Nature Remo Cloud API（home.nature.global）経由で haroin 自宅の家電
+# (エアコン / 照明 / TV / IR 家電) 制御と温湿度・人感センサー読み取り。Bearer トークン
+# 1 本で完結（自宅 LAN 越え不要）。
+#
+# 認可: bot のオーナー（haroin）の Discord user_id 列だけが spawn できる。
+# admin 全員（haroin + b0nchichi）でも個人 IoT は危ないので、別 env で絞る。env が空なら
+# 誰も spawn できない（fail-closed）。設定形式は ADMIN_USER_IDS と同じカンマ区切り。
+_raw_nature_ids = os.environ.get("NATURE_REMO_ALLOWED_USER_IDS", "")
+NATURE_REMO_ALLOWED_USER_IDS: set[int] = set()
+for _s in _raw_nature_ids.split(","):
+    _s = _s.strip()
+    if _s.isdigit():
+        NATURE_REMO_ALLOWED_USER_IDS.add(int(_s))
+
+MCP_SERVERS_IOT: dict = {
+    "nature-remo": {
+        "command": "/home/ubuntu/nature-remo-mcp/.venv/bin/python",
+        "args": ["/home/ubuntu/nature-remo-mcp/server.py"],
+        "env": {
+            "NATURE_REMO_TOKEN": os.environ.get("NATURE_REMO_TOKEN", ""),
+        },
+    },
+}
+
+
 # Union (used as a default + by code paths that just need to know "all configured")
 MCP_SERVERS: dict = {
     **MCP_SERVERS_BASE,
@@ -741,6 +1008,7 @@ MCP_SERVERS: dict = {
     **MCP_SERVERS_PAPER,
     **MCP_SERVERS_DOCS,
     **MCP_SERVERS_REALESTATE,
+    **MCP_SERVERS_IOT,
 }
 
 
@@ -790,6 +1058,11 @@ MEM0_SMART_SEARCH = _bool_env("MEM0_SMART_SEARCH", True)                   # P3
 # the race for the 5 slots. Admins get a wider window; non-admins stay narrow.
 MEM0_RECALL_LIMIT = int(os.environ.get("MEM0_RECALL_LIMIT", "12"))
 MEM0_RECALL_LIMIT_RESTRICTED = int(os.environ.get("MEM0_RECALL_LIMIT_RESTRICTED", "5"))
+# Core memory 常時注入枠: importance=5 かつ tier∈{Live,Hot} の基本事実（名前・
+# 所属・健康情報等）をクエリ非依存で recall 結果の先頭にマージする。従来は
+# クエリの引き次第でコア事実が欠落していた。TTL キャッシュで get_all を償却。
+MEM0_CORE_MEMORY_ENABLED = _bool_env("MEM0_CORE_MEMORY_ENABLED", True)
+MEM0_CORE_CACHE_TTL_S = int(os.environ.get("MEM0_CORE_CACHE_TTL_S", "300"))
 # Phase 5: semantic search over the RAW transcript. Each JSONL line is embedded
 # into a separate ChromaDB collection so paraphrased queries reach old raw
 # lines that Mem0 curation/keyword-FTS miss. OFF by default — it adds a

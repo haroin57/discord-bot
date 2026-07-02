@@ -54,9 +54,19 @@ def _is_fact_valid(r: dict) -> bool:
         return True
 
 
-async def search_memories(query: str, user_id: str, limit: int = 8) -> list[dict]:
-    """Semantic search for relevant memories with relevance filtering."""
-    mem = _get_mem0()
+async def search_memories(
+    query: str, user_id: str, limit: int = 8,
+    *, apply_distance_filter: bool = True,
+) -> list[dict]:
+    """Semantic search for relevant memories with relevance filtering.
+
+    ``apply_distance_filter=False`` は LLM rerank に候補を渡す smart パス用。
+    rerank 前に cosine 距離で pre-filter すると「遠いが関連ある」候補が
+    reranker に届かないため、そこでは距離ゲートを外す（archived 事実の
+    ``_is_fact_valid`` フィルタは常時適用）。
+    """
+    # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
+    mem = await asyncio.to_thread(_get_mem0)
     if not mem:
         return []
     try:
@@ -72,7 +82,11 @@ async def search_memories(query: str, user_id: str, limit: int = 8) -> list[dict
         )
         filtered = [
             r for r in results
-            if (r.get("score") is None or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE)
+            if (
+                not apply_distance_filter
+                or r.get("score") is None
+                or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
+            )
             and _is_fact_valid(r)
         ]
         return filtered
@@ -112,6 +126,7 @@ async def search_memories_multi(
 # ---------------------------------------------------------------------------
 async def search_memories_hybrid(
     query: str, user_id: str, limit: int = 8,
+    *, apply_distance_filter: bool = True,
 ) -> list[dict]:
     """Run vector search and BM25 in parallel, fuse via Reciprocal Rank Fusion.
 
@@ -128,10 +143,16 @@ async def search_memories_hybrid(
     except Exception:
         MEM0_HYBRID_ENABLED, MEM0_BM25_RRF_K, MEM0_BM25_LIMIT = True, 60, 20
     if not MEM0_HYBRID_ENABLED:
-        return await search_memories(query, user_id, limit=limit)
+        return await search_memories(
+            query, user_id, limit=limit,
+            apply_distance_filter=apply_distance_filter,
+        )
 
     from services.mem0 import bm25_index
-    vector_task = search_memories(query, user_id, limit=limit)
+    vector_task = search_memories(
+        query, user_id, limit=limit,
+        apply_distance_filter=apply_distance_filter,
+    )
     bm25_task = asyncio.to_thread(
         bm25_index.search_bm25, query, user_id, MEM0_BM25_LIMIT,
     )
@@ -157,6 +178,7 @@ async def search_memories_hybrid(
 
 async def _search_multi_hybrid(
     queries: list[str], user_id: str, limit: int = 8,
+    *, apply_distance_filter: bool = True,
 ) -> list[dict]:
     """Multi-query merge that uses ``search_memories_hybrid`` per query.
 
@@ -167,7 +189,13 @@ async def _search_multi_hybrid(
     """
     if not queries:
         return []
-    tasks = [search_memories_hybrid(q, user_id, limit=limit) for q in queries]
+    tasks = [
+        search_memories_hybrid(
+            q, user_id, limit=limit,
+            apply_distance_filter=apply_distance_filter,
+        )
+        for q in queries
+    ]
     all_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     seen_ids: set[str] = set()
@@ -515,7 +543,8 @@ async def get_episode_facts(
     """
     if not episode_id or not user_id:
         return []
-    mem = _get_mem0()
+    # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
+    mem = await asyncio.to_thread(_get_mem0)
     if mem is None:
         return []
     try:
@@ -597,9 +626,87 @@ async def _expand_query_via_graph(query: str, user_id: str) -> list[str]:
         return []
 
 
+# Core memory: クエリ依存 recall とは別に「毎ターン注入されるべき基本事実」
+# （importance=5 かつ tier Live/Hot）の常時注入枠。従来はクエリの引き次第で
+# 名前・所属・健康情報のようなコア事実が欠落していた。get_all は hot path で
+# 重いので user_id 単位の TTL キャッシュで償却する。
+_CORE_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_CORE_CACHE_KEEP = 10  # キャッシュに保持する上限（取り出しは max_items で切る）
+
+
+async def get_core_memories(user_id: str, max_items: int = 3) -> list[dict]:
+    """常時注入すべきコア事実（imp=5, tier∈{Live,Hot}）を返す。
+
+    返り値の各 dict には ``_core=True`` フラグが付く（format 側の先頭固定と
+    smart マージの dedup 判定に使う）。失敗時は空リスト（recall 全体を
+    巻き込まない）。
+    """
+    try:
+        from config import MEM0_CORE_MEMORY_ENABLED, MEM0_CORE_CACHE_TTL_S
+    except Exception:
+        MEM0_CORE_MEMORY_ENABLED, MEM0_CORE_CACHE_TTL_S = True, 300
+    if not MEM0_CORE_MEMORY_ENABLED or max_items <= 0:
+        return []
+    now = time.monotonic()
+    hit = _CORE_CACHE.get(user_id)
+    if hit is not None and now - hit[0] < MEM0_CORE_CACHE_TTL_S:
+        return [dict(m) for m in hit[1][:max_items]]
+    try:
+        from services.mem0.client import get_all_memories
+        all_mems = await get_all_memories(user_id)
+        core: list[dict] = []
+        for m in all_mems:
+            md = m.get("metadata") or {}
+            if not isinstance(md, dict):
+                continue
+            try:
+                imp = int(md.get("importance"))
+            except (TypeError, ValueError):
+                continue
+            if imp < 5 or md.get("tier") not in (0, 1):
+                continue
+            if not _is_fact_valid(m):
+                continue
+            core.append(m)
+        # tier 昇順（Live が先）→ 直近 reinforce 降順。importance は全件 5。
+        core.sort(
+            key=lambda m: (
+                int((m.get("metadata") or {}).get("tier") or 0),
+                -int((m.get("metadata") or {}).get("last_reinforced_at") or 0),
+            ),
+        )
+        core = core[:_CORE_CACHE_KEEP]
+        for m in core:
+            m["_core"] = True
+        _CORE_CACHE[user_id] = (now, core)
+        return [dict(m) for m in core[:max_items]]
+    except Exception as exc:
+        log.warning("core memory fetch failed (non-fatal): %s", exc)
+        return []
+
+
+def _merge_core_first(
+    core: list[dict], results: list[dict], limit: int,
+) -> list[dict]:
+    """core を先頭に固定しつつ総数を limit に保つマージ。
+
+    episode bundle 由来のエントリ（``_episode_bundle``）は設計上 limit 超過を
+    許容しているので、切り詰め対象から外してそのまま temp 末尾に残す。
+    """
+    if not core:
+        return results
+    seen = {c.get("id") for c in core if c.get("id")}
+    rest = [r for r in results if r.get("id") not in seen]
+    main = [r for r in rest if not r.get("_episode_bundle")]
+    bundle = [r for r in rest if r.get("_episode_bundle")]
+    keep_main = max(limit - len(core), 0)
+    return core + main[:keep_main] + bundle
+
+
 async def search_memories_smart(
     query: str, user_id: str, limit: int = 5,
     rewrite: bool = True, rerank: bool = True,
+    include_core: bool = False,
 ) -> list[dict]:
     """Query-rewriting + re-ranking enhanced search.
 
@@ -611,7 +718,14 @@ async def search_memories_smart(
       4. Re-rank the merged top-20 by LLM-judged relevance, return top-`limit`.
 
     Both ``rewrite`` and ``rerank`` can be disabled for plain search.
+    ``include_core=True`` merges the always-inject core facts (imp=5,
+    tier Live/Hot) at the head of the result, within the same ``limit``.
     """
+    # core memory はクエリ検索と独立なので並行に走らせる（TTL cache 命中時は即返る）。
+    core_task = (
+        asyncio.create_task(get_core_memories(user_id))
+        if include_core else None
+    )
     queries = [query]
     # Graph-based alias expansion runs even when LLM rewrite is disabled
     # — it's a cheap sqlite lookup, no extra Anthropic round-trip.
@@ -664,7 +778,14 @@ async def search_memories_smart(
     # vector-only when MEM0_HYBRID_ENABLED=false. Same return shape as
     # search_memories_multi, so the downstream rerank / graph_expand keep
     # working unchanged.
-    candidates = await _search_multi_hybrid(queries, user_id, limit=20)
+    #
+    # rerank=True のときは cosine 距離の pre-filter を外す: LLM reranker が
+    # 関連度を判定するのに、その前段で「遠いが関連ある」候補を機械的に
+    # 落とすのは設計矛盾（rerank=False パスは従来通り距離ゲート維持）。
+    candidates = await _search_multi_hybrid(
+        queries, user_id, limit=20,
+        apply_distance_filter=not rerank,
+    )
 
     # Graph expansion (Obsidian-style 1-hop): for each top-3 candidate,
     # look up its linked entities and surface sibling facts that share an
@@ -733,6 +854,8 @@ async def search_memories_smart(
             len(query or ""), len(candidates), len(reranked), bundle_added,
             bool(_hyb), bool(_hyde),
         )
+        if core_task is not None:
+            reranked = _merge_core_first(await core_task, reranked, limit)
         return reranked
 
     # Per-user recency/engagement ordering on the plain path too (no LLM).
@@ -751,6 +874,8 @@ async def search_memories_smart(
         "hybrid=plain hyde=off rerank=off]",
         len(query or ""), len(candidates), len(filtered),
     )
+    if core_task is not None:
+        filtered = _merge_core_first(await core_task, filtered, limit)
     return filtered
 
 
@@ -770,7 +895,8 @@ async def _graph_expand_candidates(
     import asyncio as _asyncio
     from services.mem0 import graph
     from services.mem0.client import _get_mem0
-    mem = _get_mem0()
+    # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
+    mem = await asyncio.to_thread(_get_mem0)
     if mem is None:
         return candidates
 

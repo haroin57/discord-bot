@@ -17,6 +17,10 @@ from discord.ext import commands
 
 from config import (
     ADMIN_USER_IDS,
+    CLAUDE_TAG_EMOJI_ID,
+    CLAUDE_TAG_EMOJI_NAME,
+    CLAUDE_TAG_ENABLED,
+    DEEP_RESEARCH_ENABLED,
     SPINNER_MODE,
     BOT_KEYWORDS,
     BOT_ROLE_IDS,
@@ -40,6 +44,10 @@ from config import (
     MEM0_SMART_SEARCH,
     RESTRICTED_COOLDOWN_SECONDS,
     RESTRICTED_DAILY_QUOTA,
+    SLEEP_ENFORCE_ENABLED,
+    SLEEP_ENFORCE_END_HOUR,
+    SLEEP_ENFORCE_START_HOUR,
+    SLEEP_ENFORCE_USER_ID,
     STATE_DIR,
     speaker_label,
     VSCODE_SYNC_ENABLED,
@@ -51,6 +59,8 @@ from config import (
 from services.claude_sdk import _is_session_fresh, call_with_tools, kill_orphan_claude_cli
 from services.oauth_manager import OAuthRefreshFailed
 from services import vscode_sync
+from services import claude_tag
+from services import deep_research
 from services.vscode_sync.discord_post import make_post_callback
 from services.mem0_service import (
     add_memories,
@@ -64,6 +74,7 @@ from services.mem0_service import (
 )
 from services.session import (
     SessionInfo,
+    clear_channel_context,
     get_session,
     load_history_channel,
     load_sessions,
@@ -519,6 +530,23 @@ async def on_ready():
             "daily summaries will write to a different Mem0 namespace.",
             KANAE_BOT_USER_ID, bot.user.id,
         )
+    # claude tag (ADR-0027): warn if the trigger emoji isn't pinned by ID, so a
+    # same-named :claude: from another guild can't misfire the task path.
+    if CLAUDE_TAG_ENABLED and CLAUDE_TAG_EMOJI_ID is None:
+        log.warning(
+            "CLAUDE_TAG_ENABLED but CLAUDE_TAG_EMOJI_ID is unset; :claude: "
+            "reactions will fire on emoji NAME match alone (%r), which can "
+            "misfire from another guild's same-named emoji. Set "
+            "CLAUDE_TAG_EMOJI_ID in .env to pin the exact emoji.",
+            CLAUDE_TAG_EMOJI_NAME,
+        )
+    # Deep Research (ADR-0028): /research needs a general web backend.
+    if DEEP_RESEARCH_ENABLED and not deep_research.has_required_web_backend():
+        log.warning(
+            "DEEP_RESEARCH_ENABLED but no general web backend (brave-search / "
+            "tavily) is configured; /research will refuse. Set BRAVE_API_KEY or "
+            "TAVILY_API_KEY in .env."
+        )
     # D5: cleanup_stale_attachments was previously called synchronously from
     # main.py before bot.run(). For a tmpdir with thousands of files the
     # scan+stat loop blocked startup. Schedule it as a fire-and-forget
@@ -641,6 +669,43 @@ async def _send_segmented(
 
 
 # ---------------------------------------------------------------------------
+# claude tag — :claude: リアクションでタスクをスレッド処理 (ADR-0027)
+# ---------------------------------------------------------------------------
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    """Dispatch a :claude: reaction to the task-processing orchestrator.
+
+    Only the cheap, side-effect-free gate runs inline on every reaction; all
+    heavy work is delegated to services.claude_tag as a tracked fire-and-forget
+    task so the gateway loop is never blocked. on_message is left untouched —
+    the orchestrator shares _get_channel_sema / sessions / _send_segmented via
+    the injected TagDeps, which is what serializes it against on_message.
+    """
+    if not CLAUDE_TAG_ENABLED or bot.user is None:
+        return
+    if not claude_tag.passes_cheap_gate(
+        payload,
+        bot_user_id=bot.user.id,
+        admin_ids=ADMIN_USER_IDS,
+        emoji_id=CLAUDE_TAG_EMOJI_ID,
+        emoji_name=CLAUDE_TAG_EMOJI_NAME,
+    ):
+        return
+    deps = claude_tag.TagDeps(
+        bot=bot,
+        sessions=sessions,
+        send_segmented=_send_segmented,
+        get_channel_sema=_get_channel_sema,
+        get_http_session=get_http_session,
+        track_task=_track_task,
+    )
+    _track_task(
+        claude_tag.handle_claude_tag(payload, deps),
+        name="claude_tag",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
 @bot.tree.command(name="abort", description="現チャンネルで進行中の応答を中断する (admin only)")
@@ -658,6 +723,64 @@ async def abort_cmd(interaction: discord.Interaction):
         return
     await interaction.response.send_message(
         f"中断要求を送りました({cancelled}件: 実行中と待機中のジョブを含む)",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="research",
+    description="Deep Research: 多段 Web 調査で引用付きレポートを生成 (admin only)",
+)
+@app_commands.describe(
+    query="調査したいテーマ",
+    skip_clarify="明確化質問をスキップして即実行する",
+)
+async def research_cmd(
+    interaction: discord.Interaction,
+    query: str,
+    skip_clarify: bool = False,
+):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("admin only", ephemeral=True)
+        return
+    if not DEEP_RESEARCH_ENABLED:
+        await interaction.response.send_message(
+            "Deep Research は現在無効です (DEEP_RESEARCH_ENABLED=false)。", ephemeral=True,
+        )
+        return
+    if not deep_research.has_required_web_backend():
+        await interaction.response.send_message(
+            "一般 Web 検索バックエンド (brave-search / tavily) が未設定です。"
+            ".env に BRAVE_API_KEY か TAVILY_API_KEY を設定してください。",
+            ephemeral=True,
+        )
+        return
+    query = (query or "").strip()
+    if not query:
+        await interaction.response.send_message("query を入力してください。", ephemeral=True)
+        return
+    channel = interaction.channel
+    if channel is None or not hasattr(channel, "create_thread"):
+        await interaction.response.send_message(
+            "このチャンネルではスレッドを作成できません。サーバーのテキストチャンネルで実行してください。",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    deps = deep_research.DeepResearchDeps(
+        bot=bot,
+        send_segmented=_send_segmented,
+        get_http_session=get_http_session,
+        track_task=_track_task,
+    )
+    _track_task(
+        deep_research.run_deep_research(
+            channel, interaction.user, query, deps, skip_clarify=skip_clarify,
+        ),
+        name="deep_research",
+    )
+    await interaction.followup.send(
+        "🔬 Deep Research を開始しました。スレッドで進行します（数分かかることがあります）。",
         ephemeral=True,
     )
 
@@ -891,6 +1014,39 @@ async def compact_cmd(interaction: discord.Interaction):
         )
 
 
+@bot.tree.command(
+    name="clear",
+    description="このチャンネルの会話履歴とセッションをクリアする (admin only)",
+)
+async def clear_cmd(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("admin only", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message("チャンネル外では使えません", ephemeral=True)
+        return
+    try:
+        report = clear_channel_context(channel_id)
+    except Exception as exc:
+        log.exception("/clear failed for ch=%s", channel_id)
+        await interaction.response.send_message(
+            f"クリアに失敗しました: {exc}", ephemeral=True,
+        )
+        return
+    parts = ["✅ このチャンネルの会話コンテキストをクリアしました。"]
+    if report["archived_path"]:
+        parts.append(
+            f"-# 履歴 {report['bytes']:,} bytes を "
+            f"`{os.path.basename(report['archived_path'])}` にアーカイブ済み（監査用に保持）"
+        )
+    else:
+        parts.append("-# 履歴ファイルは無かったのでスキップ")
+    parts.append(f"-# in-memory session {report['sessions_dropped']} 件を破棄")
+    parts.append("-# 次のメッセージから完全にフレッシュな会話が始まります。")
+    await interaction.response.send_message("\n".join(parts), ephemeral=True)
+
+
 @bot.tree.command(name="context", description="このチャンネルでの直近トークン使用量と圧縮余裕を表示する (admin only)")
 async def context_cmd(interaction: discord.Interaction):
     if not is_admin(interaction.user):
@@ -1030,6 +1186,13 @@ async def _index_channel_message(message: discord.Message) -> None:
 @bot.event
 async def on_message(message: discord.Message):
     if message.author == bot.user or message.author.bot:
+        return
+
+    # Deep Research (ADR-0028/0029): skip messages in an active /research thread.
+    # The clarification reply is consumed by orchestrator's bot.wait_for (a
+    # separate listener), so processing it here too would double-fire a normal
+    # chat response in the research thread. Suppress until the research finishes.
+    if deep_research.is_active_research_thread(message.channel.id):
         return
 
     new_request_id()  # SRE-H4: set correlation ID for this request context
@@ -1674,6 +1837,7 @@ async def on_message(message: discord.Message):
                 search_memories_smart(
                     raw_user_text, mem0_user_id, limit=_recall_limit,
                     rewrite=mem0_llm_mode, rerank=mem0_llm_mode,
+                    include_core=True,
                 )
             )
 
@@ -1869,16 +2033,28 @@ async def on_message(message: discord.Message):
             time_line = PromptBuilder.build_time_line()
             prompt_breakdown["speaker_line"] = len(speaker_line)
             prompt_breakdown["time_line"] = len(time_line)
+            # Sleep-enforcement hook (ADR-0032): haroin's pre-committed 早寝早起き
+            # pact. Non-empty only when HE messages inside the late JST window.
+            sleep_directive = PromptBuilder.build_sleep_directive(
+                sender_id=message.author.id,
+                target_id=SLEEP_ENFORCE_USER_ID,
+                enabled=SLEEP_ENFORCE_ENABLED,
+                start_hour=SLEEP_ENFORCE_START_HOUR,
+                end_hour=SLEEP_ENFORCE_END_HOUR,
+            )
+            sleep_seg = f"{sleep_directive}\n" if sleep_directive else ""
+            if sleep_directive:
+                prompt_breakdown["sleep_directive"] = len(sleep_directive)
             # Reply context stays outside the wrapper regardless of trust level;
             # the tag (<replied_to_trusted_message> vs <replied_to_message>)
             # carries the trust. See the full-path branch for the rationale.
             if reply_context:
-                prompt = f"{speaker_line}\n{time_line}\n{reply_context}{untrusted_block}"
+                prompt = f"{speaker_line}\n{time_line}\n{sleep_seg}{reply_context}{untrusted_block}"
                 prompt_breakdown[
                     "replied_to_trusted" if reply_is_trusted else "reply_context"
                 ] = len(reply_context)
             else:
-                prompt = f"{speaker_line}\n{time_line}\n{untrusted_block}"
+                prompt = f"{speaker_line}\n{time_line}\n{sleep_seg}{untrusted_block}"
         else:
             # ── Full initial prompt ─────────────────────────────────
             parts = []
@@ -1981,6 +2157,18 @@ async def on_message(message: discord.Message):
             # Time-line hook (full path): same as the lean branch — JST wall-clock
             # injected so the model never has to guess time-of-day.
             time_line = PromptBuilder.build_time_line()
+            # Sleep-enforcement hook (ADR-0032): haroin's pre-committed 早寝早起き
+            # pact. Non-empty only when HE messages inside the late JST window.
+            sleep_directive = PromptBuilder.build_sleep_directive(
+                sender_id=message.author.id,
+                target_id=SLEEP_ENFORCE_USER_ID,
+                enabled=SLEEP_ENFORCE_ENABLED,
+                start_hour=SLEEP_ENFORCE_START_HOUR,
+                end_hour=SLEEP_ENFORCE_END_HOUR,
+            )
+            sleep_seg = f"{sleep_directive}\n" if sleep_directive else ""
+            if sleep_directive:
+                prompt_breakdown["sleep_directive"] = len(sleep_directive)
             # Replied-to context ALWAYS sits outside the caller's input wrapper,
             # regardless of trust level — its tag encodes the trust:
             #   <replied_to_trusted_message>  → bot/admin authored (first-party)
@@ -1990,12 +2178,12 @@ async def on_message(message: discord.Message):
             # must not have that external text land inside their first-party
             # wrapper, where a prompt injection could read as a trusted instruction.
             if reply_context:
-                prompt = f"{header}\n{time_line}\n{reply_context}{untrusted_block}"
+                prompt = f"{header}\n{time_line}\n{sleep_seg}{reply_context}{untrusted_block}"
                 prompt_breakdown[
                     "replied_to_trusted" if reply_is_trusted else "reply_context"
                 ] = len(reply_context)
             else:
-                prompt = f"{header}\n{time_line}\n{untrusted_block}"
+                prompt = f"{header}\n{time_line}\n{sleep_seg}{untrusted_block}"
             prompt_breakdown["trusted_header"] = len(header)
             prompt_breakdown["time_line"] = len(time_line)
             prompt_breakdown["untrusted_wrapper_overhead"] = len(untrusted_block) - sum(len(p) for p in parts) - (len(parts) - 1) * 2
@@ -2182,7 +2370,35 @@ async def on_message(message: discord.Message):
                 log.warning("[rid=%s] content send failed: %s", get_request_id(), exc)
                 return None
             _live_sent_any["v"] = True
+            await _reposition_spinner()
             return m
+
+        async def _reposition_spinner() -> None:
+            """Keep the spinner pinned at the BOTTOM of the reply while generating.
+
+            When a new content message is appended below it, re-post the spinner so
+            it stays the last message. Order: send NEW → reassign status_msg →
+            delete OLD, so the animator (which reads status_msg every frame) never
+            edits a just-deleted message (the stray frame between is swallowed by
+            the HTTPException guards in _spin_edit/_do_edit/_animate_gif). No-op once
+            generation ends or if the spinner is gone. In-place draft edits don't go
+            through _send_content, so the spinner is NOT repositioned for them
+            (only at real content boundaries — low frequency, send/delete is a
+            separate rate bucket from the spinner's edits).
+            """
+            nonlocal status_msg
+            if not _spin["on"] or status_msg is None:
+                return
+            old = status_msg
+            try:
+                new = await message.channel.send(_spin_body())
+            except discord.errors.HTTPException:
+                return
+            status_msg = new
+            try:
+                await old.delete()
+            except discord.errors.HTTPException:
+                return
 
         def _disp(text: str) -> str:
             # Display-only transform: strip numeric inline-code backticks (only
@@ -2289,9 +2505,9 @@ async def on_message(message: discord.Message):
                     settled_end = len(full_text)
                     is_open = False
                 else:
-                    settled, _pending, is_open = await asyncio.to_thread(
-                        split_settled, full_text,
-                    )
+                    # 純 CPU の regex 関数。to_thread の dispatch コストの方が
+                    # 実行コストより高いので直接呼ぶ（毎 tick 実行される）。
+                    settled, _pending, is_open = split_settled(full_text)
                     settled_end = len(settled)
 
                 # Emit every closed block in [_emitted, settled_end] in order.
@@ -2302,7 +2518,7 @@ async def on_message(message: discord.Message):
                 while _guard < 500:
                     _guard += 1
                     region = full_text[_emitted["upto"]:settled_end]
-                    span = await asyncio.to_thread(first_block_span, region)
+                    span = first_block_span(region)
                     if span is None:
                         break
                     start, end, seg = span
@@ -2353,49 +2569,71 @@ async def on_message(message: discord.Message):
             )
             await _render_incremental(_acc["committed"], force=True)
 
-        # Single edit-overwriting notice for tool invocations. The user
-        # asked that tool scaffolding (Bash command, Read path, Edit
-        # diff, etc.) NOT linger in the channel — only the final
-        # assistant prose should remain. We post one message on the
-        # first tool call, edit it on every subsequent call, and delete
-        # it once the agent loop returns.
-        _tool_notice_state: dict = {"msg": None}
+        # Parallel tool-call notice. Tool scaffolding (Bash command, Read
+        # path, Edit diff, etc.) is NOT meant to linger in the channel — only
+        # the final assistant prose should remain. Accumulate one short line
+        # per tool call into a single notice message, debounced so a burst of
+        # parallel calls collapses into one edit, and delete it once the agent
+        # loop returns.
+        _tool_notice_state: dict = {"msg": None, "lines": [], "task": None}
+        TOOL_BATCH_WINDOW_S = 0.08
+        TOOL_NOTICE_MAX_LINES = 8
 
-        async def _tool_invocation_send(tool_name: str, tool_input: dict) -> None:
-            job.phase = JobPhase.TOOL_RUNNING
-            try:
-                from services.claude_api.tool_loop import (
-                    _format_tool_invocation_for_display,
-                )
-                payload = _format_tool_invocation_for_display(tool_name, tool_input)
-            except Exception as exc:
-                log.warning("tool notice format failed: %s", exc)
+        async def _flush_tool_notice() -> None:
+            lines = _tool_notice_state.get("lines") or []
+            if not lines:
                 return
-            if not payload:
-                return
-            # Discord caps a single message at 2000 chars. The formatter
-            # already truncates oversized fields but the wrapper headers
-            # can push the total just over the line — cap again here.
-            if len(payload) > 2000:
-                payload = payload[:1960] + "\n...(truncated)"
+            _tool_notice_state["lines"] = []
+            shown = lines[:TOOL_NOTICE_MAX_LINES]
+            extra = len(lines) - len(shown)
+            payload = "\n".join(shown)
+            if extra > 0:
+                payload += f"\n-# …他 {extra} 件"
+            if len(payload) > 1990:
+                payload = payload[:1960] + "\n…(truncated)"
             existing = _tool_notice_state.get("msg")
             try:
                 if existing is None:
-                    new_msg = await message.channel.send(payload)
-                    _tool_notice_state["msg"] = new_msg
-                else:
-                    await existing.edit(content=payload)
+                    _tool_notice_state["msg"] = await message.channel.send(payload)
+                    await _reposition_spinner()
+                    return
+                await existing.edit(content=payload)
             except discord.errors.NotFound:
-                # Earlier notice was already deleted (user / cleanup);
-                # re-post.
                 try:
-                    new_msg = await message.channel.send(payload)
-                    _tool_notice_state["msg"] = new_msg
+                    _tool_notice_state["msg"] = await message.channel.send(payload)
+                    await _reposition_spinner()
                 except Exception as exc:
                     log.warning("tool notice re-post failed: %s", exc)
             except Exception as exc:
                 log.warning("tool notice send/edit failed: %s", exc)
 
+        async def _tool_invocation_send(tool_name: str, tool_input: dict) -> None:
+            job.phase = JobPhase.TOOL_RUNNING
+            try:
+                from services.claude_api.status import tool_oneline
+                line = tool_oneline(tool_name, tool_input)
+            except Exception as exc:
+                log.warning("tool notice format failed: %s", exc)
+                return
+            if not line:
+                return
+            _tool_notice_state["lines"].append(line)
+            # Debounce: collapse a burst of parallel tool calls into one edit by
+            # (re)scheduling the flush TOOL_BATCH_WINDOW_S after the latest call.
+            pending = _tool_notice_state.get("task")
+            if pending and not pending.done():
+                pending.cancel()
+
+            async def _delayed_flush():
+                try:
+                    await asyncio.sleep(TOOL_BATCH_WINDOW_S)
+                except asyncio.CancelledError:
+                    return
+                await _flush_tool_notice()
+
+            _tool_notice_state["task"] = _track_task(
+                _delayed_flush(), name="tool_notice_flush"
+            )
         # Stable speaker label (e.g. "先輩") for resume-history attribution.
         # "" when the sender has no configured label — recorded as no
         # attribution, which keeps the pre-existing behaviour.
@@ -2454,6 +2692,10 @@ async def on_message(message: discord.Message):
                 get_request_id(),
             )
 
+        # Cancel any pending debounced tool-notice flush before teardown.
+        pending_notice_task = _tool_notice_state.get("task")
+        if pending_notice_task and not pending_notice_task.done():
+            pending_notice_task.cancel()
         # Tear down the tool-invocation notice so the channel transcript
         # reads as "user prompt → assistant prose" with no scaffolding.
         notice_msg = _tool_notice_state.get("msg")
