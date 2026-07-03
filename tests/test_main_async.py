@@ -304,12 +304,13 @@ class TestSigtermHandler:
         fake_web_api_module = types.ModuleType("web_api")
         fake_web_api_module.WebAPI = FakeWebAPI
 
-        fake_claude_sdk = types.ModuleType("services.claude_sdk")
-        fake_claude_sdk.kill_orphan_claude_cli = lambda: kill_calls.append(True)
-
         monkeypatch.setitem(sys.modules, "bot", fake_bot_module)
         monkeypatch.setitem(sys.modules, "web_api", fake_web_api_module)
-        monkeypatch.setitem(sys.modules, "services.claude_sdk", fake_claude_sdk)
+        # main_async's shutdown imports kill_orphan_claude_cli from
+        # services.claude_api (PR9: claude_sdk deleted); patch the attribute.
+        import services.claude_api as _capi
+        monkeypatch.setattr(
+            _capi, "kill_orphan_claude_cli", lambda: kill_calls.append(True))
 
         registered_handlers = {}
 

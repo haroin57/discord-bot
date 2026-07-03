@@ -58,7 +58,7 @@ from config import (
     VSCODE_SYNC_PROJECTS_ROOT,
     VSCODE_SYNC_THREAD_ID,
 )
-from services.claude_sdk import _is_session_fresh, call_with_tools, kill_orphan_claude_cli
+from services.claude_api import _is_session_fresh, call_with_tools, kill_orphan_claude_cli
 from services.oauth_manager import OAuthRefreshFailed
 from services import vscode_sync
 from services import claude_tag

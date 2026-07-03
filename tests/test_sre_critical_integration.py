@@ -86,6 +86,7 @@ class TestOAuthEscalation:
 # ─── SRE-C1: signal handler test (subprocess-based) ─────────────
 class TestSignalHandler:
     def test_kill_orphan_function_exists(self):
-        from services.claude_sdk import kill_orphan_claude_cli
+        # PR9: claude_sdk deleted; the shutdown path imports from claude_api.
+        from services.claude_api import kill_orphan_claude_cli
         # Just verify it's callable
         assert callable(kill_orphan_claude_cli)

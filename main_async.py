@@ -172,7 +172,7 @@ async def main() -> None:
     if shutdown_task in done:
         log.info("Graceful shutdown: cancelling main_task and killing Claude subprocesses")
         try:
-            from services.claude_sdk import kill_orphan_claude_cli
+            from services.claude_api import kill_orphan_claude_cli
             kill_orphan_claude_cli()
         except Exception as e:
             log.warning("kill_orphan_claude_cli failed: %s", e)

@@ -37,7 +37,7 @@ from config import (
     MAX_PROMPT_CHARS,
     speaker_label,
 )
-from services.claude_sdk import call_with_tools
+from services.claude_api import call_with_tools
 from services.prompt_builder import PromptBuilder
 from services.sentinel import sanitize_untrusted_text
 from services.job_state import (

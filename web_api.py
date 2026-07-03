@@ -33,7 +33,7 @@ from config import (
     WEB_API_HOST,
     WEB_API_PORT,
 )
-from services.claude_sdk import call_with_tools
+from services.claude_api import call_with_tools
 from services.prompt_builder import PromptBuilder
 from services.session import load_history_channel, load_sessions, update_session
 try:
