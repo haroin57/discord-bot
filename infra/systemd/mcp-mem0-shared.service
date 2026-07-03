@@ -1,0 +1,48 @@
+[Unit]
+# Shared streamable-HTTP mem0 MCP. One daemon that every parallel Claude Code
+# session connects to over 127.0.0.1:8013/mcp, instead of each `claude` CLI
+# spawning its own ~280MB stdio child. (Phase 1.5 stdio dedup.)
+Description=Shared MCP: mem0 (streamable HTTP, :8013)
+Documentation=file:///home/ubuntu/discord-bot/CLAUDE.md
+After=network-online.target chromadb-server.service
+Wants=network-online.target
+# mem0 reads/writes the ChromaDB served by chromadb-server; prefer it up first.
+After=chromadb-server.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/discord-bot
+Environment=HOME=/home/ubuntu
+Environment=MCP_HTTP_PORT=8013
+EnvironmentFile=/home/ubuntu/discord-bot/.env
+ExecStart=/home/ubuntu/discord-bot/.venv/bin/python /home/ubuntu/discord-bot/mcp_mem0_server.py
+Restart=always
+RestartSec=5
+# Reap the whole cgroup (uvicorn workers, any thread pools) on stop/restart so
+# we don't leak a half-dead listener holding :8013.
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-mem0-shared
+
+# Resource caps. MemoryHigh = soft (cgroup reclaim pressure), MemoryMax = hard
+# kill. mem0 loads embeddings + the mem0 client; ~280MB observed as stdio child.
+MemoryHigh=300M
+MemoryMax=450M
+LimitNOFILE=4096
+
+# Light hardening. Kept minimal: the process writes ChromaDB state under
+# /home/ubuntu and reads .env, so we avoid aggressive filesystem lockdown.
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,41 @@
+[Unit]
+# Shared oracle MCP. oracle-mcp is a node stdio server, so we can't do native
+# HTTP the way the FastMCP servers do — supergateway bridges stdio->streamable
+# HTTP on 127.0.0.1:8015/mcp. One daemon for all parallel Claude Code sessions
+# instead of a ~104MB node child each. (Phase 1.5 stdio dedup.)
+Description=Shared MCP: oracle (supergateway stdio->streamable HTTP, :8015)
+Documentation=file:///home/ubuntu/discord-bot/docs/oracle_mcp.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/discord-bot
+Environment=HOME=/home/ubuntu
+# volta node bin first so supergateway + the wrapped oracle-mcp resolve.
+Environment=PATH=/home/ubuntu/.volta/tools/image/node/24.14.1/bin:/home/ubuntu/.volta/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/ubuntu/discord-bot/.env
+# oracle_mcp_launch.sh injects .env keys + self-heals the local oracle patches,
+# then execs oracle-mcp over stdio; supergateway fans it out over HTTP.
+ExecStart=/home/ubuntu/.volta/tools/image/node/24.14.1/bin/node /home/ubuntu/.volta/tools/image/node/24.14.1/lib/node_modules/supergateway/dist/index.js --stdio "/home/ubuntu/discord-bot/scripts/oracle_mcp_launch.sh" --port 8015 --outputTransport streamableHttp --streamableHttpPath /mcp
+Restart=always
+RestartSec=10
+# control-group kill so supergateway's wrapped bash -> oracle-mcp child chain
+# gets fully reaped on restart (child-leak guard).
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-oracle-shared
+
+# Resource cap. The stdio child was ~104MB, but running it under supergateway
+# means two node runtimes (gateway + oracle-mcp) whose combined baseline heap
+# measures ~215MB idle. Cap above that so we're not pinned at MemoryHigh with
+# constant cgroup reclaim pressure; MemoryMax still hard-kills a runaway.
+MemoryHigh=300M
+MemoryMax=400M
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

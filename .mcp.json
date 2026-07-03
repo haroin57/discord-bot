@@ -1,12 +1,12 @@
 {
   "mcpServers": {
     "second-opinion": {
-      "command": "/home/ubuntu/discord-bot/.venv/bin/python",
-      "args": ["/home/ubuntu/discord-bot/second_opinion_mcp_server.py"]
+      "type": "http",
+      "url": "http://127.0.0.1:8014/mcp"
     },
     "oracle": {
-      "command": "/home/ubuntu/discord-bot/scripts/oracle_mcp_launch.sh",
-      "args": []
+      "type": "http",
+      "url": "http://127.0.0.1:8015/mcp"
     }
   }
 }

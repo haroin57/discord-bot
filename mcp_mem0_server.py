@@ -261,4 +261,16 @@ async def delete(memory_id: str, user_id: str = DEFAULT_USER_ID) -> str:
 
 if __name__ == "__main__":
     log.info("Starting mem0 MCP server (default user_id=%s)", DEFAULT_USER_ID)
-    mcp.run()
+    # Shared-instance mode: when MCP_HTTP_PORT is set, serve one streamable-HTTP
+    # daemon that every parallel Claude Code session shares (see systemd unit
+    # mcp-mem0-shared.service). When unset, fall back to stdio so the Discord
+    # bot's on-demand spawn path and `claude mcp add ... -- python …` keep
+    # working unchanged. MUST remain backward compatible.
+    _http_port = os.environ.get("MCP_HTTP_PORT")
+    if _http_port:
+        mcp.settings.host = "127.0.0.1"
+        mcp.settings.port = int(_http_port)
+        log.info("mem0 MCP serving streamable-http on 127.0.0.1:%s/mcp", _http_port)
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()

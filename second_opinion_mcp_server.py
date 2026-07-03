@@ -108,4 +108,15 @@ async def second_opinion(question: str, context: str = "") -> str:
 
 if __name__ == "__main__":
     log.info("SecondOpinion MCP server starting (PATH augmented for agy/codex)")
-    mcp.run()
+    # Shared-instance mode: MCP_HTTP_PORT set => one streamable-HTTP daemon
+    # shared across parallel Claude Code sessions (mcp-second-opinion-shared
+    # .service). Unset => stdio, preserving the on-demand spawn / `claude mcp
+    # add` path. MUST remain backward compatible.
+    _http_port = os.environ.get("MCP_HTTP_PORT")
+    if _http_port:
+        mcp.settings.host = "127.0.0.1"
+        mcp.settings.port = int(_http_port)
+        log.info("second-opinion MCP serving streamable-http on 127.0.0.1:%s/mcp", _http_port)
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()
