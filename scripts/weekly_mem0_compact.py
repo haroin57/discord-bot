@@ -36,7 +36,7 @@ sys.path.insert(0, "/home/ubuntu/discord-bot")
 from dotenv import load_dotenv
 load_dotenv("/home/ubuntu/discord-bot/.env")
 
-from services.mem0_service import _get_mem0, _refresh_mem0_client_token  # noqa: E402
+from services.mem0.client import _get_mem0, _refresh_mem0_client_token  # noqa: E402
 from services.oauth_manager import ensure_valid_token  # noqa: E402
 
 DEFAULT_USER_ID = "573489206240870410"

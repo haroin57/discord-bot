@@ -1,0 +1,12 @@
+[Unit]
+Description=Kanae Discord Bot — auto-deploy timer (dev, every 5 min)
+Requires=discord-bot-dev-autodeploy.service
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+# Offset from prod timer to avoid simultaneous gh API calls
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

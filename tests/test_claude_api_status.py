@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.claude_api.status import _safe_status, _tool_input_hint
+from services.claude_api.status import _safe_status, _tool_input_hint, tool_oneline
 
 
 class TestSafeStatus:
@@ -59,6 +59,14 @@ class TestToolInputHint:
     def test_agent(self):
         assert _tool_input_hint("Agent", {"description": "research"}) == "research"
 
+    def test_scratchpad(self):
+        assert _tool_input_hint("Scratchpad", {"section": "進捗"}) == "進捗"
+
+    def test_scratchpad_partial_snapshot_no_section_yet(self):
+        # input_json snapshots arrive incrementally — "op" may land before
+        # "section" is parsed. Must not raise or return the wrong field.
+        assert _tool_input_hint("Scratchpad", {"op": "write"}) == ""
+
     def test_mcp_prefix_stripped(self):
         assert _tool_input_hint("mcp__server__Bash", {"command": "id"}) == "id"
 
@@ -75,3 +83,14 @@ class TestToolInputHint:
     def test_exception_returns_empty(self):
         # passing a non-dict triggers AttributeError inside; suppressed.
         assert _tool_input_hint("Bash", "not a dict") == ""
+
+
+class TestToolOneline:
+    def test_scratchpad_uses_dedicated_emoji(self):
+        line = tool_oneline("Scratchpad", {"section": "進捗"})
+        assert line.startswith("💭 Scratchpad")
+        assert "進捗" in line
+
+    def test_unregistered_tool_falls_back_to_wrench(self):
+        line = tool_oneline("SecondOpinion", {"query": "x"})
+        assert line.startswith("🔧 SecondOpinion")

@@ -6,6 +6,15 @@ import tempfile
 
 import pytest
 
+# Redirect any file logging set up during tests away from the production
+# bot.log. Some tests exercise main/main_async._setup_logging(); without this
+# guard their RotatingFileHandler targets the live log and pytest tracebacks
+# get interleaved with real bot lines, poisoning the error-rate monitor
+# (observed 2026-07-03). Set at import time so it precedes ALL collection.
+os.environ.setdefault(
+    "BOT_LOG_PATH", os.path.join(tempfile.gettempdir(), "discord-bot-test.log")
+)
+
 
 @pytest.fixture
 def tmp_state_dir(tmp_path, monkeypatch):
@@ -50,14 +59,15 @@ def _isolate_bot_state():
     except Exception:
         yield
         return
-    cooldowns = getattr(_bot, "cooldowns", None)
-    daily_quota = getattr(_bot, "_daily_quota", None)
-    if cooldowns is not None:
-        cooldowns.clear()
-    if daily_quota is not None:
-        daily_quota.clear()
+    # P2.5 group-1: cooldown/quota now live only in the shared ledger.
+    from services import rate_limit as _rl
+    _rl.reset_for_tests()
+    # P4a: bot.sessions is now the process-wide shared dict from
+    # services.session.shared_sessions(). Clear its CONTENTS (not rebind —
+    # bot.py and web_api hold references to the same object) so entries
+    # created by one test never leak into the next.
+    shared = getattr(_bot, "sessions", None)
+    if shared is not None:
+        shared.clear()
     yield
-    if cooldowns is not None:
-        cooldowns.clear()
-    if daily_quota is not None:
-        daily_quota.clear()
+    _rl.reset_for_tests()

@@ -38,14 +38,14 @@ def _reset_oauth_globals(monkeypatch):
 
     monkeypatch.setattr is used for all globals so changes are rolled back
     automatically at teardown — even direct assignments like
-    ``om._access_token = "new-access"`` made inside test bodies.
+    ``om._accounts["primary"].access_token = "new-access"`` made inside test bodies.
     """
     # Force the real module to be loaded (not a stub left by another test file).
     import services.oauth_manager as om
     real_mod = importlib.import_module("services.oauth_manager")
-    # If what's in sys.modules is NOT the real module (no _access_token attr),
+    # If what's in sys.modules is NOT the real module (no _accounts attr),
     # reload to get the genuine implementation.
-    if not hasattr(real_mod, "_access_token"):
+    if not hasattr(real_mod, "_accounts"):
         real_mod = importlib.reload(
             importlib.import_module("services.oauth_manager")
         )
@@ -53,13 +53,19 @@ def _reset_oauth_globals(monkeypatch):
     original_module = sys.modules.get("services.oauth_manager")
     sys.modules["services.oauth_manager"] = real_mod
 
-    monkeypatch.setattr(real_mod, "_access_token", None)
-    monkeypatch.setattr(real_mod, "_refresh_token", None)
-    monkeypatch.setattr(real_mod, "_expires_at", 0)
+    # 二重アカウント化 (2026-07-02): per-account 状態は _reset_for_tests() で初期化。
+    real_mod._reset_for_tests()
     monkeypatch.setattr(real_mod, "_http_session", None)
     monkeypatch.setattr(real_mod, "_patched", False)
-    monkeypatch.setattr(real_mod, "_refresh_failure_count", 0)
-    monkeypatch.setattr(real_mod, "_refresh_permanent", False)
+    monkeypatch.setattr(real_mod, "OAUTH_FAILOVER_ENABLED", True)
+    # 2nd contamination vector: a sibling test (mcp_mem0_server path) sets
+    # OAUTH_NO_REFRESH=1 in the env, which oauth_manager reads at import time
+    # into a module-level bool (~line 137). The globals reset above misses it,
+    # so ensure_valid_token() silently no-ops and returns None under a full
+    # suite. Reset BOTH the env var and the already-bound constant (a reload
+    # may re-read the env).
+    monkeypatch.delenv("OAUTH_NO_REFRESH", raising=False)
+    monkeypatch.setattr(real_mod, "OAUTH_NO_REFRESH", False)
 
     yield
 
@@ -291,8 +297,8 @@ class TestRefreshToken:
     async def test_success(self, monkeypatch):
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
-        monkeypatch.setattr(om, "_access_token", None)
+        om._accounts["primary"].refresh_token = "ref-tok"
+        om._accounts["primary"].access_token = None
 
         future_expires = int(time.time() * 1000) + 3600_000
 
@@ -320,15 +326,15 @@ class TestRefreshToken:
         result = await om.refresh_token()
 
         assert result is True
-        assert om._access_token == "new-access"
-        assert om._refresh_token == "new-refresh"
-        assert om._expires_at > 0
+        assert om._accounts["primary"].access_token == "new-access"
+        assert om._accounts["primary"].refresh_token == "new-refresh"
+        assert om._accounts["primary"].expires_at > 0
 
     @pytest.mark.asyncio
     async def test_no_refresh_token_returns_false(self, monkeypatch):
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_refresh_token", None)
+        om._accounts["primary"].refresh_token = None
 
         result = await om.refresh_token()
         assert result is False
@@ -337,7 +343,7 @@ class TestRefreshToken:
     async def test_http_error_returns_false(self, monkeypatch):
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
+        om._accounts["primary"].refresh_token = "ref-tok"
 
         mock_resp = AsyncMock()
         mock_resp.status = 401
@@ -362,7 +368,7 @@ class TestRefreshToken:
     async def test_network_exception_returns_false(self, monkeypatch):
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
+        om._accounts["primary"].refresh_token = "ref-tok"
 
         async def fake_get_session():
             raise RuntimeError("network down")
@@ -382,8 +388,8 @@ class TestEnsureValidToken:
     async def test_returns_token_when_not_expired(self, monkeypatch):
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_access_token", "valid-tok")
-        monkeypatch.setattr(om, "_expires_at", int(time.time() * 1000) + 600_000)
+        om._accounts["primary"].access_token = "valid-tok"
+        om._accounts["primary"].expires_at = int(time.time() * 1000) + 600_000
 
         result = await om.ensure_valid_token()
         assert result == "valid-tok"
@@ -392,12 +398,12 @@ class TestEnsureValidToken:
     async def test_refreshes_when_expired(self, monkeypatch):
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_access_token", "old-tok")
-        monkeypatch.setattr(om, "_expires_at", 0)  # expired
-        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
+        om._accounts["primary"].access_token = "old-tok"
+        om._accounts["primary"].expires_at = 0  # expired
+        om._accounts["primary"].refresh_token = "ref-tok"
 
-        async def fake_refresh():
-            om._access_token = "refreshed-tok"
+        async def fake_refresh(account=None):
+            om._accounts["primary"].access_token = "refreshed-tok"
             return True
 
         monkeypatch.setattr(om, "refresh_token", fake_refresh)
@@ -409,9 +415,9 @@ class TestEnsureValidToken:
     async def test_returns_none_when_no_token_no_refresh(self, monkeypatch):
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_access_token", None)
-        monkeypatch.setattr(om, "_expires_at", 0)
-        monkeypatch.setattr(om, "_refresh_token", None)
+        om._accounts["primary"].access_token = None
+        om._accounts["primary"].expires_at = 0
+        om._accounts["primary"].refresh_token = None
 
         result = await om.ensure_valid_token()
         assert result is None
@@ -420,11 +426,11 @@ class TestEnsureValidToken:
     async def test_returns_old_token_if_refresh_fails(self, monkeypatch):
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_access_token", "stale-tok")
-        monkeypatch.setattr(om, "_expires_at", 0)
-        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
+        om._accounts["primary"].access_token = "stale-tok"
+        om._accounts["primary"].expires_at = 0
+        om._accounts["primary"].refresh_token = "ref-tok"
 
-        async def fake_refresh():
+        async def fake_refresh(account=None):
             return False
 
         monkeypatch.setattr(om, "refresh_token", fake_refresh)
@@ -442,13 +448,13 @@ class TestGetAccessToken:
     def test_returns_none_by_default(self, monkeypatch):
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_access_token", None)
+        om._accounts["primary"].access_token = None
         assert om.get_access_token() is None
 
     def test_returns_current_token(self, monkeypatch):
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_access_token", "test-access-token")
+        om._accounts["primary"].access_token = "test-access-token"
         assert om.get_access_token() == "test-access-token"
 
 
@@ -462,7 +468,7 @@ class TestPatchAnthropicSdk:
 
         # Reset patch state so each test is independent.
         monkeypatch.setattr(om, "_patched", False)
-        monkeypatch.setattr(om, "_access_token", "bearer-tok")
+        om._accounts["primary"].access_token = "bearer-tok"
 
         # Build a minimal fake anthropic module with an Anthropic class.
         init_calls = []
@@ -514,7 +520,7 @@ class TestPatchAnthropicSdk:
         import services.oauth_manager as om
 
         monkeypatch.setattr(om, "_patched", False)
-        monkeypatch.setattr(om, "_access_token", "tok")
+        om._accounts["primary"].access_token = "tok"
 
         init_calls = []
 
@@ -546,7 +552,7 @@ class TestPatchAnthropicSdk:
         import services.oauth_manager as om
 
         monkeypatch.setattr(om, "_patched", False)
-        monkeypatch.setattr(om, "_access_token", "tok")
+        om._accounts["primary"].access_token = "tok"
 
         init_calls = []
 
@@ -597,15 +603,20 @@ class TestInit:
         result = om.init()
 
         assert result is True
-        assert om._access_token == "valid-tok"
-        assert om._refresh_token == "ref-tok"
+        assert om._accounts["primary"].access_token == "valid-tok"
+        assert om._accounts["primary"].refresh_token == "ref-tok"
 
     def test_returns_false_when_no_creds_file(self, tmp_path, monkeypatch):
         import services.oauth_manager as om
 
         missing = tmp_path / "nope.json"
         monkeypatch.setattr(om, "CREDENTIALS_PATH", str(missing))
-
+        # failover も隔離（実機の .credentials-failover.json / state を拾わない）
+        monkeypatch.setattr(om, "FAILOVER_CREDENTIALS_PATH",
+                            str(tmp_path / "fo-missing.json"))
+        monkeypatch.setattr(om, "FAILOVER_STATE_PATH",
+                            str(tmp_path / "state.json"))
+        om._reset_for_tests()
         result = om.init()
         assert result is False
 
@@ -620,7 +631,11 @@ class TestInit:
             }
         })
         monkeypatch.setattr(om, "CREDENTIALS_PATH", str(creds_file))
-
+        monkeypatch.setattr(om, "FAILOVER_CREDENTIALS_PATH",
+                            str(tmp_path / "fo-missing.json"))
+        monkeypatch.setattr(om, "FAILOVER_STATE_PATH",
+                            str(tmp_path / "state.json"))
+        om._reset_for_tests()
         result = om.init()
         assert result is False
 
@@ -662,7 +677,7 @@ class TestInit:
 
         result = om.init()
         assert result is True
-        assert om._access_token == "expired-tok"
+        assert om._accounts["primary"].access_token == "expired-tok"
 
 
 # ---------------------------------------------------------------------------
@@ -715,18 +730,18 @@ class TestRefreshFailureCounter:
         import logging
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_refresh_failure_count", 0)
+        om._accounts["primary"].refresh_failure_count = 0
 
         with caplog.at_level(logging.WARNING, logger="services.oauth_manager"):
-            om._record_refresh_failure("err1")
-            om._record_refresh_failure("err2")
+            om._record_refresh_failure(om._accounts["primary"], "err1")
+            om._record_refresh_failure(om._accounts["primary"], "err2")
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 2
 
         caplog.clear()
         with caplog.at_level(logging.ERROR, logger="services.oauth_manager"):
-            om._record_refresh_failure("err3")
+            om._record_refresh_failure(om._accounts["primary"], "err3")
 
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert len(errors) == 1
@@ -736,37 +751,37 @@ class TestRefreshFailureCounter:
         import logging
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_refresh_failure_count", 2)
+        om._accounts["primary"].refresh_failure_count = 2
 
         with caplog.at_level(logging.INFO, logger="services.oauth_manager"):
-            om._record_refresh_success()
+            om._record_refresh_success(om._accounts["primary"])
 
-        assert om._refresh_failure_count == 0
+        assert om._accounts["primary"].refresh_failure_count == 0
         info_msgs = [r for r in caplog.records if r.levelno == logging.INFO]
         assert any("recovered" in r.message for r in info_msgs)
 
     def test_is_oauth_healthy_reflects_threshold(self, monkeypatch):
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_refresh_failure_count", 0)
+        om._accounts["primary"].refresh_failure_count = 0
         assert om.is_oauth_healthy() is True
 
-        monkeypatch.setattr(om, "_refresh_failure_count", 2)
+        om._accounts["primary"].refresh_failure_count = 2
         assert om.is_oauth_healthy() is True
 
-        monkeypatch.setattr(om, "_refresh_failure_count", 3)
+        om._accounts["primary"].refresh_failure_count = 3
         assert om.is_oauth_healthy() is False
 
     @pytest.mark.asyncio
     async def test_ensure_valid_token_raises_when_expired_and_failing(self, monkeypatch):
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_access_token", "stale-tok")
-        monkeypatch.setattr(om, "_expires_at", 0)  # expired
-        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
-        monkeypatch.setattr(om, "_refresh_failure_count", 3)
+        om._accounts["primary"].access_token = "stale-tok"
+        om._accounts["primary"].expires_at = 0  # expired
+        om._accounts["primary"].refresh_token = "ref-tok"
+        om._accounts["primary"].refresh_failure_count = 3
 
-        async def fake_refresh():
+        async def fake_refresh(account=None):
             return False
 
         monkeypatch.setattr(om, "refresh_token", fake_refresh)
@@ -785,8 +800,8 @@ class TestInvalidGrant:
         """Non-200 with JSON {"error": "invalid_grant"} sets _refresh_permanent=True."""
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
-        monkeypatch.setattr(om, "_refresh_permanent", False)
+        om._accounts["primary"].refresh_token = "ref-tok"
+        om._accounts["primary"].refresh_permanent = False
 
         mock_resp = AsyncMock()
         mock_resp.status = 400
@@ -806,15 +821,15 @@ class TestInvalidGrant:
 
         result = await om.refresh_token()
         assert result is False
-        assert om._refresh_permanent is True
+        assert om._accounts["primary"].refresh_permanent is True
 
     @pytest.mark.asyncio
     async def test_invalid_grant_substring_sets_permanent_flag(self, monkeypatch):
         """Non-200 body containing 'invalid_grant' text sets _refresh_permanent=True."""
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
-        monkeypatch.setattr(om, "_refresh_permanent", False)
+        om._accounts["primary"].refresh_token = "ref-tok"
+        om._accounts["primary"].refresh_permanent = False
 
         mock_resp = AsyncMock()
         mock_resp.status = 401
@@ -834,15 +849,15 @@ class TestInvalidGrant:
 
         result = await om.refresh_token()
         assert result is False
-        assert om._refresh_permanent is True
+        assert om._accounts["primary"].refresh_permanent is True
 
     @pytest.mark.asyncio
     async def test_non_invalid_grant_error_does_not_set_permanent(self, monkeypatch):
         """Transient HTTP error (e.g. 503) does NOT set _refresh_permanent."""
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
-        monkeypatch.setattr(om, "_refresh_permanent", False)
+        om._accounts["primary"].refresh_token = "ref-tok"
+        om._accounts["primary"].refresh_permanent = False
 
         mock_resp = AsyncMock()
         mock_resp.status = 503
@@ -862,22 +877,22 @@ class TestInvalidGrant:
 
         result = await om.refresh_token()
         assert result is False
-        assert om._refresh_permanent is False
+        assert om._accounts["primary"].refresh_permanent is False
 
     @pytest.mark.asyncio
     async def test_ensure_valid_token_raises_immediately_on_permanent(self, monkeypatch):
         """When _refresh_permanent is True, ensure_valid_token raises without retrying."""
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_access_token", "stale-tok")
-        monkeypatch.setattr(om, "_expires_at", 0)  # expired
-        monkeypatch.setattr(om, "_refresh_token", "ref-tok")
-        monkeypatch.setattr(om, "_refresh_permanent", True)
-        monkeypatch.setattr(om, "_refresh_failure_count", 0)  # count below threshold
+        om._accounts["primary"].access_token = "stale-tok"
+        om._accounts["primary"].expires_at = 0  # expired
+        om._accounts["primary"].refresh_token = "ref-tok"
+        om._accounts["primary"].refresh_permanent = True
+        om._accounts["primary"].refresh_failure_count = 0  # count below threshold
 
         refresh_called = []
 
-        async def fake_refresh():
+        async def fake_refresh(account=None):
             refresh_called.append(True)
             return False
 
@@ -894,8 +909,357 @@ class TestInvalidGrant:
         """_record_refresh_success() resets _refresh_permanent to False."""
         import services.oauth_manager as om
 
-        monkeypatch.setattr(om, "_refresh_permanent", True)
-        monkeypatch.setattr(om, "_refresh_failure_count", 0)
+        om._accounts["primary"].refresh_permanent = True
+        om._accounts["primary"].refresh_failure_count = 0
 
-        om._record_refresh_success()
-        assert om._refresh_permanent is False
+        om._record_refresh_success(om._accounts["primary"])
+        assert om._accounts["primary"].refresh_permanent is False
+
+
+# ---------------------------------------------------------------------------
+# OAuth 二重アカウント（failover）— 2026-07-02
+# ---------------------------------------------------------------------------
+
+def _setup_dual(tmp_path, monkeypatch, *, with_failover=True):
+    """primary/failover の credentials ファイルと state パスを tmp に用意する。"""
+    import services.oauth_manager as om
+    d = _make_creds_dir(tmp_path)
+    primary = _make_creds_file(d, {"claudeAiOauth": {
+        "accessToken": "prim-acc", "refreshToken": "prim-ref",
+        "expiresAt": int(time.time() * 1000) + 3_600_000}})
+    fo = d / ".credentials-failover.json"
+    if with_failover:
+        fo.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "fo-acc", "refreshToken": "fo-ref",
+            "expiresAt": int(time.time() * 1000) + 3_600_000}}))
+        os.chmod(fo, 0o600)
+    monkeypatch.setattr(om, "CREDENTIALS_PATH", str(primary))
+    monkeypatch.setattr(om, "FAILOVER_CREDENTIALS_PATH", str(fo))
+    monkeypatch.setattr(om, "FAILOVER_STATE_PATH", str(tmp_path / "state.json"))
+    om._reset_for_tests()
+    return primary, fo
+
+
+class TestFailoverToSecondary:
+    def test_success_switches_and_persists(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        _setup_dual(tmp_path, monkeypatch)
+        assert om.init() is True
+        assert om.get_active_account() == "primary"
+        ok = om.failover_to_secondary("quota", primary_retry_at=time.time() + 100)
+        assert ok is True
+        assert om.get_active_account() == "failover"
+        assert om.get_access_token() == "fo-acc"
+        state = json.loads(open(om.FAILOVER_STATE_PATH).read())
+        assert state["active"] == "failover" and state["reason"] == "quota"
+        assert state["primary_retry_at"] is not None
+
+    def test_auth_reason_has_no_retry_at(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        assert om.failover_to_secondary("auth", primary_retry_at=time.time()) is True
+        state = json.loads(open(om.FAILOVER_STATE_PATH).read())
+        assert state["primary_retry_at"] is None  # auth は手動復旧まで張り付き
+
+    def test_missing_failover_creds_returns_false(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        _setup_dual(tmp_path, monkeypatch, with_failover=False)
+        om.init()
+        assert om.failover_to_secondary("quota") is False
+        assert om.get_active_account() == "primary"
+
+    def test_broken_failover_creds_returns_false(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        _p, fo = _setup_dual(tmp_path, monkeypatch)
+        fo.write_text("not json")
+        assert om.failover_to_secondary("quota") is False
+
+    def test_flag_off_returns_false(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        _setup_dual(tmp_path, monkeypatch)
+        monkeypatch.setattr(om, "OAUTH_FAILOVER_ENABLED", False)
+        assert om.failover_to_secondary("quota") is False
+
+    def test_idempotent_when_already_failover(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        assert om.failover_to_secondary("quota") is True
+        assert om.failover_to_secondary("quota") is False
+
+    def test_no_refresh_child_returns_false(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        _setup_dual(tmp_path, monkeypatch)
+        monkeypatch.setattr(om, "OAUTH_NO_REFRESH", True)
+        assert om.failover_to_secondary("quota") is False
+
+
+class TestMaybeRestorePrimary:
+    @pytest.mark.asyncio
+    async def test_before_retry_at_stays(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        om.failover_to_secondary("quota", primary_retry_at=time.time() + 3600)
+        assert await om.maybe_restore_primary() is False
+        assert om.get_active_account() == "failover"
+
+    @pytest.mark.asyncio
+    async def test_after_retry_at_restores(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        om.failover_to_secondary("quota", primary_retry_at=time.time() - 10)
+        assert await om.maybe_restore_primary() is True
+        assert om.get_active_account() == "primary"
+        assert om.get_access_token() == "prim-acc"
+        assert not os.path.exists(om.FAILOVER_STATE_PATH)  # 状態クリア
+
+    @pytest.mark.asyncio
+    async def test_auth_reason_never_auto_restores(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        om.failover_to_secondary("auth")
+        assert await om.maybe_restore_primary() is False
+        assert om.get_active_account() == "failover"
+
+    @pytest.mark.asyncio
+    async def test_failed_primary_refresh_pushes_retry_at(
+            self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        primary, _fo = _setup_dual(tmp_path, monkeypatch)
+        # primary を期限切れにして refresh を失敗させる
+        primary.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "prim-acc", "refreshToken": "prim-ref",
+            "expiresAt": 1}}))
+        om.init()
+        om.failover_to_secondary("quota", primary_retry_at=time.time() - 10)
+
+        async def fail_refresh(account=None):
+            return False
+        monkeypatch.setattr(om, "refresh_token", fail_refresh)
+        before = time.time()
+        assert await om.maybe_restore_primary() is False
+        assert om.get_active_account() == "failover"
+        assert om._primary_retry_at > before + 500  # 後ろ倒し
+
+
+# ---------------------------------------------------------------------------
+# 双方向 failover（2026-07-03 障害対応）
+# auth 張り付きの /login 自動復旧 + failover 死亡時の強制切り戻し
+# ---------------------------------------------------------------------------
+
+def _touch_future(path, offset_s: float = 5.0) -> None:
+    """mtime を確実に「failover 発動より後」にする（FS 粒度対策）。"""
+    t = time.time() + offset_s
+    os.utime(str(path), (t, t))
+
+
+class TestAuthFailbackOnRelogin:
+    @pytest.mark.asyncio
+    async def test_relogin_restores_primary(self, tmp_path, monkeypatch):
+        """/login で primary credential が更新されたら auth 張り付きが解ける。"""
+        import services.oauth_manager as om
+        primary, _fo = _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        om.failover_to_secondary("auth")
+        assert om.get_active_account() == "failover"
+        # /login 相当: 有効な credential でファイルが書き直される
+        primary.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "prim-new", "refreshToken": "prim-ref2",
+            "expiresAt": int(time.time() * 1000) + 3_600_000}}))
+        _touch_future(primary)
+        assert await om.maybe_restore_primary() is True
+        assert om.get_active_account() == "primary"
+        assert om.get_access_token() == "prim-new"
+        assert not os.path.exists(om.FAILOVER_STATE_PATH)  # 状態クリア
+
+    @pytest.mark.asyncio
+    async def test_same_dead_creds_tried_only_once(self, tmp_path, monkeypatch):
+        """更新された credential が無効でも、同じ mtime では refresh を再試行しない。"""
+        import services.oauth_manager as om
+        primary, _fo = _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        om.failover_to_secondary("auth")
+        # 書き直されたが期限切れ（refresh も失敗する想定）
+        primary.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "prim-new", "refreshToken": "prim-ref2",
+            "expiresAt": 1}}))
+        _touch_future(primary)
+        calls = {"n": 0}
+
+        async def fail_refresh(account=None):
+            calls["n"] += 1
+            return False
+        monkeypatch.setattr(om, "refresh_token", fail_refresh)
+        assert await om.maybe_restore_primary() is False
+        assert calls["n"] == 1
+        # 同じ mtime → 再試行しない（refresh 空振り連打防止）
+        assert await om.maybe_restore_primary() is False
+        assert calls["n"] == 1
+        assert om.get_active_account() == "failover"
+
+    @pytest.mark.asyncio
+    async def test_state_survives_restart_with_since(self, tmp_path, monkeypatch):
+        """再起動（init で state 復元）後も since が引き継がれ mtime 判定が働く。"""
+        import services.oauth_manager as om
+        primary, _fo = _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        om.failover_to_secondary("auth")
+        # 再起動相当
+        om._reset_for_tests()
+        om.init()
+        assert om.get_active_account() == "failover"
+        assert om._failover_since > 0
+        # /login → 自動復帰
+        primary.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "prim-new", "refreshToken": "prim-ref2",
+            "expiresAt": int(time.time() * 1000) + 3_600_000}}))
+        _touch_future(primary)
+        assert await om.maybe_restore_primary() is True
+        assert om.get_active_account() == "primary"
+
+
+class TestFailbackToPrimary:
+    @pytest.mark.asyncio
+    async def test_forced_failback_when_primary_alive(self, tmp_path, monkeypatch):
+        """failover が死んだとき primary が生きていれば戻す（2026-07-03 の穴）。"""
+        import services.oauth_manager as om
+        _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        om.failover_to_secondary("quota", primary_retry_at=time.time() + 3600)
+        assert om.get_active_account() == "failover"
+        assert await om.failback_to_primary("quota") is True
+        assert om.get_active_account() == "primary"
+        assert om.get_access_token() == "prim-acc"
+        assert not os.path.exists(om.FAILOVER_STATE_PATH)
+
+    @pytest.mark.asyncio
+    async def test_primary_still_dead_stays_on_failover(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        primary, _fo = _setup_dual(tmp_path, monkeypatch)
+        primary.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "prim-acc", "refreshToken": "prim-ref",
+            "expiresAt": 1}}))  # 期限切れ
+        om.init()
+        om.failover_to_secondary("auth")
+
+        async def fail_refresh(account=None):
+            return False
+        monkeypatch.setattr(om, "refresh_token", fail_refresh)
+        assert await om.failback_to_primary("quota") is False
+        assert om.get_active_account() == "failover"
+
+    @pytest.mark.asyncio
+    async def test_cooldown_prevents_hammering(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        primary, _fo = _setup_dual(tmp_path, monkeypatch)
+        primary.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "prim-acc", "refreshToken": "prim-ref",
+            "expiresAt": 1}}))
+        om.init()
+        om.failover_to_secondary("auth")
+        calls = {"n": 0}
+
+        async def fail_refresh(account=None):
+            calls["n"] += 1
+            return False
+        monkeypatch.setattr(om, "refresh_token", fail_refresh)
+        assert await om.failback_to_primary("quota") is False
+        assert calls["n"] == 1
+        # クールダウン内の再試行は refresh に到達しない
+        assert await om.failback_to_primary("quota") is False
+        assert calls["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_noop_when_active_is_primary(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        assert await om.failback_to_primary("quota") is False
+        assert om.get_active_account() == "primary"
+
+
+class TestFailoverPersistence:
+    def test_state_survives_reinit(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        om.failover_to_secondary("quota", primary_retry_at=time.time() + 100)
+        # 再起動相当
+        om._reset_for_tests()
+        assert om.init() is True
+        assert om.get_active_account() == "failover"
+        assert om.get_access_token() == "fo-acc"
+
+    def test_reinit_falls_back_when_creds_gone(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        _p, fo = _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        om.failover_to_secondary("quota")
+        os.remove(fo)
+        om._reset_for_tests()
+        assert om.init() is True
+        assert om.get_active_account() == "primary"
+
+
+class TestRefreshWriteback:
+    @pytest.mark.asyncio
+    async def test_failover_refresh_never_touches_primary_file(
+            self, tmp_path, monkeypatch):
+        """本丸: failover の refresh が primary ファイルを clobber しない。"""
+        import services.oauth_manager as om
+        primary, fo = _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        om.failover_to_secondary("quota")
+        primary_before = primary.read_text()
+
+        class _Resp:
+            status = 200
+            async def json(self):
+                return {"access_token": "fo-new", "refresh_token": "fo-ref2",
+                        "expires_in": 3600}
+            async def text(self):
+                return ""
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+
+        class _Sess:
+            def post(self, *a, **k):
+                return _Resp()
+
+        async def fake_get_session():
+            return _Sess()
+        monkeypatch.setattr(om, "_get_session", fake_get_session)
+
+        assert await om.refresh_token() is True
+        assert primary.read_text() == primary_before  # primary 無傷
+        fo_data = json.loads(fo.read_text())["claudeAiOauth"]
+        assert fo_data["accessToken"] == "fo-new"     # failover のみ更新
+
+
+class TestPrimePerAccount:
+    def test_switch_resets_primed_flag(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+        _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        om._accounts["primary"].session_primed = True
+        om.failover_to_secondary("quota")
+        assert om._accounts["failover"].session_primed is False
+
+
+class TestRatelimitReset:
+    def test_reset_state_clears_observations(self):
+        from services.claude_api import ratelimit as rl
+        rl._state.five_h_status = "rejected"
+        rl._state.five_h_utilization = 1.2
+        rl.reset_state()
+        st = rl.get_state()
+        assert st.five_h_status == "allowed"
+        assert st.five_h_utilization == 0.0
+        blocked, _ = rl.should_block()
+        assert blocked is False

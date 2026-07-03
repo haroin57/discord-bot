@@ -6,6 +6,8 @@ import os
 import re
 import time
 
+from services.mem0.format import strip_json_fence
+
 from services.mem0.client import (
     MEM0_RELEVANCE_MAX_DISTANCE,
     _get_mem0,
@@ -33,18 +35,43 @@ def should_use_memory_llm_mode(query: str, *, enabled: bool = True) -> bool:
     return bool(_MEMORY_LLM_INTENT_RE.search(query or ""))
 
 
-def _is_fact_valid(r: dict) -> bool:
+def _is_fact_valid(
+    r: dict, current_channel_id=None, *, check_scope: bool = True,
+) -> bool:
     """Phase B-2: hide facts that the conflict-detection layer
     soft-archived (valid_to <= now). The flag MEM0_HIDE_ARCHIVED is the
     one-shot rollback knob — flip false to re-surface every archived row.
+
+    Phase C/R: conversation スコープの fact は、その会話(channel)でだけ有効。
+    現在の channel_id が一致しなければ汎用検索から除外して誤注入を防ぐ。
+    MEM0_SCOPE_FILTER_ENABLED=False(既定)なら scope 判定は完全に skip。
+
+    ``check_scope=False`` は get_core_memories のキャッシュ計算用: キャッシュは
+    user 単位で channel 横断共有なので、scope 判定はキャッシュ取り出し後に
+    channel 付きで行う（内側でやるとチャンネル間でキャッシュ汚染する）。
     """
+    md = r.get("metadata") or {}
+    # Phase C/R: scope フィルタ（conversation 限定 fact の誤注入防止）
+    try:
+        from config import MEM0_SCOPE_FILTER_ENABLED
+    except Exception:
+        MEM0_SCOPE_FILTER_ENABLED = False
+    if MEM0_SCOPE_FILTER_ENABLED and check_scope:
+        scope = md.get("scope") or "global"
+        if scope.startswith("conversation"):
+            want = (
+                f"conversation:{current_channel_id}"
+                if current_channel_id else ""
+            )
+            if scope != want:
+                return False
+    # Phase B-2: valid_to soft-archive
     try:
         from config import MEM0_HIDE_ARCHIVED
     except Exception:
         MEM0_HIDE_ARCHIVED = True
     if not MEM0_HIDE_ARCHIVED:
         return True
-    md = r.get("metadata") or {}
     vt = md.get("valid_to")
     if not vt:
         return True
@@ -54,9 +81,24 @@ def _is_fact_valid(r: dict) -> bool:
         return True
 
 
-async def search_memories(query: str, user_id: str, limit: int = 8) -> list[dict]:
-    """Semantic search for relevant memories with relevance filtering."""
-    mem = _get_mem0()
+async def search_memories(
+    query: str, user_id: str, limit: int = 8,
+    *, apply_distance_filter: bool = True,
+    current_channel_id: str | None = None,
+) -> list[dict]:
+    """Semantic search for relevant memories with relevance filtering.
+
+    ``apply_distance_filter=False`` は LLM rerank に候補を渡す smart パス用。
+    rerank 前に cosine 距離で pre-filter すると「遠いが関連ある」候補が
+    reranker に届かないため、そこでは距離ゲートを外す（archived 事実の
+    ``_is_fact_valid`` フィルタは常時適用）。
+
+    ``current_channel_id`` (Phase R): conversation スコープ fact の適用先
+    channel。未指定(None)なら scope フィルタ有効時に conversation fact は
+    全て除外される（安全側）。
+    """
+    # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
+    mem = await asyncio.to_thread(_get_mem0)
     if not mem:
         return []
     try:
@@ -72,8 +114,12 @@ async def search_memories(query: str, user_id: str, limit: int = 8) -> list[dict
         )
         filtered = [
             r for r in results
-            if (r.get("score") is None or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE)
-            and _is_fact_valid(r)
+            if (
+                not apply_distance_filter
+                or r.get("score") is None
+                or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
+            )
+            and _is_fact_valid(r, current_channel_id)
         ]
         return filtered
     except Exception as exc:
@@ -82,12 +128,18 @@ async def search_memories(query: str, user_id: str, limit: int = 8) -> list[dict
 
 
 async def search_memories_multi(
-    queries: list[str], user_id: str, limit: int = 8
+    queries: list[str], user_id: str, limit: int = 8,
+    *, current_channel_id: str | None = None,
 ) -> list[dict]:
     """Search with multiple queries and merge deduplicated results."""
     if not queries:
         return []
-    tasks = [search_memories(q, user_id, limit=limit) for q in queries]
+    tasks = [
+        search_memories(
+            q, user_id, limit=limit, current_channel_id=current_channel_id,
+        )
+        for q in queries
+    ]
     all_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     seen_ids: set[str] = set()
@@ -112,6 +164,8 @@ async def search_memories_multi(
 # ---------------------------------------------------------------------------
 async def search_memories_hybrid(
     query: str, user_id: str, limit: int = 8,
+    *, apply_distance_filter: bool = True,
+    current_channel_id: str | None = None,
 ) -> list[dict]:
     """Run vector search and BM25 in parallel, fuse via Reciprocal Rank Fusion.
 
@@ -128,10 +182,18 @@ async def search_memories_hybrid(
     except Exception:
         MEM0_HYBRID_ENABLED, MEM0_BM25_RRF_K, MEM0_BM25_LIMIT = True, 60, 20
     if not MEM0_HYBRID_ENABLED:
-        return await search_memories(query, user_id, limit=limit)
+        return await search_memories(
+            query, user_id, limit=limit,
+            apply_distance_filter=apply_distance_filter,
+            current_channel_id=current_channel_id,
+        )
 
     from services.mem0 import bm25_index
-    vector_task = search_memories(query, user_id, limit=limit)
+    vector_task = search_memories(
+        query, user_id, limit=limit,
+        apply_distance_filter=apply_distance_filter,
+        current_channel_id=current_channel_id,
+    )
     bm25_task = asyncio.to_thread(
         bm25_index.search_bm25, query, user_id, MEM0_BM25_LIMIT,
     )
@@ -157,6 +219,8 @@ async def search_memories_hybrid(
 
 async def _search_multi_hybrid(
     queries: list[str], user_id: str, limit: int = 8,
+    *, apply_distance_filter: bool = True,
+    current_channel_id: str | None = None,
 ) -> list[dict]:
     """Multi-query merge that uses ``search_memories_hybrid`` per query.
 
@@ -167,7 +231,14 @@ async def _search_multi_hybrid(
     """
     if not queries:
         return []
-    tasks = [search_memories_hybrid(q, user_id, limit=limit) for q in queries]
+    tasks = [
+        search_memories_hybrid(
+            q, user_id, limit=limit,
+            apply_distance_filter=apply_distance_filter,
+            current_channel_id=current_channel_id,
+        )
+        for q in queries
+    ]
     all_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     seen_ids: set[str] = set()
@@ -277,12 +348,7 @@ async def _extract_keywords_via_llm(query: str) -> str:
                 "query. Return JSON only."
             ),
         )
-        text = extract_text(resp).strip()
-        if text.startswith("```"):
-            text = text.split("```", 2)[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.rsplit("```", 1)[0].strip()
+        text = strip_json_fence(extract_text(resp))
         import json as _json
         data = _json.loads(text)
         kws = [str(k).strip() for k in data.get("keywords", []) if str(k).strip()]
@@ -337,12 +403,7 @@ async def _generate_hypothetical_fact(query: str) -> str:
                 "would answer the user's question. Return JSON only."
             ),
         )
-        text = extract_text(resp).strip()
-        if text.startswith("```"):
-            text = text.split("```", 2)[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.rsplit("```", 1)[0].strip()
+        text = strip_json_fence(extract_text(resp))
         import json as _json
         out = _json.loads(text).get("hypothetical", "")
         if isinstance(out, str):
@@ -376,12 +437,7 @@ async def _rewrite_query(query: str) -> list[str]:
                 "Return JSON only."
             ),
         )
-        text = extract_text(resp).strip()
-        if text.startswith("```"):
-            text = text.split("```", 2)[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.rsplit("```", 1)[0].strip()
+        text = strip_json_fence(extract_text(resp))
         import json as _json
         data = _json.loads(text)
         out = data.get("queries", [])
@@ -465,12 +521,7 @@ async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> 
                 "original query. Return JSON only."
             ),
         )
-        text = extract_text(resp).strip()
-        if text.startswith("```"):
-            text = text.split("```", 2)[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.rsplit("```", 1)[0].strip()
+        text = strip_json_fence(extract_text(resp))
         import json as _json
         idxs = _json.loads(text).get("top", [])
         picked = []
@@ -515,7 +566,8 @@ async def get_episode_facts(
     """
     if not episode_id or not user_id:
         return []
-    mem = _get_mem0()
+    # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
+    mem = await asyncio.to_thread(_get_mem0)
     if mem is None:
         return []
     try:
@@ -597,20 +649,105 @@ async def _expand_query_via_graph(query: str, user_id: str) -> list[str]:
         return []
 
 
-async def search_memories_smart(
-    query: str, user_id: str, limit: int = 5,
-    rewrite: bool = True, rerank: bool = True,
+# Core memory: クエリ依存 recall とは別に「毎ターン注入されるべき基本事実」
+# （importance=5 かつ tier Live/Hot）の常時注入枠。従来はクエリの引き次第で
+# 名前・所属・健康情報のようなコア事実が欠落していた。get_all は hot path で
+# 重いので user_id 単位の TTL キャッシュで償却する。
+_CORE_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_CORE_CACHE_KEEP = 10  # キャッシュに保持する上限（取り出しは max_items で切る）
+
+
+async def get_core_memories(
+    user_id: str, max_items: int = 3,
+    *, current_channel_id: str | None = None,
 ) -> list[dict]:
-    """Query-rewriting + re-ranking enhanced search.
+    """常時注入すべきコア事実（imp=5, tier∈{Live,Hot}）を返す。
 
-    Behavior:
-      1. Expand the query into canonical / alias forms via the entity graph
-         (e.g. "クラナド" → ["CLANNAD"]). Catches cross-language hits.
-      2. Rewrite into ~3-5 canonical-keyword variants via Haiku (semantic).
-      3. Run search_memories_multi over [original + alias forms + variants].
-      4. Re-rank the merged top-20 by LLM-judged relevance, return top-`limit`.
+    返り値の各 dict には ``_core=True`` フラグが付く（format 側の先頭固定と
+    smart マージの dedup 判定に使う）。失敗時は空リスト（recall 全体を
+    巻き込まない）。
 
-    Both ``rewrite`` and ``rerank`` can be disabled for plain search.
+    Phase R: scope 判定はキャッシュ取り出し後に channel 付きで行う。
+    キャッシュは user 単位で channel 横断共有なので、内側で scope を落とすと
+    チャンネル間でキャッシュ汚染する（キャッシュ計算は check_scope=False）。
+    """
+    try:
+        from config import MEM0_CORE_MEMORY_ENABLED, MEM0_CORE_CACHE_TTL_S
+    except Exception:
+        MEM0_CORE_MEMORY_ENABLED, MEM0_CORE_CACHE_TTL_S = True, 300
+    if not MEM0_CORE_MEMORY_ENABLED or max_items <= 0:
+        return []
+    now = time.monotonic()
+    hit = _CORE_CACHE.get(user_id)
+    if hit is not None and now - hit[0] < MEM0_CORE_CACHE_TTL_S:
+        return [
+            dict(m) for m in hit[1]
+            if _is_fact_valid(m, current_channel_id)
+        ][:max_items]
+    try:
+        from services.mem0.client import get_all_memories
+        all_mems = await get_all_memories(user_id)
+        core: list[dict] = []
+        for m in all_mems:
+            md = m.get("metadata") or {}
+            if not isinstance(md, dict):
+                continue
+            try:
+                imp = int(md.get("importance"))
+            except (TypeError, ValueError):
+                continue
+            if imp < 5 or md.get("tier") not in (0, 1):
+                continue
+            # scope はここで判定しない（キャッシュ汚染防止）。valid_to のみ。
+            if not _is_fact_valid(m, check_scope=False):
+                continue
+            core.append(m)
+        # tier 昇順（Live が先）→ 直近 reinforce 降順。importance は全件 5。
+        core.sort(
+            key=lambda m: (
+                int((m.get("metadata") or {}).get("tier") or 0),
+                -int((m.get("metadata") or {}).get("last_reinforced_at") or 0),
+            ),
+        )
+        core = core[:_CORE_CACHE_KEEP]
+        for m in core:
+            m["_core"] = True
+        _CORE_CACHE[user_id] = (now, core)
+        return [
+            dict(m) for m in core
+            if _is_fact_valid(m, current_channel_id)
+        ][:max_items]
+    except Exception as exc:
+        log.warning("core memory fetch failed (non-fatal): %s", exc)
+        return []
+
+
+def _merge_core_first(
+    core: list[dict], results: list[dict], limit: int,
+) -> list[dict]:
+    """core を先頭に固定しつつ総数を limit に保つマージ。
+
+    episode bundle 由来のエントリ（``_episode_bundle``）は設計上 limit 超過を
+    許容しているので、切り詰め対象から外してそのまま temp 末尾に残す。
+    """
+    if not core:
+        return results
+    seen = {c.get("id") for c in core if c.get("id")}
+    rest = [r for r in results if r.get("id") not in seen]
+    main = [r for r in rest if not r.get("_episode_bundle")]
+    bundle = [r for r in rest if r.get("_episode_bundle")]
+    keep_main = max(limit - len(core), 0)
+    return core + main[:keep_main] + bundle
+
+
+async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[str]:
+    """Phase A-1/B-1: build the multi-query set from one user query.
+
+    Layers, cheapest first: entity-graph alias expansion (sqlite lookup),
+    morphological content-word variant (Janome, no LLM), then — only when
+    ``rewrite`` — the Haiku trio (canonical-keyword rewrite, HyDE fact
+    paraphrase, LLM keyword extraction) run in parallel. Downstream merge
+    dedupes, so redundancy between layers is harmless.
     """
     queries = [query]
     # Graph-based alias expansion runs even when LLM rewrite is disabled
@@ -624,29 +761,18 @@ async def search_memories_smart(
         for a in alias_variants:
             if a not in queries:
                 queries.append(a)
-    # Phase A-1 follow-up: morphological content-word variant. ~ms-level
-    # cost, no LLM. Helps vector embedding too: "上伊那ぼたんで誰が一番
-    # 好き？" → "上伊那 ぼたん 一番 好き" weights the proper nouns rather
-    # than letting stop-particles (の は で が) drag the vector toward
-    # the question-form centroid.
+    # Morphological variant: "上伊那ぼたんで誰が一番好き？" → "上伊那 ぼたん
+    # 一番 好き" weights the proper nouns rather than letting stop-particles
+    # drag the vector toward the question-form centroid.
     morpho_variant = _expand_query_via_morpho(query)
     if morpho_variant and morpho_variant not in queries:
         log.info("morpho_expand: %r → %r", (query or "")[:60], morpho_variant)
         queries.append(morpho_variant)
     if rewrite:
-        # Phase B-1 + A-1 follow-up: run rewrite + HyDE + LLM keyword
-        # extraction in parallel.
-        #   - rewrite: canonical-label variants (toeic-prep / rust-async)
-        #   - HyDE: a fact-shaped paraphrase ("先輩は砺波いぶきが好き")
-        #   - llm_keywords: content-word extraction that respects new
-        #     proper nouns Janome doesn't know about ("砺波いぶき" intact)
-        # All three feed into the multi-query merge; the layers below
-        # dedupe and rerank so any redundancy is harmless.
-        variants_task = _rewrite_query(query)
-        hyde_task = _generate_hypothetical_fact(query)
-        llm_kw_task = _extract_keywords_via_llm(query)
         variants, hyde, llm_keywords = await asyncio.gather(
-            variants_task, hyde_task, llm_kw_task,
+            _rewrite_query(query),
+            _generate_hypothetical_fact(query),
+            _extract_keywords_via_llm(query),
         )
         for v in variants:
             if v and v not in queries:
@@ -660,18 +786,129 @@ async def search_memories_smart(
                 (query or "")[:60], llm_keywords[:120],
             )
             queries.append(llm_keywords)
+    return queries
+
+
+async def _expand_episode_bundle(
+    reranked: list[dict], user_id: str, current_channel_id: "str | None",
+) -> int:
+    """Phase C-3: append sibling facts from the top-1 hit's episode.
+
+    Mutates ``reranked`` in place and returns how many facts were appended.
+    Non-fatal on every failure path (fail-open, returns 0).
+    """
+    try:
+        from config import MEM0_EPISODE_BUNDLE_ENABLED, MEM0_EPISODE_BUNDLE_LIMIT
+    except Exception:
+        MEM0_EPISODE_BUNDLE_ENABLED, MEM0_EPISODE_BUNDLE_LIMIT = True, 5
+    if not (MEM0_EPISODE_BUNDLE_ENABLED and reranked):
+        return 0
+    try:
+        top_md = reranked[0].get("metadata") or {}
+        top_episode = top_md.get("episode_id")
+        if not top_episode:
+            return 0
+        bundle = await get_episode_facts(top_episode, user_id, limit=15)
+        seen = {r.get("id") for r in reranked if r.get("id")}
+        # Phase R: bundle 経路は search_memories の validity フィルタを
+        # 通らないので、ここで archived / 他会話 scope を落とす
+        # （bundle 経由の誤注入・archived 復活を防ぐ）。
+        extras = [
+            r for r in bundle
+            if r.get("id") and r.get("id") not in seen
+            and _is_fact_valid(r, current_channel_id)
+        ]
+        if not extras:
+            return 0
+        # Tag them so downstream prompt builders can render the bundle
+        # hint differently if desired.
+        for e in extras:
+            e["_episode_bundle"] = True
+            if e.get("score") is None:
+                e["score"] = 0.85
+        keep = extras[: max(int(MEM0_EPISODE_BUNDLE_LIMIT), 0)]
+        reranked.extend(keep)
+        log.info("episode_bundle: +%d facts from %s", len(keep), top_episode)
+        return len(keep)
+    except Exception as exc:
+        log.warning("episode_bundle expansion failed (non-fatal): %s", exc)
+        return 0
+
+
+def _log_smart_metrics(
+    query: str, candidates: list[dict], kept: int, bundle_added: int, *, rerank: bool,
+) -> None:
+    """Phase B-3: one-line metric so a week of journalctl reduces to
+    hit-rate stats with grep. Keys are positional for a simple regex."""
+    if rerank:
+        try:
+            from config import MEM0_HYBRID_ENABLED as _hyb
+            from config import MEM0_HYDE_ENABLED as _hyde
+        except Exception:
+            _hyb = _hyde = False
+        log.info(
+            "[MEM0_METRICS query_len=%d candidates=%d kept=%d bundle=%d "
+            "hybrid=%s hyde=%s rerank=on]",
+            len(query or ""), len(candidates), kept, bundle_added,
+            bool(_hyb), bool(_hyde),
+        )
+    else:
+        log.info(
+            "[MEM0_METRICS query_len=%d candidates=%d kept=%d "
+            "hybrid=plain hyde=off rerank=off]",
+            len(query or ""), len(candidates), kept,
+        )
+
+
+async def search_memories_smart(
+    query: str, user_id: str, limit: int = 5,
+    rewrite: bool = True, rerank: bool = True,
+    include_core: bool = False,
+    current_channel_id: str | None = None,
+) -> list[dict]:
+    """Query-rewriting + re-ranking enhanced search.
+
+    Orchestration only — each phase lives in its own helper (P5-a):
+      1. _expand_queries: graph alias + morpho + Haiku trio variants.
+      2. _search_multi_hybrid over the expanded query set.
+      3. _graph_expand_candidates: 1-hop entity sibling rescue.
+      4. rerank path: _rerank_memories + _expand_episode_bundle;
+         plain path: _apply_reinforcement_boost + distance gate.
+
+    Both ``rewrite`` and ``rerank`` can be disabled for plain search.
+    ``include_core=True`` merges the always-inject core facts (imp=5,
+    tier Live/Hot) at the head of the result, within the same ``limit``.
+    """
+    # core memory はクエリ検索と独立なので並行に走らせる（TTL cache 命中時は即返る）。
+    core_task = (
+        asyncio.create_task(
+            get_core_memories(user_id, current_channel_id=current_channel_id)
+        )
+        if include_core else None
+    )
+    queries = await _expand_queries(query, user_id, rewrite=rewrite)
     # Phase A-1: hybrid retrieval (vector + BM25 RRF fusion). Falls back to
     # vector-only when MEM0_HYBRID_ENABLED=false. Same return shape as
     # search_memories_multi, so the downstream rerank / graph_expand keep
     # working unchanged.
-    candidates = await _search_multi_hybrid(queries, user_id, limit=20)
+    #
+    # rerank=True のときは cosine 距離の pre-filter を外す: LLM reranker が
+    # 関連度を判定するのに、その前段で「遠いが関連ある」候補を機械的に
+    # 落とすのは設計矛盾（rerank=False パスは従来通り距離ゲート維持）。
+    candidates = await _search_multi_hybrid(
+        queries, user_id, limit=20,
+        apply_distance_filter=not rerank,
+        current_channel_id=current_channel_id,
+    )
 
     # Graph expansion (Obsidian-style 1-hop): for each top-3 candidate,
     # look up its linked entities and surface sibling facts that share an
     # entity. This rescues facts that share an entity with the user's
     # intent but didn't make the cosine cut. Non-fatal on failure.
     try:
-        candidates = await _graph_expand_candidates(candidates, user_id)
+        candidates = await _graph_expand_candidates(
+            candidates, user_id, current_channel_id=current_channel_id,
+        )
     except Exception as exc:
         log.warning("graph_expand failed (non-fatal): %s", exc)
 
@@ -682,57 +919,14 @@ async def search_memories_smart(
         # (incident 2026-05-19, ADR-0002). Plain-path callers below get a
         # loose sanity gate instead, since no LLM judge ran there.
         reranked = await _rerank_memories(query, candidates, top_k=limit)
-        # Phase C-3: episode bundle expansion. If the top-1 hit carries an
-        # episode_id, surface a handful of sibling facts from the same
-        # episode so the LLM gets the full topical context instead of one
-        # isolated fact. Cap at MEM0_EPISODE_BUNDLE_LIMIT so we don't
-        # blow MAX_PROMPT_CHARS.
-        bundle_added = 0
-        try:
-            from config import MEM0_EPISODE_BUNDLE_ENABLED, MEM0_EPISODE_BUNDLE_LIMIT
-        except Exception:
-            MEM0_EPISODE_BUNDLE_ENABLED, MEM0_EPISODE_BUNDLE_LIMIT = True, 5
-        if MEM0_EPISODE_BUNDLE_ENABLED and reranked:
-            try:
-                top_md = reranked[0].get("metadata") or {}
-                top_episode = top_md.get("episode_id")
-                if top_episode:
-                    bundle = await get_episode_facts(top_episode, user_id, limit=15)
-                    seen = {r.get("id") for r in reranked if r.get("id")}
-                    extras = [
-                        r for r in bundle
-                        if r.get("id") and r.get("id") not in seen
-                    ]
-                    if extras:
-                        # Tag them so downstream prompt builders can render
-                        # the bundle hint differently if desired.
-                        for e in extras:
-                            e["_episode_bundle"] = True
-                            if e.get("score") is None:
-                                e["score"] = 0.85
-                        keep = extras[: max(int(MEM0_EPISODE_BUNDLE_LIMIT), 0)]
-                        bundle_added = len(keep)
-                        reranked.extend(keep)
-                        log.info(
-                            "episode_bundle: +%d facts from %s",
-                            bundle_added, top_episode,
-                        )
-            except Exception as exc:
-                log.warning("episode_bundle expansion failed (non-fatal): %s", exc)
-        # Phase B-3: one-line metric so a week of journalctl can be reduced
-        # to hit-rate stats with grep. Keys are positional so the regex
-        # downstream stays simple.
-        try:
-            from config import MEM0_HYBRID_ENABLED as _hyb
-            from config import MEM0_HYDE_ENABLED as _hyde
-        except Exception:
-            _hyb = _hyde = False
-        log.info(
-            "[MEM0_METRICS query_len=%d candidates=%d kept=%d bundle=%d "
-            "hybrid=%s hyde=%s rerank=on]",
-            len(query or ""), len(candidates), len(reranked), bundle_added,
-            bool(_hyb), bool(_hyde),
+        bundle_added = await _expand_episode_bundle(
+            reranked, user_id, current_channel_id,
         )
+        _log_smart_metrics(
+            query, candidates, len(reranked), bundle_added, rerank=True,
+        )
+        if core_task is not None:
+            reranked = _merge_core_first(await core_task, reranked, limit)
         return reranked
 
     # Per-user recency/engagement ordering on the plain path too (no LLM).
@@ -746,16 +940,15 @@ async def search_memories_smart(
         if r.get("score") is None
         or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
     ]
-    log.info(
-        "[MEM0_METRICS query_len=%d candidates=%d kept=%d "
-        "hybrid=plain hyde=off rerank=off]",
-        len(query or ""), len(candidates), len(filtered),
-    )
+    _log_smart_metrics(query, candidates, len(filtered), 0, rerank=False)
+    if core_task is not None:
+        filtered = _merge_core_first(await core_task, filtered, limit)
     return filtered
 
 
 async def _graph_expand_candidates(
     candidates: list[dict], user_id: str, *, top_seed: int = 3, per_entity: int = 3,
+    current_channel_id: str | None = None,
 ) -> list[dict]:
     """1-hop graph expansion via services.mem0.graph.
 
@@ -770,7 +963,8 @@ async def _graph_expand_candidates(
     import asyncio as _asyncio
     from services.mem0 import graph
     from services.mem0.client import _get_mem0
-    mem = _get_mem0()
+    # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
+    mem = await asyncio.to_thread(_get_mem0)
     if mem is None:
         return candidates
 
@@ -805,7 +999,12 @@ async def _graph_expand_candidates(
     for fid in sibling_ids:
         try:
             fact = await _asyncio.to_thread(mem.get, fid)
-            if isinstance(fact, dict) and fact.get("memory"):
+            # Phase R: graph 経由の sibling は search_memories の validity
+            # フィルタを通らないので、archived / 他会話 scope をここで落とす。
+            if (
+                isinstance(fact, dict) and fact.get("memory")
+                and _is_fact_valid(fact, current_channel_id)
+            ):
                 # Sibling facts pulled by graph expansion don't carry a
                 # cosine score. Assign a neutral mid-range distance so they
                 # don't crowd out actual top-cosine matches but still get

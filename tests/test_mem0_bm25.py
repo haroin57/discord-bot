@@ -250,7 +250,7 @@ class TestSearchMemoriesHybrid:
         # config-import side-effect: simulate hybrid=False.
         import services.mem0.search as search_mod
 
-        async def fake_search(query, user_id, limit=8):
+        async def fake_search(query, user_id, limit=8, **kwargs):
             return [{"id": "f1", "score": 0.1, "memory": "vec hit"}]
 
         monkeypatch.setattr(search_mod, "search_memories", fake_search)
@@ -265,7 +265,7 @@ class TestSearchMemoriesHybrid:
     async def test_merges_vector_and_bm25(self, monkeypatch, fresh_bm25_db):
         import services.mem0.search as search_mod
 
-        async def fake_search(query, user_id, limit=8):
+        async def fake_search(query, user_id, limit=8, **kwargs):
             return [{"id": "vec1", "score": 0.1, "memory": "vec hit"}]
 
         monkeypatch.setattr(search_mod, "search_memories", fake_search)

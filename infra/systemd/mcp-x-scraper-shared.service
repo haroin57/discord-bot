@@ -1,0 +1,43 @@
+[Unit]
+# Shared streamable-HTTP x-scraper MCP (FastMCP native HTTP) on
+# 127.0.0.1:8016/mcp. One daemon for all parallel Claude Code sessions instead
+# of a ~59MB stdio child each. (Phase 1.5 stdio dedup.)
+Description=Shared MCP: x-scraper (streamable HTTP, :8016)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+# x-scraper lives outside the repo (free-code); its server adds ./src to
+# sys.path relative to the file, so WorkingDirectory is its own root.
+WorkingDirectory=/home/ubuntu/free-code/x-scraper
+Environment=HOME=/home/ubuntu
+Environment=MCP_HTTP_PORT=8016
+EnvironmentFile=/home/ubuntu/discord-bot/.env
+ExecStart=/home/ubuntu/free-code/x-scraper/.venv/bin/python /home/ubuntu/free-code/x-scraper/mcp_server.py
+Restart=always
+RestartSec=5
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-x-scraper-shared
+
+# Resource caps. ~59MB observed as stdio child; scraping spins up async HTTP.
+MemoryHigh=200M
+MemoryMax=300M
+LimitNOFILE=4096
+
+# Light hardening.
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

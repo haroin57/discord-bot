@@ -62,7 +62,9 @@ class TestHealthIntegration:
 class TestOAuthEscalation:
     def test_alert_escalates_after_threshold(self, caplog):
         try:
-            from services.oauth_manager import _record_refresh_failure, _record_refresh_success
+            import services.oauth_manager as _om
+            _record_refresh_failure = lambda err: _om._record_refresh_failure(_om._accounts['primary'], err)
+            _record_refresh_success = lambda: _om._record_refresh_success(_om._accounts['primary'])
         except ImportError:
             pytest.skip("oauth_manager helpers not yet present")
         _record_refresh_success()  # reset
@@ -84,6 +86,7 @@ class TestOAuthEscalation:
 # ─── SRE-C1: signal handler test (subprocess-based) ─────────────
 class TestSignalHandler:
     def test_kill_orphan_function_exists(self):
-        from services.claude_sdk import kill_orphan_claude_cli
+        # PR9: claude_sdk deleted; the shutdown path imports from claude_api.
+        from services.claude_api import kill_orphan_claude_cli
         # Just verify it's callable
         assert callable(kill_orphan_claude_cli)

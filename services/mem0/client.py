@@ -69,8 +69,12 @@ async def get_anthropic_client():
     await ensure_valid_token()
     token = get_access_token()
 
+    # Same fallback chain as _build_config / _get_mem0 (P1-e/P4b): both the
+    # direct-Haiku path here and Mem0's internal client follow one decision.
+    provider = _desired_llm_provider()
+
     # OAuth token available — use Anthropic directly.
-    if token:
+    if provider == "anthropic" and token:
         # Fast path: no rebuild needed.
         if _async_anthropic_client is not None and token == _async_anthropic_token:
             return _async_anthropic_client
@@ -86,7 +90,7 @@ async def get_anthropic_client():
 
     # OAuth unavailable — fall back to DeepSeek V4 Flash.
     # Tier 1: OpenRouter (explicit key). Tier 2: OpenCode Zen (free key).
-    if _OPENROUTER_API_KEY:
+    if provider == "openrouter":
         log.warning("get_anthropic_client: OAuth unavailable, using OpenRouter fallback (%s)", _DEEPSEEK_V4_FLASH)
         from openai import AsyncOpenAI
         return AsyncOpenAI(
@@ -94,7 +98,7 @@ async def get_anthropic_client():
             base_url="https://openrouter.ai/api/v1",
             default_headers={"HTTP-Referer": "https://discord-bot.kanae.local"},
         )
-    if _OPENCODE_API_KEY:
+    if provider == "opencode":
         log.warning("get_anthropic_client: OAuth unavailable, using OpenCode Zen fallback (%s)", _DEEPSEEK_V4_FLASH)
         from openai import AsyncOpenAI
         return AsyncOpenAI(
@@ -102,7 +106,8 @@ async def get_anthropic_client():
             base_url="https://api.opencode.ai/v1",
         )
 
-    # No auth at all.
+    # No auth at all (or an explicit non-anthropic MEM0_LLM_PROVIDER override
+    # that this direct-call path doesn't serve).
     return None
 
 
@@ -154,6 +159,27 @@ _OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY", "")
 _DEEPSEEK_V4_FLASH = "deepseek/deepseek-chat-v4-flash"
 
 
+def _desired_llm_provider() -> "str | None":
+    """Single source of truth for the LLM fallback chain (P1-e).
+
+    Previously this decision lived in two divergent copies — _build_config()
+    (Mem0 SDK config) and get_anthropic_client() (direct Haiku calls) — so an
+    OAuth failover could flip one path while the other kept its stale
+    provider. Order: explicit MEM0_LLM_PROVIDER override → Anthropic (OAuth
+    or API key) → OpenRouter → OpenCode Zen → None.
+    """
+    configured = os.environ.get("MEM0_LLM_PROVIDER", "anthropic")
+    if configured != "anthropic":
+        return configured  # explicit override wins; no fallback logic
+    if _has_oauth_token():
+        return "anthropic"
+    if _OPENROUTER_API_KEY:
+        return "openrouter"
+    if _OPENCODE_API_KEY:
+        return "opencode"
+    return None
+
+
 def _build_config() -> dict:
     """Build Mem0 configuration from env vars.
 
@@ -193,8 +219,9 @@ def _build_config() -> dict:
             "path": db_path,
         }
 
-    # Determine LLM provider: primary=Anthropic OAuth, fallback=OpenRouter
-    llm_provider = os.environ.get("MEM0_LLM_PROVIDER", "anthropic")
+    # LLM provider comes from the shared fallback chain (P1-e) so this config
+    # can never disagree with get_anthropic_client()'s direct-call path.
+    desired = _desired_llm_provider()
     llm_model = os.environ.get("MEM0_LLM_MODEL", "claude-haiku-4-5-20251001")
     llm_config = {
         "model": llm_model,
@@ -202,46 +229,45 @@ def _build_config() -> dict:
         "max_tokens": 2000,
     }
 
-    if llm_provider == "anthropic" and not _has_oauth_token():
-        if _OPENROUTER_API_KEY:
-            log.warning(
-                "Anthropic OAuth unavailable — falling back to %s via OpenRouter",
-                _DEEPSEEK_V4_FLASH,
-            )
-            llm_provider = "openrouter"
-            llm_model = _DEEPSEEK_V4_FLASH
-            llm_config = {
-                "model": _DEEPSEEK_V4_FLASH,
-                "temperature": 0.1,
-                "max_tokens": 2000,
-            }
-        elif _OPENCODE_API_KEY:
-            log.warning(
-                "Anthropic OAuth unavailable — falling back to %s via OpenCode Zen",
-                _DEEPSEEK_V4_FLASH,
-            )
-            # OpenCode Zen speaks OpenAI-compatible API at api.opencode.ai
-            llm_provider = "openai"
-            llm_model = _DEEPSEEK_V4_FLASH
-            llm_config = {
-                "model": _DEEPSEEK_V4_FLASH,
-                "temperature": 0.1,
-                "max_tokens": 2000,
-                # mem0 1.0.11 OpenAIConfig uses `api_key` (not `openai_api_key`);
-                # `openai_base_url` is still accepted.
-                "api_key": _OPENCODE_API_KEY,
-                "openai_base_url": "https://api.opencode.ai/v1",
-            }
-        else:
-            log.error(
-                "Anthropic OAuth unavailable and no fallback key configured "
-                "(OPENROUTER_API_KEY / OPENCODE_API_KEY) — Mem0 LLM calls will fail"
-            )
-
-    if llm_provider == "openrouter":
-        # Mem0's openrouter provider wraps the OpenAI-compatible API.
-        llm_config["api_key"] = _OPENROUTER_API_KEY
-        llm_config["openai_base_url"] = "https://openrouter.ai/api/v1"
+    if desired == "openrouter":
+        log.warning(
+            "Anthropic OAuth unavailable — falling back to %s via OpenRouter",
+            _DEEPSEEK_V4_FLASH,
+        )
+        llm_provider = "openrouter"
+        llm_config = {
+            "model": _DEEPSEEK_V4_FLASH,
+            "temperature": 0.1,
+            "max_tokens": 2000,
+            # Mem0's openrouter provider wraps the OpenAI-compatible API.
+            "api_key": _OPENROUTER_API_KEY,
+            "openai_base_url": "https://openrouter.ai/api/v1",
+        }
+    elif desired == "opencode":
+        log.warning(
+            "Anthropic OAuth unavailable — falling back to %s via OpenCode Zen",
+            _DEEPSEEK_V4_FLASH,
+        )
+        # OpenCode Zen speaks OpenAI-compatible API at api.opencode.ai
+        llm_provider = "openai"
+        llm_config = {
+            "model": _DEEPSEEK_V4_FLASH,
+            "temperature": 0.1,
+            "max_tokens": 2000,
+            # mem0 1.0.11 OpenAIConfig uses `api_key` (not `openai_api_key`);
+            # `openai_base_url` is still accepted.
+            "api_key": _OPENCODE_API_KEY,
+            "openai_base_url": "https://api.opencode.ai/v1",
+        }
+    elif desired is None:
+        log.error(
+            "Anthropic OAuth unavailable and no fallback key configured "
+            "(OPENROUTER_API_KEY / OPENCODE_API_KEY) — Mem0 LLM calls will fail"
+        )
+        llm_provider = os.environ.get("MEM0_LLM_PROVIDER", "anthropic")
+    else:
+        # "anthropic" or an explicit MEM0_LLM_PROVIDER override.
+        llm_provider = desired
 
     config: dict = {
         "llm": {
@@ -289,11 +315,24 @@ def _get_mem0():
     On init failure, sets _init_failed_at and returns None for the next
     _INIT_RETRY_COOLDOWN_SEC seconds before retrying. This allows
     automatic recovery after ChromaDB systemd-restarts.
+
+    Provider drift (P1-e): the instance remembers which LLM provider it was
+    built with; when the desired provider changes (OAuth failover kicked in,
+    or OAuth came back after a DeepSeek fallback) the singleton is rebuilt on
+    the next access instead of silently keeping a stale provider forever —
+    the split-brain the plan flagged as a live operational risk.
     """
-    global _mem0_instance, _init_failed_at
+    global _mem0_instance, _mem0_provider, _init_failed_at
 
     if _mem0_instance is not None:
-        return _mem0_instance
+        desired = _desired_llm_provider()
+        if desired == _mem0_provider:
+            return _mem0_instance
+        log.warning(
+            "Mem0 LLM provider drift (%s -> %s) — rebuilding instance",
+            _mem0_provider, desired,
+        )
+        _mem0_instance = None
     if _init_failed_at is not None and (time.monotonic() - _init_failed_at) < _INIT_RETRY_COOLDOWN_SEC:
         return None
 
@@ -307,12 +346,14 @@ def _get_mem0():
 
         cfg = _build_config()
         _mem0_instance = Memory.from_config(cfg)
+        _mem0_provider = _desired_llm_provider()
         _init_failed_at = None
         vs_cfg = cfg["vector_store"]["config"]
         store_id = vs_cfg.get("path") or f'{vs_cfg.get("host")}:{vs_cfg.get("port")}'
         log.info(
-            "Mem0 ready — llm=%s (OAuth) embedder=%s store=chroma(%s)",
+            "Mem0 ready — llm=%s provider=%s embedder=%s store=chroma(%s)",
             cfg["llm"]["config"]["model"],
+            cfg["llm"]["provider"],
             cfg["embedder"]["config"]["model"],
             store_id,
         )
@@ -336,7 +377,9 @@ async def get_all_memories(user_id: str, limit: int | None = None) -> list[dict]
     Pass None (default) to fetch all (used by the weekly housekeeping cron;
     avoid on hot paths).
     """
-    mem = _get_mem0()
+    # 初回 init は ChromaDB heartbeat (同期 requests) + Memory.from_config を
+    # 含むためイベントループから直接呼ばない（最大5秒のループ停止になる）。
+    mem = await asyncio.to_thread(_get_mem0)
     if not mem:
         return []
     try:
@@ -354,7 +397,9 @@ async def get_all_memories(user_id: str, limit: int | None = None) -> list[dict]
 
 async def delete_memory(memory_id: str) -> bool:
     """Delete a specific memory by ID."""
-    mem = _get_mem0()
+    # 初回 init は ChromaDB heartbeat (同期 requests) + Memory.from_config を
+    # 含むためイベントループから直接呼ばない（最大5秒のループ停止になる）。
+    mem = await asyncio.to_thread(_get_mem0)
     if not mem:
         return False
     try:

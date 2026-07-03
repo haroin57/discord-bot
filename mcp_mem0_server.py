@@ -4,7 +4,7 @@ Exposes Mem0 search/add/list/delete as MCP tools so Claude Code can read and
 write the same ChromaDB that かなえ Discord bot uses. Default user_id is
 hardcoded to 先輩's Discord ID so記憶がそのまま共有される。
 
-Reuses discord-bot's services.mem0_service which handles OAuth + config.
+Reuses discord-bot's services.mem0 which handles OAuth + config.
 """
 
 import asyncio
@@ -60,7 +60,7 @@ os.environ["OAUTH_NO_REFRESH"] = "1"
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
-from services.mem0_service import (  # noqa: E402
+from services.mem0 import (  # noqa: E402
     add_memories,
     delete_memory,
     get_all_memories,
@@ -195,7 +195,9 @@ async def add(
     msgs.append({"role": "assistant", "content": assistant_message})
     result = await add_memories(msgs, user_id=user_id)
     if not result:
-        return "(mem0 add failed — see server logs)"
+        return "(mem0 add failed — pipeline unavailable, e.g. ChromaDB down or init cooldown)"
+    if isinstance(result, dict) and result.get("error"):
+        return f"(mem0 add failed: {result['error']})"
     count = len(result.get("results", [])) if isinstance(result, dict) else 0
     return f"stored {count} new memories for user={user_id}"
 
@@ -259,4 +261,16 @@ async def delete(memory_id: str, user_id: str = DEFAULT_USER_ID) -> str:
 
 if __name__ == "__main__":
     log.info("Starting mem0 MCP server (default user_id=%s)", DEFAULT_USER_ID)
-    mcp.run()
+    # Shared-instance mode: when MCP_HTTP_PORT is set, serve one streamable-HTTP
+    # daemon that every parallel Claude Code session shares (see systemd unit
+    # mcp-mem0-shared.service). When unset, fall back to stdio so the Discord
+    # bot's on-demand spawn path and `claude mcp add ... -- python …` keep
+    # working unchanged. MUST remain backward compatible.
+    _http_port = os.environ.get("MCP_HTTP_PORT")
+    if _http_port:
+        mcp.settings.host = "127.0.0.1"
+        mcp.settings.port = int(_http_port)
+        log.info("mem0 MCP serving streamable-http on 127.0.0.1:%s/mcp", _http_port)
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()

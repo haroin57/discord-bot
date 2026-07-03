@@ -6,6 +6,7 @@ Matches free-code QueryEngine pattern: orchestrates services and utils.
 import asyncio
 import io
 import logging
+import os
 import re
 import time
 from collections import OrderedDict, deque
@@ -15,8 +16,18 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import bot_commands
+import bot_preprocess
+import bot_record
+import bot_ui
+
 from config import (
     ADMIN_USER_IDS,
+    CLAUDE_TAG_EMOJI_ID,
+    CLAUDE_TAG_EMOJI_NAME,
+    CLAUDE_TAG_ENABLED,
+    DEEP_RESEARCH_ENABLED,
+    DELIB_ROUTER_ENABLED,
     SPINNER_MODE,
     BOT_KEYWORDS,
     BOT_ROLE_IDS,
@@ -40,19 +51,19 @@ from config import (
     MEM0_SMART_SEARCH,
     RESTRICTED_COOLDOWN_SECONDS,
     RESTRICTED_DAILY_QUOTA,
+    SCRATCHPAD_STREAM_ENABLED,
+    SLEEP_ENFORCE_ENABLED,
+    SLEEP_ENFORCE_END_HOUR,
+    SLEEP_ENFORCE_START_HOUR,
+    SLEEP_ENFORCE_USER_ID,
     STATE_DIR,
     speaker_label,
-    VSCODE_SYNC_ENABLED,
-    VSCODE_SYNC_FLUSH_INTERVAL,
-    VSCODE_SYNC_IDLE_NOTIFY_SECONDS,
-    VSCODE_SYNC_PROJECTS_ROOT,
-    VSCODE_SYNC_THREAD_ID,
 )
-from services.claude_sdk import _is_session_fresh, call_with_tools, kill_orphan_claude_cli
+from services.claude_api import _is_session_fresh, call_with_tools, kill_orphan_claude_cli
 from services.oauth_manager import OAuthRefreshFailed
-from services import vscode_sync
-from services.vscode_sync.discord_post import make_post_callback
-from services.mem0_service import (
+from services import claude_tag
+from services import deep_research
+from services.mem0 import (
     add_memories,
     delete_memory,
     format_history_for_prompt,
@@ -64,13 +75,13 @@ from services.mem0_service import (
 )
 from services.session import (
     SessionInfo,
+    clear_channel_context,
     get_session,
     load_history_channel,
-    load_sessions,
+    shared_sessions,
     update_session,
 )
 from services.prompt_builder import PromptBuilder
-from services.music_analyzer import analyze_music_attachments
 from utils.attachments import (
     IMAGE_CONTENT_TYPES,
     MAX_ATTACHMENT_BYTES,
@@ -89,6 +100,7 @@ from utils.attachments import (
     strip_attached_paths,
 )
 from utils.discord_helpers import (
+    ReplyChainSender,
     build_mention_regex,
     fetch_channel_context,
     fetch_thread_context,
@@ -153,19 +165,14 @@ def _mark_mem0_recorded(channel_id: int) -> None:
     _last_mem0_record_at[channel_id] = time.time()
 
 
-# ---------------------------------------------------------------------------
-# Shared rate-limit module (H6) — defensive import with legacy fallback
-# ---------------------------------------------------------------------------
-try:
-    from services.rate_limit import (
-        check_cooldown as _rl_check_cooldown,
-        check_daily_quota as _rl_check_daily_quota,
-        daily_quota_reset_seconds as _rl_daily_quota_reset_seconds,
-    )
-    _USE_SHARED_RATE_LIMIT = True
-except ImportError:
-    _USE_SHARED_RATE_LIMIT = False
-    log.warning("services.rate_limit not available; using local cooldown/quota fallback")
+# Shared rate-limit ledger (P2.5 group-1): bot.py's local cooldown/quota
+# fallback duplicated services.rate_limit behind a defensive import that
+# could silently split the ledger again. The shared module is a hard dep.
+from services.rate_limit import (
+    check_cooldown as _rl_check_cooldown,
+    check_daily_quota as _rl_check_daily_quota,
+    daily_quota_reset_seconds as _rl_daily_quota_reset_seconds,
+)
 
 from services.job_state import (
     JobPhase,
@@ -243,8 +250,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
-sessions = load_sessions()
-cooldowns: OrderedDict[int, float] = OrderedDict()
+sessions = shared_sessions()
 # 機能6: /model and /effort live overrides, keyed per (channel, user). Set by
 # the slash commands, consumed by call_with_tools below. In-memory only — a
 # restart clears overrides back to the env defaults intentionally; the commands
@@ -268,9 +274,6 @@ _background_tasks: set[asyncio.Task] = set()
 # Phase G/D5: one-shot guard so the on_ready cleanup doesn't fire again on
 # every Discord reconnect (which is otherwise harmless but wasteful).
 _cleanup_scheduled: bool = False
-# Same idea for the vscode_sync daemon: on_ready fires on every reconnect
-# and run_daemon() must not be scheduled twice.
-_vscode_sync_started: bool = False
 
 # Job lifecycle tracking moved to services/job_state.py: jobs register BEFORE
 # the channel semaphore, so /abort reaches queued work too, and the queue
@@ -386,35 +389,6 @@ def _cap_text(text: str, limit: int) -> str:
 # ---------------------------------------------------------------------------
 # Daily quota tracking for non-admin callers (M-4)
 # ---------------------------------------------------------------------------
-_QUOTA_WINDOW_S = 24 * 60 * 60
-# user_id -> deque of request epoch seconds within the window. deque keeps
-# entries in insertion (= time) order, so we can popleft expired entries in
-# O(expired) instead of rebuilding a new list every call.
-_daily_quota: OrderedDict[int, deque[float]] = OrderedDict()
-
-
-def _check_daily_quota(user_id: int) -> tuple[bool, int]:
-    """Return (allowed, remaining). Evicts expired entries lazily."""
-    if RESTRICTED_DAILY_QUOTA <= 0:
-        return True, -1
-    now = time.time()
-    cutoff = now - _QUOTA_WINDOW_S
-    bucket = _daily_quota.get(user_id)
-    if bucket is None:
-        bucket = deque()
-        _daily_quota[user_id] = bucket
-    while bucket and bucket[0] < cutoff:
-        bucket.popleft()
-    if len(bucket) >= RESTRICTED_DAILY_QUOTA:
-        _daily_quota.move_to_end(user_id)
-        return False, 0
-    bucket.append(now)
-    _daily_quota.move_to_end(user_id)
-    while len(_daily_quota) > MAX_COOLDOWN_ENTRIES:
-        _daily_quota.popitem(last=False)
-    return True, RESTRICTED_DAILY_QUOTA - len(bucket)
-
-
 async def get_http_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
@@ -424,24 +398,6 @@ async def get_http_session() -> aiohttp.ClientSession:
 
 def is_admin(user: discord.User | discord.Member) -> bool:
     return user.id in ADMIN_USER_IDS
-
-
-
-def _purge_cooldowns() -> None:
-    """Drop expired cooldown entries.
-
-    `cooldowns` is an OrderedDict keyed by insertion order, but entries get
-    `move_to_end`'d on every new request, so the front of the dict really
-    is the oldest activity. We can therefore stop scanning the moment we
-    hit a non-expired entry instead of walking the entire dict each call.
-    """
-    now = time.time()
-    threshold = COOLDOWN_SECONDS * 10
-    while cooldowns:
-        oldest_uid, oldest_ts = next(iter(cooldowns.items()))
-        if now - oldest_ts <= threshold:
-            break
-        del cooldowns[oldest_uid]
 
 
 # ---------------------------------------------------------------------------
@@ -509,15 +465,31 @@ async def on_ready():
         log.debug("Slash command sync already done; skipping on reconnect")
     log.info("Bot is ready: %s (id=%s), role_ids=%s", bot.user, bot.user.id, BOT_ROLE_IDS)
     # Sanity-check that the env-pinned kanae namespace matches the live
-    # bot id. Mismatch means scripts/kanae_daily.py and bot.py runtime
-    # would land in different ChromaDB collections, leaving daily writes
-    # invisible at recall time. Just a warning — don't refuse to start.
+    # bot id. Mismatch means Mem0 writes land in a different collection.
+    # Just a warning — don't refuse to start.
     from config import KANAE_BOT_USER_ID
     if KANAE_BOT_USER_ID and KANAE_BOT_USER_ID != str(bot.user.id):
         log.warning(
             "KANAE_BOT_USER_ID=%s does not match live bot.user.id=%s; "
             "daily summaries will write to a different Mem0 namespace.",
             KANAE_BOT_USER_ID, bot.user.id,
+        )
+    # claude tag (ADR-0027): warn if the trigger emoji isn't pinned by ID, so a
+    # same-named :claude: from another guild can't misfire the task path.
+    if CLAUDE_TAG_ENABLED and CLAUDE_TAG_EMOJI_ID is None:
+        log.warning(
+            "CLAUDE_TAG_ENABLED but CLAUDE_TAG_EMOJI_ID is unset; :claude: "
+            "reactions will fire on emoji NAME match alone (%r), which can "
+            "misfire from another guild's same-named emoji. Set "
+            "CLAUDE_TAG_EMOJI_ID in .env to pin the exact emoji.",
+            CLAUDE_TAG_EMOJI_NAME,
+        )
+    # Deep Research (ADR-0028): /research needs a general web backend.
+    if DEEP_RESEARCH_ENABLED and not deep_research.has_required_web_backend():
+        log.warning(
+            "DEEP_RESEARCH_ENABLED but no general web backend (brave-search / "
+            "tavily) is configured; /research will refuse. Set BRAVE_API_KEY or "
+            "TAVILY_API_KEY in .env."
         )
     # D5: cleanup_stale_attachments was previously called synchronously from
     # main.py before bot.run(). For a tmpdir with thousands of files the
@@ -531,19 +503,6 @@ async def on_ready():
         _track_task(
             asyncio.to_thread(cleanup_stale_attachments),
             name="cleanup_stale_attachments",
-        )
-
-    global _vscode_sync_started
-    if VSCODE_SYNC_ENABLED and not _vscode_sync_started and not vscode_sync.is_running():
-        _vscode_sync_started = True
-        _track_task(
-            vscode_sync.run_daemon(
-                post_callback=make_post_callback(bot, VSCODE_SYNC_THREAD_ID),
-                projects_root=VSCODE_SYNC_PROJECTS_ROOT,
-                flush_interval=VSCODE_SYNC_FLUSH_INTERVAL,
-                idle_notify_seconds=VSCODE_SYNC_IDLE_NOTIFY_SECONDS,
-            ),
-            name="vscode_sync",
         )
 
 
@@ -565,7 +524,7 @@ async def _send_segmented(
     import os as _os
 
     segments = parse_segments(response_text)
-    is_first = True
+    sender = ReplyChainSender(message)
     rendered_images: list[str] = []
 
     for seg in segments:
@@ -573,13 +532,7 @@ async def _send_segmented(
             text = seg.content.strip()
             if not text:
                 continue
-            chunks = split_message(text)
-            for chunk in chunks:
-                if is_first:
-                    await message.reply(chunk)
-                    is_first = False
-                else:
-                    await message.channel.send(chunk)
+            await sender.send_split(text)
 
         elif isinstance(seg, TableSegment):
             img_path = await render_table_image(seg.markdown, caption=seg.caption)
@@ -587,23 +540,13 @@ async def _send_segmented(
                 rendered_images.append(img_path)
                 f = discord.File(img_path)
                 try:
-                    if is_first:
-                        await message.reply(file=f)
-                        is_first = False
-                    else:
-                        await message.channel.send(file=f)
+                    await sender.send(file=f)
                 finally:
                     f.close()
             else:
                 # Fallback: send table as plain text
                 log.warning("Table render failed, falling back to text")
-                chunks = split_message(seg.markdown)
-                for chunk in chunks:
-                    if is_first:
-                        await message.reply(chunk)
-                        is_first = False
-                    else:
-                        await message.channel.send(chunk)
+                await sender.send_split(seg.markdown)
 
         elif isinstance(seg, MathSegment):
             img_path = await render_math_image(seg.latex, display_mode=seg.display_mode)
@@ -611,22 +554,14 @@ async def _send_segmented(
                 rendered_images.append(img_path)
                 f = discord.File(img_path)
                 try:
-                    if is_first:
-                        await message.reply(file=f)
-                        is_first = False
-                    else:
-                        await message.channel.send(file=f)
+                    await sender.send(file=f)
                 finally:
                     f.close()
             else:
                 # Fallback: send math as raw LaTeX text
                 log.warning("Math render failed, falling back to text")
                 fallback = f"`{seg.latex}`" if not seg.display_mode else f"```\n{seg.latex}\n```"
-                if is_first:
-                    await message.reply(fallback)
-                    is_first = False
-                else:
-                    await message.channel.send(fallback)
+                await sender.send(fallback)
 
     # Send any extracted file attachments at the end
     if attach_files:
@@ -641,366 +576,59 @@ async def _send_segmented(
 
 
 # ---------------------------------------------------------------------------
-# Slash commands
+# claude tag — :claude: リアクションでタスクをスレッド処理 (ADR-0027)
 # ---------------------------------------------------------------------------
-@bot.tree.command(name="abort", description="現チャンネルで進行中の応答を中断する (admin only)")
-async def abort_cmd(interaction: discord.Interaction):
-    if not is_admin(interaction.user):
-        await interaction.response.send_message("admin only", ephemeral=True)
-        return
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    """Dispatch a :claude: reaction to the task-processing orchestrator.
 
-    channel_id = interaction.channel_id
-    cancelled = cancel_channel_jobs(channel_id) if channel_id is not None else 0
-    if cancelled == 0:
-        await interaction.response.send_message(
-            "中断対象なし (進行中・待機中の応答はありません)", ephemeral=True,
-        )
-        return
-    await interaction.response.send_message(
-        f"中断要求を送りました({cancelled}件: 実行中と待機中のジョブを含む)",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="vscode-sync", description="VSCode Claude Code → Discord 同期の切替 (admin only)")
-@app_commands.describe(action="on で開始 / off で停止 / status で状態確認")
-@app_commands.choices(action=[
-    app_commands.Choice(name="on", value="on"),
-    app_commands.Choice(name="off", value="off"),
-    app_commands.Choice(name="status", value="status"),
-])
-async def vscode_sync_cmd(
-    interaction: discord.Interaction,
-    action: app_commands.Choice[str],
-):
-    if not is_admin(interaction.user):
-        await interaction.response.send_message("admin only", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    if action.value == "status":
-        running = vscode_sync.is_running()
-        await interaction.followup.send(
-            f"vscode_sync: {'running' if running else 'stopped'} "
-            f"(enabled={VSCODE_SYNC_ENABLED}, thread={VSCODE_SYNC_THREAD_ID})",
-            ephemeral=True,
-        )
-        return
-
-    global _vscode_sync_started
-
-    if action.value == "on":
-        if vscode_sync.is_running():
-            await interaction.followup.send("already running", ephemeral=True)
-            return
-        if VSCODE_SYNC_THREAD_ID <= 0:
-            await interaction.followup.send(
-                "VSCODE_SYNC_THREAD_ID が未設定です",
-                ephemeral=True,
-            )
-            return
-        _vscode_sync_started = True
-        _track_task(
-            vscode_sync.run_daemon(
-                post_callback=make_post_callback(bot, VSCODE_SYNC_THREAD_ID),
-                projects_root=VSCODE_SYNC_PROJECTS_ROOT,
-                flush_interval=VSCODE_SYNC_FLUSH_INTERVAL,
-                idle_notify_seconds=VSCODE_SYNC_IDLE_NOTIFY_SECONDS,
-            ),
-            name="vscode_sync",
-        )
-        await interaction.followup.send("started", ephemeral=True)
-        return
-
-    # action.value == "off"
-    await vscode_sync.stop_daemon()
-    _vscode_sync_started = False
-    await interaction.followup.send("stopped", ephemeral=True)
-
-
-# --- Mem0 ユーザー制御コマンド (機能3) -------------------------------------
-# /remember /recall /forget — 自動 ingest に加え、ユーザーが明示的に記憶を
-# 登録/閲覧/削除できる口。すべて発話者本人の Mem0 namespace
-# (user_id = interaction.user.id) のみを対象にするので、所有権は構造的に担保
-# される (get_all/search は user_id スコープ、delete は本人の候補からしか選べない)。
-@bot.tree.command(name="remember", description="指定したテキストを長期記憶に登録する (admin only)")
-@app_commands.describe(text="覚えておいてほしい内容")
-async def remember_cmd(interaction: discord.Interaction, text: str):
-    if not is_admin(interaction.user):
-        await interaction.response.send_message("admin only", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    uid = str(interaction.user.id)
-    try:
-        result = await add_memories(
-            user_text=text, user_id=uid, context_hint="(手動登録 via /remember)",
-        )
-    except Exception as exc:
-        await interaction.followup.send(f"記憶に失敗しました: {exc}", ephemeral=True)
-        return
-    if not result:
-        await interaction.followup.send("記憶システムが利用できませんでした", ephemeral=True)
-        return
-    kept = result.get("kept", 0)
-    if kept > 0:
-        await interaction.followup.send(f"✅ {kept}件を記憶しました", ephemeral=True)
-    else:
-        sk = result.get("skipped", {})
-        await interaction.followup.send(
-            f"記憶対象として保存されませんでした (重複や低重要度と判定: {sk})",
-            ephemeral=True,
-        )
-
-
-@bot.tree.command(name="recall", description="自分についての記憶を検索・一覧する (admin only)")
-@app_commands.describe(query="検索語 (省略で最近の記憶を一覧)")
-async def recall_cmd(interaction: discord.Interaction, query: str | None = None):
-    if not is_admin(interaction.user):
-        await interaction.response.send_message("admin only", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    uid = str(interaction.user.id)
-    try:
-        if query:
-            rows = await search_memories_smart(query, uid, limit=10, rewrite=True, rerank=True)
-        else:
-            rows = await get_all_memories(uid, limit=20)
-    except Exception as exc:
-        await interaction.followup.send(f"検索に失敗しました: {exc}", ephemeral=True)
-        return
-    if not rows:
-        await interaction.followup.send("該当する記憶はありませんでした", ephemeral=True)
-        return
-    lines = [f"{i}. {(r.get('memory') or '').strip()}" for i, r in enumerate(rows, 1)]
-    header = (
-        f"🧠 記憶 {len(rows)}件"
-        + (f"（検索: {query}）" if query else "（最近の登録）")
-        + ":\n"
-    )
-    for chunk in split_message(header + "\n".join(lines)):
-        await interaction.followup.send(chunk, ephemeral=True)
-
-
-class _ForgetSelect(discord.ui.Select):
-    """削除候補から複数選択させ、選ばれた memory_id を delete_memory する。
-
-    候補は forget_cmd 側で本人 namespace から引いているので、ここで削除できるのは
-    必ず発話者本人の記憶に限られる。
+    Only the cheap, side-effect-free gate runs inline on every reaction; all
+    heavy work is delegated to services.claude_tag as a tracked fire-and-forget
+    task so the gateway loop is never blocked. on_message is left untouched —
+    the orchestrator shares _get_channel_sema / sessions / _send_segmented via
+    the injected TagDeps, which is what serializes it against on_message.
     """
-
-    def __init__(self, rows: list[dict]):
-        self._by_value: dict[str, tuple[str, str]] = {}
-        options: list[discord.SelectOption] = []
-        for i, r in enumerate(rows[:25]):
-            mid = r.get("id")
-            if not mid:
-                continue
-            text = (r.get("memory") or "").strip()
-            self._by_value[str(i)] = (mid, text)
-            options.append(
-                discord.SelectOption(label=(text[:95] or "(空の記憶)"), value=str(i))
-            )
-        super().__init__(
-            placeholder="削除する記憶を選択（複数可）",
-            min_values=1,
-            max_values=max(len(options), 1),
-            options=options or [discord.SelectOption(label="(候補なし)", value="_none")],
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        deleted: list[str] = []
-        failed: list[str] = []
-        for v in self.values:
-            entry = self._by_value.get(v)
-            if not entry:
-                continue
-            mid, text = entry
-            ok = await delete_memory(mid)
-            (deleted if ok else failed).append(text[:60] or "(空)")
-        msg = ""
-        if deleted:
-            msg += "🗑️ 削除しました:\n" + "\n".join(f"- {t}" for t in deleted)
-        if failed:
-            msg += ("\n" if msg else "") + "削除失敗:\n" + "\n".join(f"- {t}" for t in failed)
-        await interaction.followup.send(msg or "削除対象なし", ephemeral=True)
-
-
-class _ForgetView(discord.ui.View):
-    def __init__(self, rows: list[dict]):
-        super().__init__(timeout=120)
-        self.add_item(_ForgetSelect(rows))
-
-
-@bot.tree.command(name="forget", description="自分についての記憶を選んで削除する (admin only)")
-@app_commands.describe(query="削除候補を絞る検索語 (省略で最近の記憶から選択)")
-async def forget_cmd(interaction: discord.Interaction, query: str | None = None):
-    if not is_admin(interaction.user):
-        await interaction.response.send_message("admin only", ephemeral=True)
+    if not CLAUDE_TAG_ENABLED or bot.user is None:
         return
-    await interaction.response.defer(ephemeral=True)
-    uid = str(interaction.user.id)
-    try:
-        if query:
-            rows = await search_memories_smart(query, uid, limit=25, rewrite=True, rerank=True)
-        else:
-            rows = await get_all_memories(uid, limit=25)
-    except Exception as exc:
-        await interaction.followup.send(f"検索に失敗しました: {exc}", ephemeral=True)
+    if not claude_tag.passes_cheap_gate(
+        payload,
+        bot_user_id=bot.user.id,
+        admin_ids=ADMIN_USER_IDS,
+        emoji_id=CLAUDE_TAG_EMOJI_ID,
+        emoji_name=CLAUDE_TAG_EMOJI_NAME,
+    ):
         return
-    rows = [r for r in rows if r.get("id")]
-    if not rows:
-        await interaction.followup.send("削除できる記憶がありませんでした", ephemeral=True)
-        return
-    await interaction.followup.send(
-        f"削除する記憶を選んでください（候補 {len(rows[:25])}件、120秒以内）:",
-        view=_ForgetView(rows),
-        ephemeral=True,
+    deps = claude_tag.TagDeps(
+        bot=bot,
+        sessions=sessions,
+        send_segmented=_send_segmented,
+        get_channel_sema=_get_channel_sema,
+        get_http_session=get_http_session,
+        track_task=_track_task,
+    )
+    _track_task(
+        claude_tag.handle_claude_tag(payload, deps),
+        name="claude_tag",
     )
 
 
-@bot.tree.command(name="compact", description="このチャンネルの会話履歴を手動で圧縮する (admin only)")
-async def compact_cmd(interaction: discord.Interaction):
-    if not is_admin(interaction.user):
-        await interaction.response.send_message("admin only", ephemeral=True)
-        return
-    channel_id = interaction.channel_id
-    if channel_id is None:
-        await interaction.response.send_message("チャンネル外では使えません", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    try:
-        # 遅延 import: startup 時の循環 import (bot ← claude_api ← bot) を避ける。
-        from services.claude_api.client_factory import make_api_client
-        from services.claude_api.compaction import compact_channel_history
-
-        api_client = await make_api_client(restricted=False)
-        ok = await compact_channel_history(channel_id, api_client, force=True)
-    except Exception as exc:
-        await interaction.followup.send(f"圧縮に失敗しました: {exc}", ephemeral=True)
-        return
-    if ok:
-        await interaction.followup.send(
-            "✅ 会話履歴を圧縮しました（次ターンから反映されます）", ephemeral=True,
-        )
-    else:
-        await interaction.followup.send(
-            "圧縮は実行されませんでした（無効・circuit breaker 開放・対象が小さい等）",
-            ephemeral=True,
-        )
-
-
-@bot.tree.command(name="context", description="このチャンネルでの直近トークン使用量と圧縮余裕を表示する (admin only)")
-async def context_cmd(interaction: discord.Interaction):
-    if not is_admin(interaction.user):
-        await interaction.response.send_message("admin only", ephemeral=True)
-        return
-    cid = interaction.channel_id
-    uid = interaction.user.id
-    info = get_session(cid, uid) if cid is not None else None
-    usage = getattr(info, "last_usage", None) if info else None
-    if not usage:
-        await interaction.response.send_message(
-            "このチャンネル × あなたの組み合わせでは、まだ usage を観測していません",
-            ephemeral=True,
-        )
-        return
-    inp = int(usage.get("input_tokens", 0) or 0)
-    cr = int(usage.get("cache_read_input_tokens", 0) or 0)
-    cc = int(usage.get("cache_creation_input_tokens", 0) or 0)
-    out = int(usage.get("output_tokens", 0) or 0)
-    total_in = inp + cr + cc
-    # 500K の圧縮トリガーまでの余裕。env override されてれば追従する。
-    from config import HISTORY_COMPACT_TRIGGER_TOKENS
-    head = max(0, HISTORY_COMPACT_TRIGGER_TOKENS - total_in)
-    msg = (
-        f"**直近ターンの usage**\n"
-        f"- input: {inp:,}\n"
-        f"- cache_read: {cr:,}\n"
-        f"- cache_creation: {cc:,}\n"
-        f"- output: {out:,}\n"
-        f"\n"
-        f"**圧縮トリガーまでの余裕**\n"
-        f"- 入力側合計: {total_in:,} / 閾値 {HISTORY_COMPACT_TRIGGER_TOKENS:,}\n"
-        f"- 残り {head:,} トークン"
-    )
-    await interaction.response.send_message(msg, ephemeral=True)
-
-
-@bot.tree.command(name="model", description="このチャンネル×自分用にモデルを切り替える (admin only)")
-@app_commands.describe(model="例: claude-opus-4-8 / claude-opus-4-7 / claude-fable-5 / clear で解除")
-async def model_cmd(interaction: discord.Interaction, model: str):
-    if not is_admin(interaction.user):
-        await interaction.response.send_message("admin only", ephemeral=True)
-        return
-    cid = interaction.channel_id
-    uid = interaction.user.id
-    if cid is None:
-        await interaction.response.send_message("チャンネル外では使えません", ephemeral=True)
-        return
-    key = (cid, uid)
-    if model.strip().lower() in ("clear", "reset", "off", "default", ""):
-        _MODEL_OVERRIDES.pop(key, None)
-        await interaction.response.send_message(
-            "🧹 モデル override を解除しました（env 既定に戻ります）", ephemeral=True,
-        )
-        return
-    _MODEL_OVERRIDES[key] = model.strip()
-    await interaction.response.send_message(
-        f"✅ 次のターンから `{model.strip()}` を使います（このチャンネル × あなただけ）",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="effort", description="このチャンネル×自分用に推論強度を切り替える (admin only)")
-@app_commands.describe(level="low / medium / high / xhigh / max / clear")
-@app_commands.choices(level=[
-    app_commands.Choice(name="low", value="low"),
-    app_commands.Choice(name="medium", value="medium"),
-    app_commands.Choice(name="high", value="high"),
-    app_commands.Choice(name="xhigh", value="xhigh"),
-    app_commands.Choice(name="max", value="max"),
-    app_commands.Choice(name="clear", value="clear"),
-])
-async def effort_cmd(interaction: discord.Interaction, level: app_commands.Choice[str]):
-    if not is_admin(interaction.user):
-        await interaction.response.send_message("admin only", ephemeral=True)
-        return
-    cid = interaction.channel_id
-    uid = interaction.user.id
-    if cid is None:
-        await interaction.response.send_message("チャンネル外では使えません", ephemeral=True)
-        return
-    key = (cid, uid)
-    if level.value == "clear":
-        _EFFORT_OVERRIDES.pop(key, None)
-        await interaction.response.send_message(
-            "🧹 effort override を解除しました", ephemeral=True,
-        )
-        return
-    _EFFORT_OVERRIDES[key] = level.value
-    await interaction.response.send_message(
-        f"✅ 次のターンから effort=`{level.value}`（このチャンネル × あなただけ）",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="help", description="使えるコマンドの一覧と使い方を表示する")
-async def help_cmd(interaction: discord.Interaction):
-    # スラッシュコマンドは tree から動的に列挙するので、コマンドを足しても
-    # /help は自動で追従する。prefix コマンドだけ手書きで補う。
-    lines = ["**スラッシュコマンド**"]
-    for cmd in sorted(bot.tree.get_commands(), key=lambda c: c.name):
-        desc = getattr(cmd, "description", "") or ""
-        lines.append(f"- `/{cmd.name}` — {desc}")
-    lines.append("")
-    lines.append("**プレフィックスコマンド（admin、メッセージ本文で）**")
-    lines.append("- `!purge <N>` — かなえ自身の直近メッセージを N 件削除")
-    lines.append("- `!purge-since HH:MM` — 指定時刻（JST・24h）以降のかなえの投稿を削除")
-    lines.append("- `!purge-from` — 起点にしたいメッセージへ**返信**して、それ以降を削除")
-    lines.append("- 削除したいメッセージへ**返信**で `!delete` / `削除` / `消して` — その1件を削除")
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+# ---------------------------------------------------------------------------
+# Slash commands — moved to bot_commands/ (P2-d). register_all runs at import
+# time, matching the old decorator-at-module-level behavior; tree.sync timing
+# stays owned by on_ready.
+# ---------------------------------------------------------------------------
+# Kept as a module attribute so tests can patch per-command dependencies
+# (e.g. patch.object(bot._command_deps, "track_task", ...)).
+_command_deps = bot_commands.CommandDeps(
+    bot=bot,
+    is_admin=is_admin,
+    track_task=_track_task,
+    send_segmented=_send_segmented,
+    get_http_session=get_http_session,
+    model_overrides=_MODEL_OVERRIDES,
+    effort_overrides=_EFFORT_OVERRIDES,
+)
+bot_commands.register_all(bot.tree, _command_deps)
 
 
 async def _index_channel_message(message: discord.Message) -> None:
@@ -1032,6 +660,13 @@ async def on_message(message: discord.Message):
     if message.author == bot.user or message.author.bot:
         return
 
+    # Deep Research (ADR-0028/0029): skip messages in an active /research thread.
+    # The clarification reply is consumed by orchestrator's bot.wait_for (a
+    # separate listener), so processing it here too would double-fire a normal
+    # chat response in the research thread. Suppress until the research finishes.
+    if deep_research.is_active_research_thread(message.channel.id):
+        return
+
     new_request_id()  # SRE-H4: set correlation ID for this request context
     log.debug("[rid=%s] [%s] %s: %s", get_request_id(), message.channel, message.author, message.content[:200])
 
@@ -1056,163 +691,15 @@ async def on_message(message: discord.Message):
     # message content. All downstream behaviour branches on this variable.
     caller_is_admin = is_admin(message.author)
 
-    # --- Quick command: delete replied-to message (admin only) ---
+    # --- Prefix commands (!delete / !purge family) — bot_commands/prefix.py (R1) ---
     content_stripped = message.content.strip().lower()
-    # Match: mention + delete keyword, or just the keyword in DMs
-    delete_keywords = {"!delete", "削除", "消して", "delete"}
-    # Strip bot mention from content for keyword matching
+    # Strip bot mention from content for keyword matching. Computed HERE (not
+    # inside the handler) so tests patching bot.strip_mention keep working.
     bare_text = strip_mention(message.content, bot.user.id).strip().lower() if not is_dm else content_stripped
-    if bare_text in delete_keywords and message.reference and message.reference.message_id:
-        if not caller_is_admin:
-            await message.reply("❌ この操作はadminユーザーのみ使用できます。")
-            return
-        try:
-            ref_msg = message.reference.cached_message
-            if ref_msg is None:
-                ref_msg = await message.channel.fetch_message(message.reference.message_id)
-            await ref_msg.delete()
-            # Also delete the command message itself for cleanliness
-            try:
-                await message.delete()
-            except discord.errors.HTTPException:
-                pass
-            log.info("Deleted message %s (requested by admin %s)", ref_msg.id, message.author.id)
-        except discord.errors.NotFound:
-            await message.reply("⚠️ そのメッセージはもう存在しません。")
-        except discord.errors.Forbidden:
-            await message.reply("⚠️ そのメッセージを削除する権限がありません。")
-        except Exception as e:
-            log.warning("Failed to delete message: %s", e, exc_info=True)
-            await message.reply("❌ 削除に失敗しました。ログを確認してください。")
-        return
-
-    # --- Bulk purge of the bot's OWN messages (admin only) ---
-    # Three modes, all scoped to messages authored by this bot:
-    #   !purge-from   (as a reply) -> delete bot msgs from the replied-to msg onward
-    #   !purge-since HH:MM (JST)   -> delete bot msgs since that time today
-    #   !purge N                   -> delete the most recent N bot msgs
-    # Never deletes other users' messages. Hard-capped at MAX_PURGE.
-    _purge_mode = None
-    _purge_arg = None
-    if bare_text == "!purge-from":
-        _purge_mode = "from"
-    elif bare_text.startswith("!purge-since "):
-        _purge_mode, _purge_arg = "since", bare_text[len("!purge-since "):].strip()
-    elif bare_text.startswith("!purge ") and bare_text[len("!purge "):].strip().isdigit():
-        _purge_mode, _purge_arg = "count", bare_text[len("!purge "):].strip()
-
-    if _purge_mode:
-        if not caller_is_admin:
-            await message.reply("❌ この操作はadminユーザーのみ使用できます。")
-            return
-        from datetime import datetime, timedelta, timezone
-
-        MAX_PURGE = 200
-        _me_id = bot.user.id
-
-        def _is_bot_msg(m: discord.Message) -> bool:
-            return m.author.id == _me_id
-
-        try:
-            after_dt = None
-            count_target = None
-            if _purge_mode == "from":
-                if not (message.reference and message.reference.message_id):
-                    await message.reply(
-                        "⚠️ `!purge-from` は削除の起点にしたいメッセージに**返信**して送ってください。"
-                    )
-                    return
-                ref_msg = message.reference.cached_message
-                if ref_msg is None:
-                    ref_msg = await message.channel.fetch_message(
-                        message.reference.message_id
-                    )
-                after_dt = ref_msg.created_at - timedelta(seconds=1)
-            elif _purge_mode == "since":
-                try:
-                    hh, mm = (int(x) for x in _purge_arg.split(":"))
-                    jst = timezone(timedelta(hours=9))
-                    now_jst = datetime.now(jst)
-                    after_dt = now_jst.replace(
-                        hour=hh, minute=mm, second=0, microsecond=0
-                    )
-                    if after_dt > now_jst:  # time hasn't happened yet today -> yesterday
-                        after_dt -= timedelta(days=1)
-                    after_dt -= timedelta(seconds=1)  # make the boundary inclusive
-                except Exception:
-                    await message.reply(
-                        "⚠️ 時刻は `!purge-since HH:MM`（JST・24h）で指定してください。例: `!purge-since 12:02`"
-                    )
-                    return
-            else:  # count
-                count_target = min(int(_purge_arg), MAX_PURGE)
-
-            deleted = 0
-            if _purge_mode == "count":
-                targets = []
-                async for m in message.channel.history(limit=1000):
-                    if m.id == message.id:
-                        continue  # skip the command message itself
-                    if _is_bot_msg(m):
-                        targets.append(m)
-                        if len(targets) >= count_target:
-                            break
-                for m in targets:
-                    try:
-                        await m.delete()
-                        deleted += 1
-                    except discord.errors.HTTPException:
-                        pass
-            elif not is_dm:
-                # Guild text channel / thread: use purge(). Bulk delete needs
-                # manage_messages; fall back to per-message delete if denied.
-                _reason = f"purge requested by admin {message.author.id}"
-                try:
-                    purged = await message.channel.purge(
-                        after=after_dt, limit=MAX_PURGE, check=_is_bot_msg,
-                        bulk=True, reason=_reason,
-                    )
-                except discord.errors.Forbidden:
-                    purged = await message.channel.purge(
-                        after=after_dt, limit=MAX_PURGE, check=_is_bot_msg,
-                        bulk=False, reason=_reason,
-                    )
-                deleted = len(purged)
-            else:
-                # DMs can't bulk-delete: iterate and delete own messages.
-                async for m in message.channel.history(
-                    after=after_dt, limit=MAX_PURGE, oldest_first=True
-                ):
-                    if _is_bot_msg(m):
-                        try:
-                            await m.delete()
-                            deleted += 1
-                        except discord.errors.HTTPException:
-                            pass
-
-            try:
-                await message.delete()  # clean up the command message
-            except discord.errors.HTTPException:
-                pass
-            log.info(
-                "Purged %d bot message(s) (mode=%s, admin=%s)",
-                deleted, _purge_mode, message.author.id,
-            )
-            note = await message.channel.send(
-                f"🧹 かなえの投稿を **{deleted}件** 削除しました。"
-            )
-            await asyncio.sleep(5)
-            try:
-                await note.delete()
-            except discord.errors.HTTPException:
-                pass
-        except discord.errors.Forbidden:
-            await message.reply(
-                "⚠️ メッセージを削除する権限がありません（read message history / manage messages を確認）。"
-            )
-        except Exception as e:
-            log.warning("Failed to purge messages: %s", e, exc_info=True)
-            await message.reply("❌ 一括削除に失敗しました。ログを確認してください。")
+    if await bot_commands.prefix.handle_prefix_commands(
+        message, bot,
+        bare_text=bare_text, is_dm=is_dm, caller_is_admin=caller_is_admin,
+    ):
         return
 
     # Tiered rate limiting. Admins are NOT cooldown-rejected: their rapid
@@ -1222,51 +709,28 @@ async def on_message(message: discord.Message):
     # per-channel semaphore already serialises admin work, so there's no flood
     # risk. Non-admins keep the cooldown so they can't flood the shared Claude
     # quota / memory budget — mirrors the admin-skip on the daily quota below.
-    _purge_cooldowns()
     if not caller_is_admin:
-        if _USE_SHARED_RATE_LIMIT:
-            _cd_allowed, _cd_wait = _rl_check_cooldown(str(message.author.id), caller_is_admin)
-            if not _cd_allowed:
-                await message.reply(
-                    f"⏳ クールダウン中です。あと{_cd_wait}秒"
-                    f"({_fmt_clock(time.time() + _cd_wait)} 頃に解除)で送信できます。"
-                )
-                return
-        else:
-            now = time.time()
-            last = cooldowns.get(message.author.id, 0)
-            if now - last < RESTRICTED_COOLDOWN_SECONDS:
-                remaining = int(RESTRICTED_COOLDOWN_SECONDS - (now - last))
-                await message.reply(
-                    f"⏳ クールダウン中です。あと{remaining}秒"
-                    f"({_fmt_clock(now + remaining)} 頃に解除)で送信できます。"
-                )
-                return
-            cooldowns[message.author.id] = now
-            cooldowns.move_to_end(message.author.id)
-            while len(cooldowns) > MAX_COOLDOWN_ENTRIES:
-                cooldowns.popitem(last=False)
+        _cd_allowed, _cd_wait = _rl_check_cooldown(str(message.author.id), caller_is_admin)
+        if not _cd_allowed:
+            await message.reply(
+                f"⏳ クールダウン中です。あと{_cd_wait}秒"
+                f"({_fmt_clock(time.time() + _cd_wait)} 頃に解除)で送信できます。"
+            )
+            return
 
-    # Daily quota (non-admin only).
-    if not caller_is_admin:
-        if _USE_SHARED_RATE_LIMIT:
-            _q_allowed, _q_remaining = _rl_check_daily_quota(str(message.author.id), caller_is_admin)
-        else:
-            _q_allowed, _q_remaining = _check_daily_quota(message.author.id)
+        # Daily quota (non-admin only).
+        _q_allowed, _q_remaining = _rl_check_daily_quota(str(message.author.id), caller_is_admin)
         if not _q_allowed:
             quota_msg = "⏳ 今日の利用上限に達しました。"
-            if _USE_SHARED_RATE_LIMIT:
-                reset_s = _rl_daily_quota_reset_seconds(
-                    str(message.author.id), caller_is_admin
+            reset_s = _rl_daily_quota_reset_seconds(
+                str(message.author.id), caller_is_admin
+            )
+            if reset_s > 0:
+                reset_at = time.time() + reset_s
+                quota_msg += (
+                    f"{time.strftime('%m/%d %H:%M', time.localtime(reset_at))}"
+                    " 頃に回復します。"
                 )
-                if reset_s > 0:
-                    reset_at = time.time() + reset_s
-                    quota_msg += (
-                        f"{time.strftime('%m/%d %H:%M', time.localtime(reset_at))}"
-                        " 頃に回復します。"
-                    )
-                else:
-                    quota_msg += "また明日来てください。"
             else:
                 quota_msg += "また明日来てください。"
             await message.reply(quota_msg)
@@ -1294,17 +758,15 @@ async def on_message(message: discord.Message):
     )
     register_job(job)
 
-    status_msg: discord.Message | None = None
-    try:
-        if was_queued:
-            wait_pos = max(1, queue_position(job) - 1)
-            status_msg = await message.reply(f"⏳ 待機中({wait_pos}番目)")
-            log.info("Message %s queued in channel %s (pos=%d)",
-                     message.id, message.channel.id, wait_pos)
-        else:
-            status_msg = await message.reply("⏳ 考え中...")
-    except discord.errors.HTTPException:
-        status_msg = None
+    # Status/spinner UI — one writer for the status message (R2, bot_ui.py).
+    status = bot_ui.StatusController(message, track_task=_track_task)
+    if was_queued:
+        wait_pos = max(1, queue_position(job) - 1)
+        await status.initial_reply(was_queued=True, wait_pos=wait_pos)
+        log.info("Message %s queued in channel %s (pos=%d)",
+                 message.id, message.channel.id, wait_pos)
+    else:
+        await status.initial_reply(was_queued=False)
 
     # 👀/⏳ reaction marker on the user's message (restored 2026-06-13,
     # haroin request). The job-state status reply above replaced the old
@@ -1318,229 +780,6 @@ async def on_message(message: discord.Message):
     except discord.errors.HTTPException:
         pass
 
-    # Status updater (latest-wins, 2s rate limit) — defined this early so
-    # the queue/preprocessing phases share the message the model phases
-    # edit later.
-    last_status_update = 0.0
-    _pending_status: dict = {"text": None, "task": None}
-    STATUS_INTERVAL_S = 2.0
-
-    # Claude-Code-CLI-style animated spinner (services/claude_api/progress.py).
-    # CADENCE = 1 char / second, and this is a HARD Discord limit, not a choice:
-    # editing one message has a per-message bucket (~5 edits / 5s ≈ 1/s
-    # sustained). A faster cadence (0.25s/4fps) renders for the first ~5 frames
-    # then exhausts the bucket — discord.py blocks inside message.edit() until a
-    # slot frees, which FREEZES this serial loop for seconds at a time (the
-    # "描画が止まる" report; reproduced in scripts/spinner_capture.py: 4s freezes
-    # every ~1.25s of burst; the bucket itself measured by
-    # scripts/measure_edit_ratelimit.py). frame-drop doesn't help — a LANDED edit
-    # is itself bucket-limited, so it stalls too and jumps on resume. Continuous
-    # motion comes instead from SPINNER_EMOJI (animated application emoji, free).
-    # So we pace edits to what Discord sustains. Design: a single serial loop awaits each edit THEN
-    # steps the window one char (every visible frame advances exactly one
-    # position — no skipped chars, no create_task churn); wall-clock cadence
-    # self-corrects drift; split_message is off-loop in _draft_live. The elapsed
-    # seconds in the meta line tick every frame, so 1fps still reads as alive.
-    # During generation _update_status feeds the animator a transient "action"
-    # (tool labels surface; plain thinking/generating reverts to the shimmer).
-    from services.claude_api.progress import ProgressSpinner, _fmt_tokens, SPINNER_EMOJI
-    _spinner = ProgressSpinner()
-    _prog: dict = {"tokens": 0}          # live output-token count (set by tool_loop)
-    _spin: dict = {"on": False, "action": "", "start": 0.0}
-    # Vestigial guard, kept False: status_msg is the spinner only — the response
-    # is always a fresh reply now (the in-place-repurpose path was removed
-    # 2026-06-22 because it made the spinner vanish at generation start and put
-    # the reply in the wrong timeline slot). So _do_edit always owns status_msg
-    # for status text, and the success-path delete always removes it.
-    _status_consumed = {"v": False}
-    SPIN_INTERVAL_S = 1.0  # ≈ Discord's sustainable single-message edit rate
-    _animator_task: asyncio.Task | None = None
-
-    def _spin_body() -> str:
-        elapsed = time.monotonic() - _spin["start"]
-        action = _spin["action"]
-        if action:
-            prefix = f"{SPINNER_EMOJI} " if SPINNER_EMOJI else ""
-            body = f"{prefix}{action}  ({int(elapsed)}s"
-            if _prog["tokens"]:
-                body += f" · ↑ {_fmt_tokens(_prog['tokens'])} tokens"
-            return body + ")"
-        return _spinner.render(
-            elapsed_s=elapsed, tokens=_prog["tokens"], interrupt_hint="/abort で中断",
-        )
-
-    async def _spin_edit(text: str) -> None:
-        try:
-            if status_msg is not None:
-                await status_msg.edit(content=text)
-        except discord.errors.HTTPException:
-            pass
-
-    async def _animate() -> None:
-        next_frame = time.monotonic()
-        while _spin["on"]:
-            if status_msg is not None:
-                # Serial: await this edit, THEN advance one char. Stepping only
-                # after the edit lands guarantees each visible frame moves the
-                # bold window by exactly one position (never skips → no
-                # stutter), with zero task-spawn churn.
-                try:
-                    await _spin_edit(_spin_body())
-                except asyncio.CancelledError:
-                    break
-                _spinner.step()
-            # Wall-clock cadence: pace to SPIN_INTERVAL_S when edits are fast;
-            # if an edit ran long, delay clamps to 0 and the grid resyncs (the
-            # loop then runs at the edit rate, still one step per frame).
-            next_frame += SPIN_INTERVAL_S
-            delay = next_frame - time.monotonic()
-            if delay < 0:
-                next_frame = time.monotonic()
-                delay = 0.0
-            try:
-                await asyncio.sleep(delay)
-            except asyncio.CancelledError:
-                break
-
-    async def _animate_gif() -> None:
-        # Option B (SPINNER_MODE=gif): the WHOLE status line (gerund word +
-        # elapsed/tokens) is baked into one seamlessly-looping bold-shimmer GIF
-        # attachment with empty message content — so it's a single block (no
-        # line break) at Discord's text size. The client loops the GIF for free,
-        # re-uploaded once a second (≈ Discord's sustainable edit rate) with a
-        # fresh word + ticking counters; each GIF is a one-second forward bold
-        # sweep, so the word visibly shimmers and the seconds advance every tick.
-        # While a tool runs (_spin["action"]) we switch to a plain text line and
-        # drop the GIF, restoring it when the action clears.
-        import os as _os
-        from services.claude_api.progress import pick_word
-        from services.claude_api.spinner_gif import render_status_gif, _CACHE_DIR
-        REFRESH_S = 1.0
-        gif_path = _os.path.join(_CACHE_DIR, f"status_{message.channel.id}.gif")
-        state = {"mode": None, "action": None, "last_refresh": 0.0}
-        next_frame = time.monotonic()
-
-        def _meta() -> str:
-            elapsed = int(time.monotonic() - _spin["start"])
-            parts = [f"{elapsed}s"]
-            if _prog["tokens"]:
-                parts.append(f"↑ {_fmt_tokens(_prog['tokens'])} tokens")
-            parts.append("/abort で中断")
-            return f"({' · '.join(parts)})"
-
-        async def _refresh_gif(meta: str) -> None:
-            try:
-                path = await asyncio.to_thread(
-                    render_status_gif, pick_word(), meta, gif_path,
-                )
-            except Exception as exc:
-                log.warning("[rid=%s] status gif render failed: %s",
-                            get_request_id(), exc)
-                await status_msg.edit(content=f"⏳ {meta}")
-                state["mode"] = "text"
-                return
-            f = discord.File(path)
-            try:
-                await status_msg.edit(content="", attachments=[f])
-                state["mode"] = "gif"
-                state["last_refresh"] = time.monotonic()
-            finally:
-                f.close()
-
-        while _spin["on"]:
-            if status_msg is not None:
-                meta = _meta()
-                action = _spin["action"]
-                try:
-                    if action:
-                        # tool running → plain text line, drop the gif
-                        changed = state["mode"] != "action" or state["action"] != action
-                        if changed or time.monotonic() - state["last_refresh"] >= REFRESH_S:
-                            if state["mode"] == "gif":
-                                # clear the gif attachment when leaving gif mode
-                                await status_msg.edit(content=f"{action}  {meta}",
-                                                      attachments=[])
-                            else:
-                                await status_msg.edit(content=f"{action}  {meta}")
-                            state["mode"] = "action"
-                            state["action"] = action
-                            state["last_refresh"] = time.monotonic()
-                    else:
-                        state["action"] = None
-                        # Refresh every tick (~1s): new sweep + ticking counters.
-                        await _refresh_gif(meta)
-                except discord.errors.HTTPException:
-                    pass
-                except asyncio.CancelledError:
-                    break
-            next_frame += SPIN_INTERVAL_S
-            delay = next_frame - time.monotonic()
-            if delay < 0:
-                next_frame = time.monotonic()
-                delay = 0.0
-            try:
-                await asyncio.sleep(delay)
-            except asyncio.CancelledError:
-                break
-
-    async def _do_edit(text: str) -> None:
-        if status_msg is None or _status_consumed["v"]:
-            # status_msg was repurposed as the response body — don't clobber it.
-            return
-        try:
-            await status_msg.edit(content=text)
-        except discord.errors.HTTPException:
-            pass
-
-    async def _delayed_edit(text: str, delay: float) -> None:
-        try:
-            await asyncio.sleep(delay)
-        except asyncio.CancelledError:
-            return
-        nonlocal last_status_update
-        last_status_update = time.monotonic()
-        _pending_status["task"] = None
-        await _do_edit(text)
-
-    async def _update_status(text: str):
-        """Latest-wins status updater with 2s rate limit.
-
-        Never drops the most recent text: if called within the cool-down,
-        schedule a delayed edit (cancelling any previously pending one).
-        Discord message limit is 2000 chars — truncate to stay safe.
-        """
-        if len(text) > 1990:
-            text = text[:1990] + "…"
-        # While the animator owns status_msg, route phase/tool labels into its
-        # transient "action" line instead of editing directly (avoids two
-        # writers fighting over one message). Plain thinking/generating
-        # indicators clear the action so the shimmer shows through.
-        if _spin["on"]:
-            _spin["action"] = "" if text[:1] in ("💭", "📝") else text
-            return
-        nonlocal last_status_update
-        now_mono = time.monotonic()
-        elapsed = now_mono - last_status_update
-        if elapsed >= STATUS_INTERVAL_S:
-            # Cancel any pending delayed edit — this call is fresh enough.
-            pending = _pending_status.get("task")
-            if pending and not pending.done():
-                pending.cancel()
-                _pending_status["task"] = None
-            last_status_update = now_mono
-            # Fire-and-forget so the streaming loop isn't blocked on Discord I/O.
-            _track_task(_do_edit(text), name="status_edit")
-            return
-        # Too soon: remember latest text, schedule a single delayed edit.
-        _pending_status["text"] = text
-        pending = _pending_status.get("task")
-        if pending and not pending.done():
-            pending.cancel()
-        _pending_status["task"] = _track_task(
-            _delayed_edit(text, STATUS_INTERVAL_S - elapsed),
-            name="status_delayed_edit",
-        )
-
     try:
         await sema.acquire()  # waits if channel is busy (FIFO)
     except asyncio.CancelledError:
@@ -1548,18 +787,14 @@ async def on_message(message: discord.Message):
         # there is nothing to release.
         job.phase = JobPhase.FAILED
         unregister_job(job)
-        if status_msg is not None:
-            try:
-                await status_msg.edit(content="⏹️ 待機中に中断されました")
-            except discord.errors.HTTPException:
-                pass
+        await status.edit_final("⏹️ 待機中に中断されました")
         log.info("Message %s cancelled while queued in channel %s",
                  message.id, message.channel.id)
         return
 
     job.phase = JobPhase.PREPROCESSING
     if was_queued:
-        await _update_status("⏳ 考え中...")
+        await status.update("⏳ 考え中...")
         # Swap ⏳→👀 now that processing actually starts.
         try:
             await message.remove_reaction("⏳", bot.user)
@@ -1571,159 +806,49 @@ async def on_message(message: discord.Message):
 
     mem0_user_id = str(message.author.id)
     image_paths: list[str] = []
+    is_thread = isinstance(message.channel, discord.Thread)
     try:
-        # --- Parallel pre-processing ---
-        async def _fetch_reply():
-            if not (message.reference and message.reference.message_id):
-                return "", [], False
-            try:
-                ref_msg = message.reference.cached_message
-                if ref_msg is None:
-                    ref_msg = await message.channel.fetch_message(message.reference.message_id)
-                # For non-admins, refuse to inline admin messages — they may
-                # contain command output / secrets the attacker should not see.
-                if not caller_is_admin and ref_msg.author.id in ADMIN_USER_IDS:
-                    return "", [], False
-                body = _sanitize_untrusted_text(
-                    _cap_text(ref_msg.content or "(no text)", MAX_USER_MESSAGE_CHARS)
-                )
-                author = _sanitize_untrusted_text(ref_msg.author.display_name)
-                # An admin replying to admin- or bot-authored content is
-                # trusted context (own past instructions, kanae's prior
-                # output, b0nchichi's messages). Place it OUTSIDE
-                # <untrusted_user_input>. External authors stay inside.
-                is_trusted = caller_is_admin and (
-                    (bot.user is not None and ref_msg.author.id == bot.user.id)
-                    or ref_msg.author.id in ADMIN_USER_IDS
-                )
-                if is_trusted:
-                    ctx = (
-                        f"<replied_to_trusted_message author={author!r}>\n"
-                        f"{body}\n"
-                        f"</replied_to_trusted_message>\n\n"
-                    )
-                else:
-                    ctx = (
-                        f"<replied_to_message author={author!r}>\n"
-                        f"{body}\n"
-                        f"</replied_to_message>\n\n"
-                    )
-                return ctx, list(ref_msg.attachments), is_trusted
-            except Exception as e:
-                log.warning("Failed to fetch replied-to message: %s", e)
-                return "", [], False
-
-        is_thread = isinstance(message.channel, discord.Thread)
-        # If we expect to resume an existing session in this channel,
-        # skip fetching thread/channel context — Claude already has it
-        # in its context window. Saves tokens on every resumed turn.
-        # 機能1: resume 可否は (channel, user) 単位で判定する。同一チャンネルに
-        # 複数 admin がいても、相手のセッションを自分の resume 判定に使わない。
-        will_resume = (
-            caller_is_admin
-            and get_session(message.channel.id, message.author.id) is not None
-            and _is_session_fresh(message.channel.id, message.author.id)
+        # --- Parallel pre-processing (P2-a: launch lives in bot_preprocess) ---
+        # Collaborator functions are passed at call time so test patches on
+        # bot-module attributes (patch("bot.fetch_thread_context") etc.)
+        # keep working.
+        _ctx = bot_preprocess.launch_context_tasks(
+            bot=bot,
+            message=message,
+            prompt=prompt,
+            raw_user_text=raw_user_text,
+            caller_is_admin=caller_is_admin,
+            mem0_user_id=mem0_user_id,
+            sanitize=_sanitize_untrusted_text,
+            cap_text=_cap_text,
+            get_session=get_session,
+            is_session_fresh=_is_session_fresh,
+            fetch_thread_context=fetch_thread_context,
+            fetch_channel_context=fetch_channel_context,
+            resolve_message_links=resolve_message_links,
+            resolve_channel_mention_contexts=resolve_channel_mention_contexts,
+            search_memories_smart=search_memories_smart,
+            should_use_memory_llm_mode=should_use_memory_llm_mode,
+            admin_user_ids=ADMIN_USER_IDS,
+            max_user_message_chars=MAX_USER_MESSAGE_CHARS,
+            mem0_min_query_length=MEM0_MIN_QUERY_LENGTH,
+            mem0_smart_search=MEM0_SMART_SEARCH,
+            mem0_recall_limit=MEM0_RECALL_LIMIT,
+            mem0_recall_limit_restricted=MEM0_RECALL_LIMIT_RESTRICTED,
+            mem0_history_search_enabled=MEM0_HISTORY_SEARCH_ENABLED,
+            mem0_history_search_limit=MEM0_HISTORY_SEARCH_LIMIT,
+            mem0_history_embed_enabled=MEM0_HISTORY_EMBED_ENABLED,
+            mem0_history_embed_limit=MEM0_HISTORY_EMBED_LIMIT,
         )
-
-        async def _fetch_thread():
-            if will_resume:
-                return ""
-            if is_thread:
-                return await fetch_thread_context(
-                    message.channel, message, caller_is_admin=caller_is_admin,
-                )
-            return await fetch_channel_context(
-                message.channel, message, caller_is_admin=caller_is_admin,
-            )
-
-        reply_task = asyncio.create_task(_fetch_reply())
-        thread_task = asyncio.create_task(_fetch_thread())
-        link_task = asyncio.create_task(
-            resolve_message_links(bot, prompt, requester=message.author, caller_is_admin=caller_is_admin)
-        )
-        # Cross-thread context from channel mentions (<#id>)
-        cross_thread_task = asyncio.create_task(
-            resolve_channel_mention_contexts(
-                bot, prompt,
-                current_channel_id=message.channel.id,
-                requester=message.author,
-                caller_is_admin=caller_is_admin,
-            )
-        )
-        # Always recall Mem0 memories so Claude has long-term context,
-        # even on resumed sessions. Skip only for very short messages
-        # (stickers, "はい", "うん", etc.) where embedding search won't match.
-        history_search_task: asyncio.Task | None = None
-        history_embed_task: asyncio.Task | None = None
-        invest_kb_task: asyncio.Task | None = None
-        if len(raw_user_text) >= MEM0_MIN_QUERY_LENGTH:
-            mem0_llm_mode = should_use_memory_llm_mode(
-                raw_user_text, enabled=MEM0_SMART_SEARCH,
-            )
-            # Admins always rewrite+rerank so a multi-fact topic (the日経VI
-            # strategy ≈ 6 memories) surfaces, not only on explicit recall
-            # asks; the Haiku round-trip runs concurrently with prompt prep and
-            # is dwarfed by the main response. They also get a wider recall
-            # window. Non-admins keep the cheaper, narrower path.
-            if caller_is_admin and MEM0_SMART_SEARCH:
-                mem0_llm_mode = True
-            _recall_limit = (
-                MEM0_RECALL_LIMIT if caller_is_admin else MEM0_RECALL_LIMIT_RESTRICTED
-            )
-            mem0_task: asyncio.Task | None = asyncio.create_task(
-                search_memories_smart(
-                    raw_user_text, mem0_user_id, limit=_recall_limit,
-                    rewrite=mem0_llm_mode, rerank=mem0_llm_mode,
-                )
-            )
-
-            # invest_kb recall — neutral long-form investment knowledge stored
-            # in a separate LanceDB side-store. Gated by a cheap keyword
-            # check so chitchat doesn't spend Haiku budget on rewrite/HyDE/
-            # rerank. Admin-only: the KB itself is neutral but the recall
-            # latency would slow down non-admin restricted calls for no benefit.
-            invest_kb_task: asyncio.Task | None = None
-            if caller_is_admin:
-                from config import (
-                    INVEST_KB_ENABLED, INVEST_KB_LIMIT, INVEST_KB_QUERY_GATE,
-                )
-                if INVEST_KB_ENABLED:
-                    from services.invest_kb import is_investment_query, search_invest_kb
-                    gate = INVEST_KB_QUERY_GATE
-                    if gate == "always" or (gate == "auto" and is_investment_query(raw_user_text)):
-                        invest_kb_task = asyncio.create_task(
-                            search_invest_kb(raw_user_text, limit=INVEST_KB_LIMIT)
-                        )
-
-            # Per-turn literal-keyword recall over this channel's raw JSONL
-            # transcript — rescues exact terms (proper nouns mentioned once)
-            # that Mem0 curation dropped. Admin-only: the transcript has no
-            # author id, so surfacing it to a non-admin could leak admin lines.
-            if caller_is_admin and MEM0_HISTORY_SEARCH_ENABLED:
-                from services.mem0 import history_index
-                history_search_task = asyncio.create_task(
-                    asyncio.to_thread(
-                        history_index.search_history,
-                        raw_user_text, message.channel.id,
-                        MEM0_HISTORY_SEARCH_LIMIT,
-                    )
-                )
-
-            # Phase 5: semantic (vector) recall over the same raw transcript,
-            # run in parallel and merged with the keyword hits below. Self-gated
-            # (default OFF), admin-only (transcript may hold other admins' lines).
-            if caller_is_admin and MEM0_HISTORY_EMBED_ENABLED:
-                from services.mem0 import history_embed
-                history_embed_task = asyncio.create_task(
-                    asyncio.to_thread(
-                        history_embed.search_semantic,
-                        raw_user_text, message.channel.id,
-                        MEM0_HISTORY_EMBED_LIMIT,
-                    )
-                )
-        else:
-            mem0_task = None
-            invest_kb_task = None
+        will_resume = _ctx.will_resume
+        reply_task = _ctx.reply
+        thread_task = _ctx.thread
+        link_task = _ctx.links
+        cross_thread_task = _ctx.cross_thread
+        mem0_task = _ctx.mem0
+        invest_kb_task = _ctx.invest_kb
+        history_search_task = _ctx.history_search
+        history_embed_task = _ctx.history_embed
 
         reply_context, ref_attachments, reply_is_trusted = await reply_task
         all_attachments = list(message.attachments) + ref_attachments
@@ -1748,7 +873,7 @@ async def on_message(message: discord.Message):
             _attach_accepted, _attach_rejected = _classify_attachment_rejections(
                 all_attachments, caller_is_admin=caller_is_admin,
             )
-            await _update_status(
+            await status.update(
                 f"📎 添付ファイルを確認中({_attach_accepted}件受理"
                 + (f"・{len(_attach_rejected)}件不可" if _attach_rejected else "")
                 + ")"
@@ -1761,17 +886,6 @@ async def on_message(message: discord.Message):
         arbitrary_attachments = await download_arbitrary_attachments(
             http_session, all_attachments, caller_is_admin=caller_is_admin,
         )
-        # Music analysis: detect audio among arbitrary attachments and
-        # run Gemini/OpenAI analysis to produce a textual description
-        # that Claude can reason about.
-        music_analysis: str | None = None
-        if arbitrary_attachments and caller_is_admin:
-            try:
-                music_analysis = await analyze_music_attachments(arbitrary_attachments)
-                if music_analysis:
-                    log.info("Music analysis produced %d chars", len(music_analysis))
-            except Exception:
-                log.warning("Music analysis failed", exc_info=True)
 
         resolved_prompt = await link_task
         conv_context = await thread_task
@@ -1846,13 +960,6 @@ async def on_message(message: discord.Message):
                 af_blk = "\n".join(af_lines)
                 parts.append(af_blk)
                 prompt_breakdown["arbitrary_attachments"] = len(af_blk)
-            if music_analysis:
-                ma_blk = (
-                    "<music_analysis note=\"Gemini/OpenAI MIR analysis of attached audio\">"
-                    "\n" + music_analysis + "\n</music_analysis>"
-                )
-                parts.append(ma_blk)
-                prompt_breakdown["music_analysis"] = len(ma_blk)
             untrusted_block = _wrap_user_input(
                 "\n\n".join(parts), is_admin=caller_is_admin,
             )
@@ -1869,16 +976,28 @@ async def on_message(message: discord.Message):
             time_line = PromptBuilder.build_time_line()
             prompt_breakdown["speaker_line"] = len(speaker_line)
             prompt_breakdown["time_line"] = len(time_line)
+            # Sleep-enforcement hook (ADR-0032): haroin's pre-committed 早寝早起き
+            # pact. Non-empty only when HE messages inside the late JST window.
+            sleep_directive = PromptBuilder.build_sleep_directive(
+                sender_id=message.author.id,
+                target_id=SLEEP_ENFORCE_USER_ID,
+                enabled=SLEEP_ENFORCE_ENABLED,
+                start_hour=SLEEP_ENFORCE_START_HOUR,
+                end_hour=SLEEP_ENFORCE_END_HOUR,
+            )
+            sleep_seg = f"{sleep_directive}\n" if sleep_directive else ""
+            if sleep_directive:
+                prompt_breakdown["sleep_directive"] = len(sleep_directive)
             # Reply context stays outside the wrapper regardless of trust level;
             # the tag (<replied_to_trusted_message> vs <replied_to_message>)
             # carries the trust. See the full-path branch for the rationale.
             if reply_context:
-                prompt = f"{speaker_line}\n{time_line}\n{reply_context}{untrusted_block}"
+                prompt = f"{speaker_line}\n{time_line}\n{sleep_seg}{reply_context}{untrusted_block}"
                 prompt_breakdown[
                     "replied_to_trusted" if reply_is_trusted else "reply_context"
                 ] = len(reply_context)
             else:
-                prompt = f"{speaker_line}\n{time_line}\n{untrusted_block}"
+                prompt = f"{speaker_line}\n{time_line}\n{sleep_seg}{untrusted_block}"
         else:
             # ── Full initial prompt ─────────────────────────────────
             parts = []
@@ -1963,13 +1082,6 @@ async def on_message(message: discord.Message):
                 af_blk = "\n".join(af_lines)
                 parts.append(af_blk)
                 prompt_breakdown["arbitrary_attachments"] = len(af_blk)
-            if music_analysis:
-                ma_blk = (
-                    "<music_analysis note=\"Gemini/OpenAI MIR analysis of attached audio\">"
-                    "\n" + music_analysis + "\n</music_analysis>"
-                )
-                parts.append(ma_blk)
-                prompt_breakdown["music_analysis"] = len(ma_blk)
 
             untrusted_block = _wrap_user_input(
                 "\n\n".join(parts), is_admin=caller_is_admin,
@@ -1981,6 +1093,18 @@ async def on_message(message: discord.Message):
             # Time-line hook (full path): same as the lean branch — JST wall-clock
             # injected so the model never has to guess time-of-day.
             time_line = PromptBuilder.build_time_line()
+            # Sleep-enforcement hook (ADR-0032): haroin's pre-committed 早寝早起き
+            # pact. Non-empty only when HE messages inside the late JST window.
+            sleep_directive = PromptBuilder.build_sleep_directive(
+                sender_id=message.author.id,
+                target_id=SLEEP_ENFORCE_USER_ID,
+                enabled=SLEEP_ENFORCE_ENABLED,
+                start_hour=SLEEP_ENFORCE_START_HOUR,
+                end_hour=SLEEP_ENFORCE_END_HOUR,
+            )
+            sleep_seg = f"{sleep_directive}\n" if sleep_directive else ""
+            if sleep_directive:
+                prompt_breakdown["sleep_directive"] = len(sleep_directive)
             # Replied-to context ALWAYS sits outside the caller's input wrapper,
             # regardless of trust level — its tag encodes the trust:
             #   <replied_to_trusted_message>  → bot/admin authored (first-party)
@@ -1990,12 +1114,12 @@ async def on_message(message: discord.Message):
             # must not have that external text land inside their first-party
             # wrapper, where a prompt injection could read as a trusted instruction.
             if reply_context:
-                prompt = f"{header}\n{time_line}\n{reply_context}{untrusted_block}"
+                prompt = f"{header}\n{time_line}\n{sleep_seg}{reply_context}{untrusted_block}"
                 prompt_breakdown[
                     "replied_to_trusted" if reply_is_trusted else "reply_context"
                 ] = len(reply_context)
             else:
-                prompt = f"{header}\n{time_line}\n{untrusted_block}"
+                prompt = f"{header}\n{time_line}\n{sleep_seg}{untrusted_block}"
             prompt_breakdown["trusted_header"] = len(header)
             prompt_breakdown["time_line"] = len(time_line)
             prompt_breakdown["untrusted_wrapper_overhead"] = len(untrusted_block) - sum(len(p) for p in parts) - (len(parts) - 1) * 2
@@ -2004,7 +1128,7 @@ async def on_message(message: discord.Message):
         # Non-admins only see memories from their OWN user_id space.
         if mem0_task is not None:
             job.phase = JobPhase.RECALLING
-            await _update_status("🧠 記憶を検索中")
+            await status.update("🧠 記憶を検索中")
             try:
                 mem_results = await mem0_task
                 mem0_block = format_memories_for_prompt(mem_results)
@@ -2119,7 +1243,7 @@ async def on_message(message: discord.Message):
         # semaphore) so the queued phase shares the same message. Transition
         # into the model phase here.
         job.phase = JobPhase.CALLING_CLAUDE
-        await _update_status("📨 Claudeへ送信中")
+        await status.update("📨 Claudeへ送信中")
 
         log.info("Routing to SDK/CLI (restricted=%s, is_thread=%s)", not admin, is_thread)
 
@@ -2129,7 +1253,6 @@ async def on_message(message: discord.Message):
         # immediately instead of buffering until end_turn. Without this
         # the user would see a 2-3 minute silence while 20 manga pages
         # are read, then one mega-chunk at the very end.
-        _live_sent_any = {"v": False}
         # Incremental in-stream renderer (B, 2026-06-19): render tables / $$..$$
         # / inline $..$ as images IN PLACE the moment their block closes — never
         # show raw markdown that then gets deleted (the old post-stream swap did
@@ -2140,281 +1263,68 @@ async def on_message(message: discord.Message):
         # in order via first_block_span(); the prose before each becomes
         # immutable, the block renders to an image. An OPEN block at the tail is
         # held behind a "📊 描画中" placeholder until it closes. Plain prose
-        # streams as editable live drafts (_draft_msgs); block detection runs on
-        # the RAW text so offsets stay stable, while displayed prose chunks get
+        # streams as editable live drafts; block detection runs on the RAW text
+        # so offsets stay stable, while displayed prose chunks get
         # strip_numeric_inline_code applied (display-only).
-        # LIVE_DRAFT_LIMIT 1880: margin under Discord's 2000 so a fence-balancing
-        # split can grow a chunk without crossing the hard cap.
-        LIVE_DRAFT_LIMIT = 1880
-        STREAM_EDIT_INTERVAL_S = 1.5
-        DISCORD_HARD_CAP = 1990
-        _acc = {"committed": "", "last_edit": 0.0}   # raw prose across all turns
-        _emitted = {"upto": 0}                        # raw offset finalized (immutable)
-        _draft_msgs: list[discord.Message] = []       # editable live-tail prose msgs
-        _placeholder: dict = {"msg": None}            # held open-block placeholder
-        _rendered_images: list[str] = []              # temp image paths to clean up
-        _first_reply = {"done": False}                # first content msg replies to user
-        # _status_consumed is initialised earlier (next to the spinner state) so
-        # the _do_edit/_animate closures never read it unbound. Don't re-create
-        # it here — rebinding would point those closures at a stale dict.
-        _render_lock = asyncio.Lock()
-
-        async def _send_content(text: str | None = None, *, file=None):
-            """Send one content message; the first one replies to the user's.
-
-            The response is ALWAYS a fresh message (reply for the first chunk,
-            channel.send after) — never an in-place edit of the spinner's
-            status_msg. Repurposing status_msg made the spinner vanish the
-            instant generation began and, worse, dropped the reply into the
-            spinner's OLD timeline slot, so a reply sent mid-generation landed
-            above newer messages (haroin, 2026-06-22). The spinner keeps
-            running in its own status_msg and is deleted when the turn ends.
-            """
-            try:
-                if not _first_reply["done"]:
-                    _first_reply["done"] = True
-                    m = await (message.reply(file=file) if file is not None
-                               else message.reply(text))
-                else:
-                    m = await (message.channel.send(file=file) if file is not None
-                               else message.channel.send(text))
-            except discord.errors.HTTPException as exc:
-                log.warning("[rid=%s] content send failed: %s", get_request_id(), exc)
-                return None
-            _live_sent_any["v"] = True
-            return m
-
-        def _disp(text: str) -> str:
-            # Display-only transform: strip numeric inline-code backticks (only
-            # removes chars, never shifts the RAW offsets the streamer tracks)
-            # and hard-cap to stay under Discord's limit.
-            text = strip_numeric_inline_code(text)
-            if len(text) > DISCORD_HARD_CAP:
-                text = text[:DISCORD_HARD_CAP - 1] + "…"
-            return text
-
-        async def _draft_live(prose: str) -> None:
-            """Render trailing prose into the editable draft messages, edits in
-            place and appends as the tail grows. Idempotent (skips unchanged)."""
-            prose = (prose or "").strip("\n")
-            if not prose.strip():
-                return
-            chunks = await asyncio.to_thread(
-                split_message, prose, LIVE_DRAFT_LIMIT, numbered=False,
-            )
-            for i, chunk in enumerate(chunks):
-                disp = _disp(chunk)
-                if not disp.strip():
-                    continue
-                if i < len(_draft_msgs):
-                    existing = _draft_msgs[i]
-                    if getattr(existing, "content", None) == disp:
-                        continue
-                    try:
-                        await existing.edit(content=disp)
-                    except discord.errors.HTTPException:
-                        pass
-                else:
-                    sent = await _send_content(disp)
-                    if sent is None:
-                        return
-                    _draft_msgs.append(sent)
-
-        async def _finalize_text(prose: str) -> None:
-            """Freeze the live-tail prose as immutable messages: render it once
-            more, then stop tracking those messages (no further edits). Reuses
-            the existing draft messages — never re-sends, so no duplication."""
-            await _draft_live(prose)
-            _draft_msgs.clear()
-
-        async def _show_placeholder() -> None:
-            if _placeholder.get("msg") is None:
-                _placeholder["msg"] = await _send_content("📊 描画中…")
-
-        async def _hide_placeholder() -> None:
-            ph = _placeholder.get("msg")
-            if ph is not None:
-                try:
-                    await ph.delete()
-                except discord.errors.HTTPException:
-                    pass
-                _placeholder["msg"] = None
-
-        async def _emit_block(seg) -> None:
-            """Render a Table/Math segment to an image (immutable, in order).
-            Removes the held placeholder first; falls back to text on failure."""
-            img_path = None
-            try:
-                if isinstance(seg, TableSegment):
-                    img_path = await render_table_image(seg.markdown, caption=seg.caption)
-                elif isinstance(seg, MathSegment):
-                    img_path = await render_math_image(seg.latex, display_mode=seg.display_mode)
-            except Exception as exc:
-                log.warning("[rid=%s] block render failed: %s", get_request_id(), exc)
-                img_path = None
-            # Drop the placeholder right before placing the final content so the
-            # image lands at the same position (a placeholder→image swap, never
-            # a raw-markdown→image swap).
-            await _hide_placeholder()
-            if img_path:
-                _rendered_images.append(img_path)
-                f = discord.File(img_path)
-                try:
-                    await _send_content(file=f)
-                finally:
-                    f.close()
-                return
-            # Render failed → raw-text fallback at the same position.
-            if isinstance(seg, TableSegment):
-                fallback = seg.markdown
-            else:
-                fallback = (f"```\n{seg.latex}\n```" if seg.display_mode
-                            else f"`{seg.latex}`")
-            for chunk in await asyncio.to_thread(
-                split_message, fallback, LIVE_DRAFT_LIMIT, numbered=False,
-            ):
-                await _send_content(_disp(chunk))
-
-        async def _render_incremental(full_text: str, *, final: bool = False,
-                                      force: bool = False) -> None:
-            full_text = full_text or ""
-            async with _render_lock:
-                now_mono = time.monotonic()
-                if not final and not force and \
-                        (now_mono - _acc["last_edit"]) < STREAM_EDIT_INTERVAL_S:
-                    return
-                _acc["last_edit"] = now_mono
-
-                if final:
-                    settled_end = len(full_text)
-                    is_open = False
-                else:
-                    settled, _pending, is_open = await asyncio.to_thread(
-                        split_settled, full_text,
-                    )
-                    settled_end = len(settled)
-
-                # Emit every closed block in [_emitted, settled_end] in order.
-                # Bounded loop: each iteration must advance _emitted (end > 0),
-                # but guard against a pathological zero-width span so the event
-                # loop can never spin here.
-                _guard = 0
-                while _guard < 500:
-                    _guard += 1
-                    region = full_text[_emitted["upto"]:settled_end]
-                    span = await asyncio.to_thread(first_block_span, region)
-                    if span is None:
-                        break
-                    start, end, seg = span
-                    if end <= 0:
-                        break  # never advances → bail (defensive)
-                    prose_before = region[:start]
-                    if prose_before.strip():
-                        await _finalize_text(prose_before)
-                    else:
-                        _draft_msgs.clear()  # freeze any stale draft before block
-                    await _emit_block(seg)
-                    _emitted["upto"] += end
-
-                # Trailing region after the last emitted block.
-                if final:
-                    tail = full_text[_emitted["upto"]:]
-                    if tail.strip():
-                        await _finalize_text(tail)
-                    await _hide_placeholder()
-                    return
-                if is_open:
-                    # Prose before the open block (settled) is shown live; the
-                    # open block is held behind the placeholder until it closes.
-                    await _draft_live(full_text[_emitted["upto"]:settled_end])
-                    await _show_placeholder()
-                else:
-                    await _hide_placeholder()
-                    await _draft_live(full_text[_emitted["upto"]:])
-
-        async def _stream_preview(partial_turn_text: str) -> None:
-            # In-progress text of the CURRENT turn appended to everything
-            # already committed. Throttled (the turn-final _incremental_send
-            # forces a render; the post-stream final flush is authoritative).
-            sep = "\n\n" if _acc["committed"] else ""
-            await _render_incremental(
-                _acc["committed"] + sep + (partial_turn_text or ""),
-            )
-
-        async def _incremental_send(text: str) -> None:
-            text = (text or "").strip()
-            if not text:
-                return
-            sep = "\n\n" if _acc["committed"] else ""
-            _acc["committed"] = _acc["committed"] + sep + text
-            log.info(
-                "[rid=%s] live commit: +%d chars committed=%d",
-                get_request_id(), len(text), len(_acc["committed"]),
-            )
-            await _render_incremental(_acc["committed"], force=True)
-
-        # Single edit-overwriting notice for tool invocations. The user
-        # asked that tool scaffolding (Bash command, Read path, Edit
-        # diff, etc.) NOT linger in the channel — only the final
-        # assistant prose should remain. We post one message on the
-        # first tool call, edit it on every subsequent call, and delete
-        # it once the agent loop returns.
-        _tool_notice_state: dict = {"msg": None}
-
-        async def _tool_invocation_send(tool_name: str, tool_input: dict) -> None:
-            job.phase = JobPhase.TOOL_RUNNING
-            try:
-                from services.claude_api.tool_loop import (
-                    _format_tool_invocation_for_display,
-                )
-                payload = _format_tool_invocation_for_display(tool_name, tool_input)
-            except Exception as exc:
-                log.warning("tool notice format failed: %s", exc)
-                return
-            if not payload:
-                return
-            # Discord caps a single message at 2000 chars. The formatter
-            # already truncates oversized fields but the wrapper headers
-            # can push the total just over the line — cap again here.
-            if len(payload) > 2000:
-                payload = payload[:1960] + "\n...(truncated)"
-            existing = _tool_notice_state.get("msg")
-            try:
-                if existing is None:
-                    new_msg = await message.channel.send(payload)
-                    _tool_notice_state["msg"] = new_msg
-                else:
-                    await existing.edit(content=payload)
-            except discord.errors.NotFound:
-                # Earlier notice was already deleted (user / cleanup);
-                # re-post.
-                try:
-                    new_msg = await message.channel.send(payload)
-                    _tool_notice_state["msg"] = new_msg
-                except Exception as exc:
-                    log.warning("tool notice re-post failed: %s", exc)
-            except Exception as exc:
-                log.warning("tool notice send/edit failed: %s", exc)
-
+        # Extracted into bot_ui.LiveRenderer (R3, 2026-07-04); behaviour verbatim.
+        # split_message is injected so the test-suite's patch("bot.split_message")
+        # still swaps the callable the renderer uses.
+        _renderer = bot_ui.LiveRenderer(
+            message, status,
+            track_task=_track_task,
+            job=job,
+            split_message=split_message,
+        )
+        _incremental_send = _renderer.incremental_send
+        _stream_preview = _renderer.stream_preview
+        _tool_invocation_send = _renderer.tool_invocation_send
+        # Scratchpad live preview: wired in ALL tiers (including deliberate,
+        # where prose streaming is off) since scratchpad is an internal
+        # working-memory note, not the final answer — deliberate's
+        # verified-final-text-only policy stays intact.
+        _scratch_stream = _renderer.scratch_stream_preview if SCRATCHPAD_STREAM_ENABLED else None
+        _scratch_finalize = _renderer.scratch_finalize if SCRATCHPAD_STREAM_ENABLED else None
         # Stable speaker label (e.g. "先輩") for resume-history attribution.
         # "" when the sender has no configured label — recorded as no
         # attribution, which keeps the pre-existing behaviour.
         sender_speaker_label = speaker_label(message.author.id)
+        # 熟考 P2: tier 判定（admin のみ）。deliberate では incremental streaming
+        # を切り、planner→executor→verifier→revise の検証済み最終文を一括送信する
+        # （callbacks 非配線 → 既存の非 streaming 送信経路に自然に落ちる）。
+        _tier = None
+        _route_judgment = False
+        if caller_is_admin and DELIB_ROUTER_ENABLED:
+            try:
+                from services.claude_api.router import decide_tier
+                _decision = await decide_tier(
+                    raw_user_text,
+                    has_attachments=bool(
+                        image_paths or text_attachments or arbitrary_attachments
+                    ),
+                )
+                _tier = _decision.tier
+                _route_judgment = _decision.judgment
+            except Exception as exc:
+                log.warning("delib_router failed (chat 扱い): %s", exc)
+        _delib = _tier == "deliberate"
+        if _delib:
+            await status.update("🧠 熟考モード")
         # Start the CLI-style spinner: it owns status_msg until the call returns.
         # SPINNER_MODE picks the renderer: "gif" = animated word-GIF (B), else
         # the 1/sec text shimmer + animated emoji (A+C).
-        _spin["on"] = True
-        _spin["start"] = time.monotonic()
-        _spin_coro = _animate_gif() if SPINNER_MODE == "gif" else _animate()
-        _animator_task = _track_task(_spin_coro, name="status_spinner")
+        status.spin_start(mode=SPINNER_MODE)
         try:
             response_text, session_info, actually_resumed = await call_with_tools(
                 prompt, message.channel.id, sessions,
-                status_callback=_update_status,
-                incremental_text_callback=_incremental_send,
-                text_stream_callback=_stream_preview,
+                status_callback=status.update,
+                incremental_text_callback=None if _delib else _incremental_send,
+                text_stream_callback=None if _delib else _stream_preview,
                 tool_invocation_callback=_tool_invocation_send,
-                progress=_prog,
+                scratch_stream_callback=_scratch_stream,
+                scratch_finalize_callback=_scratch_finalize,
+                progress=status.prog,
+                tier=_tier,
+                route_judgment=_route_judgment,
                 restricted=not admin,
                 raw_user_text=raw_user_text,
                 is_thread=is_thread,
@@ -2431,12 +1341,10 @@ async def on_message(message: discord.Message):
             )
         finally:
             # Spinner hands status_msg back to the normal (throttled) flow.
-            _spin["on"] = False
-            if _animator_task is not None:
-                _animator_task.cancel()
+            status.spin_stop()
 
         job.phase = JobPhase.FINALIZING
-        await _update_status("🪄 整形中")
+        await status.update("🪄 整形中")
 
         if will_resume and not actually_resumed:
             # actually_resumed is the 3rd return value from call_with_tools.
@@ -2454,9 +1362,13 @@ async def on_message(message: discord.Message):
                 get_request_id(),
             )
 
+        # Cancel any pending debounced tool-notice flush before teardown.
+        pending_notice_task = _renderer.tool_notice_task
+        if pending_notice_task and not pending_notice_task.done():
+            pending_notice_task.cancel()
         # Tear down the tool-invocation notice so the channel transcript
         # reads as "user prompt → assistant prose" with no scaffolding.
-        notice_msg = _tool_notice_state.get("msg")
+        notice_msg = _renderer.tool_notice_msg
         if notice_msg is not None:
             try:
                 await notice_msg.delete()
@@ -2464,7 +1376,7 @@ async def on_message(message: discord.Message):
                 pass
             except Exception as exc:
                 log.warning("tool notice delete failed: %s", exc)
-            _tool_notice_state["msg"] = None
+            _renderer.clear_tool_notice_msg()
 
         # NOTE (2026-05-15): the previous "suppress final-send" line was
         #     if _live_sent_any["v"] and not (response_text or "").strip():
@@ -2485,19 +1397,12 @@ async def on_message(message: discord.Message):
         response_text = strip_numeric_inline_code(response_text)
 
         # Cancel any pending delayed status edit before deleting the message.
-        pending_status_task = _pending_status.get("task")
-        if pending_status_task and not pending_status_task.done():
-            pending_status_task.cancel()
-            _pending_status["task"] = None
+        status.cancel_pending()
 
         # Delete status message (success path only — error paths leave a
         # short explanation on it instead). Skip when status_msg was repurposed
         # as the first response message: deleting it would remove the response.
-        if status_msg is not None and not _status_consumed["v"]:
-            try:
-                await status_msg.delete()
-            except discord.errors.HTTPException:
-                pass
+        await status.delete_if_alive()
 
         # Empty-response guard. The model occasionally returns an empty
         # message (refusal stripped to nothing, ThinkingBlock-only output,
@@ -2506,7 +1411,7 @@ async def on_message(message: discord.Message):
         # surfaces as a noisy traceback and gives the user no feedback.
         # Skip Mem0 ingest too — there's no fact to extract from "".
         if not (response_text or "").strip():
-            if _live_sent_any["v"]:
+            if _renderer.live_sent_any:
                 # Incremental streaming already delivered the visible
                 # reply; only the final-message body happened to be empty
                 # (thinking-only end_turn, etc.). Suppress the fallback
@@ -2537,79 +1442,23 @@ async def on_message(message: discord.Message):
                 message.author.id,
             )
 
-        # --- Mem0: batch turn accumulation + per-turn kanae extract ---
+        # --- Mem0: batch turn accumulation (R4: body lives in bot_record) ---
         # Only admin callers may write to long-term memory. Non-admin writes
         # would let an attacker plant persistent "facts" that later sessions
-        # inject into the prompt (C-7 poisoning).
+        # inject into the prompt (C-7 poisoning). Collaborators are passed at
+        # call time so test patches on bot-module attributes keep working.
         if caller_is_admin:
-            from services.mem0.batch import (
-                append_turn as _batch_append_turn,
-                pop_batch as _batch_pop,
-                build_batch_summary as _build_batch_summary,
-                BATCH_SIZE as _BATCH_SIZE,
+            await bot_record.record_turn(
+                message=message,
+                raw_user_text=raw_user_text,
+                response_text=response_text,
+                mem0_user_id=mem0_user_id,
+                conv_context=conv_context,
+                add_memories=add_memories,
+                track_task=_track_task,
+                load_history_channel=load_history_channel,
+                is_force_record_request=_is_force_record_request,
             )
-
-            _turn_count = await asyncio.to_thread(
-                _batch_append_turn, STATE_DIR, message.channel.id,
-                raw_user_text, response_text,
-            )
-
-            _should_flush = (
-                _turn_count >= _BATCH_SIZE
-                or _is_force_record_request(raw_user_text)
-            )
-
-            # P1 (2026-05-12): system-message経路は廃止して複数人混入を遮断。
-            _ctx_for_mem0 = ""
-            if MEM0_LEGACY_CONTEXT:
-                _ctx_for_mem0 = conv_context or ""
-                if not _ctx_for_mem0:
-                    try:
-                        recent = await asyncio.to_thread(load_history_channel, message.channel.id)
-                        if recent:
-                            _ctx_for_mem0 = "\n".join(
-                                f"{m['role']}: {m['content'][:300]}" for m in recent[-10:]
-                            )
-                    except Exception:
-                        pass
-
-            if _should_flush:
-                _batch_turns, _ = await asyncio.to_thread(
-                    _batch_pop, STATE_DIR, message.channel.id,
-                )
-
-                async def _mem0_batch_store():
-                    try:
-                        ctx_hint = _ctx_for_mem0 if MEM0_LEGACY_CONTEXT else ""
-                        summary_text = _build_batch_summary(_batch_turns)
-                        log.info(
-                            "Mem0 batch ingest: uid=%s turns=%d chars=%d",
-                            mem0_user_id, len(_batch_turns), len(summary_text),
-                        )
-                        await add_memories(
-                            user_text=summary_text,
-                            assistant_text="",
-                            user_id=mem0_user_id,
-                            context_hint=ctx_hint,
-                            metadata={
-                                "channel_id": str(message.channel.id),
-                                "channel_name": getattr(message.channel, "name", "DM"),
-                                "batch_size": str(len(_batch_turns)),
-                            },
-                        )
-
-                    except Exception as exc:
-                        log.warning(
-                            "Mem0 batch store failed: %s (user=%s, channel=%s)",
-                            exc, mem0_user_id, message.channel.id,
-                        )
-
-                _track_task(_mem0_batch_store(), name="mem0_batch_store")
-            else:
-                log.debug(
-                    "Mem0 batch: ch=%s turns=%d/%d (waiting)",
-                    message.channel.id, _turn_count, _BATCH_SIZE,
-                )
 
         # Extract file paths from response. For non-admin sessions the
         # model has no file-system tools, so any path it "outputs" can only
@@ -2652,7 +1501,7 @@ async def on_message(message: discord.Message):
             # Keep file paths in the response text (don't strip them)
 
         try:
-            if _live_sent_any["v"]:
+            if _renderer.live_sent_any:
                 # Streaming already rendered prose + table/$$/$ block images in
                 # order via the incremental renderer (_render_incremental) — no
                 # raw markdown was ever shown then deleted. Run the authoritative
@@ -2663,7 +1512,9 @@ async def on_message(message: discord.Message):
                 # attachment extraction); the streamed display already applied
                 # the same numeric-backtick strip per chunk, so the visible
                 # result matches.
-                await _render_incremental(_acc["committed"] or response_text, final=True)
+                await _renderer.render_incremental(
+                    _renderer.committed or response_text, final=True,
+                )
                 if attach_files:
                     _reply_files = attach_files
                     if len(_reply_files) > 10:
@@ -2688,32 +1539,29 @@ async def on_message(message: discord.Message):
                 elif _has_rich:
                     await _send_segmented(message, response_text, attach_files)
                 else:
-                    chunks = split_message(response_text)
-                    for i, chunk in enumerate(chunks):
-                        if i == 0:
-                            if attach_files:
-                                _reply_files = attach_files
-                                if len(_reply_files) > 10:
-                                    log.warning("Capping attachments %d -> 10 for Discord limit", len(_reply_files))
-                                    _reply_files = _reply_files[:10]
-                                await message.reply(chunk, files=_reply_files)
-                            else:
-                                await message.reply(chunk)
+                    _sender = ReplyChainSender(message)
+                    _reply_files = attach_files
+                    if _reply_files and len(_reply_files) > 10:
+                        log.warning("Capping attachments %d -> 10 for Discord limit", len(_reply_files))
+                        _reply_files = _reply_files[:10]
+                    for i, chunk in enumerate(split_message(response_text)):
+                        if i == 0 and _reply_files:
+                            await _sender.send(chunk, files=_reply_files)
                         else:
-                            await message.channel.send(chunk)
+                            await _sender.send(chunk)
         finally:
             for f in attach_files:
                 f.close()
             # Clean up temp images rendered in-stream by _emit_block (the
             # non-streamed _send_segmented path cleans up its own).
-            if _rendered_images:
+            if _renderer.rendered_images:
                 import os as _os
-                for _p in _rendered_images:
+                for _p in _renderer.rendered_images:
                     try:
                         _os.remove(_p)
                     except OSError:
                         pass
-                _rendered_images.clear()
+                _renderer.rendered_images.clear()
 
         # Surface rejected attachments (P2): one short line per file with its
         # reason, instead of silently dropping. non-admin rejections are
@@ -2737,8 +1585,8 @@ async def on_message(message: discord.Message):
         # Leave a short note on the status message instead of deleting it
         # (P0: errors keep a brief explanation; success deletes).
         try:
-            if status_msg is not None:
-                await status_msg.edit(content="⏹️ 中断しました")
+            if status.status_msg is not None:
+                await status.edit_final("⏹️ 中断しました")
             else:
                 await message.channel.send("⏹️ 中断しました")
         except Exception:
@@ -2762,8 +1610,8 @@ async def on_message(message: discord.Message):
             "（再認証後は次のメッセージから自動で復帰します）"
         )
         try:
-            if status_msg is not None:
-                await status_msg.edit(content=oauth_text)
+            if status.status_msg is not None:
+                await status.edit_final(oauth_text)
             else:
                 await message.reply(oauth_text)
         except Exception:
@@ -2780,8 +1628,8 @@ async def on_message(message: discord.Message):
             # Short request id so the admin can grep the logs (P2).
             err_text += f"\n-# req: {rid}"
         try:
-            if status_msg is not None:
-                await status_msg.edit(content=err_text)
+            if status.status_msg is not None:
+                await status.edit_final(err_text)
             else:
                 await message.reply(err_text)
         except Exception:

@@ -281,10 +281,18 @@ class TestGrep:
 
 
 class TestRegistry:
-    def test_admin_advertises_all(self):
+    def test_admin_advertises_all(self, monkeypatch):
+        # 熟考 P3/P4 tools はフラグ単位で広告される。env に依存しないよう固定。
+        import config
+        monkeypatch.setattr(config, "DELIB_SCRATCHPAD_ENABLED", False)
+        monkeypatch.setattr(config, "SECOND_OPINION_ENABLED", False)
         out = builtin_tools_for_api(restricted=False)
         names = {t["name"] for t in out}
-        assert names == set(BUILTIN_TOOLS.keys())
+        flag_gated = {"Scratchpad", "SecondOpinion"}
+        assert names == set(BUILTIN_TOOLS.keys()) - flag_gated
+        monkeypatch.setattr(config, "SECOND_OPINION_ENABLED", True)
+        names_on = {t["name"] for t in builtin_tools_for_api(restricted=False)}
+        assert "SecondOpinion" in names_on
 
     def test_restricted_advertises_none(self):
         assert builtin_tools_for_api(restricted=True) == []

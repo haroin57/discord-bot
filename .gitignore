@@ -7,6 +7,16 @@ __pycache__/
 .omc/
 .env.example
 .coverage
+htmlcov/
+
+# Runtime logs — operational logs contain conversation traces; never commit
+# (P0-a of docs/2026-07-03-grand-refactor-plan.md)
+bot.log
+bot.log.*
+
+# Local tooling artifacts
+.playwright-mcp/
+example-com.png
 
 # Personal docs (private to haroin, not for repo)
 docs/2026-06-08_*

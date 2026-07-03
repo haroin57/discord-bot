@@ -35,7 +35,7 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv("/home/ubuntu/discord-bot/.env")
 
-from services.mem0_service import _get_mem0, _refresh_mem0_client_token  # noqa: E402
+from services.mem0.client import _get_mem0, _refresh_mem0_client_token  # noqa: E402
 from services.oauth_manager import ensure_valid_token  # noqa: E402
 from services.mem0.extract import _classify_for_metadata  # noqa: E402
 

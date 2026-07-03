@@ -1,0 +1,14 @@
+[Unit]
+Description=Kanae Discord Bot — auto-deploy timer (prod, every 5 min)
+Requires=discord-bot-autodeploy.service
+
+[Timer]
+# Fire every 5 minutes at :00 :05 :10 ... :55
+OnCalendar=*:0/5
+# Re-fire immediately if a scheduled activation was missed (e.g. after sleep/resume)
+Persistent=true
+# Randomise start within 30s to avoid thundering-herd with dev timer
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

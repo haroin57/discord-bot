@@ -872,3 +872,39 @@ class TestThinkingOnlyFramePrune:
         msgs = [{"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "a", "content": "ok"}]}]
         assert self._sanitize(msgs) == msgs
+
+
+class TestToolSearchReplay:
+    """Tool Search ブロック（server_tool_use / tool_search_tool_result）が
+    replay パイプライン（sanitize → orphan prune → JSON 往復）で不変なこと。
+    server_tool_use は client 側 tool_result を持たないのが正常であり、
+    orphan 扱いで落とされてはいけない。"""
+
+    def _msgs(self):
+        return [
+            {"role": "user", "content": "探して"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "検索します"},
+                {"type": "server_tool_use", "id": "srvtoolu_1",
+                 "name": "tool_search_tool_regex", "input": {"query": "mem"}},
+                {"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_1",
+                 "content": [{"type": "tool_reference",
+                              "tool_name": "mcp__scholarly__search"}]},
+                {"type": "tool_use", "id": "toolu_1",
+                 "name": "mcp__scholarly__search", "input": {"q": "x"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1",
+                 "content": "results"},
+            ]},
+        ]
+
+    def test_round_trip_preserves_tool_search_blocks(self):
+        import json as _json
+        from services.session import (
+            _prune_orphan_tool_blocks,
+            _sanitize_replay_messages,
+        )
+        msgs = _json.loads(_json.dumps(self._msgs()))  # JSONL 往復相当
+        out = _prune_orphan_tool_blocks(_sanitize_replay_messages(msgs))
+        assert out == self._msgs()

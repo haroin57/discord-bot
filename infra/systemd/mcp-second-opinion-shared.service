@@ -1,0 +1,45 @@
+[Unit]
+# Shared streamable-HTTP second-opinion MCP. One daemon on 127.0.0.1:8014/mcp
+# for all parallel Claude Code sessions instead of a ~106MB stdio child each.
+# (Phase 1.5 stdio dedup.)
+Description=Shared MCP: second-opinion (streamable HTTP, :8014)
+Documentation=file:///home/ubuntu/discord-bot/CLAUDE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/discord-bot
+Environment=HOME=/home/ubuntu
+Environment=MCP_HTTP_PORT=8014
+EnvironmentFile=/home/ubuntu/discord-bot/.env
+ExecStart=/home/ubuntu/discord-bot/.venv/bin/python /home/ubuntu/discord-bot/second_opinion_mcp_server.py
+Restart=always
+RestartSec=5
+# Reap the whole cgroup: second_opinion shells out to agy/codex node CLIs; a
+# control-group kill prevents orphaned child processes on restart.
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-second-opinion-shared
+
+# Resource caps. ~106MB observed as stdio child; short-lived child CLIs push
+# transient peaks, so MemoryMax leaves headroom above the steady state.
+MemoryHigh=200M
+MemoryMax=300M
+LimitNOFILE=4096
+
+# Light hardening (see mem0 unit rationale).
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -344,6 +344,38 @@ def compute_keep_boundary(rows: list[dict], keep_chars: int) -> int:
     return boundary
 
 
+_API_MSG_FALLBACK_CHARS = 2000
+
+
+def _api_messages_text_fallback(row: dict) -> str:
+    """Recover summarizer input from ``api_messages`` when ``content`` is empty.
+
+    ツール中心のターンは display text（content）が空になり得るが、実際の
+    やり取りは api_messages に残っている。text ブロックだけを連結して
+    要約入力の「assistant の行動側」が全損するのを防ぐ（tool_use / tool_result
+    の中身は bulk なので拾わない）。
+    """
+    chunks: list[str] = []
+    for msg in row.get("api_messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+                and block["text"].strip()
+            ):
+                chunks.append(block["text"].strip())
+    text = "\n".join(chunks).strip()
+    if len(text) > _API_MSG_FALLBACK_CHARS:
+        text = text[:_API_MSG_FALLBACK_CHARS] + "\n...(truncated)"
+    return text
+
+
 def _flatten_rows_for_summary(rows: list[dict], max_chars: int) -> str:
     """Render rows as labelled plain text for the summarizer input.
 
@@ -355,7 +387,9 @@ def _flatten_rows_for_summary(rows: list[dict], max_chars: int) -> str:
     for row in rows:
         content = row.get("content")
         if not isinstance(content, str) or not content.strip():
-            continue
+            content = _api_messages_text_fallback(row)
+            if not content:
+                continue
         author = row.get("author")
         if isinstance(author, str) and author:
             label = f"[発言者: {author}]"

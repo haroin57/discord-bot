@@ -66,3 +66,167 @@ sudo systemctl restart discord-bot
 sudo systemctl stop discord-bot
 sudo systemctl start discord-bot
 ```
+
+## Refactor Train Operations (P0.25 — docs/2026-07-03-grand-refactor-plan.md)
+
+リファクタ期間中、state/session/fallback/mem0 を触る PR の本番反映は必ずこの順で行う:
+
+```bash
+# 1. 整合スナップショット（無停止・SQLite .backup API）+ 復元リハーサル
+scripts/snapshot_state.sh                     # → ~/.local/state/discord-bot/refactor-snapshots/<ts>
+scripts/snapshot_state.sh --verify <snap-dir> # integrity_check まで通ることを確認
+
+# 2. 再起動前スモーク（red なら再起動しない）
+scripts/smoke_bot.sh
+
+# 3. 再起動（深夜帯推奨）
+sudo systemctl restart discord-bot
+
+# 4. 観察期間（24〜72h）はエラー率ゲートを回す
+scripts/error_rate_monitor.sh                 # 15分窓 / ERROR>5 で exit 1
+# cron 例: */15 * * * * .../error_rate_monitor.sh || echo "breach $(date)" >> /tmp/bot_alerts.log
+```
+
+### 切り戻し
+
+```bash
+scripts/bot-rollback.sh refactor-base-20260703   # tag へ即時 rollback + restart
+# .state が壊れた場合のみ: bot 停止 → snapshot から .state を戻す → 起動
+```
+
+### Feature flag 規約（リファクタ用）
+
+- 新旧経路を切り替えるフラグは `REFACTOR_<AREA>_NEW=1` 形式の env で `config.py` の
+  `_bool_env()` を使って定義する（例: `REFACTOR_SENDER_NEW`）
+- デフォルトは**旧経路**。新経路が観察期間を通過したらデフォルト反転 → 次のフェーズで旧経路削除
+- フラグの寿命は最長1フェーズ。恒久 config 化しない
+
+## 外形監視（C0b, 2026-07-04）
+
+bot と運命を共にしない監視経路。**bot 完全死でもアラートが届く**。
+
+- probe: Cloudflare Worker `kanae-health-probe`（毎分 cron）→
+  https://health.haroin57.com/health（cloudflared tunnel、/health のみ path 公開）
+- 判定: 3回連続失敗で DOWN、2回連続成功で復帰（フラップ抑制）。HTTP 200 でも
+  body の status≠"ok"（degraded）は失敗扱い
+- 通知: Discord Webhook → haroin のサーバーの監視チャンネル
+  （channel_id 1522684302687469749）。DOWN 継続中は 30分毎に再通知。
+  Webhook URL は Worker の secret `WEBHOOK_URL`（差し替えは
+  `wrangler secret put WEBHOOK_URL`）
+- 状態確認: https://kanae-health-probe.haroin57.workers.dev/ （現在の KV 状態を返す。
+  `service`=サービスUP/DOWN、`resources`=リソース閾値状態）
+- ソース: ~/archives/cloudflare-workers-src-20260704/kanae-health-probe（wrangler プロジェクト）
+
+### ホストリソース閾値監視（C0c, 2026-07-04）
+
+`/health` の `subsystems.system`（psutil 由来）を同じ Worker が毎分チェック。
+サービスの UP/DOWN とは独立した通知経路（🟡 WARN / 🟢 復帰）。
+
+| メトリクス | 警告閾値 | 復帰閾値 |
+|---|---|---|
+| disk_pct | 85% | 80% |
+| mem_pct | 90% | 85% |
+| swap_pct | 50% | 40% |
+| cpu_load_pct（load1/nproc×100） | 150% | 120% |
+
+3回連続超過で WARN、2回連続回復で CLEAR（ヒステリシス幅でフラップ抑制）。
+継続 WARN 中は 30分毎に再通知。
+
+## journal ログ配信（C0d, 2026-07-04）
+
+discord-bot の journal のうち WARNING 以上を haroin サーバーの
+`#bot-journal-log`（channel_id 1522691767001157672）へリアルタイム配信する。
+
+- デーモン: `scripts/journal_forward.py`、systemd unit
+  `discord-bot-journal-forward.service`（`discord-bot.service` と同居、
+  stdlib のみで venv 非依存）
+- **選定基準は journalctl の `-p` ではない**: discord-bot は
+  `services.structured_log.JsonFormatter` で1行1JSONのログを出しており、
+  どのレベルも同じ syslog priority で出力されるため `journalctl -p warning`
+  は常に0件になる（実測: 24hで177件のWARNINGがあるのに `-p warning` は0件）。
+  正しくは journalctl をフィルタなしで流し、各行を JSON パースして
+  `level` フィールドで WARNING/ERROR/CRITICAL を選定する（`select_line()`）
+- バッチ処理: 5秒 or 1800文字でフラッシュ、コードブロックで送信
+- Webhook URL は `/home/ubuntu/discord-bot/.env.journal-forward`
+  （`JOURNAL_WEBHOOK_URL`、mode 600）
+- **既知の落とし穴**: urllib のデフォルト User-Agent は Discord/Cloudflare の
+  WAF に 403 で弾かれる。`User-Agent: kanae-journal-forward/1.0` を明示すること
+- **残項目**: Worker 自体の死の検知は Cloudflare ダッシュボードの Workers アラート
+  設定 or 外部 SaaS（UptimeRobot 等）を追加すること（監視の監視）
+
+## Cloudflareオフロード実装状況（Phase 0-2, 2026-07-04）
+
+計画: docs/2026-07-04-radical-cloudflare-outsourcing-plan.md
+
+### 完了
+- Phase 0 止血: mcp-brave-search / kanae-scheduler / mcp-chrome-devtools
+  (一度も動いたことがないゾンビと判明) 停止、kanae_daily cron 削除、
+  **backup_mem0.sh の毎日 bot 停止 cron 廃止** (R2 restore test 合格後)、
+  MEM0_HISTORY_EMBED_ENABLED=0
+- Phase 1: web_api/vscode_sync/music_analyzer/kanae-daily 削除 (/health は
+  services/health_server.py へ移設)、Chroma ダイエット (41,493→15,021 vectors、
+  recall 回帰 30/30 合格、cgroup 400M)、.state 2.4GB→299MB、死蔵22本掃除
+- Phase 1.5: 共有 MCP 4本 (:8013 mem0 / :8014 second-opinion / :8015 oracle /
+  :8016 x-scraper)。unit は infra/systemd/mcp-*-shared.service
+- Phase 2: kanae-notify Worker (通知プロキシ)、kanae-vi-signal +
+  kanae-intervention Worker (**シャドーモード DRY_RUN=1 で cron 稼働中**)
+
+### vi/intervention の本番切替手順 (シャドー検証後)
+1. 数日間、Worker の KV 記録 (`curl https://kanae-vi-signal.haroin57.workers.dev/` 等)
+   とローカル scheduler の判定を突き合わせる
+2. **vi-signal は切替前に要判断**: Worker 版はデータソースが日経VI→VIX に変わって
+   いる (Workers から indexes.nikkei.co.jp が不安定なため)。閾値 >=30 の意味が
+   変わるので、VIX 用に閾値を再調整するか日経VI の代替取得を実装するまで
+   ローカル版を止めないこと
+3. 切替: 通知先 webhook を作成 → `wrangler secret put WEBHOOK_VI_SIGNAL` (kanae-notify)
+   → 各 Worker に `wrangler secret put NOTIFY_URL` (= https://kanae-notify.haroin57.workers.dev)
+   → DRY_RUN=0 に → ローカル vi-signal / intervention-scheduler unit を disable
+4. ロールバック: DRY_RUN=1 に戻してローカル unit を re-enable
+
+### Browser Rendering 置換 (Phase 2-1) — 完了 (2026-07-04)
+- table/math renderer は Cloudflare Browser Rendering REST (utils/cf_browser.py)。
+  認証は .env の `CF_BROWSER_RENDERING_TOKEN`、アカウント ID は
+  8574821c4ec0b24f61d59c5a15dc31f4 (**古い unit に埋まっていた fcf1f31d... は
+  別アカウントの死んだ ID。使うと 401**)
+- 実測: cache-miss 0.35〜1.61s (旧ローカル cold 9.1s)。KaTeX は jsDelivr CDN
+- **free-tier は req/min が低い**: 描画連発で 429 → 1リトライ後 None (text fallback)。
+  頻発するならリトライのバックオフ延長 or クライアント側キューを検討
+- mermaid (mmdc) は別経路で**ローカル Chromium 依存のまま** — mermaid-cli と
+  ~/.cache/puppeteer は削除禁止。トークン失効時も renderer は None を返して
+  bot はテキスト劣化で継続する (落ちない)
+
+### Workers 一覧 (ソース: ~/archives/cloudflare-workers-src-20260704/)
+| Worker | 役割 | 状態 |
+|---|---|---|
+| kanae-health-probe | 外形監視 (毎分) + リソース閾値 | 本番 |
+| kanae-mcp-brave | brave-search MCP (bot + Claude Code 共用) | 本番 |
+| kanae-notify | 通知プロキシ (X-Notify-Auth) | 本番 (health target のみ配線) |
+| kanae-vi-signal | 日次シグナル (0 9 * * 1-5 UTC) | シャドー |
+| kanae-intervention | 介入スコア (*/30) | シャドー |
+| kanae-egress-poc | egress 検証用 | 削除可 |
+
+## systemd イベント配信（2026-07-04）
+
+systemd のユニットライフサイクル（🟢 Started / ⚪ Stopped / 🔴 Failed・Main process
+exited / 🟠 Scheduled restart）を haroin サーバーの systemctl ログチャンネル
+（channel_id 1522737527771889824）へ配信する。
+
+- デーモン: `scripts/systemd_forward.py`、unit `kanae-systemd-forward.service`
+  （journal_forward.py の姉妹スクリプト。stdlib のみ）
+- ソース: `journalctl -f -o json _PID=1`（システム journal の読み取りに
+  `SupplementaryGroups=systemd-journal` が必要）
+- ノイズ除去: sysstat / apt-daily / session scope 等は BLOCK 正規表現で落とす
+  （実測 2h: 188行 → 36行）
+- Webhook URL: `.env.systemd-forward`（SYSTEMD_WEBHOOK_URL、mode 600）
+
+## 共有MCPログ配信（2026-07-04）
+
+共有 MCP デーモン (mem0/second-opinion/oracle/x-scraper/papermcp) の WARNING 以上と
+traceback を `#bot-mcp-log`（channel_id 1522739163412168885）へ配信する。
+
+- デーモン: `scripts/mcp_log_forward.py`、unit `kanae-mcp-forward.service`
+- ログ形式が unit ごとに違う（タイムスタンプ型 / LEVEL: 接頭辞型 / uvicorn access /
+  supergateway 中継ダンプ）。**supergateway の JSON-RPC 中継行はスキーマ内に
+  "error" 文字列を含むため無条件除外**してからマッチングする
+- traceback はレベル接頭辞が無いので形状（Traceback / File " / XxxError:）で拾う
+- 巨大行は300字で切る。Webhook URL は `.env.mcp-forward`（mode 600）

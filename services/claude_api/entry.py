@@ -28,6 +28,7 @@ import httpx
 
 from config import (
     ADMIN_MAX_TURNS,
+    SUBAGENT_ENABLED,
     ATTACHMENT_DIR,
     CLAUDE_MAX_PARALLEL,
     CLAUDE_MODEL,
@@ -41,8 +42,17 @@ from config import (
     RESTRICTED_CLAUDE_MAX_PARALLEL,
     RESTRICTED_SYSTEM_PROMPT,
     RETRY_AFTER_MAX_S,
+    DELIB_EVIDENCE_ENABLED,
+    DELIB_JUDGE_LITE_ENABLED,
+    DELIB_PLANNER_ENABLED,
+    DELIB_VERIFIER_ENABLED,
+    DELIB_VERIFIER_MODEL,
+    DELIB_VERIFY_MAX_REVISIONS,
+    EVAL_MCP_ENABLED,
+    MAGI_LITE_ENABLED,
     MCP_SERVERS,
     SYSTEM_PROMPT,
+    TOOL_SEARCH_ENABLED,
 )
 from services.claude_api.compaction import (
     compact_channel_history,
@@ -54,7 +64,7 @@ from services.claude_api.compaction import (
 from services.claude_api.microcompact import microcompact_tool_results
 from services.mcp_selector import (
     get_mcp_servers_by_keys,
-    pick_mcp_servers,
+    select_mcp_servers,
 )
 from services.session import (
     SessionInfo,
@@ -77,12 +87,16 @@ from services.claude_api.errors import (
     _is_transient,
     classify_anthropic_error,
     is_non_persistable_reply,
+    is_tool_search_request_error,
 )
-from services.claude_api.mcp_client import (
-    McpPool,
-    mcp_tools_to_anthropic,
-    static_mcp_tools_to_anthropic,
+from services.claude_api.mcp_client import McpPool
+from services.claude_api.tool_catalog import (
+    build_advertised_tools,
+    deferred_catalog_keys,
+    disable_tool_search,
+    is_tool_search_active,
 )
+from services.claude_api.evidence import new_index as new_evidence_index
 from services.claude_api.restricted import (
     RESTRICTED_MAX_TURNS,
     make_can_use_tool,
@@ -93,7 +107,17 @@ from services.claude_api.retry import (
     compute_backoff,
     retry_after_from_headers,
 )
-from services.claude_api.ratelimit import append_rate_limit_details
+from services.claude_api.ratelimit import (
+    append_rate_limit_details,
+    get_state as ratelimit_get_state,
+)
+from services.oauth_manager import (
+    OAuthRefreshFailed,
+    failback_to_primary as oauth_failback_to_primary,
+    failover_to_secondary as oauth_failover_to_secondary,
+    get_active_account as oauth_get_active_account,
+    maybe_restore_primary as oauth_maybe_restore_primary,
+)
 from services.claude_api.session_store import (
     _clear_session_time,
     _get_sticky_model,
@@ -111,7 +135,6 @@ from services.claude_api.tool_loop import (
 )
 from services.claude_api.tools import (
     ToolContext,
-    builtin_tools_for_api,
     execute_builtin_tool,
 )
 
@@ -134,9 +157,50 @@ ALWAYS_ADVERTISED_MCP_KEYS = {
     # pattern for quotes, and feeds the VI strategy signal checks. Static
     # schemas + lazy spawn, same as the rest.
     "nikkei-indexes", "yfj-quote", "polymarket",
+    # みんかぶFX オーダーブック (注文/建玉の価格帯別分布)。2026-06-24。
+    "minkabu-fx",
 }
 
 _SNAPSHOT_MAX_AGE_S = int(os.environ.get("SNAPSHOT_MAX_AGE_S", "900"))
+
+
+def _quota_exhausted_signal() -> bool:
+    """subscriber 枠が構造的に尽きているか（OAuth failover の即時発動条件）。
+
+    5h/7d バケットの rejected / utilization>=1.0 は「reset まで数時間、
+    秒単位 backoff では絶対に回復しない」ことを意味する。確率的 throttle
+    由来の一時的 429 はここに該当せず、従来 backoff に任せる。
+    """
+    st = ratelimit_get_state()
+    return (
+        st.five_h_status == "rejected"
+        or st.seven_d_status == "rejected"
+        or st.five_h_utilization >= 1.0
+        or st.seven_d_utilization >= 1.0
+    )
+
+
+def _failover_retry_at(exc: BaseException) -> float:
+    """quota 起因 failover の primary 自動復帰時刻を推定する。
+
+    retry-after ヘッダと 5h バケットの reset 時刻の遅い方。どちらも
+    取れなければ 30 分後（保守的既定）。
+    """
+    now = time.time()
+    known: list[float] = []
+    try:
+        ra = retry_after_from_headers(_anthropic_error_headers(exc))
+        if ra:
+            known.append(now + min(float(ra), 6 * 3600.0))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        st = ratelimit_get_state()
+        if st.five_h_reset > now:
+            known.append(float(st.five_h_reset))
+    except Exception:  # noqa: BLE001
+        pass
+    return max(known) if known else now + 1800.0
 
 
 def _anthropic_error_headers(exc: BaseException):
@@ -242,6 +306,28 @@ def _resolve_session(
 from services.claude_api.client_factory import make_api_client as _make_api_client
 
 
+async def _transient_backoff(
+    attempt: int,
+    backoff: float,
+    *,
+    status_callback,
+    label: str = "再試行中",
+) -> None:
+    """User-visible countdown + sleep for one transient-retry arm (P3-a).
+
+    All three except arms of the attempt loop (AnthropicError / bare
+    httpx.RequestError / TaskGroup-wrapped ExceptionGroup) ended in this
+    exact status+sleep dance; the backoff *value* stays caller-computed
+    because the Anthropic arm merges a server retry-after into it.
+    """
+    await _safe_status(
+        status_callback,
+        f"🔄 {label} ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})"
+        f"、次は約{int(round(backoff))}秒後",
+    )
+    await asyncio.sleep(backoff)
+
+
 async def call_with_tools(
     prompt: str,
     channel_id: int,
@@ -250,6 +336,8 @@ async def call_with_tools(
     incremental_text_callback=None,
     text_stream_callback=None,
     tool_invocation_callback=None,
+    scratch_stream_callback=None,
+    scratch_finalize_callback=None,
     progress: "dict | None" = None,
     restricted: bool = False,
     raw_user_text: str = "",
@@ -259,6 +347,8 @@ async def call_with_tools(
     user_id: "int | None" = None,
     forced_model_override: "str | None" = None,
     forced_effort_override: "str | None" = None,
+    tier: "str | None" = None,        # 熟考P2: "chat" | "deliberate" | None(=従来)
+    route_judgment: bool = False,      # 熟考P5: 判断系の問い（MAGI-lite トリガー）
 ) -> tuple[str, SessionInfo | None, bool]:
     """Direct-API replacement for services/claude_sdk.py:call_with_tools.
 
@@ -278,6 +368,9 @@ async def call_with_tools(
     history-based so the gate is irrelevant.
     """
     sema = restricted_claude_semaphore if restricted else claude_semaphore
+    if restricted:
+        tier = None  # 二重ゲート: restricted に熟考パイプラインは適用しない
+        route_judgment = False
     async with sema:
         # 1. Parse images out of the prompt (only when caller signaled them
         #    + when admin / restricted-with-image-handling actually wants
@@ -292,8 +385,13 @@ async def call_with_tools(
             chosen_mcp_cfg: dict[str, dict] = {}
             always_advertised_mcp_keys: set[str] = set()
         else:
-            chosen_mcp_cfg = pick_mcp_servers(raw_user_text, user_id=user_id)
+            chosen_mcp_cfg = await select_mcp_servers(raw_user_text, user_id=user_id)
             always_advertised_mcp_keys = set(ALWAYS_ADVERTISED_MCP_KEYS)
+            if EVAL_MCP_ENABLED and "evalsearch" in MCP_SERVERS:
+                # 評価ハーネス: 凍結コーパス検索を eager spawn 経路で広告する
+                # （静的 schema が無いので live handle 経由でしか tools に載らない）。
+                chosen_mcp_cfg = dict(chosen_mcp_cfg)
+                chosen_mcp_cfg["evalsearch"] = MCP_SERVERS["evalsearch"]
         chosen_mcp_keys = set(chosen_mcp_cfg.keys())
 
         # 3. Session resume (admin only — restricted is stateless).
@@ -394,28 +492,37 @@ async def call_with_tools(
             system_prompt = RESTRICTED_SYSTEM_PROMPT
             cwd = ATTACHMENT_DIR
             max_turns = RESTRICTED_MAX_TURNS
-            advertised_tools: list[dict] = []  # restricted advertises none
         else:
             system_prompt = SYSTEM_PROMPT
             cwd = CWD
             max_turns = ADMIN_MAX_TURNS
-            # admin path advertises builtin tools on every request. The
-            # earlier `_needs_builtin_tools` keyword gate misclassified
-            # natural follow-ups ("次のページ読んで", "20〜40読んで") as
-            # pure chat and broke ongoing tool workflows. The ~686-token
-            # schema lands in prompt cache from the second turn on, so the
-            # warm-time cost is ~68 tokens — not worth the UX hit.
-            advertised_tools = builtin_tools_for_api(restricted=False)
 
         can_use_tool = make_can_use_tool(restricted=restricted)
         tool_ctx = ToolContext(cwd=cwd, restricted=restricted, channel_id=channel_id)
+
+        # 熟考 P1: tool 呼び出し台帳（観測層）。restricted には作らない。
+        evidence = (
+            new_evidence_index(channel_id)
+            if (DELIB_EVIDENCE_ENABLED and not restricted) else None
+        )
 
         async with AsyncExitStack() as stack:
             # 6. MCP pool: keyword-matched servers are spawned eagerly, the
             # rest are spawned lazily the moment kanae calls one of their
             # tools. restricted users get an empty config so auto-spawn
             # can't surface tools they shouldn't see.
-            pool_available = {} if restricted else MCP_SERVERS
+            # Lazy spawn の対象は「広告カタログに載り得るサーバー」に限定する
+            # （defer 広告の導入で発見可能性が上がるため、permission-gated
+            # サーバーをツール名の幻覚/発見経由で spawn できる既存ギャップも
+            # ここで閉じる）。
+            hot_mcp_keys = set(chosen_mcp_keys) | set(always_advertised_mcp_keys)
+            if restricted:
+                pool_available: dict[str, dict] = {}
+            else:
+                _spawnable = deferred_catalog_keys(user_id) | hot_mcp_keys
+                pool_available = {
+                    k: v for k, v in MCP_SERVERS.items() if k in _spawnable
+                }
             pool = McpPool(stack=stack, available_configs=pool_available)
             if chosen_mcp_cfg:
                 # Always-advertised MCPs (Mem0) are spawned lazily on first
@@ -427,19 +534,125 @@ async def call_with_tools(
                 ]
                 if eager_keys:
                     await pool.spawn_eager(eager_keys)
-            advertised_tools = (
-                advertised_tools
-                + static_mcp_tools_to_anthropic(always_advertised_mcp_keys)
-                + mcp_tools_to_anthropic(pool.handles)
-            )
+
+            # Agent tool（メインパイプライン subagent。CLI 純正と足並み）。admin のみ。
+            _agent_schema: dict | None = None
+            if SUBAGENT_ENABLED and not restricted:
+                from services.claude_api.agent_tool import agent_tool_schema
+                _agent_schema = agent_tool_schema()
+
+            def _build_tools() -> list[dict]:
+                """広告 tools 配列を（再）構築する。
+
+                Tool Search の 400 auto-off 後にリトライ内で従来構成へ
+                組み直せるよう closure 化してある。フラグ OFF 時は従来実装と
+                byte-identical（tool_catalog.build_advertised_tools 参照）。
+                """
+                return build_advertised_tools(
+                    restricted=restricted,
+                    live_handles=pool.handles,
+                    always_keys=set(always_advertised_mcp_keys),
+                    hot_keys=hot_mcp_keys,
+                    user_id=user_id,
+                    tool_search_enabled=(
+                        TOOL_SEARCH_ENABLED and is_tool_search_active()
+                    ),
+                    agent_tool_schema=_agent_schema,
+                )
+
+            advertised_tools = _build_tools()
+
+            # Agent tool（メインパイプライン subagent）の実行は api_client と
+            # effective_model に依存するが、どちらも _execute_tool が定義された後で
+            # 確定する。closure からは可変 dict 経由で参照する。
+            # parent_watchdog は subagent 実行中に親 StallWatchdog にハートビートを
+            # 送るための参照。これが無いと subagent 実行中の沈黙で親が idle_timeout
+            # で cancel され「subagent 完了前に親が exit」が起きる（haroin 2026-06-25）。
+            _agent_dispatch: dict = {"api_client": None, "model": None, "watchdog": None}
 
             async def _execute_tool(name: str, args: dict) -> str:
+                if name == "Agent" and SUBAGENT_ENABLED and not restricted:
+                    if _agent_dispatch["api_client"] is None:
+                        return "<tool_use_error>Agent: dispatcher not initialised</tool_use_error>"
+                    from services.claude_api.agent_tool import (
+                        AgentToolCtx,
+                        execute_agent_tool,
+                    )
+                    return await execute_agent_tool(
+                        args,
+                        AgentToolCtx(
+                            api_client=_agent_dispatch["api_client"],
+                            pool=pool,
+                            tools_for_api=advertised_tools,
+                            channel_id=channel_id,
+                            parent_model=_agent_dispatch["model"] or "",
+                            depth=0,
+                            parent_watchdog=_agent_dispatch["watchdog"],
+                        ),
+                    )
                 if name.startswith("mcp__"):
                     return await pool.call_tool(name, args)
                 return await execute_builtin_tool(name, args, tool_ctx)
 
             # 7. API client
-            api_client = await _make_api_client(restricted)
+            # OAuth 二重アカウント: quota 起因 failover の復帰期限チェック
+            # （非該当時は timestamp 比較のみの軽量パス）。
+            if not restricted:
+                try:
+                    if await oauth_maybe_restore_primary():
+                        await _safe_status(
+                            status_callback, "✅ メインアカウントに復帰",
+                        )
+                except Exception as exc:
+                    log.warning("oauth failback check failed: %s", exc)
+
+            async def _try_failover(reason: str, retry_at: "float | None") -> bool:
+                """アカウント切替（双方向）+ client 再構築。
+
+                - active=primary で死亡 → failover へ（従来動作）
+                - active=failover で死亡 → primary への強制切り戻しを試す
+                  （2026-07-03 障害: failover の週次 quota 枯渇時に primary が
+                  /login で復活済みでも全滅エラーになっていた片方向の穴）
+                成功時は api_client と _agent_dispatch の両方を差し替える
+                （既存 auth retry が dispatch を更新していなかったのは
+                latent bug — こちらでは必ず両方更新する）。
+                """
+                nonlocal api_client
+                if restricted:
+                    return False
+                if oauth_get_active_account() == "failover":
+                    switched = await oauth_failback_to_primary(reason)
+                    status_msg = "✅ サブ枠が使えないためメインアカウントに復帰"
+                else:
+                    switched = oauth_failover_to_secondary(
+                        reason, primary_retry_at=retry_at,
+                    )
+                    status_msg = "⚠️ メイン枠が使えないためサブアカウントに切替"
+                if not switched:
+                    return False
+                try:
+                    api_client = await _make_api_client(restricted)
+                except Exception as exc:
+                    log.error("failover client rebuild failed: %s", exc)
+                    return False
+                _agent_dispatch["api_client"] = api_client
+                await _safe_status(status_callback, status_msg)
+                return True
+
+            try:
+                api_client = await _make_api_client(restricted)
+            except OAuthRefreshFailed as exc:
+                # primary の OAuth が恒久死（invalid_grant 等）— failover へ。
+                log.error("primary OAuth dead at client build: %s", exc)
+                if not restricted and oauth_failover_to_secondary("auth"):
+                    api_client = await _make_api_client(restricted)
+                    await _safe_status(
+                        status_callback,
+                        "⚠️ メイン認証が失効したためサブアカウントに切替",
+                    )
+                else:
+                    return _error_message("auth"), None, resumable
+            _agent_dispatch["api_client"] = api_client
 
             # 7b. History compaction (ADR-0010 phase 3): when the replay
             # window has outgrown the Fable-safe budget, fold the older
@@ -540,12 +753,41 @@ async def call_with_tools(
                 )
                 return reloaded
 
+            # --- 熟考 P3: planner（deliberate tier のみ、retry を跨いで1回） ---
+            # tools 無しの計画パス。trivial 判定で chat へ自己降格（過剰装備抑止）。
+            # 失敗は plan 無しで続行（fail-open）。system prompt は不変。
+            _plan_block: str | None = None
+            if DELIB_PLANNER_ENABLED and tier == "deliberate":
+                from config import DELIB_PLANNER_MODEL, DELIB_SCRATCHPAD_ENABLED
+                from services.claude_api.planner import (
+                    generate_plan,
+                    render_plan_block,
+                )
+                await _safe_status(status_callback, "📋 計画中")
+                _plan = await generate_plan(
+                    user_request=raw_user_text or prompt,
+                    model=(DELIB_PLANNER_MODEL or forced_model or MODEL),
+                    channel_id=channel_id,
+                )
+                if _plan is not None and _plan.trivial:
+                    log.info(
+                        "[ch=%d] delib_planner self-deescalation → chat tier",
+                        channel_id,
+                    )
+                    tier = "chat"
+                elif _plan is not None:
+                    _plan_block = render_plan_block(
+                        _plan,
+                        scratchpad_available=DELIB_SCRATCHPAD_ENABLED,
+                    )
+
             for attempt in range(TRANSIENT_MAX_ATTEMPTS):
                 if attempt > 0 and not check_and_record_retry_budget(channel_id):
                     log.warning("Retry budget exhausted for ch=%d", channel_id)
                     return _error_message("unknown"), None, False
 
                 async with StallWatchdog(channel_id, status_callback) as watchdog:
+                    _agent_dispatch["watchdog"] = watchdog
                     try:
                         # Seed each attempt with a fresh copy of the prior
                         # transcript so a partial / failed retry does not
@@ -556,6 +798,12 @@ async def call_with_tools(
                         user_content_for_loop = (
                             prompt if not image_blocks else user_content
                         )
+                        # 熟考 P3: 計画ブロックを user ターン先頭へ（指針であり
+                        # 命令ではない。system prompt は cache 保護のため不変）。
+                        if _plan_block:
+                            user_content_for_loop = _prepend_context_snapshot(
+                                user_content_for_loop, _plan_block,
+                            )
                         # Replay the latest Mem0 snapshot only when the
                         # current prompt does not already carry one (short
                         # follow-up after a MEM0_MIN_QUERY_LENGTH-gated
@@ -604,6 +852,8 @@ async def call_with_tools(
                             _get_sticky_model(channel_id, user_id) if not restricted else None
                         )
                         effective_model = forced_model or sticky_model or MODEL
+                        # Agent tool subagent はこの effective_model を継承する。
+                        _agent_dispatch["model"] = effective_model
                         result = await run_agent_loop(
                             user_content_for_loop,
                             channel_id,
@@ -616,12 +866,18 @@ async def call_with_tools(
                             incremental_text_callback=incremental_text_callback,
                             text_stream_callback=text_stream_callback,
                             tool_invocation_callback=tool_invocation_callback,
+                            scratch_stream_callback=scratch_stream_callback,
+                            scratch_finalize_callback=scratch_finalize_callback,
                             progress=progress,
                             max_turns=max_turns,
                             stall_watchdog=watchdog,
                             api_client=api_client,
                             model=effective_model,
                             extra_betas=MODEL_BETAS,
+                            tool_search_enabled=(
+                                TOOL_SEARCH_ENABLED and is_tool_search_active()
+                            ),
+                            evidence=evidence,
                             active_mcp_keys=sorted(
                                 chosen_mcp_keys | always_advertised_mcp_keys
                             ),
@@ -716,6 +972,25 @@ async def call_with_tools(
                                 )
                                 continue
                             return _classified_error_message(category, exc), None, resumable
+                        if (
+                            category == "invalid_request"
+                            and TOOL_SEARCH_ENABLED
+                            and is_tool_search_active()
+                            and is_tool_search_request_error(exc)
+                        ):
+                            # Tool Search / defer_loading をこの API 経路
+                            # (subscriber OAuth 等) が受け付けなかった。プロセス
+                            # 寿命で auto-off し、従来の tools 構成に組み直して
+                            # 同一リトライ予算内で即座に degrade する。
+                            # invalid_request は通常 permanent 扱いで即 return
+                            # されるため、この分岐がないと復帰できない。
+                            disable_tool_search(f"API rejected tool search: {exc}")
+                            advertised_tools = _build_tools()
+                            await _safe_status(
+                                status_callback,
+                                "⚠️ ツール検索が使えないため従来モードに切替",
+                            )
+                            continue
                         if category == "auth" and attempt == 0:
                             # OAuth race: a sibling process (typically the
                             # mem0-mcp MCP server) refreshed the token while
@@ -728,6 +1003,7 @@ async def call_with_tools(
                             from services.oauth_manager import init as _oauth_reload
                             _oauth_reload()
                             api_client = await _make_api_client(restricted)
+                            _agent_dispatch["api_client"] = api_client
                             log.info(
                                 "[ch=%d] auth retry after token reload (attempt %d→%d)",
                                 channel_id, attempt + 1, attempt + 2,
@@ -738,9 +1014,12 @@ async def call_with_tools(
                             )
                             continue
                         if category in ("auth", "max_turns"):
-                            # auth (2nd time): genuine credential problem —
-                            # reloading didn't help, so the token is truly
-                            # invalid. Surface to user.
+                            # auth (2nd time): reload でも直らない = 本当に
+                            # credential が死んでいる → failover アカウントを試す。
+                            if category == "auth" and await _try_failover(
+                                "auth", None,
+                            ):
+                                continue
                             # max_turns: tool-loop hit the per-request turn
                             # cap — session history is still valid.
                             return _classified_error_message(category, exc), None, resumable
@@ -753,6 +1032,11 @@ async def call_with_tools(
                                     "[ch=%d] billing/credit limit hit — not retrying",
                                     channel_id,
                                 )
+                                # subscriber quota の credit 系 429 — failover へ
+                                if await _try_failover(
+                                    "quota", _failover_retry_at(exc),
+                                ):
+                                    continue
                             return _classified_error_message(category, exc), None, resumable
                         # Transient (overloaded / rate_limit): the loop runs
                         # `range(TRANSIENT_MAX_ATTEMPTS)`, so the final attempt
@@ -762,10 +1046,24 @@ async def call_with_tools(
                         # the function tail returns the "unknown" fallback
                         # ("内部エラー"), masking an overloaded as a generic
                         # failure (ADR-0006).
+                        # OAuth 二重アカウント: subscriber 枠が構造的に尽きている
+                        # シグナル（5h/7d バケットが rejected / utilization>=1.0）
+                        # なら、backoff は数学的に全滅確定 — 即 failover。
+                        if category == "rate_limit" and _quota_exhausted_signal():
+                            if await _try_failover(
+                                "quota", _failover_retry_at(exc),
+                            ):
+                                continue
                         if attempt >= TRANSIENT_MAX_ATTEMPTS - 1:
-                            # Transient errors exhausted retries — keep the
-                            # session alive so the next user message can
-                            # resume without losing context.
+                            # Transient errors exhausted retries — 最後に一度
+                            # だけ failover を試す（曖昧な 429 バーストが同一
+                            # アカウントで解けなかったケースの受け皿）。
+                            if category == "rate_limit" and await _try_failover(
+                                "quota", _failover_retry_at(exc),
+                            ):
+                                continue
+                            # keep the session alive so the next user message
+                            # can resume without losing context.
                             return _classified_error_message(category, exc), None, resumable
                         # Overload escape hatch (audit #6, CLI
                         # tengu_api_opus_fallback): when 529s have nearly
@@ -800,14 +1098,17 @@ async def call_with_tools(
                                     " — giving up early",
                                     channel_id, retry_after, RETRY_AFTER_MAX_S,
                                 )
+                                # チャット応答としては待てない長さ = 実質 quota
+                                # 切れ。give-up の前に failover を試す。
+                                if category == "rate_limit" and await _try_failover(
+                                    "quota", time.time() + retry_after,
+                                ):
+                                    continue
                                 return _classified_error_message(category, exc), None, resumable
                             backoff = max(backoff, retry_after)
-                        await _safe_status(
-                            status_callback,
-                            f"🔄 再試行中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})"
-                            f"、次は約{int(round(backoff))}秒後",
+                        await _transient_backoff(
+                            attempt, backoff, status_callback=status_callback,
                         )
-                        await asyncio.sleep(backoff)
                     except httpx.RequestError as exc:
                         # SSE streaming 中の HTTP/2 接続切断 (GOAWAY /
                         # RemoteProtocolError / ReadError 等) が、MCP の
@@ -826,13 +1127,10 @@ async def call_with_tools(
                         )
                         if attempt >= TRANSIENT_MAX_ATTEMPTS - 1:
                             return _error_message("overloaded"), None, resumable
-                        backoff = compute_backoff(attempt)
-                        await _safe_status(
-                            status_callback,
-                            f"🔄 接続再試行中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})"
-                            f"、次は約{int(round(backoff))}秒後",
+                        await _transient_backoff(
+                            attempt, compute_backoff(attempt),
+                            status_callback=status_callback, label="接続再試行中",
                         )
-                        await asyncio.sleep(backoff)
                     except BaseExceptionGroup as eg:
                         # SSE streaming中に httpx 層で接続が切れると
                         # (e.g. HTTP/2 GOAWAY mid-stream), anthropic SDK は
@@ -855,13 +1153,184 @@ async def call_with_tools(
                             raise rest
                         if attempt >= TRANSIENT_MAX_ATTEMPTS - 1:
                             return _error_message("overloaded"), None, resumable
-                        backoff = compute_backoff(attempt)
-                        await _safe_status(
-                            status_callback,
-                            f"🔄 接続再試行中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})"
-                            f"、次は約{int(round(backoff))}秒後",
+                        await _transient_backoff(
+                            attempt, compute_backoff(attempt),
+                            status_callback=status_callback, label="接続再試行中",
                         )
-                        await asyncio.sleep(backoff)
+
+            # --- 熟考 P2/P5: deliberate tier の 検証・修正パイプライン --------
+            # AsyncExitStack 内（revise の _execute_tool が pool を掴むため）。
+            # クリーン終了（synthetic_session_id あり・非 sentinel 応答）のみ対象。
+            if (
+                result is not None
+                and response_text is not None
+                and not restricted
+                and tier == "deliberate"
+                and result.synthetic_session_id is not None
+                and not is_non_persistable_reply(response_text)
+            ):
+                _revise_kw = dict(
+                    history=history_for_loop,
+                    system_prompt=system_prompt,
+                    tools_for_api=advertised_tools,
+                    can_use_tool=can_use_tool,
+                    execute_tool=_execute_tool,
+                    status_callback=status_callback,
+                    tool_invocation_callback=tool_invocation_callback,
+                    max_turns=max_turns,
+                    api_client=api_client,
+                    model=effective_model,
+                    extra_betas=MODEL_BETAS,
+                    active_mcp_keys=result.active_mcp_keys,
+                    prior_turns=result.prior_len or 0,
+                    tool_search_enabled=(
+                        TOOL_SEARCH_ENABLED and is_tool_search_active()
+                    ),
+                    evidence=evidence,
+                    output_config_override=(
+                        {"effort": forced_effort_override}
+                        if forced_effort_override else None
+                    ),
+                )
+
+                async def _run_revision(revise_prompt: str):
+                    """verdict/lens ガイダンスを user ターンとして注入し 1 周。
+
+                    履歴は同一 history_for_loop 継続なので、修正往復は step 10 の
+                    スライス（prior_len 起点）でそのまま JSONL に永続化される。
+                    """
+                    async with StallWatchdog(
+                        channel_id, None, idle_timeout_s=600,
+                    ) as _vwd:
+                        return await run_agent_loop(
+                            revise_prompt, channel_id,
+                            stall_watchdog=_vwd, **_revise_kw,
+                        )
+
+                # P5: MAGI-lite（判断系の問いのみ）— 3レンズ独立見解 + 合意度を
+                # ガイダンスとして 1 回だけ反映する。失敗は無視（fail-open）。
+                if MAGI_LITE_ENABLED and route_judgment and evidence is not None:
+                    try:
+                        from services.claude_api.magi_lite import (
+                            build_lens_revise_prompt,
+                            run_lenses,
+                        )
+                        await _safe_status(status_callback, "🧠 多視点で再考中")
+                        magi = await run_lenses(
+                            question=raw_user_text or prompt,
+                            evidence_digest=evidence.digest(),
+                            channel_id=channel_id,
+                            model=effective_model,
+                        )
+                        if magi is not None and not magi.degraded:
+                            r2 = await _run_revision(
+                                build_lens_revise_prompt(magi))
+                            if (
+                                r2.synthetic_session_id
+                                and r2.text.strip()
+                                and not is_non_persistable_reply(r2.text)
+                            ):
+                                result = r2
+                                response_text = r2.text
+                                _revise_kw["active_mcp_keys"] = r2.active_mcp_keys
+                    except Exception as exc:
+                        log.warning(
+                            "[ch=%d] magi_lite failed (non-fatal): %s",
+                            channel_id, exc,
+                        )
+
+                # P2: verifier → revise（最大 DELIB_VERIFY_MAX_REVISIONS 回）→
+                # まだ fail なら caveat を付けて正直に degrade。
+                if DELIB_VERIFIER_ENABLED:
+                    from services.claude_api.verifier import (
+                        build_caveat,
+                        build_revise_prompt,
+                        verify_draft,
+                    )
+                    _v_model = DELIB_VERIFIER_MODEL or effective_model
+                    _revisions = 0
+                    while True:
+                        await _safe_status(status_callback, "🔎 回答を検証中")
+                        verdict = await verify_draft(
+                            user_request=raw_user_text or prompt,
+                            draft=response_text,
+                            evidence_digest=(
+                                evidence.digest() if evidence is not None
+                                else "(no tool calls)"
+                            ),
+                            evidence_root=(
+                                evidence.request_dir()
+                                if evidence is not None else None
+                            ),
+                            api_client=api_client,
+                            channel_id=channel_id,
+                            model=_v_model,
+                            extra_betas=MODEL_BETAS,
+                        )
+                        if verdict.ok or verdict.degraded:
+                            break
+                        if _revisions >= DELIB_VERIFY_MAX_REVISIONS:
+                            log.warning(
+                                "[ch=%d] delib_verify still failing after %d "
+                                "revision(s) → caveat degrade",
+                                channel_id, _revisions,
+                            )
+                            response_text = (
+                                response_text + "\n\n" + build_caveat(verdict)
+                            )
+                            break
+                        _revisions += 1
+                        await _safe_status(status_callback, "✍️ 指摘を反映して修正中")
+                        try:
+                            r2 = await _run_revision(build_revise_prompt(verdict))
+                        except Exception as exc:
+                            log.warning(
+                                "[ch=%d] delib revise failed (keep draft): %s",
+                                channel_id, exc,
+                            )
+                            break
+                        if (
+                            r2.synthetic_session_id
+                            and r2.text.strip()
+                            and not is_non_persistable_reply(r2.text)
+                        ):
+                            result = r2
+                            response_text = r2.text
+                        else:
+                            break
+
+            # judge-lite（chat tier の軽量ゲート）: tool を使った長文回答のみ。
+            # streaming 済み本文は書き換えられないので caveat 追送だけ行う。
+            if (
+                result is not None
+                and response_text is not None
+                and DELIB_JUDGE_LITE_ENABLED
+                and not is_non_persistable_reply(response_text)
+            ):
+                from services.claude_api.verifier import (
+                    build_caveat as _jl_caveat,
+                    judge_lite,
+                    should_run_judge,
+                )
+                if should_run_judge(
+                    response_text, evidence, tier=tier, restricted=restricted,
+                ):
+                    _jl = await judge_lite(
+                        user_request=raw_user_text or prompt,
+                        draft=response_text,
+                        evidence_digest=(
+                            evidence.digest() if evidence is not None else ""
+                        ),
+                        channel_id=channel_id,
+                    )
+                    if not _jl.ok and _jl.issues:
+                        _cv = _jl_caveat(_jl)
+                        if incremental_text_callback is not None:
+                            try:
+                                await incremental_text_callback(_cv)
+                            except Exception:  # noqa: BLE001
+                                pass
+                        response_text = response_text + "\n\n" + _cv
 
         # 9. Wrap into SessionInfo
         if response_text is None or result is None:

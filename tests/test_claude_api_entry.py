@@ -201,57 +201,6 @@ class TestResolveSession:
         ss._clear_session_time(1)
 
 
-# ---------------------------------------------------------------------------
-# Dispatcher (claude_sdk.py wrapper)
-# ---------------------------------------------------------------------------
-class TestDispatcher:
-    def test_default_backend_is_api(self, monkeypatch):
-        # PR8: default flipped from "sdk" to "api". Rollback path is env var.
-        monkeypatch.delenv("CLAUDE_BACKEND", raising=False)
-        from services import claude_sdk
-        assert claude_sdk._backend() == "api"
-
-    def test_explicit_sdk_backend_works(self, monkeypatch):
-        monkeypatch.setenv("CLAUDE_BACKEND", "sdk")
-        from services import claude_sdk
-        assert claude_sdk._backend() == "sdk"
-
-    def test_api_backend_routes_is_session_fresh(self, monkeypatch):
-        monkeypatch.setenv("CLAUDE_BACKEND", "api")
-        from services import claude_sdk
-        # Patch the api-side implementation so we can detect the call.
-        called = {"n": 0}
-        def fake(channel_id, user_id=None):
-            called["n"] += 1
-            return False
-        import services.claude_api
-        monkeypatch.setattr(services.claude_api, "_is_session_fresh", fake)
-        # The dispatcher re-imports the symbol each call, so monkeypatching
-        # the package attribute is enough.
-        out = claude_sdk._is_session_fresh(42)
-        assert out is False
-        assert called["n"] == 1
-
-    def test_api_backend_kill_orphan_runs_both(self, monkeypatch):
-        monkeypatch.setenv("CLAUDE_BACKEND", "api")
-        from services import claude_sdk
-        legacy_calls = {"n": 0}
-        api_calls = {"n": 0}
-
-        def fake_legacy():
-            legacy_calls["n"] += 1
-            return 1
-
-        def fake_api():
-            api_calls["n"] += 1
-            return 2
-
-        monkeypatch.setattr(claude_sdk, "_legacy_kill_orphan_claude_cli", fake_legacy)
-        import services.claude_api
-        monkeypatch.setattr(services.claude_api, "kill_orphan_claude_cli", fake_api)
-        total = claude_sdk.kill_orphan_claude_cli()
-        assert total == 3
-        assert legacy_calls["n"] == 1 and api_calls["n"] == 1
 
 
 # ---------------------------------------------------------------------------

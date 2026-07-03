@@ -155,11 +155,17 @@ def _parse_unix_seconds(value: str | None) -> datetime | None:
         return None
 
 
-def _retry_after_seconds(value: str | None, now: datetime) -> int | None:
+def parse_retry_after(value: "str | None", *, now: "datetime | None" = None) -> "float | None":
+    """Parse a retry-after value (delta-seconds or HTTP-date) into seconds.
+
+    Single source of truth for retry-after parsing (P1-a): the pacing
+    formatter here and the backoff logic in retry.py previously carried two
+    divergent copies of this exact dance.
+    """
     if not value:
         return None
     try:
-        return max(0, int(float(value)))
+        return max(0.0, float(value))
     except ValueError:
         pass
     try:
@@ -168,7 +174,13 @@ def _retry_after_seconds(value: str | None, now: datetime) -> int | None:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return max(0, int((parsed - now).total_seconds()))
+    reference = now if now is not None else datetime.now(timezone.utc)
+    return max(0.0, (parsed - reference).total_seconds())
+
+
+def _retry_after_seconds(value: str | None, now: datetime) -> int | None:
+    parsed = parse_retry_after(value, now=now)
+    return None if parsed is None else int(parsed)
 
 
 def _format_dt(value: datetime) -> str:
@@ -336,6 +348,18 @@ def observe(headers) -> RateLimitState:
 
 def get_state() -> RateLimitState:
     return _state
+
+
+def reset_state() -> None:
+    """観測状態を初期化する（OAuth アカウント切替時に呼ぶ）。
+
+    切替後の観測はすべて新アカウントのものなので、旧アカウントの
+    utilization / reset 時刻を持ち越すとブロック判定・ペーシングが
+    アカウント混在で誤動作する。全参照はモジュール名 `_state` 経由なので
+    再束縛で安全（get_state() の返した参照を長期保持する呼び元は無い）。
+    """
+    global _state
+    _state = RateLimitState()
 
 
 def should_block() -> tuple[bool, str]:

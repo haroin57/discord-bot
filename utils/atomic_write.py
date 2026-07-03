@@ -46,9 +46,10 @@ def atomic_write_bytes(
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = _tmp_path(target)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
-    fd = os.open(tmp, flags, mode)
+    raw_fd = os.open(tmp, flags, mode)
+    fd: int | None = raw_fd
     try:
-        with os.fdopen(fd, "wb") as f:
+        with os.fdopen(raw_fd, "wb") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())

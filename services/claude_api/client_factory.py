@@ -16,12 +16,10 @@ import uuid as _uuid
 
 import anthropic
 
-from config import RESTRICTED_ANTHROPIC_API_KEY
 from services.claude_api.client import USER_AGENT, _session_id
 from services.oauth_manager import (
     ensure_valid_token,
     init as oauth_init,
-    make_async_api_key_client,
     make_async_oauth_client,
     prime_subscriber_session,
 )
@@ -57,17 +55,15 @@ def build_cli_headers() -> dict[str, str]:
 
 
 async def make_api_client(restricted: bool) -> anthropic.AsyncAnthropic:
-    """Return the right AsyncAnthropic client for this call.
+    """Return the AsyncAnthropic client for this call (OAuth subscriber flow).
 
-    Admin (non-restricted) calls go through the OAuth subscriber flow.
-    Restricted calls use the static API key (separate billing bucket).
+    The separate static-API-key route for restricted callers was removed
+    2026-07-04: BOT_RESTRICTED_ANTHROPIC_API_KEY was never configured in any
+    environment, so every call — restricted included — already used OAuth.
+    ``restricted`` stays in the signature because tool/permission gating
+    downstream still keys off it; only the auth transport is unified.
     """
     cli_headers = build_cli_headers()
-    if restricted and RESTRICTED_ANTHROPIC_API_KEY:
-        return make_async_api_key_client(
-            RESTRICTED_ANTHROPIC_API_KEY,
-            default_headers=cli_headers,
-        )
     # bot startup paths only call oauth_init() lazily through mem0 or the
     # sync get_client(); on a cold call_with_tools the token is still
     # uninitialized. Idempotent init() before ensure_valid_token() guarantees

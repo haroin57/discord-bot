@@ -767,7 +767,6 @@ class TestCleanupStaleAttachmentsMultiDir:
 class TestReDoSGuards:
     def test_image_path_re_bounded(self):
         """IMAGE_PATH_RE must not backtrack on adversarial input."""
-        import time
         big = "/" + "a" * 10000 + ".png"
         start = time.monotonic()
         extract_image_paths(big)
@@ -775,7 +774,6 @@ class TestReDoSGuards:
 
     def test_file_path_re_bounded(self):
         """FILE_PATH_RE must not backtrack on adversarial input."""
-        import time
         big = "/" + "a" * 10000 + ".txt"
         start = time.monotonic()
         extract_file_paths(big)

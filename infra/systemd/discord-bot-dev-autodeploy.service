@@ -1,0 +1,19 @@
+[Unit]
+Description=Kanae Discord Bot — auto-deploy (dev, pull-based)
+After=network-online.target
+Wants=network-online.target
+# Soft dependency: only start after dev bot if it exists.
+# auto_deploy.sh dev performs its own graceful skip when the service is absent.
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/discord-bot
+ExecStart=/home/ubuntu/discord-bot/scripts/auto_deploy.sh dev
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=discord-bot-dev-autodeploy
+
+[Install]
+WantedBy=multi-user.target

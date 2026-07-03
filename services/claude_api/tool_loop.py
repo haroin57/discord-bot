@@ -30,11 +30,14 @@ import anthropic
 
 from config import (
     CLAUDE_MAX_TOKENS,
+    DELIB_DISTILL_ENABLED,
     MAX_CONSECUTIVE_EMPTY_TURNS,
     MAX_FINAL_EMPTY_NUDGES,
+    MAX_PAUSE_TURN_CONTINUES,
     MAX_TEXT_INVOKE_CORRECTIONS,
     MAX_TEXT_INVOKE_RESCUES,
     MAX_TOOL_ERROR_NUDGES,
+    MCP_TOOL_RESULT_CHARS,
     PROACTIVE_COMPACT_ENABLED,
     PROACTIVE_COMPACT_TRIGGER_TOKENS,
     SERVER_SIDE_FALLBACK_ENABLED,
@@ -150,6 +153,18 @@ _FINAL_EMPTY_NUDGE = (
 )
 
 
+def _observe_response_headers(source) -> None:
+    """Feed rate-limit headers from a response-carrying object (stream or
+    SDK exception) into the shared pacing state. Best-effort: never raises.
+    Single idiom for both the success and the error path (P1-a)."""
+    try:
+        resp = getattr(source, "response", None)
+        if resp is not None and getattr(resp, "headers", None) is not None:
+            observe_ratelimit(resp.headers)
+    except Exception as exc:
+        log.debug("ratelimit observe failed: %s", exc)
+
+
 def _build_cached_system(system_prompt: str, messages: list[dict]) -> list[dict]:
     """Build the 4-block system prompt the CLI sends on /v1/messages.
 
@@ -239,9 +254,24 @@ def _inject_cache_breakpoints(messages: list[dict]) -> list[dict]:
     return messages
 
 
-def _block_to_dict(block) -> dict:
-    """Convert an anthropic content block (Pydantic model) to a serializable dict."""
+def _block_to_dict(block) -> dict | None:
+    """Convert an anthropic content block (Pydantic model) to a serializable dict.
+
+    Returns ``None`` for blocks that MUST NOT be echoed back to the API on the
+    next turn (server-side response metadata that would cause a 400 on replay).
+    Callers must ``filter(None, ...)`` before persisting to history.
+    """
     btype = getattr(block, "type", None)
+    if btype == "fallback":
+        # Server-side refusal fallback (ADR-0015): Anthropic includes a
+        # ``fallback`` metadata block in the response when it silently switched
+        # models mid-stream (Fable 5 refusal → Opus 4.8). This block carries
+        # {to:{model:...}, citations:[...]} — response-only metadata that the
+        # Messages API refuses on the way back ("messages.N.content.M.fallback
+        # .citations: Extra inputs are not permitted", HTTP 400). Drop it so
+        # the next turn's history replay doesn't poison the request.
+        # rid 0679af30 / haroin 2026-07-02: regression.
+        return None
     if btype == "text":
         return {"type": "text", "text": getattr(block, "text", "")}
     if btype == "tool_use":
@@ -283,10 +313,73 @@ def _block_to_dict(block) -> dict:
         if data is not None:
             out["data"] = data
         return out
+    if btype == "server_tool_use":
+        # Tool Search Tool（等の server-side tool）の呼び出しブロック。echo 必須
+        # だが SDK の model_dump() は `caller: None` を含み、fallback.citations
+        # 400（rid 0679af30）と同型の「レスポンス専用フィールド echo で 400」を
+        # 踏むため明示的に最小 dict へ直列化する。
+        out = {
+            "type": "server_tool_use",
+            "id": getattr(block, "id", ""),
+            "name": getattr(block, "name", ""),
+            "input": getattr(block, "input", None) or {},
+        }
+        caller = getattr(block, "caller", None)
+        if caller is not None:
+            out["caller"] = (
+                caller.model_dump() if hasattr(caller, "model_dump") else caller
+            )
+        return out
+    if btype in ("tool_search_tool_result", "advisor_tool_result"):
+        # server-side tool の result ブロック（tool search / advisor）。
+        # SDK model_dump の余剰フィールド 400 を避けて最小 dict へ。
+        return {
+            "type": btype,
+            "tool_use_id": getattr(block, "tool_use_id", ""),
+            "content": _serialize_search_result_content(
+                getattr(block, "content", None)
+            ),
+        }
     # Unknown / future block type — best effort.
     if hasattr(block, "model_dump"):
         return block.model_dump()
     return {"type": btype or "unknown"}
+
+
+def _serialize_search_result_content(content) -> "list[dict] | dict":
+    """tool_search_tool_result.content を echo 可能な最小 dict へ直列化する。
+
+    成功時は tool_reference のリスト、エラー時は error オブジェクト。SDK の
+    model_dump に頼らず必要フィールドだけ残す（余剰フィールド 400 防止）。
+    """
+    if content is None:
+        return []
+    # エラー型（BetaToolSearchToolResultError 等）は list ではなく単一オブジェクト
+    if not isinstance(content, (list, tuple)):
+        err_code = getattr(content, "error_code", None)
+        if err_code is not None:
+            return {"type": "tool_search_tool_result_error", "error_code": err_code}
+        if isinstance(content, dict):
+            return content
+        return []
+    out: list[dict] = []
+    for item in content:
+        itype = getattr(item, "type", None) or (
+            item.get("type") if isinstance(item, dict) else None
+        )
+        if itype == "tool_reference":
+            name = getattr(item, "tool_name", None) or (
+                item.get("tool_name") if isinstance(item, dict) else ""
+            )
+            out.append({"type": "tool_reference", "tool_name": name or ""})
+        elif itype == "text":
+            text = getattr(item, "text", None) or (
+                item.get("text") if isinstance(item, dict) else ""
+            )
+            out.append({"type": "text", "text": text or ""})
+        elif isinstance(item, dict):
+            out.append(item)
+    return out
 
 
 def _join_final_text(final_message) -> str:
@@ -386,6 +479,55 @@ def _cap_inline(text: str, cap: int) -> str:
     if len(text) <= cap:
         return text
     return text[:cap] + "\n...(truncated)"
+
+
+def _truncate_head_tail(text: str, cap: int) -> str:
+    """Middle-out truncation: keep the head and tail, drop the middle.
+
+    MCP 検索結果は先頭（上位ヒット）と末尾（ページネーション情報等）に価値が
+    寄りやすいので、head-only の ``_cap_inline`` ではなく中抜きにする。
+    """
+    if cap <= 0 or len(text) <= cap:
+        return text
+    half = max(1, cap // 2)
+    omitted = len(text) - cap
+    return (
+        text[:half]
+        + f"\n...[{omitted} chars omitted by MCP_TOOL_RESULT_CHARS cap]...\n"
+        + text[-half:]
+    )
+
+
+def _cap_mcp_result_content(
+    content: "str | list[dict]", cap: int,
+) -> "str | list[dict]":
+    """Apply the MCP result char cap to a tool_result content payload.
+
+    str はそのまま中抜き。list（text+image ブロック）は text ブロックにだけ
+    総量 cap を按分して適用する（image ブロックは対象外）。
+    """
+    if cap <= 0:
+        return content
+    if isinstance(content, str):
+        return _truncate_head_tail(content, cap)
+    if isinstance(content, list):
+        def _is_text(b: object) -> bool:
+            return (
+                isinstance(b, dict) and b.get("type") == "text"
+                and isinstance(b.get("text"), str)
+            )
+
+        n_text = sum(1 for b in content if _is_text(b))
+        total = sum(len(b["text"]) for b in content if _is_text(b))
+        if not n_text or total <= cap:
+            return content
+        per_block = max(1, cap // n_text)
+        return [
+            {**b, "text": _truncate_head_tail(b["text"], per_block)}
+            if _is_text(b) else b
+            for b in content
+        ]
+    return content
 
 
 def _format_tool_invocation_for_display(tool_name: str, tool_input: dict) -> str | None:
@@ -509,7 +651,79 @@ _EMPTY_CONTENT_PLACEHOLDER = [{"type": "text", "text": "(続けてください)"
 # on it. Re-exported via this module so callers/tests can import it from here.
 
 
-def _normalize_history_for_api(history: list[dict]) -> list[dict]:
+def _sanitize_content_blocks(content):
+    """Drop content blocks that the Messages API rejects on replay.
+
+    ``fallback`` blocks are server-side response metadata (ADR-0015 refusal
+    fallback); the API returns them in responses but refuses them on the way
+    back with ``messages.N.content.M.fallback.citations: Extra inputs are not
+    permitted`` (HTTP 400). This is the single choke-point for both fresh
+    in-loop turns and JSONL-resumed history — anything that reaches the API
+    passes through ``_normalize_history_for_api``. Non-list content (a plain
+    string user turn) is returned unchanged.
+    rid 0679af30 / haroin 2026-07-02: regression.
+    """
+    if not isinstance(content, list):
+        return content
+    return [b for b in content if not (isinstance(b, dict) and b.get("type") == "fallback")]
+
+
+# server-side tool のブロック type（tool search / advisor）。無効時の replay
+# strip と未対ペア判定の両方で使う。
+_TOOL_SEARCH_BLOCK_TYPES = (
+    "server_tool_use", "tool_search_tool_result", "advisor_tool_result",
+)
+_SERVER_TOOL_RESULT_TYPES = ("tool_search_tool_result", "advisor_tool_result")
+
+
+def strip_tool_search_blocks(content):
+    """Tool Search 関連ブロックを content から除去する（純関数）。
+
+    Tool Search 無効時（フラグ OFF / ランタイム auto-off 後）、過去ターンの
+    JSONL に残った ``server_tool_use`` / ``tool_search_tool_result`` を tools
+    配列に tool search が無いリクエストへ echo すると 400 になり得るため、
+    replay 前に落とす。有効時は呼ばない（echo は resume に必要）。
+    """
+    if not isinstance(content, list):
+        return content
+    return [
+        b for b in content
+        if not (isinstance(b, dict) and b.get("type") in _TOOL_SEARCH_BLOCK_TYPES)
+    ]
+
+
+def _has_unpaired_server_tool_use(content) -> bool:
+    """content 内に result 未対の server_tool_use があるか。
+
+    Tool Search の検索発行ターンでは assistant content に server_tool_use が
+    載り、対応する tool_search_tool_result が同一 content に無いまま
+    stop_reason=tool_use / pause_turn で止まることがある。この状態で user
+    ターンを挟むと server 側の resume 検出（trailing server_tool_use）が壊れる。
+    """
+    server_ids: set[str] = set()
+    result_ids: set[str] = set()
+    for b in content or []:
+        btype = getattr(b, "type", None) or (
+            b.get("type") if isinstance(b, dict) else None
+        )
+        if btype == "server_tool_use":
+            bid = getattr(b, "id", None) or (
+                b.get("id") if isinstance(b, dict) else None
+            )
+            if bid:
+                server_ids.add(bid)
+        elif btype in _SERVER_TOOL_RESULT_TYPES:
+            rid = getattr(b, "tool_use_id", None) or (
+                b.get("tool_use_id") if isinstance(b, dict) else None
+            )
+            if rid:
+                result_ids.add(rid)
+    return bool(server_ids - result_ids)
+
+
+def _normalize_history_for_api(
+    history: list[dict], *, strip_tool_search: bool = False,
+) -> list[dict]:
     """Strip extra fields, leaving only {role, content} for the API.
 
     Also guards against empty content (``""`` or ``[]``), which the Messages
@@ -522,7 +736,9 @@ def _normalize_history_for_api(history: list[dict]) -> list[dict]:
     """
     out: list[dict] = []
     for h in history:
-        content = h["content"]
+        content = _sanitize_content_blocks(h["content"])
+        if strip_tool_search:
+            content = strip_tool_search_blocks(content)
         if content == "" or content == []:
             content = _EMPTY_CONTENT_PLACEHOLDER
         out.append({"role": h["role"], "content": content})
@@ -533,7 +749,14 @@ def _normalize_history_for_api(history: list[dict]) -> list[dict]:
 # isConcurrencySafe, audit #12). When a turn's tool_use blocks are ALL in
 # this set they are dispatched via asyncio.gather; anything else (writes,
 # Bash, MCP tools with unknown side effects) keeps the sequential path.
-CONCURRENCY_SAFE_TOOLS = frozenset({"Read", "Glob", "Grep"})
+#
+# Agent is concurrency-safe because each subagent runs in a fresh context
+# (history=[] inside run_subagent), takes no shared mutable state from the
+# parent, and is intentionally designed to be fanned out — matching the
+# CLI's Promise.all dispatch when the model fires multiple Agent() calls
+# in one turn. Per-process throttling lives in agent_tool._subagent_sema
+# (SUBAGENT_MAX_PARALLEL), not here.
+CONCURRENCY_SAFE_TOOLS = frozenset({"Read", "Glob", "Grep", "Agent"})
 
 
 def _validate_tool_input(schema, args: dict) -> str | None:
@@ -747,7 +970,136 @@ class _RescuedToolUse:
     type: str = "tool_use"
 
 
+def _build_stream_kwargs(
+    *,
+    current_model: str,
+    cached_system: "list[dict]",
+    messages: "list[dict]",
+    extra_betas,
+    output_config_override,
+    refusal_fallback_model: "str | None",
+    tools_for_api,
+    extra_headers,
+    fallback_used: bool,
+) -> dict:
+    """Assemble the per-turn ``messages.stream`` kwargs (P3-b extraction).
+
+    Body fields the CLI pairs with its betas (mitm capture 2026-05-15,
+    docs/captures/A_one_shot/): output_config + context_management ride as
+    top-level body fields.
+
+    - output_config MUST be a direct kwarg, NOT nested in extra_body: the
+      anthropic SDK 0.88.0 beta streaming path silently drops it from
+      extra_body (verified by mitmproxy — effort never reached the wire),
+      which made the server see a contradictory request and return
+      stop_reason=refusal (ADR-0009). /effort override (機能6) takes
+      precedence per request; falls through to env-driven OUTPUT_CONFIG.
+    - Server-side model fallback (ADR-0015): when a refusal fallback model
+      is in play, declare it via the ``fallbacks`` body field so the server
+      switches mid-stream on a Fable refusal — no client-side second
+      request. SDK doesn't model ``fallbacks``, so it rides extra_body.
+    """
+    max_tokens = (
+        CLAUDE_MAX_TOKENS_OPUS if "opus" in (current_model or "").lower()
+        else CLAUDE_MAX_TOKENS
+    )
+    stream_kwargs = dict(
+        model=current_model,
+        max_tokens=max_tokens,
+        system=cached_system,
+        messages=messages,
+        betas=extra_betas,
+        metadata=get_metadata(),
+        thinking=THINKING_CONFIG,
+        output_config=output_config_override or OUTPUT_CONFIG,
+        extra_body={
+            "context_management": CONTEXT_MANAGEMENT_CONFIG,
+        },
+    )
+    if SERVER_SIDE_FALLBACK_ENABLED and refusal_fallback_model:
+        stream_kwargs["extra_body"]["fallbacks"] = [
+            {"model": refusal_fallback_model}
+        ]
+    if tools_for_api:
+        stream_kwargs["tools"] = tools_for_api
+    merged_headers = dict(extra_headers or {})
+    if fallback_used:
+        merged_headers[REFUSAL_FALLBACK_HEADER] = "true"
+    if merged_headers:
+        stream_kwargs["extra_headers"] = merged_headers
+    return stream_kwargs
+
+
 async def _run_one_tool(
+    block,
+    *,
+    can_use_tool,
+    execute_tool,
+    tool_schemas: dict,
+    status_callback,
+    tool_invocation_callback,
+    turn: int,
+    evidence=None,  # services.claude_api.evidence.EvidenceIndex | None
+) -> dict:
+    """Execute one tool_use block → a tool_result dict（evidence/蒸留の wrapper）.
+
+    実行本体は ``_run_one_tool_inner``。この wrapper が
+      1. evidence index への台帳記録（seq は最初の await 前に同期採番 —
+         asyncio.gather は生成順に最初の同期区間を走らせるため block 順が保たれる）
+      2. result distillation（原文に対して蒸留 → 成功時 content 差し替え）
+      3. MCP 結果の文字数 cap（蒸留失敗時の最終防壁。蒸留前の原文は evidence 側に残る）
+    を一手に担う。normal / text-form rescue の両経路がここを通る。
+    """
+    seq = evidence.next_seq() if evidence is not None else 0
+    result = await _run_one_tool_inner(
+        block,
+        can_use_tool=can_use_tool,
+        execute_tool=execute_tool,
+        tool_schemas=tool_schemas,
+        status_callback=status_callback,
+        tool_invocation_callback=tool_invocation_callback,
+        turn=turn,
+    )
+    tool_name = getattr(block, "name", "")
+    tool_input = getattr(block, "input", None) or {}
+    content = result.get("content")
+    is_error = bool(result.get("is_error"))
+
+    if evidence is not None:
+        from services.claude_api.distill import (
+            distill_result,
+            render_note_for_model,
+            should_distill,
+        )
+        rec = await evidence.add(
+            seq=seq, turn=turn, tool=tool_name, tool_input=tool_input,
+            content=content, is_error=is_error,
+        )
+        if (
+            DELIB_DISTILL_ENABLED
+            and not is_error
+            and should_distill(tool_name, content)
+        ):
+            note = await distill_result(tool_name, tool_input, content)
+            if note is not None:
+                evidence.attach_note(rec, note, distilled=True)
+                content = render_note_for_model(note, rec.raw_path, rec.raw_chars)
+                result = dict(result)
+                result["content"] = content
+
+    # MCP tool 結果のみ文字数 cap（builtin は各自の cap を持つ）。蒸留成功時は
+    # note が cap 未満なので no-op、失敗時はこれが従来どおりの防壁になる。
+    if tool_name.startswith("mcp__"):
+        capped = _cap_mcp_result_content(
+            result.get("content"), MCP_TOOL_RESULT_CHARS,
+        )
+        if capped is not result.get("content"):
+            result = dict(result)
+            result["content"] = capped
+    return result
+
+
+async def _run_one_tool_inner(
     block,
     *,
     can_use_tool,
@@ -831,6 +1183,8 @@ async def _run_one_tool(
             result_content = output
         else:
             result_content = str(output)
+        # NOTE: MCP 結果の文字数 cap は wrapper（_run_one_tool）側で、蒸留の
+        # 後に適用する（蒸留は原文に対して行いたいため）。
         await _safe_status(
             status_callback,
             f"📨 結果を受信 ({dt:.1f}s)",
@@ -877,6 +1231,7 @@ async def _attempt_text_invoke_rescue(
     tool_invocation_callback,
     channel_id: int,
     turn: int,
+    evidence=None,
 ) -> "list[dict] | None":
     """Rescue tool calls the model emitted as plain text.
 
@@ -942,6 +1297,7 @@ async def _attempt_text_invoke_rescue(
                 b, can_use_tool=can_use_tool, execute_tool=execute_tool,
                 tool_schemas=tool_schemas, status_callback=status_callback,
                 tool_invocation_callback=tool_invocation_callback, turn=turn,
+                evidence=evidence,
             ) for b in pseudo_blocks
         )))
     else:
@@ -950,6 +1306,7 @@ async def _attempt_text_invoke_rescue(
                 b, can_use_tool=can_use_tool, execute_tool=execute_tool,
                 tool_schemas=tool_schemas, status_callback=status_callback,
                 tool_invocation_callback=tool_invocation_callback, turn=turn,
+                evidence=evidence,
             )
             for b in pseudo_blocks
         ]
@@ -976,6 +1333,8 @@ async def run_agent_loop(
     incremental_text_callback=None,   # async (text:str)->None  (per-turn final)
     text_stream_callback=None,        # async (partial_turn_text:str)->None
     tool_invocation_callback=None,    # async (name:str, args:dict)->None
+    scratch_stream_callback=None,     # async (section:str, content:str, op:str)->None
+    scratch_finalize_callback=None,   # async ()->None  (Scratchpad block closed)
     progress=None,                    # mutable {"tokens": int} for the live spinner
     max_turns: int,
     stall_watchdog: StallWatchdog,
@@ -988,6 +1347,8 @@ async def run_agent_loop(
     proactive_compact=None,  # async () -> list[dict] | None (new prior window)
     prior_turns: int = 0,
     output_config_override: dict | None = None,  # /effort per-request override
+    tool_search_enabled: bool = False,  # Tool Search Tool (defer_loading) 有効時 True
+    evidence=None,  # services.claude_api.evidence.EvidenceIndex | None（熟考P1）
 ) -> AgentLoopResult:
     """Run the streaming + tool-use loop. See module docstring for invariants.
 
@@ -1073,8 +1434,14 @@ async def run_agent_loop(
     # bot.py spinner via the shared `progress` dict.
     _tok_base = 0
 
+    # server-side tool (Tool Search) の pause_turn 再開回数。userターンを足さずに
+    # そのまま再送する continue の暴走防止（MAX_PAUSE_TURN_CONTINUES で打ち切り）。
+    pause_turn_continues = 0
+
     for turn in range(max_turns):
-        messages = _normalize_history_for_api(history)
+        messages = _normalize_history_for_api(
+            history, strip_tool_search=not tool_search_enabled,
+        )
         messages = _inject_cache_breakpoints(messages)
         cached_system = _build_cached_system(system_prompt, messages)
 
@@ -1092,60 +1459,17 @@ async def run_agent_loop(
         # we're in the warning zone, so we don't trip the probabilistic throttle.
         await maybe_wait_before_request()
 
-        # Body fields the CLI pairs with its betas. Re-instated 2026-05-15
-        # after a fresh mitm capture (docs/captures/A_one_shot/) showed
-        # claude-cli 2.1.92 *does* send output_config + context_management
-        # as top-level body fields — the earlier "extra_body: null"
-        # reading was a misinterpretation of the Python SDK's wire format
-        # (extra_body is the SDK's own merge slot, not the field name
-        # the server sees). Without these, effort-2025-11-24 has nowhere
-        # to read its dial from, so the model behaves as if effort were
-        # unset.
-        max_tokens = (
-            CLAUDE_MAX_TOKENS_OPUS if "opus" in (current_model or "").lower()
-            else CLAUDE_MAX_TOKENS
-        )
-        stream_kwargs = dict(
-            model=current_model,
-            max_tokens=max_tokens,
-            system=cached_system,
+        stream_kwargs = _build_stream_kwargs(
+            current_model=current_model,
+            cached_system=cached_system,
             messages=messages,
-            betas=extra_betas,
-            metadata=get_metadata(),
-            thinking=THINKING_CONFIG,
-            # output_config MUST be a direct kwarg, NOT nested in extra_body.
-            # anthropic SDK 0.88.0's beta streaming path silently DROPS
-            # output_config when it's inside extra_body (verified by mitmproxy:
-            # effort never reached the wire), while context_management survives.
-            # With effort gone but the effort-2025-11-24 beta header still set,
-            # the server saw a contradictory request and returned
-            # stop_reason=refusal. Direct kwarg puts effort on the wire (ADR-0009).
-            # /effort override (機能6, 2026-06-17) takes precedence per request;
-            # falls through to OUTPUT_CONFIG (env-driven default).
-            output_config=output_config_override or OUTPUT_CONFIG,
-            extra_body={
-                "context_management": CONTEXT_MANAGEMENT_CONFIG,
-            },
+            extra_betas=extra_betas,
+            output_config_override=output_config_override,
+            refusal_fallback_model=refusal_fallback_model,
+            tools_for_api=tools_for_api,
+            extra_headers=extra_headers,
+            fallback_used=fallback_used,
         )
-        # Server-side model fallback (ADR-0015). When a refusal fallback model
-        # is in play (Fable primary + enabled; entry.py passes None once
-        # sticky-pinned to Opus, so this is auto-gated off there), declare it
-        # to the server via the `fallbacks` body field. The server switches to
-        # it mid-stream on a Fable refusal — no client-side second request. The
-        # SDK (0.88.0) doesn't model `fallbacks`, so it must ride extra_body;
-        # wire arrival is verified by mitm capture (plan gate A). The two
-        # required betas are already in MODEL_BETAS.
-        if SERVER_SIDE_FALLBACK_ENABLED and refusal_fallback_model:
-            stream_kwargs["extra_body"]["fallbacks"] = [
-                {"model": refusal_fallback_model}
-            ]
-        if tools_for_api:
-            stream_kwargs["tools"] = tools_for_api
-        merged_headers = dict(extra_headers or {})
-        if fallback_used:
-            merged_headers[REFUSAL_FALLBACK_HEADER] = "true"
-        if merged_headers:
-            stream_kwargs["extra_headers"] = merged_headers
 
         # Live token stream for the CURRENT turn's visible text. Accumulated
         # across text_delta events so text_stream_callback always receives the
@@ -1163,6 +1487,12 @@ async def run_agent_loop(
         # first event, so a slow first byte and a mid-stream stall look alike).
         request_start = time.monotonic()
         ttft_ms: int | None = None
+        # Tracks the tool_use block currently being streamed (its input
+        # arrives incrementally via "input_json" events, one block at a
+        # time since the API streams content_blocks sequentially). Reset on
+        # content_block_stop so a later text block after this tool doesn't
+        # inherit a stale tool identity.
+        cur_tool: dict | None = None
         try:
             async with api_client.beta.messages.stream(**stream_kwargs) as stream:
                 async for event in stream:
@@ -1199,11 +1529,21 @@ async def run_agent_loop(
                             await _safe_status(status_callback, "💭 thinking…")
                         elif btype == "text":
                             await _safe_status(status_callback, "📝 応答を生成中")
+                        elif btype == "server_tool_use":
+                            # Tool Search 等の server-side tool 呼び出し。実行は
+                            # API 側なので client 処理は不要、進捗表示とログのみ。
+                            name = getattr(block, "name", "?")
+                            log.info(
+                                "[ch=%d] turn=%d server_tool_use: name=%s",
+                                channel_id, turn + 1, name,
+                            )
+                            await _safe_status(status_callback, "🔎 ツール検索中")
                         elif btype == "tool_use":
                             name = getattr(block, "name", "?")
                             tool_input = getattr(block, "input", None)
                             hint = _tool_input_hint(name, tool_input)
                             short_name = name.split("__", 2)[-1] if "__" in name else name
+                            cur_tool = {"name": name, "short": short_name}
                             # journal にも tool 名 + input を残す (audit / debug 用).
                             # input は最大 300 文字でクリップ。MCP 通信失敗時の切り分けに使う。
                             log.info(
@@ -1215,6 +1555,45 @@ async def run_agent_loop(
                             if hint:
                                 label += f" `{hint[:60]}`"
                             await _safe_status(status_callback, label)
+                        else:
+                            cur_tool = None
+                    elif etype == "input_json" and cur_tool is not None:
+                        # Synthesized by the SDK's beta stream helper from
+                        # input_json_delta events — event.snapshot is the
+                        # jiter-parsed dict-so-far of the tool_use input, so
+                        # no partial-JSON parsing is needed here.
+                        snapshot = getattr(event, "snapshot", None) or {}
+                        if isinstance(snapshot, dict):
+                            hint = _tool_input_hint(cur_tool["name"], snapshot)
+                            if hint:
+                                label = f"🔧 {cur_tool['short']}"
+                                label += f" `{hint[:60]}`"
+                                await _safe_status(status_callback, label)
+                            if (
+                                cur_tool["short"] == "Scratchpad"
+                                and scratch_stream_callback is not None
+                            ):
+                                section = snapshot.get("section")
+                                content = snapshot.get("content")
+                                op = snapshot.get("op")
+                                if section and content:
+                                    try:
+                                        await scratch_stream_callback(section, content, op)
+                                    except Exception as exc:
+                                        log.debug(
+                                            "scratch_stream_callback failed: %s", exc,
+                                        )
+                    elif etype == "content_block_stop":
+                        if (
+                            cur_tool is not None
+                            and cur_tool["short"] == "Scratchpad"
+                            and scratch_finalize_callback is not None
+                        ):
+                            try:
+                                await scratch_finalize_callback()
+                            except Exception as exc:
+                                log.debug("scratch_finalize_callback failed: %s", exc)
+                        cur_tool = None
                     elif etype == "message_delta":
                         # Live output-token count for the spinner: cumulative
                         # for this stream + already-completed turns.
@@ -1277,12 +1656,7 @@ async def run_agent_loop(
                 # the next turn (and the next call from entry.py) can pace
                 # itself before sending. anthropic SDK exposes the raw
                 # response via stream.response.headers.
-                try:
-                    resp = getattr(stream, "response", None)
-                    if resp is not None and getattr(resp, "headers", None) is not None:
-                        observe_ratelimit(resp.headers)
-                except Exception as exc:
-                    log.debug("ratelimit observe failed: %s", exc)
+                _observe_response_headers(stream)
 
                 # Server-side fallback detection (ADR-0015), multiplexed so any
                 # one signal counts: (1) the mid-stream `fallback` content block
@@ -1341,17 +1715,16 @@ async def run_agent_loop(
                       turn, category, exc)
             # Also try to observe ratelimit headers from the failing response
             # so the next pre-check can refuse outright.
-            try:
-                resp = getattr(exc, "response", None)
-                if resp is not None and getattr(resp, "headers", None) is not None:
-                    observe_ratelimit(resp.headers)
-            except Exception:
-                pass
+            _observe_response_headers(exc)
             # Caller (entry.py) owns retry/backoff; surface the exception.
             raise
 
         # Persist the assistant turn (in-memory only; disk write is caller's job)
-        assistant_blocks = [_block_to_dict(b) for b in (final_msg.content or [])]
+        # filter(None, ...): _block_to_dict returns None for server-only
+        # metadata blocks (e.g. ``fallback``) that would cause a 400 on replay.
+        assistant_blocks = [
+            d for d in (_block_to_dict(b) for b in (final_msg.content or [])) if d is not None
+        ]
         history.append({"role": "assistant", "content": assistant_blocks})
 
         # Capture any prose this turn emitted before deciding how to exit.
@@ -1403,6 +1776,7 @@ async def run_agent_loop(
                     tool_invocation_callback=tool_invocation_callback,
                     channel_id=channel_id,
                     turn=turn,
+                    evidence=evidence,
                 )
             if rescued_results is not None:
                 text_invoke_rescues += 1
@@ -1501,6 +1875,35 @@ async def run_agent_loop(
                     log.warning("fallback alert callback failed: %s", exc)
             continue
 
+        if stop_reason == "pause_turn":
+            # Server-side tool（Tool Search 等）実行中の一時停止。assistant turn
+            # は上で history に append 済みなので、user ターンを一切足さずに
+            # そのまま再送すると server 側が trailing server_tool_use を検出して
+            # resume する（公式仕様: "Continue." 等を足してはいけない）。
+            pause_turn_continues += 1
+            if pause_turn_continues <= MAX_PAUSE_TURN_CONTINUES:
+                log.info(
+                    "[ch=%d] turn=%d stop_reason=pause_turn → resume (%d/%d)",
+                    channel_id, turn + 1, pause_turn_continues,
+                    MAX_PAUSE_TURN_CONTINUES,
+                )
+                await _safe_status(status_callback, "🔎 サーバー側処理を継続中")
+                continue
+            log.warning(
+                "[ch=%d] turn=%d pause_turn limit reached (%d) → give up",
+                channel_id, turn + 1, MAX_PAUSE_TURN_CONTINUES,
+            )
+            last_text = "\n\n".join(text_across_turns)
+            _log_total_usage(channel_id, usage_totals)
+            return AgentLoopResult(
+                text=last_text or "(no response)",
+                synthetic_session_id=None,
+                active_mcp_keys=active_mcp_keys,
+                fallback_model=current_model if fallback_used else None,
+                prior_len=prior_len,
+                usage_total=dict(usage_totals),
+            )
+
         if stop_reason in ("end_turn", "stop_sequence"):
             # (B) The previous turn's tool(s) errored and the model gave up with
             # an empty/near-empty reply — nudge once to recover or at least
@@ -1574,6 +1977,7 @@ async def run_agent_loop(
             status_callback=status_callback,
             tool_invocation_callback=tool_invocation_callback,
             turn=turn,
+            evidence=evidence,
         )
         # Read-only batches run concurrently (CLI isConcurrencySafe, audit
         # #12); tool_result order still follows tool_use order because
@@ -1591,6 +1995,21 @@ async def run_agent_loop(
             ]
 
         if not tool_results:
+            # Tool Search 検索ターン: client 側 tool_use はゼロだが、result 未対の
+            # server_tool_use が残っている場合は server 側の検索がこれから走る。
+            # 「続けてください。」を挟むと trailing server_tool_use の resume
+            # プロトコルが壊れるので、user ターンを足さずにそのまま再送する。
+            if _has_unpaired_server_tool_use(final_msg.content):
+                pause_turn_continues += 1
+                if pause_turn_continues <= MAX_PAUSE_TURN_CONTINUES:
+                    log.info(
+                        "[ch=%d] turn=%d unpaired server_tool_use → resume "
+                        "without nudge (%d/%d)",
+                        channel_id, turn + 1, pause_turn_continues,
+                        MAX_PAUSE_TURN_CONTINUES,
+                    )
+                    await _safe_status(status_callback, "🔎 ツール検索中")
+                    continue
             # Pause turn: stop_reason was tool_use but the model emitted only
             # thinking/text and zero tool_use blocks (seen under effort=max +
             # interleaved-thinking). Appending {"role":"user","content":[]}
@@ -1654,6 +2073,24 @@ async def run_agent_loop(
         last_turn_had_tool_error = any(
             r.get("is_error") for r in tool_results
         )
+
+        # Sticky 昇格: このターンで実際に呼ばれた MCP サーバーを active_mcp_keys
+        # に合流させる。entry.py が SessionInfo.mcp_server_keys へ永続化する
+        # ので、Tool Search で発見された deferred サーバーは次ターンから
+        # hot set（非 defer 広告）に昇格する。compact collapse で履歴中の
+        # tool_reference が消えても発見済みツールを忘れない。
+        _used_servers = set()
+        for _b in tool_blocks:
+            _bname = getattr(_b, "name", "") or ""
+            if _bname.startswith("mcp__") and _bname.count("__") >= 2:
+                _used_servers.add(_bname.split("__", 2)[1])
+        _new_servers = _used_servers - set(active_mcp_keys)
+        if _new_servers:
+            active_mcp_keys = sorted(set(active_mcp_keys) | _new_servers)
+            log.info(
+                "[ch=%d] turn=%d MCP sticky promote: +%s → %s",
+                channel_id, turn + 1, sorted(_new_servers), active_mcp_keys,
+            )
 
         # In-loop proactive compaction (audit #3, ADR-0012): the CLI folds the
         # conversation BEFORE it overflows (proactive floor with a 20% buffer);

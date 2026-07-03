@@ -249,12 +249,33 @@ class TestModuleLevelEnvBranches:
 
     def test_brave_api_key_adds_server(self, monkeypatch):
         # ADR-0022: direct stdio (bot-owned, self-reaping), not supergateway HTTP.
+        # C3 (2026-07-04): stdio is now the *fallback* — remote Worker vars must
+        # be absent for this branch to fire. Use empty-string setenv (not delenv):
+        # config reload calls load_dotenv(), which would resurrect deleted vars
+        # from .env, but override=False leaves an existing empty string alone.
+        monkeypatch.setenv("BRAVE_MCP_REMOTE_URL", "")
+        monkeypatch.setenv("BRAVE_MCP_AUTH_TOKEN", "")
         cfg = self._reload_config(monkeypatch, {"BRAVE_API_KEY": "test-brave-key"})
         assert "brave-search" in cfg.MCP_SERVERS_WEB
         entry = cfg.MCP_SERVERS_WEB["brave-search"]
         assert entry["command"] == "npx"
         assert any("@brave/brave-search-mcp-server@" in a for a in entry["args"])
         assert entry["env"]["BRAVE_API_KEY"] == "test-brave-key"
+
+    def test_brave_remote_worker_preferred_over_stdio(self, monkeypatch):
+        # C3 (Cloudflare offload, 2026-07-04): when BRAVE_MCP_REMOTE_* are set,
+        # brave-search must go through the kanae-mcp-brave Worker (streamable
+        # HTTP + X-MCP-Auth) even if BRAVE_API_KEY is also present.
+        cfg = self._reload_config(monkeypatch, {
+            "BRAVE_API_KEY": "test-brave-key",
+            "BRAVE_MCP_REMOTE_URL": "https://worker.example.test/mcp",
+            "BRAVE_MCP_AUTH_TOKEN": "test-mcp-token",
+        })
+        entry = cfg.MCP_SERVERS_WEB["brave-search"]
+        assert entry["type"] == "http"
+        assert entry["url"] == "https://worker.example.test/mcp"
+        assert entry["headers"]["X-MCP-Auth"] == "test-mcp-token"
+        assert "command" not in entry
 
     def test_tavily_api_key_adds_server(self, monkeypatch):
         cfg = self._reload_config(monkeypatch, {"TAVILY_API_KEY": "test-tavily-key"})

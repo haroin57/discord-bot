@@ -1,0 +1,17 @@
+[Unit]
+Description=Forward shared-MCP daemon errors (WARNING+/traceback) to Discord webhook
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/ubuntu/discord-bot/scripts/mcp_log_forward.py
+EnvironmentFile=/home/ubuntu/discord-bot/.env.mcp-forward
+User=ubuntu
+Group=ubuntu
+SupplementaryGroups=systemd-journal
+Restart=always
+RestartSec=10
+MemoryMax=100M
+
+[Install]
+WantedBy=multi-user.target

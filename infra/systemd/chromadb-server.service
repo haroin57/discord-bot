@@ -19,8 +19,8 @@ SyslogIdentifier=chromadb-server
 # Resource limits per requirements §3.1.4. MemoryHigh = soft cap (cgroup reclaim
 # pressure), MemoryMax = hard kill. Sized below the bot+MCP combined footprint
 # from the SEGV incident, leaving headroom on the 2GB host.
-MemoryHigh=512M
-MemoryMax=768M
+MemoryHigh=250M
+MemoryMax=400M
 LimitNOFILE=4096
 
 # Light hardening — kept minimal because chromadb writes to a known path under

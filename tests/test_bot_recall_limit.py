@@ -17,10 +17,10 @@ from tests.test_bot import _make_message  # reuse the message mock + module stub
 def _reset_bot_state(monkeypatch):
     """Mirror test_bot.TestOnMessage._reset_bot_state for this standalone file."""
     import bot
-    bot.cooldowns.clear()
+    from services import rate_limit as _rl
+    _rl.reset_for_tests()
     bot._channel_semas.clear()
     monkeypatch.setattr("bot.BOT_ROLE_IDS", set())
-    monkeypatch.setattr("bot._USE_SHARED_RATE_LIMIT", False)
     mock_user = MagicMock()
     mock_user.id = 99900
     patcher = patch.object(type(bot.bot), "user",

@@ -4,6 +4,8 @@ import asyncio
 import logging
 import os
 
+from services.mem0.format import strip_json_fence
+
 log = logging.getLogger(__name__)
 
 # mem0's Chroma adapter returns `score = distance` (NOT similarity).
@@ -71,13 +73,7 @@ _VALID_RELATIONS = ("paraphrase", "mergeable", "different")
 
 
 def _strip_json_fence(text: str) -> str:
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("```", 2)[1]
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.rsplit("```", 1)[0].strip()
-    return text
+    return strip_json_fence(text)
 
 
 async def judge_fact_relation(existing_text: str, candidate_text: str) -> str:

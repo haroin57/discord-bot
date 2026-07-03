@@ -1,4 +1,4 @@
-"""Unit tests for mcp_mem0_server.py — mocks services.mem0_service entirely."""
+"""Unit tests for mcp_mem0_server.py — mocks services.mem0 entirely."""
 
 import importlib
 import sys
@@ -24,10 +24,10 @@ def _stub_module(name: str, **attrs):
 # for any subsequent test that imports claude_code_sdk, so we use the real
 # module here. dotenv is also a real dep.
 
-# services.mem0_service — patch all five exported callables.
+# services.mem0 — patch all five exported callables.
 # IMPORTANT: do NOT stub the real `services` package — that would mask the
 # actual package for unrelated tests (web_api / claude_sdk import via
-# `services.*`). Only replace `services.mem0_service` with our mock module
+# `services.*`). Only replace `services.mem0` with our mock module
 # *if* it isn't already loaded; if the real one is loaded we monkeypatch
 # its attributes instead so other tests are unaffected.
 _MEM0_SVC_ATTRS = {
@@ -37,15 +37,15 @@ _MEM0_SVC_ATTRS = {
     "search_memories": AsyncMock(),
     "search_memories_smart": AsyncMock(),
 }
-# Always load the *real* services.mem0_service first so that
+# Always load the *real* services.mem0 first so that
 # `_REAL_MEM0_SVC` is a reference to the genuine module (needed for
 # post-test cleanup). Then overwrite its callables with our AsyncMocks
 # for the lifetime of this test file. A session-scoped finalizer restores
 # the real attributes so subsequent test files (test_bot.py,
 # test_oauth_manager.py, test_e2e_security.py ...) still see the genuine
-# `services.mem0_service` and can import `format_memories_for_prompt`.
+# `services.mem0` and can import `format_memories_for_prompt`.
 import services  # noqa: F401 — load the real `services` package
-import services.mem0_service as _REAL_MEM0_SVC  # noqa: E402
+import services.mem0 as _REAL_MEM0_SVC  # noqa: E402
 
 # Snapshot the real callables so we can restore them after this file's tests.
 _ORIGINAL_MEM0_SVC_ATTRS = {
@@ -60,7 +60,7 @@ import mcp_mem0_server as _m  # noqa: E402
 
 @pytest.fixture(scope="module", autouse=True)
 def _restore_mem0_service_after_module():
-    """Restore the real services.mem0_service callables after this file."""
+    """Restore the real services.mem0 callables after this file."""
     yield
     for _k, _orig in _ORIGINAL_MEM0_SVC_ATTRS.items():
         if _orig is not None:
@@ -80,8 +80,8 @@ VALID_UID = "573489206240870410"  # 先輩's default Discord snowflake
 
 
 def _svc(name: str):
-    """Return the AsyncMock for a services.mem0_service function."""
-    return sys.modules["services.mem0_service"].__dict__[name]
+    """Return the AsyncMock for a services.mem0 function."""
+    return sys.modules["services.mem0"].__dict__[name]
 
 
 @pytest.fixture(autouse=True)

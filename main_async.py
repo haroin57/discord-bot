@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Async entry point — runs Discord bot + Web API Socket.IO server together.
+"""Async entry point — runs Discord bot + minimal /health server together.
 
 Uses bot.start() + asyncio.gather() instead of the blocking bot.run() in
-main.py, so both coroutines share the same event loop.
+main.py, so both coroutines share the same event loop. The Web API / Socket.IO
+UI was removed in Phase 1 (Cloudflare offload); only the tiny GET /health
+endpoint on :3002 survives, served by services.health_server.HealthServer so
+the external uptime Worker probe never breaks.
 """
 
 import asyncio
@@ -20,7 +23,12 @@ from config import BOT_DIR, DISCORD_TOKEN, STATE_DIR, WEB_API_HOST, WEB_API_PORT
 
 _LOG_LEVEL = os.environ.get("BOT_LOG_LEVEL", "INFO").upper()
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
-_LOG_PATH = os.path.join(BOT_DIR, "bot.log")
+# BOT_LOG_PATH override exists so test runs can NEVER write to the production
+# bot.log, no matter which import path ends up calling _setup_logging().
+# tests/conftest.py sets it to a tmp file before collection; we observed
+# MagicMock tracebacks from pytest workers interleaved with live-bot lines
+# (2026-07-03, P0.25-d monitor false positive).
+_LOG_PATH = os.environ.get("BOT_LOG_PATH") or os.path.join(BOT_DIR, "bot.log")
 
 _log_listener: logging.handlers.QueueListener | None = None
 
@@ -120,7 +128,7 @@ async def main() -> None:
     # cleanup_stale_attachments now scheduled from bot.on_ready (Phase G/D5).
 
     from bot import bot
-    from web_api import WebAPI
+    from services.health_server import HealthServer
 
     # 機能2: restore cooldown/quota + session freshness/sticky persisted by the
     # previous run, so a restart continues conversations and keeps rate limits
@@ -132,7 +140,7 @@ async def main() -> None:
     # the loop is already stopped by then so _collect() can't race it.
     atexit.register(runtime_state.save_all_sync)
 
-    web_api = WebAPI(bot)
+    health_server = HealthServer(bot)
 
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
@@ -150,7 +158,7 @@ async def main() -> None:
     async def _run_services():
         await asyncio.gather(
             bot.start(DISCORD_TOKEN),
-            web_api.start(port=WEB_API_PORT, host=WEB_API_HOST),
+            health_server.start(port=WEB_API_PORT, host=WEB_API_HOST),
         )
 
     main_task = asyncio.create_task(_run_services())
@@ -167,7 +175,7 @@ async def main() -> None:
     if shutdown_task in done:
         log.info("Graceful shutdown: cancelling main_task and killing Claude subprocesses")
         try:
-            from services.claude_sdk import kill_orphan_claude_cli
+            from services.claude_api import kill_orphan_claude_cli
             kill_orphan_claude_cli()
         except Exception as e:
             log.warning("kill_orphan_claude_cli failed: %s", e)
