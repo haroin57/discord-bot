@@ -4,6 +4,12 @@
 # the ERROR rate of the recent window against an absolute threshold and exits
 # non-zero on breach so cron/CI can alert.
 #
+# Reads journald, NOT bot.log: install_structured_logging() replaces every
+# root handler with a JSON StreamHandler → journald, so the production
+# process never writes bot.log at all (discovered 2026-07-03 — the first
+# version of this monitor watched a file that only ever received leaked
+# pytest output and reported ERROR=0 forever).
+#
 # Usage: scripts/error_rate_monitor.sh [window_minutes] [max_errors]
 #   defaults: 15-minute window, >5 ERROR lines = breach
 # Cron example (during observation periods after risky PRs):
@@ -11,23 +17,28 @@
 #     echo "discord-bot error-rate breach $(date)" >> /tmp/bot_alerts.log
 set -euo pipefail
 
-BOT_DIR="/home/ubuntu/discord-bot"
-LOG="${BOT_DIR}/bot.log"
 WINDOW_MIN="${1:-15}"
 MAX_ERRORS="${2:-5}"
+UNIT="discord-bot"
 
-[[ -f "${LOG}" ]] || { echo "[monitor] no ${LOG}; is the bot running here?"; exit 2; }
+if ! systemctl is-active --quiet "${UNIT}"; then
+    echo "[monitor] ${UNIT} is not active"
+    exit 2
+fi
 
-SINCE="$(date -d "-${WINDOW_MIN} minutes" '+%Y-%m-%d %H:%M')"
-# Log lines start with "YYYY-MM-DD HH:MM:SS,ms LEVEL ..." — lexicographic
-# compare on the timestamp prefix is safe.
-ERRORS="$(awk -v since="${SINCE}" 'substr($0,1,16) >= since && $3 == "ERROR"' "${LOG}" | wc -l)"
-WARNINGS="$(awk -v since="${SINCE}" 'substr($0,1,16) >= since && $3 == "WARNING"' "${LOG}" | wc -l)"
+_lines() {
+    journalctl -u "${UNIT}" --since "-${WINDOW_MIN} min" -o cat --no-pager 2>/dev/null
+}
+
+# Structured lines are JSON with a "level" field; count exact matches so a
+# message merely containing the word ERROR doesn't inflate the rate.
+ERRORS="$(_lines | grep -c '"level": "ERROR"' || true)"
+WARNINGS="$(_lines | grep -c '"level": "WARNING"' || true)"
 
 echo "[monitor] last ${WINDOW_MIN}m: ERROR=${ERRORS} WARNING=${WARNINGS} (threshold ${MAX_ERRORS})"
 if [[ "${ERRORS}" -gt "${MAX_ERRORS}" ]]; then
     echo "[monitor] BREACH — recent errors:"
-    awk -v since="${SINCE}" 'substr($0,1,16) >= since && $3 == "ERROR"' "${LOG}" | tail -5
+    _lines | grep '"level": "ERROR"' | tail -5
     echo "[monitor] rollback guidance: scripts/bot-rollback.sh <tag> (see deploy/RUNBOOK.md)"
     exit 1
 fi
