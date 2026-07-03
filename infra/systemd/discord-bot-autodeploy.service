@@ -1,0 +1,15 @@
+[Unit]
+Description=Kanae Discord Bot — auto-deploy (prod, pull-based)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/discord-bot
+ExecStart=/home/ubuntu/discord-bot/scripts/auto_deploy.sh prod
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=discord-bot-autodeploy
+# Allow sudo systemctl restart discord-bot (configured in sudoers)

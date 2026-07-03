@@ -1,8 +1,9 @@
 name: test
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, dev, "feature/**"]
   pull_request:
+    branches: [master, dev]
   schedule:
     - cron: '0 18 * * *'  # 03:00 JST nightly (legacy-inclusive full suite)
 
@@ -15,6 +16,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version-file: '.python-version'
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
@@ -30,11 +38,21 @@ jobs:
         env:
           DISCORD_TOKEN: dummy_test_token
           ADMIN_USER_IDS: "1234567890"
+          # Dummy values so config imports don't error at collection time.
+          # No real API calls are made — the suite is mock-heavy.
+          ANTHROPIC_API_KEY: ci-dummy
+          OPENAI_API_KEY: ci-dummy
+          GOOGLE_AI_API_KEY: ci-dummy
+          # GitHub runners have 4 cores; -n auto exploits all of them.
+          # test_oauth_manager.py has an xdist-awareness fixture that resets
+          # module globals between workers, so parallel runs are safe on CI
+          # (the only known parallel flap requires ~/.claude/.credentials.json
+          # to exist on disk, which CI runners don't have).
         run: |
           # Full suite replaced the old hand-maintained file list, which had
           # drifted (fable fallback tests were never in CI — backlog P0).
           # `legacy` + `integration` markers are excluded via pyproject addopts.
-          pytest -q -n 2
+          pytest -q -n auto
       - name: Conflict-marker scan
         run: |
           if grep -rn "^<<<<<<<\|^>>>>>>>" --include='*.py' --include='*.md' .; then
@@ -54,6 +72,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version-file: '.python-version'
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
@@ -63,4 +88,7 @@ jobs:
         env:
           DISCORD_TOKEN: dummy_test_token
           ADMIN_USER_IDS: "1234567890"
-        run: pytest -q -n 2 -m "not integration"
+          ANTHROPIC_API_KEY: ci-dummy
+          OPENAI_API_KEY: ci-dummy
+          GOOGLE_AI_API_KEY: ci-dummy
+        run: pytest -q -n auto -m "not integration"
