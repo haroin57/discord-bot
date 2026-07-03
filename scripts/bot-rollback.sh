@@ -5,6 +5,7 @@ if [[ $# -lt 1 ]]; then
     echo "Usage: $0 <tag-name>"
     echo "Available tags:"
     git tag -l "pre-deploy-*" | tail -5
+    git tag -l "refactor-*"
     exit 1
 fi
 TAG="$1"

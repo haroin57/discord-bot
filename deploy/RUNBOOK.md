@@ -66,3 +66,37 @@ sudo systemctl restart discord-bot
 sudo systemctl stop discord-bot
 sudo systemctl start discord-bot
 ```
+
+## Refactor Train Operations (P0.25 — docs/2026-07-03-grand-refactor-plan.md)
+
+リファクタ期間中、state/session/fallback/mem0 を触る PR の本番反映は必ずこの順で行う:
+
+```bash
+# 1. 整合スナップショット（無停止・SQLite .backup API）+ 復元リハーサル
+scripts/snapshot_state.sh                     # → ~/.local/state/discord-bot/refactor-snapshots/<ts>
+scripts/snapshot_state.sh --verify <snap-dir> # integrity_check まで通ることを確認
+
+# 2. 再起動前スモーク（red なら再起動しない）
+scripts/smoke_bot.sh
+
+# 3. 再起動（深夜帯推奨）
+sudo systemctl restart discord-bot
+
+# 4. 観察期間（24〜72h）はエラー率ゲートを回す
+scripts/error_rate_monitor.sh                 # 15分窓 / ERROR>5 で exit 1
+# cron 例: */15 * * * * .../error_rate_monitor.sh || echo "breach $(date)" >> /tmp/bot_alerts.log
+```
+
+### 切り戻し
+
+```bash
+scripts/bot-rollback.sh refactor-base-20260703   # tag へ即時 rollback + restart
+# .state が壊れた場合のみ: bot 停止 → snapshot から .state を戻す → 起動
+```
+
+### Feature flag 規約（リファクタ用）
+
+- 新旧経路を切り替えるフラグは `REFACTOR_<AREA>_NEW=1` 形式の env で `config.py` の
+  `_bool_env()` を使って定義する（例: `REFACTOR_SENDER_NEW`）
+- デフォルトは**旧経路**。新経路が観察期間を通過したらデフォルト反転 → 次のフェーズで旧経路削除
+- フラグの寿命は最長1フェーズ。恒久 config 化しない
