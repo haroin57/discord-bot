@@ -21,7 +21,7 @@ def test_health_snapshot_keys():
     assert "status" in snapshot
     assert "uptime_s" in snapshot
     assert "subsystems" in snapshot
-    assert set(snapshot["subsystems"].keys()) == {"discord", "oauth", "mem0"}
+    assert set(snapshot["subsystems"].keys()) == {"discord", "oauth", "mem0", "system"}
 
 
 def test_health_degraded_when_discord_not_ready():
@@ -29,7 +29,8 @@ def test_health_degraded_when_discord_not_ready():
     bot.is_ready.return_value = False
 
     with patch("services.health._check_oauth", return_value={"ok": True}), \
-         patch("services.health._check_mem0", return_value={"ok": True}):
+         patch("services.health._check_mem0", return_value={"ok": True}), \
+         patch("services.health._check_system", return_value={"ok": True}):
         snapshot = get_health_snapshot(bot=bot)
 
     assert snapshot["status"] == "degraded"
@@ -42,9 +43,20 @@ def test_health_ok_when_all_subsystems_ok():
     bot.latency = 0.042
 
     with patch("services.health._check_oauth", return_value={"ok": True}), \
-         patch("services.health._check_mem0", return_value={"ok": True}):
+         patch("services.health._check_mem0", return_value={"ok": True}), \
+         patch("services.health._check_system", return_value={"ok": True}):
         snapshot = get_health_snapshot(bot=bot)
 
     assert snapshot["status"] == "ok"
     assert snapshot["subsystems"]["discord"]["ok"] is True
     assert snapshot["subsystems"]["discord"]["gateway_latency_ms"] == 42
+
+
+def test_check_system_reports_metrics():
+    from services.health import _check_system
+
+    snapshot = _check_system()
+    assert "cpu_load_pct" in snapshot
+    assert "mem_pct" in snapshot
+    assert "disk_pct" in snapshot
+    assert "swap_pct" in snapshot

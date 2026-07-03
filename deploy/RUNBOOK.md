@@ -113,7 +113,23 @@ bot と運命を共にしない監視経路。**bot 完全死でもアラート�
   （channel_id 1522684302687469749）。DOWN 継続中は 30分毎に再通知。
   Webhook URL は Worker の secret `WEBHOOK_URL`（差し替えは
   `wrangler secret put WEBHOOK_URL`）
-- 状態確認: https://kanae-health-probe.haroin57.workers.dev/ （現在の KV 状態を返す）
+- 状態確認: https://kanae-health-probe.haroin57.workers.dev/ （現在の KV 状態を返す。
+  `service`=サービスUP/DOWN、`resources`=リソース閾値状態）
 - ソース: ~/archives/cloudflare-workers-src-20260704/kanae-health-probe（wrangler プロジェクト）
+
+### ホストリソース閾値監視（C0c, 2026-07-04）
+
+`/health` の `subsystems.system`（psutil 由来）を同じ Worker が毎分チェック。
+サービスの UP/DOWN とは独立した通知経路（🟡 WARN / 🟢 復帰）。
+
+| メトリクス | 警告閾値 | 復帰閾値 |
+|---|---|---|
+| disk_pct | 85% | 80% |
+| mem_pct | 90% | 85% |
+| swap_pct | 50% | 40% |
+| cpu_load_pct（load1/nproc×100） | 150% | 120% |
+
+3回連続超過で WARN、2回連続回復で CLEAR（ヒステリシス幅でフラップ抑制）。
+継続 WARN 中は 30分毎に再通知。
 - **残項目**: Worker 自体の死の検知は Cloudflare ダッシュボードの Workers アラート
   設定 or 外部 SaaS（UptimeRobot 等）を追加すること（監視の監視）
