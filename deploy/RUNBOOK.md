@@ -218,3 +218,15 @@ exited / 🟠 Scheduled restart）を haroin サーバーの systemctl ログチ
 - ノイズ除去: sysstat / apt-daily / session scope 等は BLOCK 正規表現で落とす
   （実測 2h: 188行 → 36行）
 - Webhook URL: `.env.systemd-forward`（SYSTEMD_WEBHOOK_URL、mode 600）
+
+## 共有MCPログ配信（2026-07-04）
+
+共有 MCP デーモン (mem0/second-opinion/oracle/x-scraper/papermcp) の WARNING 以上と
+traceback を `#bot-mcp-log`（channel_id 1522739163412168885）へ配信する。
+
+- デーモン: `scripts/mcp_log_forward.py`、unit `kanae-mcp-forward.service`
+- ログ形式が unit ごとに違う（タイムスタンプ型 / LEVEL: 接頭辞型 / uvicorn access /
+  supergateway 中継ダンプ）。**supergateway の JSON-RPC 中継行はスキーマ内に
+  "error" 文字列を含むため無条件除外**してからマッチングする
+- traceback はレベル接頭辞が無いので形状（Traceback / File " / XxxError:）で拾う
+- 巨大行は300字で切る。Webhook URL は `.env.mcp-forward`（mode 600）
