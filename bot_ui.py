@@ -19,6 +19,16 @@ import discord
 
 from services.claude_api.progress import ProgressSpinner, _fmt_tokens, SPINNER_EMOJI
 from services.correlation import get_request_id
+from services.job_state import JobPhase
+from utils.markdown_parser import (
+    TableSegment,
+    MathSegment,
+    split_settled,
+    first_block_span,
+)
+from utils.math_renderer import render_math_image
+from utils.response_sanitizer import strip_numeric_inline_code
+from utils.table_renderer import render_table_image
 
 log = logging.getLogger(__name__)
 
@@ -311,3 +321,338 @@ class StatusController:
                 await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 break
+
+
+class LiveRenderer:
+    """In-stream renderer for the model's live narration (R3).
+
+    Extracted verbatim from the ~260 lines of closures that lived inside
+    on_message. Owns the incremental table/$$/$ block rendering, editable
+    live-tail prose drafts, the held open-block placeholder, and the
+    debounced parallel tool-call notice. One instance per on_message call.
+
+    Design (external review consensus, 2026-07-04):
+      * ``settled`` stays a monotonically increasing INTEGER offset
+        (``self._emitted["upto"]``), never a string.
+      * The renderer never touches spinner internals — it calls
+        ``await self._status.reposition()`` after appending content.
+      * Behaviour is byte-for-byte the original: throttle intervals, split
+        limits, placeholder wording, image cleanup, exception handling and
+        log strings are all preserved. No new locking / queueing.
+
+    ``split_message`` is injected (not imported) because the test-suite
+    patches ``bot.split_message``; on_message binds the (possibly patched)
+    module global and passes it in at construction time.
+    """
+
+    # Same constants the closures used (kept verbatim).
+    LIVE_DRAFT_LIMIT = 1880
+    STREAM_EDIT_INTERVAL_S = 1.5
+    DISCORD_HARD_CAP = 1990
+    TOOL_BATCH_WINDOW_S = 0.08
+    TOOL_NOTICE_MAX_LINES = 8
+
+    def __init__(
+        self,
+        message: "discord.Message",
+        status: "StatusController",
+        *,
+        track_task,
+        job,
+        split_message,
+    ) -> None:
+        self.message = message
+        self._status = status
+        self._track_task = track_task
+        self._job = job
+        self._split_message = split_message
+
+        # ── shared streaming state (was nonlocal / dict cells in on_message) ──
+        self._live_sent_any = {"v": False}
+        self._acc = {"committed": "", "last_edit": 0.0}   # raw prose across all turns
+        self._emitted = {"upto": 0}                        # raw offset finalized (immutable)
+        self._draft_msgs: list["discord.Message"] = []     # editable live-tail prose msgs
+        self._placeholder: dict = {"msg": None}            # held open-block placeholder
+        self._rendered_images: list[str] = []              # temp image paths to clean up
+        self._first_reply = {"done": False}                # first content msg replies to user
+        self._render_lock = asyncio.Lock()
+
+        # ── parallel tool-call notice state ──────────────────────────────────
+        self._tool_notice_state: dict = {"msg": None, "lines": [], "task": None}
+
+    # ── public read-only accessors (bot.py reads these after the turn) ───────
+    @property
+    def live_sent_any(self) -> bool:
+        return self._live_sent_any["v"]
+
+    @property
+    def committed(self) -> str:
+        return self._acc["committed"]
+
+    @property
+    def rendered_images(self) -> list[str]:
+        return self._rendered_images
+
+    @property
+    def tool_notice_task(self):
+        return self._tool_notice_state.get("task")
+
+    @property
+    def tool_notice_msg(self):
+        return self._tool_notice_state.get("msg")
+
+    def clear_tool_notice_msg(self) -> None:
+        self._tool_notice_state["msg"] = None
+
+    # ── content sending ─────────────────────────────────────────────────────
+    async def _send_content(self, text: str | None = None, *, file=None):
+        """Send one content message; the first one replies to the user's.
+
+        The response is ALWAYS a fresh message (reply for the first chunk,
+        channel.send after) — never an in-place edit of the spinner's
+        status_msg. Repurposing status_msg made the spinner vanish the
+        instant generation began and, worse, dropped the reply into the
+        spinner's OLD timeline slot, so a reply sent mid-generation landed
+        above newer messages (haroin, 2026-06-22). The spinner keeps
+        running in its own status_msg and is deleted when the turn ends.
+        """
+        try:
+            if not self._first_reply["done"]:
+                self._first_reply["done"] = True
+                m = await (self.message.reply(file=file) if file is not None
+                           else self.message.reply(text))
+            else:
+                m = await (self.message.channel.send(file=file) if file is not None
+                           else self.message.channel.send(text))
+        except discord.errors.HTTPException as exc:
+            log.warning("[rid=%s] content send failed: %s", get_request_id(), exc)
+            return None
+        self._live_sent_any["v"] = True
+        await self._status.reposition()
+        return m
+
+    def _disp(self, text: str) -> str:
+        # Display-only transform: strip numeric inline-code backticks (only
+        # removes chars, never shifts the RAW offsets the streamer tracks)
+        # and hard-cap to stay under Discord's limit.
+        text = strip_numeric_inline_code(text)
+        if len(text) > self.DISCORD_HARD_CAP:
+            text = text[:self.DISCORD_HARD_CAP - 1] + "…"
+        return text
+
+    async def _draft_live(self, prose: str) -> None:
+        """Render trailing prose into the editable draft messages, edits in
+        place and appends as the tail grows. Idempotent (skips unchanged)."""
+        prose = (prose or "").strip("\n")
+        if not prose.strip():
+            return
+        chunks = await asyncio.to_thread(
+            self._split_message, prose, self.LIVE_DRAFT_LIMIT, numbered=False,
+        )
+        for i, chunk in enumerate(chunks):
+            disp = self._disp(chunk)
+            if not disp.strip():
+                continue
+            if i < len(self._draft_msgs):
+                existing = self._draft_msgs[i]
+                if getattr(existing, "content", None) == disp:
+                    continue
+                try:
+                    await existing.edit(content=disp)
+                except discord.errors.HTTPException:
+                    pass
+            else:
+                sent = await self._send_content(disp)
+                if sent is None:
+                    return
+                self._draft_msgs.append(sent)
+
+    async def _finalize_text(self, prose: str) -> None:
+        """Freeze the live-tail prose as immutable messages: render it once
+        more, then stop tracking those messages (no further edits). Reuses
+        the existing draft messages — never re-sends, so no duplication."""
+        await self._draft_live(prose)
+        self._draft_msgs.clear()
+
+    async def _show_placeholder(self) -> None:
+        if self._placeholder.get("msg") is None:
+            self._placeholder["msg"] = await self._send_content("📊 描画中…")
+
+    async def _hide_placeholder(self) -> None:
+        ph = self._placeholder.get("msg")
+        if ph is not None:
+            try:
+                await ph.delete()
+            except discord.errors.HTTPException:
+                pass
+            self._placeholder["msg"] = None
+
+    async def _emit_block(self, seg) -> None:
+        """Render a Table/Math segment to an image (immutable, in order).
+        Removes the held placeholder first; falls back to text on failure."""
+        img_path = None
+        try:
+            if isinstance(seg, TableSegment):
+                img_path = await render_table_image(seg.markdown, caption=seg.caption)
+            elif isinstance(seg, MathSegment):
+                img_path = await render_math_image(seg.latex, display_mode=seg.display_mode)
+        except Exception as exc:
+            log.warning("[rid=%s] block render failed: %s", get_request_id(), exc)
+            img_path = None
+        # Drop the placeholder right before placing the final content so the
+        # image lands at the same position (a placeholder→image swap, never
+        # a raw-markdown→image swap).
+        await self._hide_placeholder()
+        if img_path:
+            self._rendered_images.append(img_path)
+            f = discord.File(img_path)
+            try:
+                await self._send_content(file=f)
+            finally:
+                f.close()
+            return
+        # Render failed → raw-text fallback at the same position.
+        if isinstance(seg, TableSegment):
+            fallback = seg.markdown
+        else:
+            fallback = (f"```\n{seg.latex}\n```" if seg.display_mode
+                        else f"`{seg.latex}`")
+        for chunk in await asyncio.to_thread(
+            self._split_message, fallback, self.LIVE_DRAFT_LIMIT, numbered=False,
+        ):
+            await self._send_content(self._disp(chunk))
+
+    async def render_incremental(self, full_text: str, *, final: bool = False,
+                                 force: bool = False) -> None:
+        full_text = full_text or ""
+        async with self._render_lock:
+            now_mono = time.monotonic()
+            if not final and not force and \
+                    (now_mono - self._acc["last_edit"]) < self.STREAM_EDIT_INTERVAL_S:
+                return
+            self._acc["last_edit"] = now_mono
+
+            if final:
+                settled_end = len(full_text)
+                is_open = False
+            else:
+                # 純 CPU の regex 関数。to_thread の dispatch コストの方が
+                # 実行コストより高いので直接呼ぶ（毎 tick 実行される）。
+                settled, _pending, is_open = split_settled(full_text)
+                settled_end = len(settled)
+
+            # Emit every closed block in [_emitted, settled_end] in order.
+            # Bounded loop: each iteration must advance _emitted (end > 0),
+            # but guard against a pathological zero-width span so the event
+            # loop can never spin here.
+            _guard = 0
+            while _guard < 500:
+                _guard += 1
+                region = full_text[self._emitted["upto"]:settled_end]
+                span = first_block_span(region)
+                if span is None:
+                    break
+                start, end, seg = span
+                if end <= 0:
+                    break  # never advances → bail (defensive)
+                prose_before = region[:start]
+                if prose_before.strip():
+                    await self._finalize_text(prose_before)
+                else:
+                    self._draft_msgs.clear()  # freeze any stale draft before block
+                await self._emit_block(seg)
+                self._emitted["upto"] += end
+
+            # Trailing region after the last emitted block.
+            if final:
+                tail = full_text[self._emitted["upto"]:]
+                if tail.strip():
+                    await self._finalize_text(tail)
+                await self._hide_placeholder()
+                return
+            if is_open:
+                # Prose before the open block (settled) is shown live; the
+                # open block is held behind the placeholder until it closes.
+                await self._draft_live(full_text[self._emitted["upto"]:settled_end])
+                await self._show_placeholder()
+            else:
+                await self._hide_placeholder()
+                await self._draft_live(full_text[self._emitted["upto"]:])
+
+    async def stream_preview(self, partial_turn_text: str) -> None:
+        # In-progress text of the CURRENT turn appended to everything
+        # already committed. Throttled (the turn-final incremental_send
+        # forces a render; the post-stream final flush is authoritative).
+        sep = "\n\n" if self._acc["committed"] else ""
+        await self.render_incremental(
+            self._acc["committed"] + sep + (partial_turn_text or ""),
+        )
+
+    async def incremental_send(self, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        sep = "\n\n" if self._acc["committed"] else ""
+        self._acc["committed"] = self._acc["committed"] + sep + text
+        log.info(
+            "[rid=%s] live commit: +%d chars committed=%d",
+            get_request_id(), len(text), len(self._acc["committed"]),
+        )
+        await self.render_incremental(self._acc["committed"], force=True)
+
+    # ── parallel tool-call notice ────────────────────────────────────────────
+    async def flush_tool_notice(self) -> None:
+        lines = self._tool_notice_state.get("lines") or []
+        if not lines:
+            return
+        self._tool_notice_state["lines"] = []
+        shown = lines[:self.TOOL_NOTICE_MAX_LINES]
+        extra = len(lines) - len(shown)
+        payload = "\n".join(shown)
+        if extra > 0:
+            payload += f"\n-# …他 {extra} 件"
+        if len(payload) > 1990:
+            payload = payload[:1960] + "\n…(truncated)"
+        existing = self._tool_notice_state.get("msg")
+        try:
+            if existing is None:
+                self._tool_notice_state["msg"] = await self.message.channel.send(payload)
+                await self._status.reposition()
+                return
+            await existing.edit(content=payload)
+        except discord.errors.NotFound:
+            try:
+                self._tool_notice_state["msg"] = await self.message.channel.send(payload)
+                await self._status.reposition()
+            except Exception as exc:
+                log.warning("tool notice re-post failed: %s", exc)
+        except Exception as exc:
+            log.warning("tool notice send/edit failed: %s", exc)
+
+    async def tool_invocation_send(self, tool_name: str, tool_input: dict) -> None:
+        self._job.phase = JobPhase.TOOL_RUNNING
+        try:
+            from services.claude_api.status import tool_oneline
+            line = tool_oneline(tool_name, tool_input)
+        except Exception as exc:
+            log.warning("tool notice format failed: %s", exc)
+            return
+        if not line:
+            return
+        self._tool_notice_state["lines"].append(line)
+        # Debounce: collapse a burst of parallel tool calls into one edit by
+        # (re)scheduling the flush TOOL_BATCH_WINDOW_S after the latest call.
+        pending = self._tool_notice_state.get("task")
+        if pending and not pending.done():
+            pending.cancel()
+
+        async def _delayed_flush():
+            try:
+                await asyncio.sleep(self.TOOL_BATCH_WINDOW_S)
+            except asyncio.CancelledError:
+                return
+            await self.flush_tool_notice()
+
+        self._tool_notice_state["task"] = self._track_task(
+            _delayed_flush(), name="tool_notice_flush"
+        )
