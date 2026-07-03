@@ -693,3 +693,33 @@ async def resolve_channel_mention_contexts(
     results = await asyncio.gather(*[_fetch_one(cid) for cid in channel_ids])
     contexts = [r for r in results if r]
     return "\n\n".join(contexts)
+
+
+class ReplyChainSender:
+    """Send a sequence of messages where the first replies to the triggering
+    message and the rest are plain channel sends.
+
+    Collapses the hand-rolled ``is_first`` flag that bot.py repeated at every
+    send site (text / table / math segments, final reply chains) into one
+    place (P2-b of docs/2026-07-03-grand-refactor-plan.md).
+    """
+
+    def __init__(self, message: "discord.Message") -> None:
+        self._message = message
+        self._first = True
+
+    async def send(self, content: "str | None" = None, **kwargs) -> "discord.Message":
+        if self._first:
+            self._first = False
+            if content is None:
+                return await self._message.reply(**kwargs)
+            return await self._message.reply(content, **kwargs)
+        channel = self._message.channel
+        if content is None:
+            return await channel.send(**kwargs)
+        return await channel.send(content, **kwargs)
+
+    async def send_split(self, text: str) -> None:
+        """Split ``text`` to fit Discord's 2000-char limit and send each chunk."""
+        for chunk in split_message(text):
+            await self.send(chunk)

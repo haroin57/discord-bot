@@ -102,6 +102,7 @@ from utils.attachments import (
     strip_attached_paths,
 )
 from utils.discord_helpers import (
+    ReplyChainSender,
     build_mention_regex,
     fetch_channel_context,
     fetch_thread_context,
@@ -595,7 +596,7 @@ async def _send_segmented(
     import os as _os
 
     segments = parse_segments(response_text)
-    is_first = True
+    sender = ReplyChainSender(message)
     rendered_images: list[str] = []
 
     for seg in segments:
@@ -603,13 +604,7 @@ async def _send_segmented(
             text = seg.content.strip()
             if not text:
                 continue
-            chunks = split_message(text)
-            for chunk in chunks:
-                if is_first:
-                    await message.reply(chunk)
-                    is_first = False
-                else:
-                    await message.channel.send(chunk)
+            await sender.send_split(text)
 
         elif isinstance(seg, TableSegment):
             img_path = await render_table_image(seg.markdown, caption=seg.caption)
@@ -617,23 +612,13 @@ async def _send_segmented(
                 rendered_images.append(img_path)
                 f = discord.File(img_path)
                 try:
-                    if is_first:
-                        await message.reply(file=f)
-                        is_first = False
-                    else:
-                        await message.channel.send(file=f)
+                    await sender.send(file=f)
                 finally:
                     f.close()
             else:
                 # Fallback: send table as plain text
                 log.warning("Table render failed, falling back to text")
-                chunks = split_message(seg.markdown)
-                for chunk in chunks:
-                    if is_first:
-                        await message.reply(chunk)
-                        is_first = False
-                    else:
-                        await message.channel.send(chunk)
+                await sender.send_split(seg.markdown)
 
         elif isinstance(seg, MathSegment):
             img_path = await render_math_image(seg.latex, display_mode=seg.display_mode)
@@ -641,22 +626,14 @@ async def _send_segmented(
                 rendered_images.append(img_path)
                 f = discord.File(img_path)
                 try:
-                    if is_first:
-                        await message.reply(file=f)
-                        is_first = False
-                    else:
-                        await message.channel.send(file=f)
+                    await sender.send(file=f)
                 finally:
                     f.close()
             else:
                 # Fallback: send math as raw LaTeX text
                 log.warning("Math render failed, falling back to text")
                 fallback = f"`{seg.latex}`" if not seg.display_mode else f"```\n{seg.latex}\n```"
-                if is_first:
-                    await message.reply(fallback)
-                    is_first = False
-                else:
-                    await message.channel.send(fallback)
+                await sender.send(fallback)
 
     # Send any extracted file attachments at the end
     if attach_files:
@@ -2966,19 +2943,16 @@ async def on_message(message: discord.Message):
                 elif _has_rich:
                     await _send_segmented(message, response_text, attach_files)
                 else:
-                    chunks = split_message(response_text)
-                    for i, chunk in enumerate(chunks):
-                        if i == 0:
-                            if attach_files:
-                                _reply_files = attach_files
-                                if len(_reply_files) > 10:
-                                    log.warning("Capping attachments %d -> 10 for Discord limit", len(_reply_files))
-                                    _reply_files = _reply_files[:10]
-                                await message.reply(chunk, files=_reply_files)
-                            else:
-                                await message.reply(chunk)
+                    _sender = ReplyChainSender(message)
+                    _reply_files = attach_files
+                    if _reply_files and len(_reply_files) > 10:
+                        log.warning("Capping attachments %d -> 10 for Discord limit", len(_reply_files))
+                        _reply_files = _reply_files[:10]
+                    for i, chunk in enumerate(split_message(response_text)):
+                        if i == 0 and _reply_files:
+                            await _sender.send(chunk, files=_reply_files)
                         else:
-                            await message.channel.send(chunk)
+                            await _sender.send(chunk)
         finally:
             for f in attach_files:
                 f.close()
