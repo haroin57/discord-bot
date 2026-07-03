@@ -1,0 +1,17 @@
+[Unit]
+Description=Forward systemd unit lifecycle events to Discord webhook
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/ubuntu/discord-bot/scripts/systemd_forward.py
+EnvironmentFile=/home/ubuntu/discord-bot/.env.systemd-forward
+User=ubuntu
+Group=ubuntu
+SupplementaryGroups=systemd-journal
+Restart=always
+RestartSec=10
+MemoryMax=100M
+
+[Install]
+WantedBy=multi-user.target

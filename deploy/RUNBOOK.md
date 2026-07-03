@@ -204,3 +204,17 @@ discord-bot の journal のうち WARNING 以上を haroin サーバーの
 | kanae-vi-signal | 日次シグナル (0 9 * * 1-5 UTC) | シャドー |
 | kanae-intervention | 介入スコア (*/30) | シャドー |
 | kanae-egress-poc | egress 検証用 | 削除可 |
+
+## systemd イベント配信（2026-07-04）
+
+systemd のユニットライフサイクル（🟢 Started / ⚪ Stopped / 🔴 Failed・Main process
+exited / 🟠 Scheduled restart）を haroin サーバーの systemctl ログチャンネル
+（channel_id 1522737527771889824）へ配信する。
+
+- デーモン: `scripts/systemd_forward.py`、unit `kanae-systemd-forward.service`
+  （journal_forward.py の姉妹スクリプト。stdlib のみ）
+- ソース: `journalctl -f -o json _PID=1`（システム journal の読み取りに
+  `SupplementaryGroups=systemd-journal` が必要）
+- ノイズ除去: sysstat / apt-daily / session scope 等は BLOCK 正規表現で落とす
+  （実測 2h: 188行 → 36行）
+- Webhook URL: `.env.systemd-forward`（SYSTEMD_WEBHOOK_URL、mode 600）
