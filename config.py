@@ -371,6 +371,9 @@ TOOL_ERROR_MIN_REPLY_CHARS = int(os.environ.get("TOOL_ERROR_MIN_REPLY_CHARS", "1
 MAX_CONSECUTIVE_EMPTY_TURNS = int(os.environ.get("MAX_CONSECUTIVE_EMPTY_TURNS", "2"))
 # (C) Last-ditch summary nudge before returning the "(no response)" sentinel.
 MAX_FINAL_EMPTY_NUDGES = int(os.environ.get("MAX_FINAL_EMPTY_NUDGES", "1"))
+# Server-side tool（Tool Search 等）の stop_reason=pause_turn を user ターンを
+# 足さずに再送して resume する回数の上限（暴走防止の backstop）。
+MAX_PAUSE_TURN_CONTINUES = int(os.environ.get("MAX_PAUSE_TURN_CONTINUES", "5"))
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -534,7 +537,9 @@ SPINNER_MODE = os.environ.get("SPINNER_MODE", "text").strip().lower()
 # that hangs (e.g. an unresponsive MCP server like onion-search) must not block
 # the turn forever — on timeout the loop gets an is_error tool_result and
 # continues, instead of the whole channel wedging behind a stuck await.
-TOOL_CALL_TIMEOUT_S = int(os.environ.get("TOOL_CALL_TIMEOUT_S", "240"))
+# SecondOpinion の per-vendor timeout (300s) を tool 実行の外壁が先に切らない
+# よう 360s（旧 240s、2026-07-02）。
+TOOL_CALL_TIMEOUT_S = int(os.environ.get("TOOL_CALL_TIMEOUT_S", "360"))
 
 # 通常 chat 経路の MCP tool 結果の文字数上限（head+tail 中抜き切り詰め）。
 # Deep Research 経路には DEEP_RESEARCH_MAX_TOOL_RESULT_CHARS=20000 が既にあるが
@@ -542,6 +547,170 @@ TOOL_CALL_TIMEOUT_S = int(os.environ.get("TOOL_CALL_TIMEOUT_S", "240"))
 # に直撃し得たため同水準の cap を入れる。builtin tools は各自の cap
 # (BASH_OUTPUT_CAP_BYTES 等) を持つので対象外。0 以下で無効化。
 MCP_TOOL_RESULT_CHARS = int(os.environ.get("MCP_TOOL_RESULT_CHARS", "20000"))
+
+# Server-side Tool Search Tool（defer_loading）。全 MCP schema を検索カタログとして
+# 常時同梱し、モデルが必要な分だけ発見・ロードする。既定 OFF — probe
+# (scripts/probe_tool_search.py) で subscriber 経路の対応を確認してから .env で
+# 有効化する（staged rollout）。CLI 経路用の ENABLE_TOOL_SEARCH（CLAUDE_CLI_ENV,
+# 上方）とは別物なので混同しないこと。
+TOOL_SEARCH_ENABLED = (
+    os.environ.get("TOOL_SEARCH_ENABLED", "false").lower() == "true"
+)
+# regex: モデルが正規表現で検索（CLI と同系）/ bm25: 自然言語クエリ
+TOOL_SEARCH_VARIANT = os.environ.get("TOOL_SEARCH_VARIANT", "regex").strip().lower()
+
+# tool loop 評価ハーネス（scripts/eval_tool_loop.py）用: 凍結コーパス検索の
+# evalsearch MCP を広告に加える。本番では常に false。
+# docs/2026-07-02-tool-loop-eval-design.md
+EVAL_MCP_ENABLED = (
+    os.environ.get("EVAL_MCP_ENABLED", "false").lower() == "true"
+)
+
+# ---------------------------------------------------------------------------
+# 熟考パイプライン (DELIB_*) — 全機能 env flag、既定 OFF。restricted には不適用。
+# P1: evidence index（tool 呼び出し台帳）+ result distillation（大結果の Haiku 蒸留）
+# ---------------------------------------------------------------------------
+DELIB_EVIDENCE_ENABLED = (
+    os.environ.get("DELIB_EVIDENCE_ENABLED", "false").lower() == "true"
+)
+DELIB_EVIDENCE_TTL_S = int(os.environ.get("DELIB_EVIDENCE_TTL_S", "86400"))
+# これ未満の tool 結果は raw ファイル保存しない（台帳の note だけ持つ）
+DELIB_EVIDENCE_RAW_MIN_CHARS = int(
+    os.environ.get("DELIB_EVIDENCE_RAW_MIN_CHARS", "2000"))
+# 台帳 note（非蒸留時は原文 head）の上限
+DELIB_EVIDENCE_NOTE_CHARS = int(
+    os.environ.get("DELIB_EVIDENCE_NOTE_CHARS", "700"))
+
+DELIB_DISTILL_ENABLED = (
+    os.environ.get("DELIB_DISTILL_ENABLED", "false").lower() == "true"
+)
+DELIB_DISTILL_MODEL = os.environ.get(
+    "DELIB_DISTILL_MODEL", "claude-haiku-4-5-20251001")
+DELIB_DISTILL_MIN_CHARS = int(os.environ.get("DELIB_DISTILL_MIN_CHARS", "4000"))
+DELIB_DISTILL_MAX_NOTE_CHARS = int(
+    os.environ.get("DELIB_DISTILL_MAX_NOTE_CHARS", "1200"))
+DELIB_DISTILL_INPUT_CAP = int(os.environ.get("DELIB_DISTILL_INPUT_CAP", "24000"))
+DELIB_DISTILL_TIMEOUT_S = int(os.environ.get("DELIB_DISTILL_TIMEOUT_S", "20"))
+DELIB_DISTILL_MAX_PARALLEL = int(
+    os.environ.get("DELIB_DISTILL_MAX_PARALLEL", "3"))
+
+# P2: tier router（積極自動 — ユーザー決定 2026-07-02）+ verifier + judge-lite
+DELIB_ROUTER_ENABLED = (
+    os.environ.get("DELIB_ROUTER_ENABLED", "false").lower() == "true"
+)
+DELIB_ROUTER_MODE = os.environ.get("DELIB_ROUTER_MODE", "heuristic").strip().lower()
+DELIB_ROUTER_MIN_CHARS = int(os.environ.get("DELIB_ROUTER_MIN_CHARS", "120"))
+# 積極自動: 依頼型キーワード単発（+2）で deliberate に届く閾値
+DELIB_ROUTER_SCORE_THRESHOLD = float(
+    os.environ.get("DELIB_ROUTER_SCORE_THRESHOLD", "1.0"))
+
+DELIB_VERIFIER_ENABLED = (
+    os.environ.get("DELIB_VERIFIER_ENABLED", "false").lower() == "true"
+)
+# "" = メイン応答の実効モデルを継承
+DELIB_VERIFIER_MODEL = os.environ.get("DELIB_VERIFIER_MODEL", "")
+DELIB_VERIFIER_MAX_TURNS = int(os.environ.get("DELIB_VERIFIER_MAX_TURNS", "6"))
+DELIB_VERIFY_MAX_REVISIONS = int(os.environ.get("DELIB_VERIFY_MAX_REVISIONS", "1"))
+
+DELIB_JUDGE_LITE_ENABLED = (
+    os.environ.get("DELIB_JUDGE_LITE_ENABLED", "false").lower() == "true"
+)
+DELIB_JUDGE_MODEL = os.environ.get(
+    "DELIB_JUDGE_MODEL", "claude-haiku-4-5-20251001")
+DELIB_JUDGE_MIN_CHARS = int(os.environ.get("DELIB_JUDGE_MIN_CHARS", "400"))
+
+# P3: planner（deliberate tier 冒頭の計画パス）+ scratchpad（作業メモリ tool）
+DELIB_PLANNER_ENABLED = (
+    os.environ.get("DELIB_PLANNER_ENABLED", "false").lower() == "true"
+)
+DELIB_PLANNER_MODEL = os.environ.get("DELIB_PLANNER_MODEL", "")  # ""=実効model継承
+DELIB_PLANNER_TIMEOUT_S = int(os.environ.get("DELIB_PLANNER_TIMEOUT_S", "45"))
+DELIB_SCRATCHPAD_ENABLED = (
+    os.environ.get("DELIB_SCRATCHPAD_ENABLED", "false").lower() == "true"
+)
+
+# P4: 他社モデルへの相談 tool（GPT-5 + DeepSeek 並列）と Anthropic Advisor tool
+SECOND_OPINION_ENABLED = (
+    os.environ.get("SECOND_OPINION_ENABLED", "false").lower() == "true"
+)
+SECOND_OPINION_OPENAI_MODEL = os.environ.get(
+    "SECOND_OPINION_OPENAI_MODEL", "gpt-5")
+# gpt-5 の reasoning effort。既定 effort は重い相談で 60s を超えて timeout した
+# （2026-07-02）ため low を既定にする（第二意見は即答性優先）。
+SECOND_OPINION_OPENAI_EFFORT = os.environ.get(
+    "SECOND_OPINION_OPENAI_EFFORT", "low")
+# GPT 経路: auto=codex(ChatGPTサブスク枠, GPT-5.5) 利用可なら codex、無ければ
+# API 直課金(gpt-5) / codex=codex 固定 / api=API 直固定。既定 auto。
+# codex はサブスク枠で GPT-5.5（API 未提供の最上位）が使える（2026-07-03 実測）。
+SECOND_OPINION_OPENAI_MODE = os.environ.get(
+    "SECOND_OPINION_OPENAI_MODE", "auto").strip().lower()
+# codex(OpenAI Codex CLI)。ChatGPT ログイン済み（~/.codex/auth.json）が前提。
+CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
+# ChatGPT アカウントで使える最上位（-codex/-pro/-codex-max は非対応）
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.5")
+# 第二意見は即答性優先。既定 config は xhigh なので下げる
+CODEX_REASONING_EFFORT = os.environ.get("CODEX_REASONING_EFFORT", "low")
+CODEX_WORKDIR = os.environ.get(
+    "CODEX_WORKDIR", os.path.join(STATE_DIR, "codex_workdir"))
+SECOND_OPINION_DEEPSEEK_MODEL = os.environ.get(
+    "SECOND_OPINION_DEEPSEEK_MODEL", "deepseek/deepseek-chat-v4-flash")
+# Gemini 最上位（Google 直・課金アカウント = GOOGLE_AI_API_KEY を使用、
+# aggregator 非経由 — haroin 指定 2026-07-02）
+SECOND_OPINION_GEMINI_MODEL = os.environ.get(
+    "SECOND_OPINION_GEMINI_MODEL", "gemini-3.1-pro-preview")
+# Gemini 経路の選択: auto=agy(OAuthサブスク枠) 利用可なら agy、無ければ API 直課金 /
+# agy=agy 固定（不通なら Gemini スキップ）/ api=API 直固定。既定 auto。
+# agy は従量課金ゼロだが print mode で Gemini 3.5 Flash 固定、API 直は最上位可だが課金。
+SECOND_OPINION_GEMINI_MODE = os.environ.get(
+    "SECOND_OPINION_GEMINI_MODE", "auto").strip().lower()
+# agy(Antigravity CLI) バイナリと transcript の場所（実機で確定 → 上書き可）
+# 2026-07-02: v1.0.15 は `install` 実行時に PATH を通すが、systemd 経由では
+# ~/.local/bin が PATH に無いことがあるのでフルパス既定にする。
+AGY_BIN = os.environ.get(
+    "AGY_BIN", os.path.expanduser("~/.local/bin/agy"))
+# v1.0.15 は --model で最上位まで選べる（旧「3.5 Flash 固定」は解消）。
+# サブスク枠で最上位 Pro を使う。
+AGY_MODEL = os.environ.get("AGY_MODEL", "Gemini 3.1 Pro (High)")
+AGY_TRANSCRIPT_ROOT = os.environ.get(
+    "AGY_TRANSCRIPT_ROOT",
+    os.path.expanduser("~/.gemini/antigravity-cli/brain"))
+# agy の作業ディレクトリ。/tmp だと他プロセスのファイルで workspace 検出が
+# 詰まって print mode がハングする（2026-07-02 実測 60s+）ため専用の空 dir を
+# 使う。副作用（自律エージェントのファイル書込み）もここに隔離される。
+AGY_WORKDIR = os.environ.get(
+    "AGY_WORKDIR", os.path.join(STATE_DIR, "agy_workdir"))
+# 両 vendor（GPT / DeepSeek）共通の per-vendor timeout。reasoning モデルの
+# 思考時間を待ち切る（haroin 指定 2026-07-02）。TOOL_CALL_TIMEOUT_S（tool 実行
+# の外壁）より短くないと tool ごと切られるので、外壁 360s とセットで運用する。
+SECOND_OPINION_TIMEOUT_S = int(os.environ.get("SECOND_OPINION_TIMEOUT_S", "300"))
+# Anthropic server-side Advisor tool（beta）。probe (scripts/probe_advisor.py,
+# 2026-07-02, 計4回 + multi-turn echo 検証) の結果:
+# - subscriber OAuth 経路で**動作する**（初回のみ transient 失敗、以降 3/3 成功）
+# - 制約: primary が Fable のとき advisor も claude-fable-5 のみ指定可
+#   （Opus 指定は 400: "cannot be used as an advisor when the request model is..."）
+# - 結果は advisor_redacted_result + encrypted_content（opaque、redacted_thinking
+#   と同系）。_block_to_dict の verbatim echo で次ターン 400 にならないことを確認済み
+# 有効化は .env で ADVISOR_ENABLED=true（beta header は client.py が自動付与）。
+ADVISOR_ENABLED = (
+    os.environ.get("ADVISOR_ENABLED", "false").lower() == "true"
+)
+ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "claude-fable-5")
+
+# P5: MAGI-lite（判断系の問いに3レンズ独立見解 + 合意度キャリブレーション）
+MAGI_LITE_ENABLED = (
+    os.environ.get("MAGI_LITE_ENABLED", "false").lower() == "true"
+)
+DELIB_MAGI_MODEL = os.environ.get("DELIB_MAGI_MODEL", "")  # ""=実効model継承
+DELIB_MAGI_CONSENSUS_MIN = float(
+    os.environ.get("DELIB_MAGI_CONSENSUS_MIN", "0.6"))
+DELIB_MAGI_TIMEOUT_S = int(os.environ.get("DELIB_MAGI_TIMEOUT_S", "180"))
+
+# MCP サーバー選択方式（層2）。keyword=従来 / semantic=埋め込みのみ /
+# hybrid=和集合（既定。keyword の recall を維持しつつ言い換えを埋め込みが拾う）。
+MCP_SELECTOR_MODE = os.environ.get("MCP_SELECTOR_MODE", "hybrid").strip().lower()
+# 埋め込み selector の採用閾値（cosine 類似、短文→説明文なので低め）と件数上限。
+MCP_SEMANTIC_MIN_SIM = float(os.environ.get("MCP_SEMANTIC_MIN_SIM", "0.28"))
+MCP_SEMANTIC_TOP_K = int(os.environ.get("MCP_SEMANTIC_TOP_K", "3"))
 
 # ---------------------------------------------------------------------------
 # Deep Research モード (/research — 多段 Web 調査で引用付きレポート、ADR-0028)
@@ -1011,6 +1180,18 @@ MCP_SERVERS: dict = {
     **MCP_SERVERS_IOT,
 }
 
+# 評価ハーネス専用（EVAL_MCP_ENABLED=true の worker プロセスのみ）。
+# 凍結コーパス検索の evalsearch を選択・spawn 可能にする。本番では不在。
+if EVAL_MCP_ENABLED:
+    MCP_SERVERS["evalsearch"] = {
+        "command": os.path.join(BOT_DIR, ".venv", "bin", "python"),
+        "args": [os.path.join(
+            BOT_DIR, "tests", "fixtures", "tool_loop_eval",
+            "evalsearch_server.py",
+        )],
+        "env": {},
+    }
+
 
 # MCP server selection logic moved to services/mcp_selector.py.
 # Import directly from there — config.py is the source of credentials
@@ -1155,6 +1336,36 @@ MEM0_RELATION_EXTRACT_ENABLED = _bool_env("MEM0_RELATION_EXTRACT_ENABLED", True)
 # Capped at MEM0_EPISODE_BUNDLE_LIMIT so MAX_PROMPT_CHARS stays sane.
 MEM0_EPISODE_BUNDLE_ENABLED = _bool_env("MEM0_EPISODE_BUNDLE_ENABLED", True)
 MEM0_EPISODE_BUNDLE_LIMIT = int(os.environ.get("MEM0_EPISODE_BUNDLE_LIMIT", "5"))
+
+# ── Mem0 v4 (2026-07-03): 3つの穴 attribute / condition / scope ──────────
+# v3プラン(docs/memory_redesign_plan.md) + v4実装Plan
+# (docs/mem0_v4_implementation_plan.md)。embedding距離に依存しない
+# 「同一 user × attribute」の決定的 conflict ルートを足し、文面の離れた
+# 数値更新(体重60→58kg 等)が dedup の近傍ゲート(距離≤0.35)をすり抜けて
+# 並置される穴(a)を塞ぐ。全 default False で段階リリース。
+MEM0_ATTRIBUTE_ENABLED = _bool_env("MEM0_ATTRIBUTE_ENABLED", False)
+# Phase A-3: 決定的 conflict ルート。抽出 fact の attribute をキーに
+# mem.get_all(filters={"attribute": ...}) で既存 valid fact を照会し、
+# 見つかれば classify_conflict → update/correction を既存 soft-archive へ。
+MEM0_ATTRIBUTE_CONFLICT_ENABLED = _bool_env("MEM0_ATTRIBUTE_CONFLICT_ENABLED", False)
+# Phase B: 時間帯・文脈条件(time:morning / context:work 等)を condition に
+# 構造化。同一 attribute でも condition が両立するなら矛盾扱いしない。
+MEM0_CONDITION_ENABLED = _bool_env("MEM0_CONDITION_ENABLED", False)
+# Phase C: fact の有効範囲 scope(global / conversation:<channel_id> / meta)。
+# 特定会話限定のメタ情報が汎用 fact として後日誤注入される穴(c)対策。
+MEM0_SCOPE_ENABLED = _bool_env("MEM0_SCOPE_ENABLED", False)
+# Phase R: 読み出し時に conversation scope を現在 channel 以外で除外する
+# フィルタ。search._is_fact_valid に相乗り。呼び出し側の channel_id 配線が要る。
+MEM0_SCOPE_FILTER_ENABLED = _bool_env("MEM0_SCOPE_FILTER_ENABLED", False)
+# v5 T7: 数値属性の typed value。抽出時に {"type":"quantity","value":58,"unit":"kg"}
+# を fact に付け、metadata に value_json として保存。決定ルートでは数値比較を
+# シャドーログ([ATTR_VALUE_COMPARE])で先行させ、精度確認後に classify の置換を判断。
+MEM0_TYPED_VALUE_ENABLED = _bool_env("MEM0_TYPED_VALUE_ENABLED", False)
+# v5 T8a: structured fact layer (services/mem0/fact_store.py)。attribute 付き
+# fact の導出インデックス(SQLite)。正本は Chroma のまま — 壊れたら backfill で
+# 再構築可。ON にすると決定ルートの照会が mem.get_all(全件走査) から SQL lookup
+# に切り替わり、supersede 連鎖で属性履歴が追える。
+MEM0_FACT_STORE_ENABLED = _bool_env("MEM0_FACT_STORE_ENABLED", False)
 
 # Stable namespace for kanae's own Mem0 entries. Both the bot's runtime
 # hook (bot.py) and the daily summary script (scripts/kanae_daily.py)

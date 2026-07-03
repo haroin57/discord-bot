@@ -94,25 +94,25 @@ class TestTokenExpiry:
     def test_past_is_expired(self, monkeypatch):
         import services.oauth_manager as om
         past_ms = int(time.time() * 1000) - 1000
-        monkeypatch.setattr(om, "_expires_at", past_ms)
+        om._accounts["primary"].expires_at = past_ms
         assert om._is_expired() is True
 
     def test_within_buffer_is_expired(self, monkeypatch):
         import services.oauth_manager as om
         # 200s from now < 300s (EXPIRY_BUFFER_MS) => still expired
         almost_expired_ms = int(time.time() * 1000) + 200_000
-        monkeypatch.setattr(om, "_expires_at", almost_expired_ms)
+        om._accounts["primary"].expires_at = almost_expired_ms
         assert om._is_expired() is True
 
     def test_future_is_not_expired(self, monkeypatch):
         import services.oauth_manager as om
         future_ms = int(time.time() * 1000) + 600_000  # 10 min from now
-        monkeypatch.setattr(om, "_expires_at", future_ms)
+        om._accounts["primary"].expires_at = future_ms
         assert om._is_expired() is False
 
     def test_zero_expires_at_is_expired(self, monkeypatch):
         import services.oauth_manager as om
-        monkeypatch.setattr(om, "_expires_at", 0)
+        om._accounts["primary"].expires_at = 0
         assert om._is_expired() is True
 
 

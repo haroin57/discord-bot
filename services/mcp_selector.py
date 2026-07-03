@@ -14,6 +14,8 @@ top of that config.
 
 from __future__ import annotations
 
+import re
+
 from config import (
     ADMIN_USER_IDS,
     MCP_SERVERS,
@@ -28,7 +30,11 @@ from config import (
     NATURE_REMO_ALLOWED_USER_IDS,
 )
 
-__all__ = ["get_mcp_servers_by_keys", "pick_mcp_servers"]
+__all__ = [
+    "get_mcp_servers_by_keys",
+    "pick_mcp_servers",
+    "select_mcp_servers",
+]
 
 
 # Keyword sets used by pick_mcp_servers(). Cheap substring scans on the
@@ -39,7 +45,9 @@ __all__ = ["get_mcp_servers_by_keys", "pick_mcp_servers"]
 _WEB_TRIGGERS = tuple(kw.lower() for kw in (
     "検索", "調べて", "ググって", "ニュース",
     "twitter", "x.com", "ツイート", "tweet", "trend", "トレンド",
-    "search", "ググ", "Brave", "x ", "X(", "X検索",
+    # NOTE: 旧 "x " (X+空白) は「マトリックス では」等の日本語文で誤爆したため
+    # 前後空白付きの " x " に変更（英文中の単独 X のみ拾う）。
+    "search", "ググ", "Brave", " x ", "X(", "X検索",
     # Market-data tier (nikkei-indexes / yfj-quote) — eager spawn for finance
     # talk. NOTE: bare "vi" is deliberately absent (substring would misfire
     # on "via", "vim", "review", …); 日経vi covers the real usage.
@@ -78,10 +86,15 @@ _PAPER_TRIGGERS = tuple(kw.lower() for kw in (
 _DOCS_TRIGGERS = tuple(kw.lower() for kw in (
     # Library / framework docs lookup via context7 MCP. Includes English +
     # Japanese cues; pre-lowercased so pick_mcp_servers skips .lower() per kw.
-    "context7", "docs", "ドキュメント", "公式ドキュメント", "api reference",
+    # NOTE: 旧 "docs" (裸4文字の substring) は "pdocs" 等で誤爆したため、
+    # 英字が直前に来ない場合のみマッチする _DOCS_BOUNDARY_RE に分離した。
+    "context7", "ドキュメント", "公式ドキュメント", "api reference",
     "リファレンス", "ライブラリ", "library", "使い方", "how to use",
     "npm package", "pypi", "github.com/",
 ))
+# "docsを見たい" / "の docs" は正当なトリガー、"pdocs" / "READMEのpdocsが" は誤爆。
+# substring では区別できないので「直前が英字でない docs」のみ拾う。
+_DOCS_BOUNDARY_RE = re.compile(r"(?<![a-z])docs")
 # IOT tier — Nature Remo Cloud API。haroin 自宅の家電制御・センサー読み取り。admin-only、
 # 自宅 IoT 操作を語った時だけ spawn する。
 _IOT_TRIGGERS = tuple(kw.lower() for kw in (
@@ -131,7 +144,7 @@ def pick_mcp_servers(raw_user_text: str, user_id: int | None = None) -> dict:
         servers.update(MCP_SERVERS_MEMORY)
     if any(kw in text for kw in _PAPER_TRIGGERS):
         servers.update(MCP_SERVERS_PAPER)
-    if any(kw in text for kw in _DOCS_TRIGGERS):
+    if any(kw in text for kw in _DOCS_TRIGGERS) or _DOCS_BOUNDARY_RE.search(text):
         servers.update(MCP_SERVERS_DOCS)
     if (
         user_id is not None
@@ -148,3 +161,37 @@ def pick_mcp_servers(raw_user_text: str, user_id: int | None = None) -> dict:
     ):
         servers.update(MCP_SERVERS_IOT)
     return servers
+
+
+async def select_mcp_servers(
+    raw_user_text: str, user_id: int | None = None,
+) -> dict:
+    """MCP サーバー選択の dispatcher（MCP_SELECTOR_MODE で方式を切替）。
+
+    - keyword: 従来のキーワード部分一致のみ
+    - semantic: 埋め込み類似のみ（例外時は keyword へフォールバック）
+    - hybrid（既定）: 両者の和集合。keyword の recall を維持しつつ、
+      キーワードに引っかからない言い回しを埋め込みが拾う。
+
+    埋め込み呼び出し（~50-150ms）は entry.py で Mem0 recall 等と並行するため
+    体感 TTFT への影響はほぼ無い。
+    """
+    from config import MCP_SELECTOR_MODE
+
+    keyword = pick_mcp_servers(raw_user_text, user_id=user_id)
+    if MCP_SELECTOR_MODE == "keyword":
+        return keyword
+    try:
+        from services.mcp_semantic_selector import pick_mcp_servers_semantic
+        semantic = await pick_mcp_servers_semantic(raw_user_text, user_id=user_id)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "semantic selector failed → keyword fallback: %s", exc,
+        )
+        return keyword
+    if MCP_SELECTOR_MODE == "semantic":
+        return semantic
+    merged = dict(keyword)
+    merged.update(semantic)
+    return merged

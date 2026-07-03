@@ -21,6 +21,7 @@ from config import (
     CLAUDE_TAG_EMOJI_NAME,
     CLAUDE_TAG_ENABLED,
     DEEP_RESEARCH_ENABLED,
+    DELIB_ROUTER_ENABLED,
     SPINNER_MODE,
     BOT_KEYWORDS,
     BOT_ROLE_IDS,
@@ -886,7 +887,12 @@ async def recall_cmd(interaction: discord.Interaction, query: str | None = None)
     uid = str(interaction.user.id)
     try:
         if query:
-            rows = await search_memories_smart(query, uid, limit=10, rewrite=True, rerank=True)
+            rows = await search_memories_smart(
+                query, uid, limit=10, rewrite=True, rerank=True,
+                current_channel_id=(
+                    str(interaction.channel_id) if interaction.channel_id else None
+                ),
+            )
         else:
             rows = await get_all_memories(uid, limit=20)
     except Exception as exc:
@@ -966,7 +972,12 @@ async def forget_cmd(interaction: discord.Interaction, query: str | None = None)
     uid = str(interaction.user.id)
     try:
         if query:
-            rows = await search_memories_smart(query, uid, limit=25, rewrite=True, rerank=True)
+            rows = await search_memories_smart(
+                query, uid, limit=25, rewrite=True, rerank=True,
+                current_channel_id=(
+                    str(interaction.channel_id) if interaction.channel_id else None
+                ),
+            )
         else:
             rows = await get_all_memories(uid, limit=25)
     except Exception as exc:
@@ -1838,6 +1849,7 @@ async def on_message(message: discord.Message):
                     raw_user_text, mem0_user_id, limit=_recall_limit,
                     rewrite=mem0_llm_mode, rerank=mem0_llm_mode,
                     include_core=True,
+                    current_channel_id=str(message.channel.id),
                 )
             )
 
@@ -2638,6 +2650,27 @@ async def on_message(message: discord.Message):
         # "" when the sender has no configured label — recorded as no
         # attribution, which keeps the pre-existing behaviour.
         sender_speaker_label = speaker_label(message.author.id)
+        # 熟考 P2: tier 判定（admin のみ）。deliberate では incremental streaming
+        # を切り、planner→executor→verifier→revise の検証済み最終文を一括送信する
+        # （callbacks 非配線 → 既存の非 streaming 送信経路に自然に落ちる）。
+        _tier = None
+        _route_judgment = False
+        if caller_is_admin and DELIB_ROUTER_ENABLED:
+            try:
+                from services.claude_api.router import decide_tier
+                _decision = await decide_tier(
+                    raw_user_text,
+                    has_attachments=bool(
+                        image_paths or text_attachments or arbitrary_attachments
+                    ),
+                )
+                _tier = _decision.tier
+                _route_judgment = _decision.judgment
+            except Exception as exc:
+                log.warning("delib_router failed (chat 扱い): %s", exc)
+        _delib = _tier == "deliberate"
+        if _delib:
+            await _update_status("🧠 熟考モード")
         # Start the CLI-style spinner: it owns status_msg until the call returns.
         # SPINNER_MODE picks the renderer: "gif" = animated word-GIF (B), else
         # the 1/sec text shimmer + animated emoji (A+C).
@@ -2649,10 +2682,12 @@ async def on_message(message: discord.Message):
             response_text, session_info, actually_resumed = await call_with_tools(
                 prompt, message.channel.id, sessions,
                 status_callback=_update_status,
-                incremental_text_callback=_incremental_send,
-                text_stream_callback=_stream_preview,
+                incremental_text_callback=None if _delib else _incremental_send,
+                text_stream_callback=None if _delib else _stream_preview,
                 tool_invocation_callback=_tool_invocation_send,
                 progress=_prog,
+                tier=_tier,
+                route_judgment=_route_judgment,
                 restricted=not admin,
                 raw_user_text=raw_user_text,
                 is_thread=is_thread,

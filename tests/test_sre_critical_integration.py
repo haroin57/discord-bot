@@ -62,7 +62,9 @@ class TestHealthIntegration:
 class TestOAuthEscalation:
     def test_alert_escalates_after_threshold(self, caplog):
         try:
-            from services.oauth_manager import _record_refresh_failure, _record_refresh_success
+            import services.oauth_manager as _om
+            _record_refresh_failure = lambda err: _om._record_refresh_failure(_om._accounts['primary'], err)
+            _record_refresh_success = lambda: _om._record_refresh_success(_om._accounts['primary'])
         except ImportError:
             pytest.skip("oauth_manager helpers not yet present")
         _record_refresh_success()  # reset

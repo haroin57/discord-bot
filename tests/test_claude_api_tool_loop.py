@@ -1700,3 +1700,278 @@ class TestBuiltinSchemaStrictness:
         from services.claude_api.tools import BUILTIN_TOOLS
         for name, td in BUILTIN_TOOLS.items():
             assert td.input_schema.get("additionalProperties") is False, name
+
+
+# ---------------------------------------------------------------------------
+# Tool Search Tool (server-side) — block serialization / pause_turn / strip
+# ---------------------------------------------------------------------------
+
+def _capture_multi_client(*responses):
+    """responses: (events, final) per turn。各turnの stream kwargs を記録する。"""
+    caps: list[dict] = []
+    iterator = iter(responses)
+    client = MagicMock()
+
+    def stream_factory(**kwargs):
+        caps.append(kwargs)
+        events, final = next(iterator)
+        return _FakeStream(events, final)
+
+    client.beta.messages.stream = stream_factory
+    return client, caps
+
+
+class TestToolSearchSerialization:
+    def test_server_tool_use_drops_none_caller(self):
+        out = _block_to_dict(_block(
+            "server_tool_use", id="s1", name="tool_search_tool_regex",
+            input={"query": "mem"}, caller=None,
+        ))
+        assert out == {
+            "type": "server_tool_use", "id": "s1",
+            "name": "tool_search_tool_regex", "input": {"query": "mem"},
+        }
+        assert "caller" not in out
+
+    def test_tool_search_result_serializes_references(self):
+        ref = _block("tool_reference", tool_name="mcp__scholarly__search")
+        out = _block_to_dict(_block(
+            "tool_search_tool_result", tool_use_id="s1", content=[ref],
+        ))
+        assert out == {
+            "type": "tool_search_tool_result",
+            "tool_use_id": "s1",
+            "content": [{"type": "tool_reference",
+                         "tool_name": "mcp__scholarly__search"}],
+        }
+
+    def test_tool_search_result_error(self):
+        err = _block("tool_search_tool_result_error", error_code="invalid_regex")
+        # エラー型は list ではなく単一オブジェクトで来る
+        err = SimpleNamespace(type="err", error_code="invalid_regex")
+        out = _block_to_dict(_block(
+            "tool_search_tool_result", tool_use_id="s1", content=err,
+        ))
+        assert out["content"] == {
+            "type": "tool_search_tool_result_error",
+            "error_code": "invalid_regex",
+        }
+
+    def test_strip_tool_search_blocks(self):
+        from services.claude_api.tool_loop import strip_tool_search_blocks
+        content = [
+            {"type": "text", "text": "hi"},
+            {"type": "server_tool_use", "id": "s1", "name": "x", "input": {}},
+            {"type": "tool_search_tool_result", "tool_use_id": "s1",
+             "content": []},
+        ]
+        assert strip_tool_search_blocks(content) == [{"type": "text", "text": "hi"}]
+        assert strip_tool_search_blocks("plain") == "plain"
+
+    def test_normalize_strips_when_disabled(self):
+        history = [{
+            "role": "assistant",
+            "content": [
+                {"type": "server_tool_use", "id": "s1", "name": "x", "input": {}},
+                {"type": "text", "text": "t"},
+            ],
+        }]
+        out = _normalize_history_for_api(history, strip_tool_search=True)
+        assert out[0]["content"] == [{"type": "text", "text": "t"}]
+        kept = _normalize_history_for_api(history, strip_tool_search=False)
+        assert len(kept[0]["content"]) == 2
+
+    def test_has_unpaired_server_tool_use(self):
+        from services.claude_api.tool_loop import _has_unpaired_server_tool_use
+        stu = _block("server_tool_use", id="s1", name="x", input={})
+        res = _block("tool_search_tool_result", tool_use_id="s1", content=[])
+        assert _has_unpaired_server_tool_use([stu]) is True
+        assert _has_unpaired_server_tool_use([stu, res]) is False
+        assert _has_unpaired_server_tool_use([]) is False
+
+
+class TestPauseTurn:
+    async def _run(self, client, **over):
+        kw = dict(
+            prompt="hi", channel_id=1, history=[], system_prompt="s",
+            tools_for_api=[], can_use_tool=_allow_all,
+            execute_tool=AsyncMock(), status_callback=_noop_status,
+            max_turns=5, stall_watchdog=over.pop("watchdog"),
+            api_client=client, model="claude-fable-5", extra_betas=[],
+            tool_search_enabled=True,
+        )
+        kw.update(over)
+        return await run_agent_loop(**kw)
+
+    @pytest.mark.asyncio
+    async def test_pause_turn_resumes_without_user_nudge(self, watchdog):
+        search_turn = _final_msg(
+            [_block("server_tool_use", id="s1",
+                    name="tool_search_tool_regex", input={"query": "q"})],
+            "pause_turn",
+        )
+        done = _final_msg([_block("text", text="done")], "end_turn")
+        client, caps = _capture_multi_client(([], search_turn), ([], done))
+        result = await self._run(client, watchdog=watchdog)
+        assert "done" in result.text
+        # 再送 messages の末尾は assistant のまま（user nudge を挟まない）
+        msgs = caps[1]["messages"]
+        assert msgs[-1]["role"] == "assistant"
+        assert any(
+            b.get("type") == "server_tool_use" for b in msgs[-1]["content"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_pause_turn_limit_gives_up(self, watchdog, monkeypatch):
+        import services.claude_api.tool_loop as tl
+        monkeypatch.setattr(tl, "MAX_PAUSE_TURN_CONTINUES", 1)
+        pause = lambda: _final_msg(
+            [_block("server_tool_use", id="s1", name="t", input={})],
+            "pause_turn",
+        )
+        client, _caps = _capture_multi_client(([], pause()), ([], pause()))
+        result = await self._run(client, watchdog=watchdog)
+        assert result.text == "(no response)"
+
+    @pytest.mark.asyncio
+    async def test_unpaired_server_tool_use_skips_nudge(self, watchdog):
+        # stop_reason=tool_use だが client tool_use はゼロ、server_tool_use が
+        # 未対 → 「続けてください。」を挟まずに resume する
+        search_turn = _final_msg(
+            [_block("server_tool_use", id="s1",
+                    name="tool_search_tool_regex", input={"query": "q"})],
+            "tool_use",
+        )
+        done = _final_msg([_block("text", text="done")], "end_turn")
+        client, caps = _capture_multi_client(([], search_turn), ([], done))
+        result = await self._run(client, watchdog=watchdog)
+        assert "done" in result.text
+        flat = str(caps[1]["messages"])
+        assert "続けてください" not in flat
+
+
+class TestEvidenceWiring:
+    """熟考 P1: evidence index が tool 実行経路に配線されること。"""
+
+    @pytest.mark.asyncio
+    async def test_run_one_tool_records_evidence(self, tmp_path, monkeypatch):
+        from services.claude_api import evidence as ev
+        from services.claude_api.tool_loop import _run_one_tool
+        monkeypatch.setattr(ev, "EVIDENCE_ROOT", str(tmp_path))
+        idx = ev.EvidenceIndex(channel_id=1)
+        block = _block("tool_use", id="t1", name="mcp__x__search",
+                       input={"q": "a"})
+        result = await _run_one_tool(
+            block, can_use_tool=_allow_all,
+            execute_tool=AsyncMock(return_value="findings"),
+            tool_schemas={}, status_callback=_noop_status,
+            tool_invocation_callback=None, turn=0, evidence=idx,
+        )
+        assert result["content"] == "findings"
+        assert len(idx.records) == 1
+        assert idx.records[0].tool == "mcp__x__search"
+        assert idx.records[0].is_error is False
+
+    @pytest.mark.asyncio
+    async def test_error_result_recorded(self, tmp_path, monkeypatch):
+        from services.claude_api import evidence as ev
+        from services.claude_api.tool_loop import _run_one_tool
+        monkeypatch.setattr(ev, "EVIDENCE_ROOT", str(tmp_path))
+        idx = ev.EvidenceIndex(channel_id=1)
+        block = _block("tool_use", id="t1", name="Bash", input={"command": "x"})
+        result = await _run_one_tool(
+            block, can_use_tool=_deny_all,
+            execute_tool=AsyncMock(), tool_schemas={},
+            status_callback=_noop_status, tool_invocation_callback=None,
+            turn=0, evidence=idx,
+        )
+        assert result["is_error"] is True
+        assert idx.records[0].is_error is True
+
+    @pytest.mark.asyncio
+    async def test_distill_replaces_content(self, tmp_path, monkeypatch):
+        import services.claude_api.tool_loop as tl
+        from services.claude_api import evidence as ev
+        monkeypatch.setattr(ev, "EVIDENCE_ROOT", str(tmp_path))
+        monkeypatch.setattr(ev, "DELIB_EVIDENCE_RAW_MIN_CHARS", 10)
+        monkeypatch.setattr(tl, "DELIB_DISTILL_ENABLED", True)
+        monkeypatch.setattr(
+            "services.claude_api.distill.distill_result",
+            AsyncMock(return_value="蒸留ノート: 要点まとめ"),
+        )
+        idx = ev.EvidenceIndex(channel_id=1)
+        raw = "verbose result " * 500  # should_distill 閾値超え
+        block = _block("tool_use", id="t1", name="mcp__brave-search__brave_web_search",
+                       input={"query": "q"})
+        result = await tl._run_one_tool(
+            block, can_use_tool=_allow_all,
+            execute_tool=AsyncMock(return_value=raw),
+            tool_schemas={}, status_callback=_noop_status,
+            tool_invocation_callback=None, turn=0, evidence=idx,
+        )
+        assert "蒸留ノート" in result["content"]
+        assert "distilled_tool_result" in result["content"]
+        assert idx.records[0].distilled is True
+        assert idx.records[0].raw_path is not None  # 原文はディスクに残る
+
+    @pytest.mark.asyncio
+    async def test_distill_failure_falls_back_to_capped_raw(
+            self, tmp_path, monkeypatch):
+        import services.claude_api.tool_loop as tl
+        from services.claude_api import evidence as ev
+        monkeypatch.setattr(ev, "EVIDENCE_ROOT", str(tmp_path))
+        monkeypatch.setattr(tl, "DELIB_DISTILL_ENABLED", True)
+        monkeypatch.setattr(tl, "MCP_TOOL_RESULT_CHARS", 100)
+        monkeypatch.setattr(
+            "services.claude_api.distill.distill_result",
+            AsyncMock(return_value=None),  # 蒸留失敗
+        )
+        idx = ev.EvidenceIndex(channel_id=1)
+        raw = "z" * 5000
+        block = _block("tool_use", id="t1", name="mcp__x__y", input={})
+        result = await tl._run_one_tool(
+            block, can_use_tool=_allow_all,
+            execute_tool=AsyncMock(return_value=raw),
+            tool_schemas={}, status_callback=_noop_status,
+            tool_invocation_callback=None, turn=0, evidence=idx,
+        )
+        # 既存 cap が最終防壁として効く
+        assert len(result["content"]) < 300
+        assert "omitted by MCP_TOOL_RESULT_CHARS cap" in result["content"]
+        assert idx.records[0].distilled is False
+
+    @pytest.mark.asyncio
+    async def test_evidence_none_keeps_legacy_behavior(self):
+        from services.claude_api.tool_loop import _run_one_tool
+        block = _block("tool_use", id="t1", name="mcp__x__y", input={})
+        result = await _run_one_tool(
+            block, can_use_tool=_allow_all,
+            execute_tool=AsyncMock(return_value="ok"),
+            tool_schemas={}, status_callback=_noop_status,
+            tool_invocation_callback=None, turn=0,
+        )
+        assert result == {"type": "tool_result", "tool_use_id": "t1",
+                          "content": "ok"}
+
+
+class TestStickyPromotion:
+    @pytest.mark.asyncio
+    async def test_used_mcp_server_promoted_to_active_keys(self, watchdog):
+        tool_turn = _final_msg(
+            [_block("tool_use", id="t1", name="mcp__scholarly__search",
+                    input={"q": "x"})],
+            "tool_use",
+        )
+        done = _final_msg([_block("text", text="done")], "end_turn")
+        client, _caps = _capture_multi_client(([], tool_turn), ([], done))
+        result = await run_agent_loop(
+            "hi", 1, history=[], system_prompt="s",
+            tools_for_api=[], can_use_tool=_allow_all,
+            execute_tool=AsyncMock(return_value="ok"),
+            status_callback=_noop_status, max_turns=5,
+            stall_watchdog=watchdog, api_client=client,
+            model="claude-fable-5", extra_betas=[],
+            active_mcp_keys=["mem0"],
+        )
+        assert "scholarly" in result.active_mcp_keys
+        assert "mem0" in result.active_mcp_keys

@@ -338,6 +338,18 @@ def get_state() -> RateLimitState:
     return _state
 
 
+def reset_state() -> None:
+    """観測状態を初期化する（OAuth アカウント切替時に呼ぶ）。
+
+    切替後の観測はすべて新アカウントのものなので、旧アカウントの
+    utilization / reset 時刻を持ち越すとブロック判定・ペーシングが
+    アカウント混在で誤動作する。全参照はモジュール名 `_state` 経由なので
+    再束縛で安全（get_state() の返した参照を長期保持する呼び元は無い）。
+    """
+    global _state
+    _state = RateLimitState()
+
+
 def should_block() -> tuple[bool, str]:
     """Return ``(True, reason)`` if a new request must be refused outright.
 

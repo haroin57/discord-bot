@@ -166,8 +166,10 @@ class TestMarketDataRegistration:
         schemas = json.loads(
             Path("services/claude_api/static_mcp_schemas.json").read_text()
         )
-        assert len(schemas.get("nikkei-indexes", [])) == 3
-        assert len(schemas.get("yfj-quote", [])) == 3
+        # 実サーバーの tool 追加で数は増え得るので下限で固定（2026-07-02:
+        # yfj-quote に get_fisco_vi_news が追加され 3→4）。
+        assert len(schemas.get("nikkei-indexes", [])) >= 3
+        assert len(schemas.get("yfj-quote", [])) >= 3
         names = {t["name"] for v in schemas.values() for t in v}
         assert "mcp__nikkei-indexes__check_vi_signal" in names
         assert "mcp__yfj-quote__get_quote" in names

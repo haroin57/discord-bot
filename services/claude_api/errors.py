@@ -78,6 +78,25 @@ _BILLING_SUBSTRINGS = (
 )
 
 
+# Tool Search Tool / defer_loading をこの API 経路が受け付けない場合の 400 検知
+# （tool_catalog の auto-off 用）。エラーメッセージの正確な文言は経路依存なので
+# substring 判定（_TOOL_USE_MISMATCH_PATTERNS と同じ流儀）。
+_TOOL_SEARCH_ERROR_SUBSTRINGS = (
+    "tool_search",
+    "defer_loading",
+    "tool_reference",
+)
+
+
+def is_tool_search_request_error(exc: BaseException) -> bool:
+    """400 invalid_request が Tool Search / defer_loading 起因かを判定する。"""
+    status, _err_type, message, _headers = _extract_fields(exc)
+    if status is not None and status != 400:
+        return False
+    body_lower = (message or "").lower()
+    return any(p in body_lower for p in _TOOL_SEARCH_ERROR_SUBSTRINGS)
+
+
 def _extract_fields(exc: BaseException) -> tuple["int | None", str, str, dict]:
     """Extract (status, err_type, message, headers) from an anthropic SDK exception.
 

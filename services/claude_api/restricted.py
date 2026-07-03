@@ -20,6 +20,7 @@ RESTRICTED_DENY_LIST: tuple[str, ...] = (
     "WebFetch", "WebSearch",
     "Task", "Agent", "SlashCommand", "ExitPlanMode", "TodoWrite",
     "Read",  # image attachments go inline; Read would let non-admin read fs
+    "Scratchpad", "SecondOpinion",  # 熟考 P3/P4 tools は admin 専用
 )
 
 RESTRICTED_MAX_TURNS = 8

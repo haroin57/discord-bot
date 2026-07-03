@@ -31,6 +31,8 @@ MODEL_BETAS = [
     "mid-conversation-system-2026-04-07",
     "advanced-tool-use-2025-11-20",
     "effort-2025-11-24",
+    "server-side-fallback-2026-06-01",
+    "fallback-credit-2026-06-01",
     "extended-cache-ttl-2025-04-11",
 ]
 CLI_IDENTITY_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
@@ -51,6 +53,10 @@ if os.environ.get("CONTEXT_1M_ENABLED", "1") not in ("0", "false", "False", ""):
 # server-side `fallbacks` body field used for the (kept) Fable refusal fallback.
 _EXTRA_BETAS.append("server-side-fallback-2026-06-01")
 _EXTRA_BETAS.append("fallback-credit-2026-06-01")
+# Advisor tool（熟考 P4）。ADVISOR_ENABLED=true のときだけ beta を付与する
+# （フラグ OFF で従来 wire-shape 完全維持）。
+if os.environ.get("ADVISOR_ENABLED", "false").lower() == "true":
+    _EXTRA_BETAS.append("advisor-tool-2026-03-01")
 for _b in _EXTRA_BETAS:
     if _b not in MODEL_BETAS:
         MODEL_BETAS.append(_b)
@@ -134,6 +140,9 @@ def _load_cli_default_system_prompt() -> str:
 CLI_DEFAULT_SYSTEM_PROMPT = _load_cli_default_system_prompt()
 
 
+FAILOVER_ACCOUNT_SIDECAR = os.path.expanduser("~/.claude/.account-failover.json")
+
+
 def _read_claude_user_account() -> dict:
     """Return ``{"device_id": str, "account_uuid": str}`` for metadata.user_id.
 
@@ -143,29 +152,53 @@ def _read_claude_user_account() -> dict:
     subscriber-tier identification; sending only ``session_id`` triggers
     HTTP 429 because the request looks like an anonymous OAuth call.
 
-    Cached in-memory after first read so the JSON parse cost is paid once.
+    OAuth 二重アカウント対応: failover アカウントが active のときは
+    サイドカー ``~/.claude/.account-failover.json``（同スキーマ、移行時に
+    旧 ~/.claude.json から抽出）を読む。accountUuid はアカウント固有で、
+    primary の uuid を failover token に添えると subscriber 識別が崩れて
+    429 を誘発し得るため。device_id は同一マシン指紋なのでサイドカーに
+    無ければ primary の値を流用する。account 別にキャッシュ。
     """
-    global _user_account_cache
-    if _user_account_cache is not None:
-        return _user_account_cache
-    path = os.path.expanduser("~/.claude.json")
     try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("could not read %s: %s", path, exc)
-        _user_account_cache = {}
-        return _user_account_cache
-    device_id = data.get("userID", "")
-    account_uuid = ""
-    oauth_account = data.get("oauthAccount")
-    if isinstance(oauth_account, dict):
-        account_uuid = oauth_account.get("accountUuid", "") or ""
-    _user_account_cache = {"device_id": device_id, "account_uuid": account_uuid}
-    return _user_account_cache
+        from services.oauth_manager import get_active_account
+        account_name = get_active_account()
+    except Exception:  # noqa: BLE001
+        account_name = "primary"
+    cached = _user_account_cache.get(account_name)
+    if cached is not None:
+        return cached
+
+    def _load(path: str) -> dict:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("could not read %s: %s", path, exc)
+            return {}
+        device_id = data.get("userID", "")
+        account_uuid = ""
+        oauth_account = data.get("oauthAccount")
+        if isinstance(oauth_account, dict):
+            account_uuid = oauth_account.get("accountUuid", "") or ""
+        return {"device_id": device_id, "account_uuid": account_uuid}
+
+    primary = _user_account_cache.get("primary")
+    if primary is None:
+        primary = _load(os.path.expanduser("~/.claude.json"))
+        _user_account_cache["primary"] = primary
+
+    if account_name == "failover":
+        side = _load(FAILOVER_ACCOUNT_SIDECAR)
+        result = {
+            "device_id": side.get("device_id") or primary.get("device_id", ""),
+            "account_uuid": side.get("account_uuid", ""),
+        }
+        _user_account_cache["failover"] = result
+        return result
+    return primary
 
 
-_user_account_cache: dict | None = None
+_user_account_cache: dict[str, dict] = {}
 
 
 def get_metadata() -> dict:

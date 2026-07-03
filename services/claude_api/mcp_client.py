@@ -173,7 +173,16 @@ STATIC_MCP_TOOL_SCHEMAS: dict[str, list[dict]] = {
     "mem0": [
         {
             "name": "mcp__mem0__search",
-            "description": "Search shared Mem0 long-term memory.",
+            "description": (
+                "Search shared Mem0 long-term memory. Results carry metadata "
+                "(category, importance 1-5, tier Live/Hot/Warm/Cold, "
+                "mention_count) — prefer high-importance fresh facts. "
+                "smart=true enables Haiku query-rewrite + rerank (slower, "
+                "use only for explicit recall asks). "
+                "【いつ呼ぶか】自動注入された記憶に無い過去の事実・好み・"
+                "出来事を確認したいとき、「覚えてる？」系の明示的な想起依頼の"
+                "ときに呼ぶ。"
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -187,7 +196,14 @@ STATIC_MCP_TOOL_SCHEMAS: dict[str, list[dict]] = {
         },
         {
             "name": "mcp__mem0__add",
-            "description": "Store a conversation turn so Mem0 can extract durable long-term facts.",
+            "description": (
+                "Store a conversation turn so Mem0 can extract durable "
+                "long-term facts (auto-classified into category / importance "
+                "/ tier). "
+                "【いつ呼ぶか】ユーザーが「覚えて」と言ったとき、または今後の"
+                "会話で参照すべき新事実（好み・予定・決定事項）が出たときに"
+                "呼ぶ。雑談の逐語保存には使わない（自動バッチ保存が別にある）。"
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -236,7 +252,11 @@ def _load_static_schemas_from_disk() -> None:
         # 空で確定させないよう明示的に弾いておく。
         if not isinstance(tools, list) or not tools:
             continue
-        STATIC_MCP_TOOL_SCHEMAS.setdefault(server_key, []).extend(tools)
+        bucket = STATIC_MCP_TOOL_SCHEMAS.setdefault(server_key, [])
+        # name dedupe: Python 内ハードコード（例: mem0 の enriched description）
+        # が優先。dump にも同名 tool が入っていても二重広告しない。
+        existing = {t.get("name") for t in bucket}
+        bucket.extend(t for t in tools if t.get("name") not in existing)
 
 
 _load_static_schemas_from_disk()
