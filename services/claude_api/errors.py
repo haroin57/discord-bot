@@ -16,8 +16,27 @@ key for backwards compat.
 
 import json
 import re
+from typing import Literal
 
 import anthropic
+
+# Closed set of error categories (P1-a). Both classifiers return one of
+# these; the type checker flags any new category string that isn't added
+# here first, and callers matching on categories can be checked against
+# the full set instead of ad-hoc strings.
+ErrorCategory = Literal[
+    "rate_limit",
+    "overloaded",
+    "auth",
+    "billing",
+    "context_overflow",
+    "invalid_request",
+    "max_turns",
+    "model_not_found",
+    "tool_use_mismatch",
+    "api_exit",
+    "unknown",
+]
 
 # ---------------------------------------------------------------------------
 # String patterns (legacy fallback)
@@ -36,7 +55,7 @@ _CONTEXT_PATTERNS = (
 _MAX_TURNS_PATTERNS = ("max_turns", "max turns", "turn limit")
 
 
-def _classify_error(err_str: str, stderr_tail: str = "") -> str:
+def _classify_error(err_str: str, stderr_tail: str = "") -> ErrorCategory:
     """Legacy string-based classifier. Used when only a log tail is available."""
     combined = f"{err_str}\n{stderr_tail}".lower()
     if any(p in combined for p in _RATE_LIMIT_PATTERNS):
@@ -130,7 +149,7 @@ def _extract_fields(exc: BaseException) -> tuple["int | None", str, str, dict]:
     return status, err_type, body_text, headers
 
 
-def classify_anthropic_error(exc: BaseException) -> str:
+def classify_anthropic_error(exc: BaseException) -> ErrorCategory:
     """Primary classifier — maps anthropic SDK exceptions to retry categories."""
     if isinstance(exc, anthropic.RateLimitError):
         # RateLimitError may still carry a credit-related message — check body.
@@ -230,7 +249,11 @@ def is_non_persistable_reply(text: str) -> bool:
 
 
 def _error_message(error_type: str) -> str:
-    """User-facing message for a classified error type."""
+    """User-facing message for a classified error type.
+
+    Accepts plain ``str`` (not just ErrorCategory) because legacy callers
+    still pass SDK-era keys like ``cli_exit``.
+    """
     return _ERROR_MESSAGE_TABLE.get(error_type, _ERROR_MESSAGE_FALLBACK)
 
 

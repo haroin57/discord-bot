@@ -153,6 +153,18 @@ _FINAL_EMPTY_NUDGE = (
 )
 
 
+def _observe_response_headers(source) -> None:
+    """Feed rate-limit headers from a response-carrying object (stream or
+    SDK exception) into the shared pacing state. Best-effort: never raises.
+    Single idiom for both the success and the error path (P1-a)."""
+    try:
+        resp = getattr(source, "response", None)
+        if resp is not None and getattr(resp, "headers", None) is not None:
+            observe_ratelimit(resp.headers)
+    except Exception as exc:
+        log.debug("ratelimit observe failed: %s", exc)
+
+
 def _build_cached_system(system_prompt: str, messages: list[dict]) -> list[dict]:
     """Build the 4-block system prompt the CLI sends on /v1/messages.
 
@@ -1579,12 +1591,7 @@ async def run_agent_loop(
                 # the next turn (and the next call from entry.py) can pace
                 # itself before sending. anthropic SDK exposes the raw
                 # response via stream.response.headers.
-                try:
-                    resp = getattr(stream, "response", None)
-                    if resp is not None and getattr(resp, "headers", None) is not None:
-                        observe_ratelimit(resp.headers)
-                except Exception as exc:
-                    log.debug("ratelimit observe failed: %s", exc)
+                _observe_response_headers(stream)
 
                 # Server-side fallback detection (ADR-0015), multiplexed so any
                 # one signal counts: (1) the mid-stream `fallback` content block
@@ -1643,12 +1650,7 @@ async def run_agent_loop(
                       turn, category, exc)
             # Also try to observe ratelimit headers from the failing response
             # so the next pre-check can refuse outright.
-            try:
-                resp = getattr(exc, "response", None)
-                if resp is not None and getattr(resp, "headers", None) is not None:
-                    observe_ratelimit(resp.headers)
-            except Exception:
-                pass
+            _observe_response_headers(exc)
             # Caller (entry.py) owns retry/backoff; surface the exception.
             raise
 

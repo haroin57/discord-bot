@@ -69,19 +69,8 @@ def retry_after_from_headers(headers) -> float | None:
         return None
     if not value:
         return None
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        pass
-    from datetime import datetime, timezone
-    from email.utils import parsedate_to_datetime
-    try:
-        parsed = parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+    from services.claude_api.ratelimit import parse_retry_after
+    return parse_retry_after(value)
 
 
 def compute_backoff(attempt: int, *, jitter: bool = True) -> float:
