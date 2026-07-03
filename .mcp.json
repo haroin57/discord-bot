@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "second-opinion": {
+      "command": "/home/ubuntu/discord-bot/.venv/bin/python",
+      "args": ["/home/ubuntu/discord-bot/second_opinion_mcp_server.py"]
+    },
+    "oracle": {
+      "command": "/home/ubuntu/discord-bot/scripts/oracle_mcp_launch.sh",
+      "args": []
+    }
+  }
+}
