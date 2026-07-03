@@ -1,8 +1,8 @@
 """Bot health snapshot for /health endpoint (SRE-C7).
 
 Aggregates liveness/readiness from each subsystem without touching their
-internal state. web_api.py calls get_health_snapshot() inside the
-/health route handler.
+internal state. services/health_server.py calls get_health_snapshot()
+inside the /health route handler.
 """
 
 import os

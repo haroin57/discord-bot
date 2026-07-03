@@ -569,7 +569,7 @@ async def extract_facts_for_self(
 
     Phase C-2 introduces ``extract_full_signals`` which returns both facts
     and relations; this wrapper preserves the legacy ``list[dict]`` return
-    shape so kanae_daily / web_api / older test mocks keep working.
+    shape so web_api / older test mocks keep working.
     """
     signals = await extract_full_signals(
         user_text, assistant_text, context_hint, user_id,

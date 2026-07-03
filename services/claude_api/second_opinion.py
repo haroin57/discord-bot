@@ -5,9 +5,9 @@
 <second_opinion> タグでデータ明示し、囲いタグの literal を strip（第二次注入
 対策）。vendor 障害は残りの系だけで返す。admin 専用（RESTRICTED_DENY_LIST）。
 
-Gemini は課金済みの Google 直アカウント（GOOGLE_AI_API_KEY、music_analyzer と
-同じキー）を OpenAI 互換エンドポイント経由で使う（OpenCode 等の aggregator は
-経由しない — haroin 指定 2026-07-02）。
+Gemini は課金済みの Google 直アカウント（GOOGLE_AI_API_KEY）を OpenAI 互換
+エンドポイント経由で使う（OpenCode 等の aggregator は経由しない
+— haroin 指定 2026-07-02）。
 """
 
 from __future__ import annotations
@@ -125,7 +125,7 @@ def _gemini_key() -> str:
     """SecondOpinion 用 Gemini キー。
 
     SECOND_OPINION_GEMINI_KEY（課金アカウント専用、haroin 2026-07-02）を優先し、
-    未設定なら GOOGLE_AI_API_KEY（music_analyzer と共用）にフォールバック。
+    未設定なら GOOGLE_AI_API_KEY にフォールバック。
     """
     import os
     return (

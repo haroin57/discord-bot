@@ -26,6 +26,3 @@ class CommandDeps:
     # dicts until P2.5 moves them into an OverrideState.
     model_overrides: dict
     effort_overrides: dict
-    # vscode_sync daemon started flag lives in bot.py (on_ready also reads
-    # it); commands flip it through this setter instead of a global.
-    set_vscode_sync_started: Callable[[bool], None]

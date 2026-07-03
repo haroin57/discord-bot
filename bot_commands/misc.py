@@ -1,21 +1,13 @@
-"""/abort /research /vscode-sync /help — 運用系コマンド."""
+"""/abort /research /help — 運用系コマンド."""
 
 from __future__ import annotations
 
 import discord
 from discord import app_commands
 
-from config import (
-    DEEP_RESEARCH_ENABLED,
-    VSCODE_SYNC_ENABLED,
-    VSCODE_SYNC_FLUSH_INTERVAL,
-    VSCODE_SYNC_IDLE_NOTIFY_SECONDS,
-    VSCODE_SYNC_PROJECTS_ROOT,
-    VSCODE_SYNC_THREAD_ID,
-)
-from services import deep_research, vscode_sync
+from config import DEEP_RESEARCH_ENABLED
+from services import deep_research
 from services.job_state import cancel_channel_jobs
-from services.vscode_sync.discord_post import make_post_callback
 
 from bot_commands._deps import CommandDeps
 
@@ -95,60 +87,6 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
             "🔬 Deep Research を開始しました。スレッドで進行します（数分かかることがあります）。",
             ephemeral=True,
         )
-
-    @tree.command(name="vscode-sync", description="VSCode Claude Code → Discord 同期の切替 (admin only)")
-    @app_commands.describe(action="on で開始 / off で停止 / status で状態確認")
-    @app_commands.choices(action=[
-        app_commands.Choice(name="on", value="on"),
-        app_commands.Choice(name="off", value="off"),
-        app_commands.Choice(name="status", value="status"),
-    ])
-    async def vscode_sync_cmd(
-        interaction: discord.Interaction,
-        action: app_commands.Choice[str],
-    ):
-        if not deps.is_admin(interaction.user):
-            await interaction.response.send_message("admin only", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        if action.value == "status":
-            running = vscode_sync.is_running()
-            await interaction.followup.send(
-                f"vscode_sync: {'running' if running else 'stopped'} "
-                f"(enabled={VSCODE_SYNC_ENABLED}, thread={VSCODE_SYNC_THREAD_ID})",
-                ephemeral=True,
-            )
-            return
-
-        if action.value == "on":
-            if vscode_sync.is_running():
-                await interaction.followup.send("already running", ephemeral=True)
-                return
-            if VSCODE_SYNC_THREAD_ID <= 0:
-                await interaction.followup.send(
-                    "VSCODE_SYNC_THREAD_ID が未設定です",
-                    ephemeral=True,
-                )
-                return
-            deps.set_vscode_sync_started(True)
-            deps.track_task(
-                vscode_sync.run_daemon(
-                    post_callback=make_post_callback(deps.bot, VSCODE_SYNC_THREAD_ID),
-                    projects_root=VSCODE_SYNC_PROJECTS_ROOT,
-                    flush_interval=VSCODE_SYNC_FLUSH_INTERVAL,
-                    idle_notify_seconds=VSCODE_SYNC_IDLE_NOTIFY_SECONDS,
-                ),
-                name="vscode_sync",
-            )
-            await interaction.followup.send("started", ephemeral=True)
-            return
-
-        # action.value == "off"
-        await vscode_sync.stop_daemon()
-        deps.set_vscode_sync_started(False)
-        await interaction.followup.send("stopped", ephemeral=True)
 
     @tree.command(name="help", description="使えるコマンドの一覧と使い方を表示する")
     async def help_cmd(interaction: discord.Interaction):

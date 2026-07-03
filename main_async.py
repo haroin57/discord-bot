@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Async entry point — runs Discord bot + Web API Socket.IO server together.
+"""Async entry point — runs Discord bot + minimal /health server together.
 
 Uses bot.start() + asyncio.gather() instead of the blocking bot.run() in
-main.py, so both coroutines share the same event loop.
+main.py, so both coroutines share the same event loop. The Web API / Socket.IO
+UI was removed in Phase 1 (Cloudflare offload); only the tiny GET /health
+endpoint on :3002 survives, served by services.health_server.HealthServer so
+the external uptime Worker probe never breaks.
 """
 
 import asyncio
@@ -125,7 +128,7 @@ async def main() -> None:
     # cleanup_stale_attachments now scheduled from bot.on_ready (Phase G/D5).
 
     from bot import bot
-    from web_api import WebAPI
+    from services.health_server import HealthServer
 
     # 機能2: restore cooldown/quota + session freshness/sticky persisted by the
     # previous run, so a restart continues conversations and keeps rate limits
@@ -137,7 +140,7 @@ async def main() -> None:
     # the loop is already stopped by then so _collect() can't race it.
     atexit.register(runtime_state.save_all_sync)
 
-    web_api = WebAPI(bot)
+    health_server = HealthServer(bot)
 
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
@@ -155,7 +158,7 @@ async def main() -> None:
     async def _run_services():
         await asyncio.gather(
             bot.start(DISCORD_TOKEN),
-            web_api.start(port=WEB_API_PORT, host=WEB_API_HOST),
+            health_server.start(port=WEB_API_PORT, host=WEB_API_HOST),
         )
 
     main_task = asyncio.create_task(_run_services())

@@ -51,24 +51,18 @@ from config import (
     MEM0_SMART_SEARCH,
     RESTRICTED_COOLDOWN_SECONDS,
     RESTRICTED_DAILY_QUOTA,
+    SCRATCHPAD_STREAM_ENABLED,
     SLEEP_ENFORCE_ENABLED,
     SLEEP_ENFORCE_END_HOUR,
     SLEEP_ENFORCE_START_HOUR,
     SLEEP_ENFORCE_USER_ID,
     STATE_DIR,
     speaker_label,
-    VSCODE_SYNC_ENABLED,
-    VSCODE_SYNC_FLUSH_INTERVAL,
-    VSCODE_SYNC_IDLE_NOTIFY_SECONDS,
-    VSCODE_SYNC_PROJECTS_ROOT,
-    VSCODE_SYNC_THREAD_ID,
 )
 from services.claude_api import _is_session_fresh, call_with_tools, kill_orphan_claude_cli
 from services.oauth_manager import OAuthRefreshFailed
-from services import vscode_sync
 from services import claude_tag
 from services import deep_research
-from services.vscode_sync.discord_post import make_post_callback
 from services.mem0 import (
     add_memories,
     delete_memory,
@@ -88,7 +82,6 @@ from services.session import (
     update_session,
 )
 from services.prompt_builder import PromptBuilder
-from services.music_analyzer import analyze_music_attachments
 from utils.attachments import (
     IMAGE_CONTENT_TYPES,
     MAX_ATTACHMENT_BYTES,
@@ -281,9 +274,6 @@ _background_tasks: set[asyncio.Task] = set()
 # Phase G/D5: one-shot guard so the on_ready cleanup doesn't fire again on
 # every Discord reconnect (which is otherwise harmless but wasteful).
 _cleanup_scheduled: bool = False
-# Same idea for the vscode_sync daemon: on_ready fires on every reconnect
-# and run_daemon() must not be scheduled twice.
-_vscode_sync_started: bool = False
 
 # Job lifecycle tracking moved to services/job_state.py: jobs register BEFORE
 # the channel semaphore, so /abort reaches queued work too, and the queue
@@ -475,9 +465,8 @@ async def on_ready():
         log.debug("Slash command sync already done; skipping on reconnect")
     log.info("Bot is ready: %s (id=%s), role_ids=%s", bot.user, bot.user.id, BOT_ROLE_IDS)
     # Sanity-check that the env-pinned kanae namespace matches the live
-    # bot id. Mismatch means scripts/kanae_daily.py and bot.py runtime
-    # would land in different ChromaDB collections, leaving daily writes
-    # invisible at recall time. Just a warning — don't refuse to start.
+    # bot id. Mismatch means Mem0 writes land in a different collection.
+    # Just a warning — don't refuse to start.
     from config import KANAE_BOT_USER_ID
     if KANAE_BOT_USER_ID and KANAE_BOT_USER_ID != str(bot.user.id):
         log.warning(
@@ -514,19 +503,6 @@ async def on_ready():
         _track_task(
             asyncio.to_thread(cleanup_stale_attachments),
             name="cleanup_stale_attachments",
-        )
-
-    global _vscode_sync_started
-    if VSCODE_SYNC_ENABLED and not _vscode_sync_started and not vscode_sync.is_running():
-        _vscode_sync_started = True
-        _track_task(
-            vscode_sync.run_daemon(
-                post_callback=make_post_callback(bot, VSCODE_SYNC_THREAD_ID),
-                projects_root=VSCODE_SYNC_PROJECTS_ROOT,
-                flush_interval=VSCODE_SYNC_FLUSH_INTERVAL,
-                idle_notify_seconds=VSCODE_SYNC_IDLE_NOTIFY_SECONDS,
-            ),
-            name="vscode_sync",
         )
 
 
@@ -641,11 +617,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 # time, matching the old decorator-at-module-level behavior; tree.sync timing
 # stays owned by on_ready.
 # ---------------------------------------------------------------------------
-def _set_vscode_sync_started(value: bool) -> None:
-    global _vscode_sync_started
-    _vscode_sync_started = value
-
-
 # Kept as a module attribute so tests can patch per-command dependencies
 # (e.g. patch.object(bot._command_deps, "track_task", ...)).
 _command_deps = bot_commands.CommandDeps(
@@ -656,7 +627,6 @@ _command_deps = bot_commands.CommandDeps(
     get_http_session=get_http_session,
     model_overrides=_MODEL_OVERRIDES,
     effort_overrides=_EFFORT_OVERRIDES,
-    set_vscode_sync_started=_set_vscode_sync_started,
 )
 bot_commands.register_all(bot.tree, _command_deps)
 
@@ -916,17 +886,6 @@ async def on_message(message: discord.Message):
         arbitrary_attachments = await download_arbitrary_attachments(
             http_session, all_attachments, caller_is_admin=caller_is_admin,
         )
-        # Music analysis: detect audio among arbitrary attachments and
-        # run Gemini/OpenAI analysis to produce a textual description
-        # that Claude can reason about.
-        music_analysis: str | None = None
-        if arbitrary_attachments and caller_is_admin:
-            try:
-                music_analysis = await analyze_music_attachments(arbitrary_attachments)
-                if music_analysis:
-                    log.info("Music analysis produced %d chars", len(music_analysis))
-            except Exception:
-                log.warning("Music analysis failed", exc_info=True)
 
         resolved_prompt = await link_task
         conv_context = await thread_task
@@ -1001,13 +960,6 @@ async def on_message(message: discord.Message):
                 af_blk = "\n".join(af_lines)
                 parts.append(af_blk)
                 prompt_breakdown["arbitrary_attachments"] = len(af_blk)
-            if music_analysis:
-                ma_blk = (
-                    "<music_analysis note=\"Gemini/OpenAI MIR analysis of attached audio\">"
-                    "\n" + music_analysis + "\n</music_analysis>"
-                )
-                parts.append(ma_blk)
-                prompt_breakdown["music_analysis"] = len(ma_blk)
             untrusted_block = _wrap_user_input(
                 "\n\n".join(parts), is_admin=caller_is_admin,
             )
@@ -1130,13 +1082,6 @@ async def on_message(message: discord.Message):
                 af_blk = "\n".join(af_lines)
                 parts.append(af_blk)
                 prompt_breakdown["arbitrary_attachments"] = len(af_blk)
-            if music_analysis:
-                ma_blk = (
-                    "<music_analysis note=\"Gemini/OpenAI MIR analysis of attached audio\">"
-                    "\n" + music_analysis + "\n</music_analysis>"
-                )
-                parts.append(ma_blk)
-                prompt_breakdown["music_analysis"] = len(ma_blk)
 
             untrusted_block = _wrap_user_input(
                 "\n\n".join(parts), is_admin=caller_is_admin,
@@ -1333,6 +1278,12 @@ async def on_message(message: discord.Message):
         _incremental_send = _renderer.incremental_send
         _stream_preview = _renderer.stream_preview
         _tool_invocation_send = _renderer.tool_invocation_send
+        # Scratchpad live preview: wired in ALL tiers (including deliberate,
+        # where prose streaming is off) since scratchpad is an internal
+        # working-memory note, not the final answer — deliberate's
+        # verified-final-text-only policy stays intact.
+        _scratch_stream = _renderer.scratch_stream_preview if SCRATCHPAD_STREAM_ENABLED else None
+        _scratch_finalize = _renderer.scratch_finalize if SCRATCHPAD_STREAM_ENABLED else None
         # Stable speaker label (e.g. "先輩") for resume-history attribution.
         # "" when the sender has no configured label — recorded as no
         # attribution, which keeps the pre-existing behaviour.
@@ -1369,6 +1320,8 @@ async def on_message(message: discord.Message):
                 incremental_text_callback=None if _delib else _incremental_send,
                 text_stream_callback=None if _delib else _stream_preview,
                 tool_invocation_callback=_tool_invocation_send,
+                scratch_stream_callback=_scratch_stream,
+                scratch_finalize_callback=_scratch_finalize,
                 progress=status.prog,
                 tier=_tier,
                 route_judgment=_route_judgment,

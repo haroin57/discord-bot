@@ -50,10 +50,9 @@ if _raw_ids:
         )
     ADMIN_USER_IDS = _valid
 
-# Haroin DM channel id. Used by kanae_daily to distinguish haroin's DM
+# Haroin DM channel id. Used to distinguish haroin's DM
 # from other channels (b0nchichi DM, server channels) when labelling
-# speakers in the journal prompt. Optional — when unset, kanae_daily
-# auto-detects by picking the largest+most-recent history JSONL.
+# speakers in history context. Optional.
 _raw_haroin_dm = os.environ.get("HAROIN_DM_CHANNEL_ID", "").strip()
 HAROIN_DM_CHANNEL_ID: int | None = int(_raw_haroin_dm) if _raw_haroin_dm.isdigit() else None
 
@@ -603,6 +602,11 @@ DELIB_PLANNER_TIMEOUT_S = int(os.environ.get("DELIB_PLANNER_TIMEOUT_S", "45"))
 DELIB_SCRATCHPAD_ENABLED = (
     os.environ.get("DELIB_SCRATCHPAD_ENABLED", "false").lower() == "true"
 )
+# Scratchpad の in-progress 書き込みを Discord へライブプレビュー表示するか。
+# Scratchpad handler 自体は不変（表示専用のトグル）。false で即座に無効化できる。
+SCRATCHPAD_STREAM_ENABLED = (
+    os.environ.get("SCRATCHPAD_STREAM_ENABLED", "true").lower() == "true"
+)
 
 # P4: 他社モデルへの相談 tool（GPT-5 + DeepSeek 並列）と Anthropic Advisor tool
 SECOND_OPINION_ENABLED = (
@@ -1051,8 +1055,20 @@ MCP_SERVERS_WEB: dict = {
 }
 
 # API key付きWEB MCPは .env にキーがある場合のみ追加
+# C3 (Cloudflare offload, 2026-07-04): kanae-mcp-brave Worker (streamable HTTP,
+# X-MCP-Auth) を優先。ローカル node プロセス不要・BRAVE_API_KEY は Worker 側
+# secret に隔離。BRAVE_MCP_REMOTE_* 未設定時は従来の npx stdio にフォールバック
+# (ADR-0022)。切替検証: 2026-07-04 initialize 200 OK 確認済み。
+_brave_remote_url = os.environ.get("BRAVE_MCP_REMOTE_URL")
+_brave_remote_token = os.environ.get("BRAVE_MCP_AUTH_TOKEN")
 _brave_key = os.environ.get("BRAVE_API_KEY")
-if _brave_key:
+if _brave_remote_url and _brave_remote_token:
+    MCP_SERVERS_WEB["brave-search"] = {
+        "type": "http",
+        "url": _brave_remote_url,
+        "headers": {"X-MCP-Auth": _brave_remote_token},
+    }
+elif _brave_key:
     # Direct stdio (bot-owned, self-reaping) — see x-scraper note / ADR-0022.
     MCP_SERVERS_WEB["brave-search"] = {
         "command": "npx",
@@ -1173,14 +1189,15 @@ if EVAL_MCP_ENABLED:
 # and tier dicts, not the dispatch logic.
 
 # ---------------------------------------------------------------------------
-# Web API
+# Health server (GET /health on :3002 — probed every minute by the external
+# uptime Worker). The old Socket.IO Web API was removed in Phase 1; the port
+# env vars are reused by services/health_server.py.
 # ---------------------------------------------------------------------------
 WEB_API_PORT = int(os.environ.get("WEB_API_PORT", "3002"))
 # Default to localhost so a fresh `main_async.py` start does not expose the
-# Web API to the public internet. Override with WEB_API_HOST=0.0.0.0 when
-# fronting it with an authenticated reverse proxy or tunnel.
+# health endpoint to the public internet. Override with WEB_API_HOST=0.0.0.0
+# when fronting it with an authenticated reverse proxy or tunnel.
 WEB_API_HOST = os.environ.get("WEB_API_HOST", "127.0.0.1")
-WEB_API_CORS_ORIGINS = os.environ.get("WEB_API_CORS_ORIGINS", "http://localhost:3001").split(",")
 
 # Mem0 quality-improvement flags (added 2026-05-12, see plans/partitioned-wibbling-sifakis.md)
 def _bool_env(name: str, default: bool) -> bool:
@@ -1342,13 +1359,9 @@ MEM0_TYPED_VALUE_ENABLED = _bool_env("MEM0_TYPED_VALUE_ENABLED", False)
 # に切り替わり、supersede 連鎖で属性履歴が追える。
 MEM0_FACT_STORE_ENABLED = _bool_env("MEM0_FACT_STORE_ENABLED", False)
 
-# Stable namespace for kanae's own Mem0 entries. Both the bot's runtime
-# hook (bot.py) and the daily summary script (scripts/kanae_daily.py)
-# must write to the same user_id, otherwise her self-facts split into
-# two ChromaDB collections that never get merged at recall time. Bot
-# runtime falls back to `str(bot.user.id)` if this env is unset, which
-# matches the historical behavior; the daily script has no bot client
-# so it cannot fall back and will skip the Mem0 push when this is empty.
+# Stable namespace for kanae's own Mem0 entries. The bot's runtime hook
+# (bot.py) writes to this user_id. Falls back to `str(bot.user.id)` if
+# unset, matching historical behavior.
 KANAE_BOT_USER_ID = os.environ.get("KANAE_BOT_USER_ID", "")
 
 _github_token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
@@ -1358,21 +1371,3 @@ if _github_token:
         "url": "https://api.githubcopilot.com/mcp/",
         "headers": {"Authorization": f"Bearer {_github_token}"},
     }
-
-# ---------------------------------------------------------------------------
-# VSCode Claude Code → Discord thread sync
-# Posts via the bot's own Discord connection (bot.get_channel(...).send) —
-# no webhook setup required. Bot must be a member of the target thread.
-# ---------------------------------------------------------------------------
-VSCODE_SYNC_ENABLED = os.environ.get("VSCODE_SYNC_ENABLED", "false").lower() == "true"
-VSCODE_SYNC_THREAD_ID = int(os.environ.get("VSCODE_SYNC_THREAD_ID", "0") or "0")
-VSCODE_SYNC_PROJECTS_ROOT = os.environ.get(
-    "VSCODE_SYNC_PROJECTS_ROOT", os.path.expanduser("~/.claude/projects")
-)
-VSCODE_SYNC_FLUSH_INTERVAL = float(os.environ.get("VSCODE_SYNC_FLUSH_INTERVAL", "2.0"))
-VSCODE_SYNC_IDLE_NOTIFY_SECONDS = int(os.environ.get("VSCODE_SYNC_IDLE_NOTIFY_SECONDS", "300"))
-
-if VSCODE_SYNC_ENABLED and VSCODE_SYNC_THREAD_ID <= 0:
-    raise RuntimeError(
-        "VSCODE_SYNC_ENABLED=true but VSCODE_SYNC_THREAD_ID is not set"
-    )

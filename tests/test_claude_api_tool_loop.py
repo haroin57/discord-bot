@@ -383,6 +383,114 @@ class TestRunAgentLoop:
         assert result.synthetic_session_id is None
 
 
+class TestScratchpadStreaming:
+    """input_json / content_block_stop events forward Scratchpad's
+    in-progress write to scratch_stream_callback and collapse it via
+    scratch_finalize_callback on block close (regression: this content used
+    to be silently dropped, freezing the live display during the write)."""
+
+    @pytest.mark.asyncio
+    async def test_scratch_callbacks_fire_during_tool_use(self, watchdog):
+        tool_use_start = _block(
+            "content_block_start",
+            content_block=_block("tool_use", name="Scratchpad", input={}),
+        )
+        input_json_partial = SimpleNamespace(
+            type="input_json",
+            snapshot={"op": "write", "section": "進捗", "content": "調べ中"},
+        )
+        input_json_full = SimpleNamespace(
+            type="input_json",
+            snapshot={"op": "write", "section": "進捗", "content": "調べ中…完了"},
+        )
+        block_stop = SimpleNamespace(type="content_block_stop")
+
+        client = _make_client((
+            [tool_use_start, input_json_partial, input_json_full, block_stop],
+            _final_msg(
+                [_block("tool_use", id="t1", name="Scratchpad",
+                         input={"op": "write", "section": "進捗", "content": "調べ中…完了"})],
+                "tool_use",
+            ),
+        ), (
+            [],
+            _final_msg([_block("text", text="done")], "end_turn"),
+        ))
+        scratch_calls = []
+        finalize_calls = []
+
+        async def _scratch_cb(section, content, op):
+            scratch_calls.append((section, content, op))
+
+        async def _finalize_cb():
+            finalize_calls.append(True)
+
+        history: list[dict] = []
+        result = await run_agent_loop(
+            "write a note", channel_id=1, history=history,
+            system_prompt="sys",
+            tools_for_api=[{"name": "Scratchpad", "description": "", "input_schema": {}}],
+            can_use_tool=_allow_all,
+            execute_tool=AsyncMock(return_value="ok"),
+            status_callback=_noop_status,
+            scratch_stream_callback=_scratch_cb,
+            scratch_finalize_callback=_finalize_cb,
+            max_turns=5,
+            stall_watchdog=watchdog,
+            api_client=client,
+            model="claude-opus-4-6",
+            extra_betas=[],
+        )
+        assert result.text == "done"
+        assert scratch_calls == [
+            ("進捗", "調べ中", "write"),
+            ("進捗", "調べ中…完了", "write"),
+        ]
+        assert finalize_calls == [True]
+
+    @pytest.mark.asyncio
+    async def test_scratch_callbacks_not_called_for_other_tools(self, watchdog):
+        tool_use_start = SimpleNamespace(
+            type="content_block_start",
+            content_block=_block("tool_use", name="Read", input={}),
+        )
+        input_json_evt = SimpleNamespace(
+            type="input_json", snapshot={"file_path": "/tmp/x"},
+        )
+        block_stop = SimpleNamespace(type="content_block_stop")
+
+        client = _make_client((
+            [tool_use_start, input_json_evt, block_stop],
+            _final_msg(
+                [_block("tool_use", id="t1", name="Read", input={"file_path": "/tmp/x"})],
+                "tool_use",
+            ),
+        ), (
+            [],
+            _final_msg([_block("text", text="done")], "end_turn"),
+        ))
+        scratch_cb = AsyncMock()
+        finalize_cb = AsyncMock()
+        history: list[dict] = []
+        await run_agent_loop(
+            "read x", channel_id=1, history=history,
+            system_prompt="sys",
+            tools_for_api=[{"name": "Read", "description": "", "input_schema": {}}],
+            can_use_tool=_allow_all,
+            execute_tool=AsyncMock(return_value="file content"),
+            status_callback=_noop_status,
+            scratch_stream_callback=scratch_cb,
+            scratch_finalize_callback=finalize_cb,
+            max_turns=5,
+            stall_watchdog=watchdog,
+            api_client=client,
+            model="claude-opus-4-6",
+            extra_betas=[],
+        )
+        scratch_cb.assert_not_awaited()
+        finalize_cb.assert_not_awaited()
+
+
 class TestHallucinationDetect:
     def test_detects_jp_claim_without_write_fire(self, caplog):
         caplog.set_level("WARNING")

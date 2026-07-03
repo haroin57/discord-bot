@@ -21,8 +21,10 @@ class _ThinkingBlock:
 
 
 class _FakeResponse:
-    def __init__(self, content):
+    def __init__(self, content, stop_reason=None, model=None):
         self.content = content
+        self.stop_reason = stop_reason
+        self.model = model
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +168,13 @@ class TestCliMessagesCreate:
         assert "thinking" not in mock_create.call_args.kwargs
 
     @pytest.mark.asyncio
-    async def test_adaptive_thinking_kept_for_opus(self):
-        """Opus supports adaptive thinking, so the kwarg is still sent."""
+    async def test_no_adaptive_thinking_even_for_opus(self):
+        """Opus/Sonnet accept adaptive thinking but must not receive it here:
+        Mem0 helpers cap max_tokens at 200-500 (sized for a short JSON reply),
+        and a thinking-capable model can spend the whole budget on thinking
+        alone, leaving zero TextBlocks (regression: rerank/rewrite silently
+        failing after MEM0_RERANK_MODEL/MEM0_REWRITE_MODEL were switched to
+        claude-sonnet-4-6)."""
         mock_create = AsyncMock(return_value=MagicMock())
         mock_client = MagicMock()
         mock_client.messages.create = mock_create
@@ -178,11 +185,23 @@ class TestCliMessagesCreate:
             user_message="hi",
             task_prompt="task",
         )
-        # Mirror the canonical THINKING_CONFIG rather than hard-coding it, so
-        # display/effort tweaks don't break this compat test.
-        from services.claude_api.client import THINKING_CONFIG
-        assert mock_create.call_args.kwargs.get("thinking") == THINKING_CONFIG
-        assert mock_create.call_args.kwargs["thinking"]["type"] == "adaptive"
+        assert "thinking" not in mock_create.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_no_adaptive_thinking_for_sonnet(self):
+        """Same guarantee for Sonnet, the model actually involved in the
+        production regression this test suite guards against."""
+        mock_create = AsyncMock(return_value=MagicMock())
+        mock_client = MagicMock()
+        mock_client.messages.create = mock_create
+        await compat_mod.cli_messages_create(
+            mock_client,
+            model="claude-sonnet-4-6",
+            max_tokens=400,
+            user_message="hi",
+            task_prompt="task",
+        )
+        assert "thinking" not in mock_create.call_args.kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -226,3 +245,24 @@ class TestExtractText:
             _TextBlock("second"),
         ])
         assert compat_mod.extract_text(resp) == "first"
+
+    def test_extract_text_warns_on_max_tokens_exhaustion(self, caplog):
+        """No TextBlock + stop_reason=max_tokens logs a diagnostic warning,
+        so a token-budget exhaustion (thinking ate the whole response) is
+        distinguishable in logs from any other empty-response cause."""
+        resp = _FakeResponse(
+            content=[_ThinkingBlock()],
+            stop_reason="max_tokens",
+            model="claude-sonnet-4-6",
+        )
+        with caplog.at_level("WARNING", logger="services.mem0.cli_compat"):
+            assert compat_mod.extract_text(resp) == ""
+        assert any("max_tokens" in r.message for r in caplog.records)
+
+    def test_extract_text_no_warning_when_not_max_tokens(self, caplog):
+        """No TextBlock but stop_reason=end_turn (e.g. empty content list)
+        must not emit the max_tokens diagnostic warning."""
+        resp = _FakeResponse(content=[], stop_reason="end_turn")
+        with caplog.at_level("WARNING", logger="services.mem0.cli_compat"):
+            assert compat_mod.extract_text(resp) == ""
+        assert not any("max_tokens" in r.message for r in caplog.records)

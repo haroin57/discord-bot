@@ -182,7 +182,7 @@ class TestMainAsync:
         assert exc_info.value.code == 1
 
     async def test_calls_gather_when_token_valid(self, monkeypatch, tmp_path):
-        """main() should call asyncio.gather with bot.start and web_api.start."""
+        """main() should call asyncio.gather with bot.start and health_server.start."""
         mod = _reload_main_async(monkeypatch, tmp_path)
 
         # Suppress logging setup and pidlock side-effects
@@ -194,28 +194,24 @@ class TestMainAsync:
         async def _fake_bot_start(token):
             gathered.append(("bot.start", token))
 
-        async def _fake_web_start(port, host=None):
-            gathered.append(("web_api.start", port))
-
-        # Build fake bot and WebAPI
+        # Build fake bot and HealthServer
         fake_bot = types.SimpleNamespace(start=_fake_bot_start)
-        fake_web_api_instance = types.SimpleNamespace(start=_fake_web_start)
 
         fake_bot_module = types.ModuleType("bot")
         fake_bot_module.bot = fake_bot
 
-        class FakeWebAPI:
+        class FakeHealthServer:
             def __init__(self, _bot):
                 pass
 
             async def start(self, port, host=None):
-                gathered.append(("web_api.start", port))
+                gathered.append(("health_server.start", port))
 
-        fake_web_api_module = types.ModuleType("web_api")
-        fake_web_api_module.WebAPI = FakeWebAPI
+        fake_health_module = types.ModuleType("services.health_server")
+        fake_health_module.HealthServer = FakeHealthServer
 
         monkeypatch.setitem(sys.modules, "bot", fake_bot_module)
-        monkeypatch.setitem(sys.modules, "web_api", fake_web_api_module)
+        monkeypatch.setitem(sys.modules, "services.health_server", fake_health_module)
 
         # validate_discord_token returns normally
         monkeypatch.setattr(mod, "validate_discord_token", lambda: "fake-token")
@@ -224,7 +220,7 @@ class TestMainAsync:
 
         await mod.main()
 
-        assert any(k == "web_api.start" for k, _ in gathered)
+        assert any(k == "health_server.start" for k, _ in gathered)
 
     async def test_validate_called_before_gather(self, monkeypatch, tmp_path):
         """validate_discord_token must be called during main()."""
@@ -249,17 +245,17 @@ class TestMainAsync:
         fake_bot_module = types.ModuleType("bot")
         fake_bot_module.bot = fake_bot
 
-        class FakeWebAPI:
+        class FakeHealthServer:
             def __init__(self, _b):
                 pass
             async def start(self, port, host=None):
                 pass
 
-        fake_web_api_module = types.ModuleType("web_api")
-        fake_web_api_module.WebAPI = FakeWebAPI
+        fake_health_module = types.ModuleType("services.health_server")
+        fake_health_module.HealthServer = FakeHealthServer
 
         monkeypatch.setitem(sys.modules, "bot", fake_bot_module)
-        monkeypatch.setitem(sys.modules, "web_api", fake_web_api_module)
+        monkeypatch.setitem(sys.modules, "services.health_server", fake_health_module)
 
         await mod.main()
         assert "validate" in calls
@@ -295,17 +291,17 @@ class TestSigtermHandler:
         fake_bot_module = types.ModuleType("bot")
         fake_bot_module.bot = fake_bot
 
-        class FakeWebAPI:
+        class FakeHealthServer:
             def __init__(self, _b):
                 pass
             async def start(self, port, host=None):
                 await asyncio.sleep(9999)
 
-        fake_web_api_module = types.ModuleType("web_api")
-        fake_web_api_module.WebAPI = FakeWebAPI
+        fake_health_module = types.ModuleType("services.health_server")
+        fake_health_module.HealthServer = FakeHealthServer
 
         monkeypatch.setitem(sys.modules, "bot", fake_bot_module)
-        monkeypatch.setitem(sys.modules, "web_api", fake_web_api_module)
+        monkeypatch.setitem(sys.modules, "services.health_server", fake_health_module)
         # main_async's shutdown imports kill_orphan_claude_cli from
         # services.claude_api (PR9: claude_sdk deleted); patch the attribute.
         import services.claude_api as _capi
