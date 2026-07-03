@@ -97,3 +97,22 @@ git -C "${BOT_DIR}" rev-parse HEAD > "${DEST}/GIT_COMMIT"
 du -sh "${DEST}" | awk '{print "[snapshot] size: "$1}'
 echo "[snapshot] done: ${DEST}"
 echo "[snapshot] verify with: scripts/snapshot_state.sh --verify ${DEST}"
+
+# --- C1 (Cloudflare offload): mirror the snapshot to R2 ---------------------
+# Requires R2 to be enabled on the account (dashboard, one-time) and the
+# bucket:  wrangler r2 bucket create kanae-state-backup
+# Off-machine copy = the .state survives total VPS loss. Controlled by env so
+# the local snapshot still works before R2 is enabled.
+if [[ "${SNAPSHOT_R2_SYNC:-1}" == "1" ]] && command -v wrangler >/dev/null 2>&1; then
+    export PATH="$HOME/.volta/bin:$PATH"
+    R2_ARCHIVE="/tmp/state-snapshot-${STAMP}.tar.gz"
+    tar czf "${R2_ARCHIVE}" -C "${DEST}" .
+    if wrangler r2 object put \
+        "kanae-state-backup/snapshots/${STAMP}.tar.gz" \
+        --file "${R2_ARCHIVE}" --remote >/dev/null 2>&1; then
+        echo "[snapshot] R2 mirror OK: snapshots/${STAMP}.tar.gz ($(du -h "${R2_ARCHIVE}" | cut -f1))"
+    else
+        echo "[snapshot] R2 mirror FAILED (R2 enabled? bucket exists?) — local snapshot is still valid"
+    fi
+    rm -f "${R2_ARCHIVE}"
+fi
