@@ -183,12 +183,17 @@ discord-bot の journal のうち WARNING 以上を haroin サーバーの
    → DRY_RUN=0 に → ローカル vi-signal / intervention-scheduler unit を disable
 4. ロールバック: DRY_RUN=1 に戻してローカル unit を re-enable
 
-### ブロック中 (要オーナー操作)
-- **Browser Rendering 置換 (Phase 2-1)**: 既存 cfut_ トークンに Browser Rendering
-  スコープが無い (全エンドポイント 401 を実測確認)。ダッシュボードで
-  「Account → Browser Rendering: Edit」権限のトークンを発行し、.env に
-  `CF_BROWSER_RENDERING_TOKEN=` として追加すれば再開可能。それまで
-  ローカル Puppeteer (browser_pool.py) が唯一の描画経路なので削除禁止
+### Browser Rendering 置換 (Phase 2-1) — 完了 (2026-07-04)
+- table/math renderer は Cloudflare Browser Rendering REST (utils/cf_browser.py)。
+  認証は .env の `CF_BROWSER_RENDERING_TOKEN`、アカウント ID は
+  8574821c4ec0b24f61d59c5a15dc31f4 (**古い unit に埋まっていた fcf1f31d... は
+  別アカウントの死んだ ID。使うと 401**)
+- 実測: cache-miss 0.35〜1.61s (旧ローカル cold 9.1s)。KaTeX は jsDelivr CDN
+- **free-tier は req/min が低い**: 描画連発で 429 → 1リトライ後 None (text fallback)。
+  頻発するならリトライのバックオフ延長 or クライアント側キューを検討
+- mermaid (mmdc) は別経路で**ローカル Chromium 依存のまま** — mermaid-cli と
+  ~/.cache/puppeteer は削除禁止。トークン失効時も renderer は None を返して
+  bot はテキスト劣化で継続する (落ちない)
 
 ### Workers 一覧 (ソース: ~/archives/cloudflare-workers-src-20260704/)
 | Worker | 役割 | 状態 |
