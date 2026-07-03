@@ -18,6 +18,7 @@ from discord.ext import commands
 
 import bot_commands
 import bot_preprocess
+import bot_ui
 
 from config import (
     ADMIN_USER_IDS,
@@ -786,17 +787,15 @@ async def on_message(message: discord.Message):
     )
     register_job(job)
 
-    status_msg: discord.Message | None = None
-    try:
-        if was_queued:
-            wait_pos = max(1, queue_position(job) - 1)
-            status_msg = await message.reply(f"⏳ 待機中({wait_pos}番目)")
-            log.info("Message %s queued in channel %s (pos=%d)",
-                     message.id, message.channel.id, wait_pos)
-        else:
-            status_msg = await message.reply("⏳ 考え中...")
-    except discord.errors.HTTPException:
-        status_msg = None
+    # Status/spinner UI — one writer for the status message (R2, bot_ui.py).
+    status = bot_ui.StatusController(message, track_task=_track_task)
+    if was_queued:
+        wait_pos = max(1, queue_position(job) - 1)
+        await status.initial_reply(was_queued=True, wait_pos=wait_pos)
+        log.info("Message %s queued in channel %s (pos=%d)",
+                 message.id, message.channel.id, wait_pos)
+    else:
+        await status.initial_reply(was_queued=False)
 
     # 👀/⏳ reaction marker on the user's message (restored 2026-06-13,
     # haroin request). The job-state status reply above replaced the old
@@ -810,229 +809,6 @@ async def on_message(message: discord.Message):
     except discord.errors.HTTPException:
         pass
 
-    # Status updater (latest-wins, 2s rate limit) — defined this early so
-    # the queue/preprocessing phases share the message the model phases
-    # edit later.
-    last_status_update = 0.0
-    _pending_status: dict = {"text": None, "task": None}
-    STATUS_INTERVAL_S = 2.0
-
-    # Claude-Code-CLI-style animated spinner (services/claude_api/progress.py).
-    # CADENCE = 1 char / second, and this is a HARD Discord limit, not a choice:
-    # editing one message has a per-message bucket (~5 edits / 5s ≈ 1/s
-    # sustained). A faster cadence (0.25s/4fps) renders for the first ~5 frames
-    # then exhausts the bucket — discord.py blocks inside message.edit() until a
-    # slot frees, which FREEZES this serial loop for seconds at a time (the
-    # "描画が止まる" report; reproduced in scripts/spinner_capture.py: 4s freezes
-    # every ~1.25s of burst; the bucket itself measured by
-    # scripts/measure_edit_ratelimit.py). frame-drop doesn't help — a LANDED edit
-    # is itself bucket-limited, so it stalls too and jumps on resume. Continuous
-    # motion comes instead from SPINNER_EMOJI (animated application emoji, free).
-    # So we pace edits to what Discord sustains. Design: a single serial loop awaits each edit THEN
-    # steps the window one char (every visible frame advances exactly one
-    # position — no skipped chars, no create_task churn); wall-clock cadence
-    # self-corrects drift; split_message is off-loop in _draft_live. The elapsed
-    # seconds in the meta line tick every frame, so 1fps still reads as alive.
-    # During generation _update_status feeds the animator a transient "action"
-    # (tool labels surface; plain thinking/generating reverts to the shimmer).
-    from services.claude_api.progress import ProgressSpinner, _fmt_tokens, SPINNER_EMOJI
-    _spinner = ProgressSpinner()
-    _prog: dict = {"tokens": 0}          # live output-token count (set by tool_loop)
-    _spin: dict = {"on": False, "action": "", "start": 0.0}
-    # Vestigial guard, kept False: status_msg is the spinner only — the response
-    # is always a fresh reply now (the in-place-repurpose path was removed
-    # 2026-06-22 because it made the spinner vanish at generation start and put
-    # the reply in the wrong timeline slot). So _do_edit always owns status_msg
-    # for status text, and the success-path delete always removes it.
-    _status_consumed = {"v": False}
-    SPIN_INTERVAL_S = 1.0  # ≈ Discord's sustainable single-message edit rate
-    _animator_task: asyncio.Task | None = None
-
-    def _spin_body() -> str:
-        elapsed = time.monotonic() - _spin["start"]
-        action = _spin["action"]
-        if action:
-            prefix = f"{SPINNER_EMOJI} " if SPINNER_EMOJI else ""
-            body = f"{prefix}{action}  ({int(elapsed)}s"
-            if _prog["tokens"]:
-                body += f" · ↑ {_fmt_tokens(_prog['tokens'])} tokens"
-            return body + ")"
-        return _spinner.render(
-            elapsed_s=elapsed, tokens=_prog["tokens"], interrupt_hint="/abort で中断",
-        )
-
-    async def _spin_edit(text: str) -> None:
-        try:
-            if status_msg is not None:
-                await status_msg.edit(content=text)
-        except discord.errors.HTTPException:
-            pass
-
-    async def _animate() -> None:
-        next_frame = time.monotonic()
-        while _spin["on"]:
-            if status_msg is not None:
-                # Serial: await this edit, THEN advance one char. Stepping only
-                # after the edit lands guarantees each visible frame moves the
-                # bold window by exactly one position (never skips → no
-                # stutter), with zero task-spawn churn.
-                try:
-                    await _spin_edit(_spin_body())
-                except asyncio.CancelledError:
-                    break
-                _spinner.step()
-            # Wall-clock cadence: pace to SPIN_INTERVAL_S when edits are fast;
-            # if an edit ran long, delay clamps to 0 and the grid resyncs (the
-            # loop then runs at the edit rate, still one step per frame).
-            next_frame += SPIN_INTERVAL_S
-            delay = next_frame - time.monotonic()
-            if delay < 0:
-                next_frame = time.monotonic()
-                delay = 0.0
-            try:
-                await asyncio.sleep(delay)
-            except asyncio.CancelledError:
-                break
-
-    async def _animate_gif() -> None:
-        # Option B (SPINNER_MODE=gif): the WHOLE status line (gerund word +
-        # elapsed/tokens) is baked into one seamlessly-looping bold-shimmer GIF
-        # attachment with empty message content — so it's a single block (no
-        # line break) at Discord's text size. The client loops the GIF for free,
-        # re-uploaded once a second (≈ Discord's sustainable edit rate) with a
-        # fresh word + ticking counters; each GIF is a one-second forward bold
-        # sweep, so the word visibly shimmers and the seconds advance every tick.
-        # While a tool runs (_spin["action"]) we switch to a plain text line and
-        # drop the GIF, restoring it when the action clears.
-        import os as _os
-        from services.claude_api.progress import pick_word
-        from services.claude_api.spinner_gif import render_status_gif, _CACHE_DIR
-        REFRESH_S = 1.0
-        gif_path = _os.path.join(_CACHE_DIR, f"status_{message.channel.id}.gif")
-        state = {"mode": None, "action": None, "last_refresh": 0.0}
-        next_frame = time.monotonic()
-
-        def _meta() -> str:
-            elapsed = int(time.monotonic() - _spin["start"])
-            parts = [f"{elapsed}s"]
-            if _prog["tokens"]:
-                parts.append(f"↑ {_fmt_tokens(_prog['tokens'])} tokens")
-            parts.append("/abort で中断")
-            return f"({' · '.join(parts)})"
-
-        async def _refresh_gif(meta: str) -> None:
-            try:
-                path = await asyncio.to_thread(
-                    render_status_gif, pick_word(), meta, gif_path,
-                )
-            except Exception as exc:
-                log.warning("[rid=%s] status gif render failed: %s",
-                            get_request_id(), exc)
-                await status_msg.edit(content=f"⏳ {meta}")
-                state["mode"] = "text"
-                return
-            f = discord.File(path)
-            try:
-                await status_msg.edit(content="", attachments=[f])
-                state["mode"] = "gif"
-                state["last_refresh"] = time.monotonic()
-            finally:
-                f.close()
-
-        while _spin["on"]:
-            if status_msg is not None:
-                meta = _meta()
-                action = _spin["action"]
-                try:
-                    if action:
-                        # tool running → plain text line, drop the gif
-                        changed = state["mode"] != "action" or state["action"] != action
-                        if changed or time.monotonic() - state["last_refresh"] >= REFRESH_S:
-                            if state["mode"] == "gif":
-                                # clear the gif attachment when leaving gif mode
-                                await status_msg.edit(content=f"{action}  {meta}",
-                                                      attachments=[])
-                            else:
-                                await status_msg.edit(content=f"{action}  {meta}")
-                            state["mode"] = "action"
-                            state["action"] = action
-                            state["last_refresh"] = time.monotonic()
-                    else:
-                        state["action"] = None
-                        # Refresh every tick (~1s): new sweep + ticking counters.
-                        await _refresh_gif(meta)
-                except discord.errors.HTTPException:
-                    pass
-                except asyncio.CancelledError:
-                    break
-            next_frame += SPIN_INTERVAL_S
-            delay = next_frame - time.monotonic()
-            if delay < 0:
-                next_frame = time.monotonic()
-                delay = 0.0
-            try:
-                await asyncio.sleep(delay)
-            except asyncio.CancelledError:
-                break
-
-    async def _do_edit(text: str) -> None:
-        if status_msg is None or _status_consumed["v"]:
-            # status_msg was repurposed as the response body — don't clobber it.
-            return
-        try:
-            await status_msg.edit(content=text)
-        except discord.errors.HTTPException:
-            pass
-
-    async def _delayed_edit(text: str, delay: float) -> None:
-        try:
-            await asyncio.sleep(delay)
-        except asyncio.CancelledError:
-            return
-        nonlocal last_status_update
-        last_status_update = time.monotonic()
-        _pending_status["task"] = None
-        await _do_edit(text)
-
-    async def _update_status(text: str):
-        """Latest-wins status updater with 2s rate limit.
-
-        Never drops the most recent text: if called within the cool-down,
-        schedule a delayed edit (cancelling any previously pending one).
-        Discord message limit is 2000 chars — truncate to stay safe.
-        """
-        if len(text) > 1990:
-            text = text[:1990] + "…"
-        # While the animator owns status_msg, route phase/tool labels into its
-        # transient "action" line instead of editing directly (avoids two
-        # writers fighting over one message). Plain thinking/generating
-        # indicators clear the action so the shimmer shows through.
-        if _spin["on"]:
-            _spin["action"] = "" if text[:1] in ("💭", "📝") else text
-            return
-        nonlocal last_status_update
-        now_mono = time.monotonic()
-        elapsed = now_mono - last_status_update
-        if elapsed >= STATUS_INTERVAL_S:
-            # Cancel any pending delayed edit — this call is fresh enough.
-            pending = _pending_status.get("task")
-            if pending and not pending.done():
-                pending.cancel()
-                _pending_status["task"] = None
-            last_status_update = now_mono
-            # Fire-and-forget so the streaming loop isn't blocked on Discord I/O.
-            _track_task(_do_edit(text), name="status_edit")
-            return
-        # Too soon: remember latest text, schedule a single delayed edit.
-        _pending_status["text"] = text
-        pending = _pending_status.get("task")
-        if pending and not pending.done():
-            pending.cancel()
-        _pending_status["task"] = _track_task(
-            _delayed_edit(text, STATUS_INTERVAL_S - elapsed),
-            name="status_delayed_edit",
-        )
-
     try:
         await sema.acquire()  # waits if channel is busy (FIFO)
     except asyncio.CancelledError:
@@ -1040,18 +816,14 @@ async def on_message(message: discord.Message):
         # there is nothing to release.
         job.phase = JobPhase.FAILED
         unregister_job(job)
-        if status_msg is not None:
-            try:
-                await status_msg.edit(content="⏹️ 待機中に中断されました")
-            except discord.errors.HTTPException:
-                pass
+        await status.edit_final("⏹️ 待機中に中断されました")
         log.info("Message %s cancelled while queued in channel %s",
                  message.id, message.channel.id)
         return
 
     job.phase = JobPhase.PREPROCESSING
     if was_queued:
-        await _update_status("⏳ 考え中...")
+        await status.update("⏳ 考え中...")
         # Swap ⏳→👀 now that processing actually starts.
         try:
             await message.remove_reaction("⏳", bot.user)
@@ -1130,7 +902,7 @@ async def on_message(message: discord.Message):
             _attach_accepted, _attach_rejected = _classify_attachment_rejections(
                 all_attachments, caller_is_admin=caller_is_admin,
             )
-            await _update_status(
+            await status.update(
                 f"📎 添付ファイルを確認中({_attach_accepted}件受理"
                 + (f"・{len(_attach_rejected)}件不可" if _attach_rejected else "")
                 + ")"
@@ -1410,7 +1182,7 @@ async def on_message(message: discord.Message):
         # Non-admins only see memories from their OWN user_id space.
         if mem0_task is not None:
             job.phase = JobPhase.RECALLING
-            await _update_status("🧠 記憶を検索中")
+            await status.update("🧠 記憶を検索中")
             try:
                 mem_results = await mem0_task
                 mem0_block = format_memories_for_prompt(mem_results)
@@ -1525,7 +1297,7 @@ async def on_message(message: discord.Message):
         # semaphore) so the queued phase shares the same message. Transition
         # into the model phase here.
         job.phase = JobPhase.CALLING_CLAUDE
-        await _update_status("📨 Claudeへ送信中")
+        await status.update("📨 Claudeへ送信中")
 
         log.info("Routing to SDK/CLI (restricted=%s, is_thread=%s)", not admin, is_thread)
 
@@ -1560,9 +1332,6 @@ async def on_message(message: discord.Message):
         _placeholder: dict = {"msg": None}            # held open-block placeholder
         _rendered_images: list[str] = []              # temp image paths to clean up
         _first_reply = {"done": False}                # first content msg replies to user
-        # _status_consumed is initialised earlier (next to the spinner state) so
-        # the _do_edit/_animate closures never read it unbound. Don't re-create
-        # it here — rebinding would point those closures at a stale dict.
         _render_lock = asyncio.Lock()
 
         async def _send_content(text: str | None = None, *, file=None):
@@ -1588,35 +1357,9 @@ async def on_message(message: discord.Message):
                 log.warning("[rid=%s] content send failed: %s", get_request_id(), exc)
                 return None
             _live_sent_any["v"] = True
-            await _reposition_spinner()
+            await status.reposition()
             return m
 
-        async def _reposition_spinner() -> None:
-            """Keep the spinner pinned at the BOTTOM of the reply while generating.
-
-            When a new content message is appended below it, re-post the spinner so
-            it stays the last message. Order: send NEW → reassign status_msg →
-            delete OLD, so the animator (which reads status_msg every frame) never
-            edits a just-deleted message (the stray frame between is swallowed by
-            the HTTPException guards in _spin_edit/_do_edit/_animate_gif). No-op once
-            generation ends or if the spinner is gone. In-place draft edits don't go
-            through _send_content, so the spinner is NOT repositioned for them
-            (only at real content boundaries — low frequency, send/delete is a
-            separate rate bucket from the spinner's edits).
-            """
-            nonlocal status_msg
-            if not _spin["on"] or status_msg is None:
-                return
-            old = status_msg
-            try:
-                new = await message.channel.send(_spin_body())
-            except discord.errors.HTTPException:
-                return
-            status_msg = new
-            try:
-                await old.delete()
-            except discord.errors.HTTPException:
-                return
 
         def _disp(text: str) -> str:
             # Display-only transform: strip numeric inline-code backticks (only
@@ -1813,13 +1556,13 @@ async def on_message(message: discord.Message):
             try:
                 if existing is None:
                     _tool_notice_state["msg"] = await message.channel.send(payload)
-                    await _reposition_spinner()
+                    await status.reposition()
                     return
                 await existing.edit(content=payload)
             except discord.errors.NotFound:
                 try:
                     _tool_notice_state["msg"] = await message.channel.send(payload)
-                    await _reposition_spinner()
+                    await status.reposition()
                 except Exception as exc:
                     log.warning("tool notice re-post failed: %s", exc)
             except Exception as exc:
@@ -1876,22 +1619,19 @@ async def on_message(message: discord.Message):
                 log.warning("delib_router failed (chat 扱い): %s", exc)
         _delib = _tier == "deliberate"
         if _delib:
-            await _update_status("🧠 熟考モード")
+            await status.update("🧠 熟考モード")
         # Start the CLI-style spinner: it owns status_msg until the call returns.
         # SPINNER_MODE picks the renderer: "gif" = animated word-GIF (B), else
         # the 1/sec text shimmer + animated emoji (A+C).
-        _spin["on"] = True
-        _spin["start"] = time.monotonic()
-        _spin_coro = _animate_gif() if SPINNER_MODE == "gif" else _animate()
-        _animator_task = _track_task(_spin_coro, name="status_spinner")
+        status.spin_start(mode=SPINNER_MODE)
         try:
             response_text, session_info, actually_resumed = await call_with_tools(
                 prompt, message.channel.id, sessions,
-                status_callback=_update_status,
+                status_callback=status.update,
                 incremental_text_callback=None if _delib else _incremental_send,
                 text_stream_callback=None if _delib else _stream_preview,
                 tool_invocation_callback=_tool_invocation_send,
-                progress=_prog,
+                progress=status.prog,
                 tier=_tier,
                 route_judgment=_route_judgment,
                 restricted=not admin,
@@ -1910,12 +1650,10 @@ async def on_message(message: discord.Message):
             )
         finally:
             # Spinner hands status_msg back to the normal (throttled) flow.
-            _spin["on"] = False
-            if _animator_task is not None:
-                _animator_task.cancel()
+            status.spin_stop()
 
         job.phase = JobPhase.FINALIZING
-        await _update_status("🪄 整形中")
+        await status.update("🪄 整形中")
 
         if will_resume and not actually_resumed:
             # actually_resumed is the 3rd return value from call_with_tools.
@@ -1968,19 +1706,12 @@ async def on_message(message: discord.Message):
         response_text = strip_numeric_inline_code(response_text)
 
         # Cancel any pending delayed status edit before deleting the message.
-        pending_status_task = _pending_status.get("task")
-        if pending_status_task and not pending_status_task.done():
-            pending_status_task.cancel()
-            _pending_status["task"] = None
+        status.cancel_pending()
 
         # Delete status message (success path only — error paths leave a
         # short explanation on it instead). Skip when status_msg was repurposed
         # as the first response message: deleting it would remove the response.
-        if status_msg is not None and not _status_consumed["v"]:
-            try:
-                await status_msg.delete()
-            except discord.errors.HTTPException:
-                pass
+        await status.delete_if_alive()
 
         # Empty-response guard. The model occasionally returns an empty
         # message (refusal stripped to nothing, ThinkingBlock-only output,
@@ -2217,8 +1948,8 @@ async def on_message(message: discord.Message):
         # Leave a short note on the status message instead of deleting it
         # (P0: errors keep a brief explanation; success deletes).
         try:
-            if status_msg is not None:
-                await status_msg.edit(content="⏹️ 中断しました")
+            if status.status_msg is not None:
+                await status.edit_final("⏹️ 中断しました")
             else:
                 await message.channel.send("⏹️ 中断しました")
         except Exception:
@@ -2242,8 +1973,8 @@ async def on_message(message: discord.Message):
             "（再認証後は次のメッセージから自動で復帰します）"
         )
         try:
-            if status_msg is not None:
-                await status_msg.edit(content=oauth_text)
+            if status.status_msg is not None:
+                await status.edit_final(oauth_text)
             else:
                 await message.reply(oauth_text)
         except Exception:
@@ -2260,8 +1991,8 @@ async def on_message(message: discord.Message):
             # Short request id so the admin can grep the logs (P2).
             err_text += f"\n-# req: {rid}"
         try:
-            if status_msg is not None:
-                await status_msg.edit(content=err_text)
+            if status.status_msg is not None:
+                await status.edit_final(err_text)
             else:
                 await message.reply(err_text)
         except Exception:
