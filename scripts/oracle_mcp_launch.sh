@@ -30,4 +30,12 @@ if [ -n "${GOOGLE_AI_API_KEY:-}" ]; then export GEMINI_API_KEY="${GOOGLE_AI_API_
 export ORACLE_TPM_LIMIT="${ORACLE_TPM_LIMIT:-50000}"
 export ORACLE_MAX_OUTPUT_TOKENS="${ORACLE_MAX_OUTPUT_TOKENS:-24000}"
 
+# search デフォルト off（ローカルパッチ連動, 2026-07-04, docs/oracle_mcp.md）:
+# oracle のデフォルト search:true は、gpt-5.5-pro + TPM 50k の org では致命的。
+# background モードの web 検索多段ラウンドが同一 1分窓に admission 予約を
+# 積み上げて 50k を突破 → 429 → background ジョブ恒久 fail（実プロンプト18連敗の
+# 根本原因。search 無効の同一プロンプトは完走することを実測で確認済み）。
+# 検索が必要な consult だけ明示的に search:true を渡す。
+export ORACLE_DEFAULT_SEARCH="${ORACLE_DEFAULT_SEARCH:-off}"
+
 exec oracle-mcp "$@"

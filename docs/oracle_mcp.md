@@ -83,3 +83,36 @@ oracle session <slug>                             # detach したジョブの回
   轢かれて `status=failed`（Used 49k / try again in 20s）になる**のを実測済み（2026-07-03）。
   コードレビュー・設計判断など検索不要なタスクでは search off が安全。web 検索が要る調査は
   SecondOpinion（サブスク枠）か gpt-5.5（非Pro, 短時間）に逃がす
+
+## 追補（2026-07-04）: search デフォルト off パッチ — 「運用ルール」から「デフォルト安全」へ
+
+上記の search:false ルールを consult 呼び出し時に渡し忘れ、cf-radical-offload-design
+系 4 セッションが連続 429 死した。忘れると死ぬルールは仕組みで封じるべきなので、
+デフォルトを反転するローカルパッチを追加した。
+
+### 実測で確定した失敗メカニズム（概念検証 2026-07-04）
+1. oracle は Responses API の **background モード**でジョブを投げる（ローカルを
+   切っても OpenAI 側で走り続ける。MCP ツール呼び出しをクライアント側で拒否/中断
+   してもセッションは開始済みになり得る — 実際に -4 は拒否後も running だった）
+2. search 有効だと、サーバー側で web_search を挟む多段ラウンドが回る。**各ラウンドの
+   admission 予約（入力累積 + max_output クランプ値）が同一 1分 TPM 窓に積み上がる**
+3. 実測の数字: round1 予約 20,362 + 中間消費 10,570 = Used 30,932 の状態で
+   round2 が 20,362 を要求 → 50,000 を 1,294 超過して 429 → **background ジョブは
+   pacing せず恒久 fail**（usage は null のまま = 課金上は未生成でも窓は占有される）
+4. 検証: search 無しの同一ブリーフ（6.4k 入力）を background 直叩き →
+   3分で完走（reasoning 9,149 + 本文 12,000）。**search の有無だけで生死が分かれる**
+5. 歴代セッション 22 件の成績: gpt-5.5-pro の実プロンプトは **18 連敗**
+   （完走は一文プロンプト 1 件のみ）。gpt-5.5(非Pro) は 2/2 完走
+
+### パッチ内容
+| ファイル | 変更 |
+|---|---|
+| `src/oracle/run.js` | `searchEnabled` を `ORACLE_DEFAULT_SEARCH=off` なら opt-in（`search===true` のみ有効）に反転 |
+| `scripts/oracle_mcp_launch.sh` | `ORACLE_DEFAULT_SEARCH=off` をデフォルト export |
+
+- 検索が本当に必要な consult だけ `search: true` を明示（そのときは gpt-5.5 非Pro か、
+  入力を小さくして TPM 窓に多段ラウンドが収まるようにする）
+- **npm update で run.js のパッチは消える**（上の表と同じ運用）
+- 中断したい background ジョブは `POST /v1/responses/{resp_id}/cancel` で殺せる
+  （resp_id はセッションの output.log に記録される）。放置すると窓を占有し続け
+  後続セッションまで連鎖死する
