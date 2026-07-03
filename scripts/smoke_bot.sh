@@ -12,11 +12,11 @@ BOT_DIR="/home/ubuntu/discord-bot"
 PY="${BOT_DIR}/.venv/bin/python"
 cd "${BOT_DIR}"
 
-echo "[smoke] 1/4 entry-point imports (bot, web_api, main_async, MCP servers)"
+echo "[smoke] 1/4 entry-point imports (bot, health_server, main_async, MCP servers)"
 "${PY}" - <<'EOF'
 import importlib
 for mod in (
-    "config", "bot", "web_api", "main_async",
+    "config", "bot", "services.health_server", "main_async",
     "mcp_mem0_server", "second_opinion_mcp_server",
     "services.claude_api.entry", "services.mem0.search",
 ):
