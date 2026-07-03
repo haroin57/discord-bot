@@ -4,7 +4,7 @@ Exposes Mem0 search/add/list/delete as MCP tools so Claude Code can read and
 write the same ChromaDB that かなえ Discord bot uses. Default user_id is
 hardcoded to 先輩's Discord ID so記憶がそのまま共有される。
 
-Reuses discord-bot's services.mem0_service which handles OAuth + config.
+Reuses discord-bot's services.mem0 which handles OAuth + config.
 """
 
 import asyncio
@@ -60,7 +60,7 @@ os.environ["OAUTH_NO_REFRESH"] = "1"
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
-from services.mem0_service import (  # noqa: E402
+from services.mem0 import (  # noqa: E402
     add_memories,
     delete_memory,
     get_all_memories,

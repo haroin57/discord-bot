@@ -42,7 +42,7 @@ def _check_oauth() -> dict[str, Any]:
 def _check_mem0() -> dict[str, Any]:
     """Lightweight check — does NOT issue a real Mem0 query (would be expensive)."""
     try:
-        from services import mem0_service  # noqa
+        from services import mem0  # noqa
         return {"ok": True}
     except ImportError as e:
         return {"ok": False, "reason": f"import_failed: {e}"}

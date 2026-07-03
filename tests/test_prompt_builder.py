@@ -504,7 +504,7 @@ class TestBuildPrompt:
     def test_mem0_fetch_called_when_text_long_enough(self):
         mock_fetch = AsyncMock(return_value=[{"memory": "past memory"}])
 
-        with patch("services.mem0_service.format_memories_for_prompt", return_value="MEMORIES"):
+        with patch("services.mem0.format_memories_for_prompt", return_value="MEMORIES"):
             with patch("config.MEM0_MIN_QUERY_LENGTH", 5):
                 result = self._run(PromptBuilder.build_prompt(
                     raw_text="this is a long enough text for mem0",
@@ -646,7 +646,7 @@ class TestBuildPrompt:
     def test_mem0_empty_result_no_memories_block(self):
         mock_fetch = AsyncMock(return_value=[])
 
-        with patch("services.mem0_service.format_memories_for_prompt", return_value=""):
+        with patch("services.mem0.format_memories_for_prompt", return_value=""):
             with patch("config.MEM0_MIN_QUERY_LENGTH", 5):
                 result = self._run(PromptBuilder.build_prompt(
                     raw_text="long enough text here",

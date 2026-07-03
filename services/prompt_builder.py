@@ -339,7 +339,7 @@ class PromptBuilder:
         if mem0_fetch is not None:
             try:
                 from config import MEM0_MIN_QUERY_LENGTH
-                from services.mem0_service import format_memories_for_prompt
+                from services.mem0 import format_memories_for_prompt
                 if len(raw_text) >= MEM0_MIN_QUERY_LENGTH:
                     queries = PromptBuilder.build_mem0_queries(raw_text)
                     mem_results = await mem0_fetch(queries, mem0_user_id)

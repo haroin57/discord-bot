@@ -550,7 +550,7 @@ class WebAPI:
             await sio.emit("status", {"phase": "⏳ 考え中...", "channel_id": channel_id}, to=sid)
 
             try:
-                from services.mem0_service import search_memories_multi
+                from services.mem0 import search_memories_multi
 
                 async def _mem0_fetch(queries, user_id):
                     return await search_memories_multi(queries, user_id, limit=8)
@@ -616,7 +616,7 @@ class WebAPI:
                 if is_admin:
                     async def _mem0_store():
                         try:
-                            from services.mem0_service import add_memories
+                            from services.mem0 import add_memories
                             msgs = [
                                 {"role": "user", "content": raw_text},
                                 {"role": "assistant", "content": response_text},

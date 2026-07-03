@@ -64,7 +64,7 @@ from services import vscode_sync
 from services import claude_tag
 from services import deep_research
 from services.vscode_sync.discord_post import make_post_callback
-from services.mem0_service import (
+from services.mem0 import (
     add_memories,
     delete_memory,
     format_history_for_prompt,

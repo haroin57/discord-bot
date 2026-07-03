@@ -656,10 +656,7 @@ async def test_send_message_success_emits_assistant_message():
          patch("web_api.asyncio.create_task"):
 
         # Patch search_memories_multi used inside send_message
-        with patch.dict("sys.modules", {"services.mem0_service": MagicMock(
-            search_memories_multi=AsyncMock(return_value=[]),
-            add_memories=AsyncMock(),
-        )}):
+        with patch("services.mem0.search_memories_multi", new=AsyncMock(return_value=[])), patch("services.mem0.add_memories", new=AsyncMock()):
             await handlers["send_message"]("sid14", {"channel_id": "10", "text": "hello"})
 
     # Find the "message" emit call
@@ -675,9 +672,7 @@ async def test_send_message_emits_error_on_exception():
 
     with patch("web_api.PromptBuilder.build_prompt", new=AsyncMock(side_effect=RuntimeError("boom"))), \
          patch("web_api.PromptBuilder.cap_text", return_value="hello"), \
-         patch.dict("sys.modules", {"services.mem0_service": MagicMock(
-             search_memories_multi=AsyncMock(return_value=[]),
-         )}):
+         patch("services.mem0.search_memories_multi", new=AsyncMock(return_value=[])):
         await handlers["send_message"]("sid15", {"channel_id": "10", "text": "hello"})
 
     all_calls = [c[0][0] for c in api.sio.emit.call_args_list]
@@ -697,9 +692,7 @@ async def test_send_message_non_admin_does_not_store_to_mem0():
          patch("web_api.call_with_tools", new=AsyncMock(return_value=("reply", None, False))), \
          patch("web_api.asyncio.to_thread", new=AsyncMock(return_value=None)), \
          patch("web_api.asyncio.create_task") as mock_task, \
-         patch.dict("sys.modules", {"services.mem0_service": MagicMock(
-             search_memories_multi=AsyncMock(return_value=[]),
-         )}):
+         patch("services.mem0.search_memories_multi", new=AsyncMock(return_value=[])):
         await handlers["send_message"]("sid16", {"channel_id": "20", "text": "hi"})
         # create_task should NOT be called for non-admin
         mock_task.assert_not_called()
@@ -1453,10 +1446,7 @@ async def test_send_message_skips_update_session_when_no_session_id():
          patch("web_api.update_session") as mock_update, \
          patch("web_api.asyncio.to_thread", new=AsyncMock(return_value=None)), \
          patch("web_api.asyncio.create_task"), \
-         patch.dict("sys.modules", {"services.mem0_service": MagicMock(
-             search_memories_multi=AsyncMock(return_value=[]),
-             add_memories=AsyncMock(),
-         )}):
+         patch("services.mem0.search_memories_multi", new=AsyncMock(return_value=[])), patch("services.mem0.add_memories", new=AsyncMock()):
         await handlers["send_message"]("sid_nosess", {"channel_id": "10", "text": "hi"})
 
     mock_update.assert_not_called()
@@ -1485,10 +1475,7 @@ async def test_send_message_admin_triggers_mem0_store():
          patch("web_api.call_with_tools", new=AsyncMock(return_value=("reply", "sess_id", False))), \
          patch("web_api.asyncio.to_thread", new=AsyncMock(return_value=None)), \
          patch("web_api.asyncio.create_task", side_effect=capture_create_task), \
-         patch.dict("sys.modules", {"services.mem0_service": MagicMock(
-             search_memories_multi=AsyncMock(return_value=[]),
-             add_memories=AsyncMock(),
-         )}):
+         patch("services.mem0.search_memories_multi", new=AsyncMock(return_value=[])), patch("services.mem0.add_memories", new=AsyncMock()):
         await handlers["send_message"]("sid_mem0", {"channel_id": "10", "text": "hi"})
         # Allow the Mem0 store coroutine to run
         await asyncio.gather(*created_tasks, return_exceptions=True)
