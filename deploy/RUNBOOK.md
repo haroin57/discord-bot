@@ -109,9 +109,11 @@ bot と運命を共にしない監視経路。**bot 完全死でもアラート�
   https://health.haroin57.com/health（cloudflared tunnel、/health のみ path 公開）
 - 判定: 3回連続失敗で DOWN、2回連続成功で復帰（フラップ抑制）。HTTP 200 でも
   body の status≠"ok"（degraded）は失敗扱い
-- 通知: Discord Webhook → #kanae-monitoring（「おはなし」サーバー）。DOWN 継続中は
-  30分毎に再通知
+- 通知: Discord Webhook → haroin のサーバーの監視チャンネル
+  （channel_id 1522684302687469749）。DOWN 継続中は 30分毎に再通知。
+  Webhook URL は Worker の secret `WEBHOOK_URL`（差し替えは
+  `wrangler secret put WEBHOOK_URL`）
 - 状態確認: https://kanae-health-probe.haroin57.workers.dev/ （現在の KV 状態を返す）
-- ソース: /tmp/kanae-health-probe（wrangler プロジェクト。恒久保管先は要検討）
+- ソース: ~/archives/cloudflare-workers-src-20260704/kanae-health-probe（wrangler プロジェクト）
 - **残項目**: Worker 自体の死の検知は Cloudflare ダッシュボードの Workers アラート
   設定 or 外部 SaaS（UptimeRobot 等）を追加すること（監視の監視）
