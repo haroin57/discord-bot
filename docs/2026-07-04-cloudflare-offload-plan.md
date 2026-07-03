@@ -181,3 +181,132 @@ C1〜C5 完了時点の見込み: **常駐メモリ -900MB 前後（ChromaDB 除
 - MCP 系: bot 経由の実呼び出し + smoke_bot.sh
 - 監視: error_rate_monitor.sh（journald）で 24h 観察、切替は feature flag
   （env の接続先 URL）で即時ロールバック可能に
+
+---
+
+# SRE 追補 — 詳細走査で見つかった追加オフロード候補（2026-07-04 第2弾）
+
+深掘り走査（crontab 全数 / docker 実測 / 公開面 / 監視経路 / シークレット管理）で
+見つかった追加項目。**発見の半分は「オフロード」以前の即時修正すべき運用債務**だった。
+
+## 発見1: happy-server スタック — 隠れた最大の常駐（Docker 4コンテナ、~300MB + 基盤250MB）
+
+`api.haroin57.com`（Caddy 公開）の実体は happy-server（Claude Code モバイル
+クライアント同期サーバー）で、**Postgres 16 + Redis + MinIO + アプリ**を Docker で
+セルフホストしている（5週間連続稼働、実測 ~300MB + docker/containerd 基盤 ~250MB）。
+
+**これは discord-bot より大きい「もう一つのプロダクト」を1台に同居させている**構図。
+オフロード先マッピング:
+| コンポーネント | 移行先 | 備考 |
+|---|---|---|
+| happy-server アプリ | Workers（TS 製なら高適合）または Containers | 要: リポジトリの実装確認 |
+| Postgres | D1（スキーマ規模次第）or Hyperdrive + 外部 PG | セッション同期程度なら D1 で足りる可能性大 |
+| Redis | Workers KV / Durable Objects | pub-sub 依存なら DO |
+| MinIO (S3) | **R2（完全互換、egress 無料）** | 最も自明な置換 |
+
+これ一式が抜けると **Docker/containerd ごと消せる**（-550MB 級 = bot 本体の2倍）。
+※ happy の公式クラウドを使う選択肢もある（セルフホストの理由を先に確認）。
+
+## 発見2: ゾンビ cron + 死んだ tunnel ingress（即時修正、コストゼロ）
+
+- **cron 3本が存在しないローカル Workers（:8787）を叩き続けている**
+  （毎分1本 + 6時/18時）。8787 は past の `wrangler dev`（ashitabo-api）の残骸で、
+  現在 LISTEN なし。**毎分 curl 失敗 ×5週間 = 誰も気づかない監視の死角**の実例
+- **cloudflared tunnel の `ashitabo-api.haroin57.com` ingress も死んだ :8787 を指してる**
+  （公開ホスト名が 502 を返し続けている状態）
+- → ashitabo-api は本来 Workers アプリ（wrangler 前提の作り）なので、
+  **Cloudflare に本デプロイして Cron Triggers を設定すれば、cron 3本と tunnel
+  ingress と「ローカルで Workers をエミュレートする」倒錯が全部消える**。
+  これが今回の走査で一番象徴的な発見: *Workers として書かれたものをローカルで
+  動かしていた*
+- timetable.haroin57.com（:8000）も LISTEN 確認が必要（同類の疑い）
+
+## 発見3: 監視の共倒れ構造 → 外形監視のアウトソーシング
+
+現在の監視は全て**監視対象と同じマシン内**にある:
+- error_rate_monitor.sh（journald 読み）→ このマシンの cron
+- アラート通知 = Discord bot 自身 → **bot が死ぬと「bot が死んだ」通知も死ぬ**
+- /health エンドポイントは localhost:3002 のみ（外部から到達不能）
+
+**オフロード**: Workers Cron（1分毎）で外から生存確認する外形監視を置く:
+1. cloudflared tunnel 経由で `/health` を公開（Cloudflare Access で保護）
+2. Workers が定期 probe → 失敗 N 回連続で **Discord Webhook**（bot 非依存の通知
+   経路）に알림。Webhook は bot プロセスと独立なので共倒れしない
+3. 同じ Worker に `error_rate` の push 先（Analytics Engine）を持たせれば、
+   journald 依存の監視も段階的に外へ出せる
+
+実装は Workers 1本 + Webhook URL 1個。**C1（R2 バックアップ）と並ぶ即効枠**。
+
+## 発見4: AI Gateway — LLM 呼び出しの可観測性を無料で externalize
+
+Cloudflare AI Gateway は Anthropic/OpenAI/Google の前段プロキシとして
+**トークン・コスト分析 / キャッシュ / レート制御 / リトライ / フォールバック**を提供
+（BYOK も、ヘッダ素通しも可）。現在 bot は usage telemetry を自前実装
+（_log_turn_usage / MEM0_METRICS の grep 集計）しており、これを外に出せる。
+
+**適合性の評価（重要な留意）**:
+- ◎ **Mem0 の抽出/rerank（Haiku）、embedding（OpenAI）、SecondOpinion の API 直
+  フォールバック、music_analyzer（Gemini/OpenAI）**: API キー認証の従量呼び出し。
+  AI Gateway を通す価値が高い（コスト可視化 + 429 リトライ + キャッシュ）
+- ✗ **bot 本体の Anthropic 呼び出し**: OAuth サブスク枠 + CLI 偽装ヘッダで
+  subscriber tier を維持している特殊経路。**ゲートウェイを挟んで経路特性が変わると
+  tier 判定を壊すリスク**があるため対象外とする（ここは触らない）
+
+## 発見5: シークレット管理（.env 平文 40変数、うち KEY/TOKEN/SECRET 10個）
+
+.env 平文 + ファイルパーミッション頼み。オフロード自体は必須ではないが、
+Workers 移行（C3/C5）に伴い **API キー類は Workers Secrets へ移る**ので、
+移行済みキーを .env から順次削除していく運用を C3 以降の各フェーズに含める。
+VPS 残留分（DISCORD_TOKEN / OAuth credentials）は現状維持で妥当
+（Cloudflare に出すものではない）。
+
+## 発見6: 定期ジョブの全数マッピング（crontab + systemd timer 合算）
+
+| ジョブ | 現在 | オフロード判定 |
+|---|---|---|
+| ashitabo-api の cron 3本 | **死んでる** | Workers Cron Triggers へ（発見2） |
+| mem0_maintenance（7時/19時） | ローカル venv | △ mem0 データがローカルの間は残留。C6 後に Workers 化可能 |
+| kanae_daily.py（毎時） | ローカル venv | △ Claude 呼び出し(OAuth)依存 → 残留。ただし出力 JSON の配信は Pages(C2) 側へ |
+| monthly_kanae_audit | ローカル | 残留（月1、軽量） |
+| vi-signal / intervention scheduler | systemd 常駐 | ○ C8: 通知を Webhook 化すれば Workers Cron へ（常駐→ゼロ） |
+| weekly_mem0_compact / backup_state | ローカル cron | △ データ移行(C6/C7)後に判断。backup は C1 で R2 同期を先行 |
+| sync-client-id.sh（6時間毎） | free-code | 残留（ローカル Claude CLI 依存） |
+| error_rate_monitor | ローカル | 発見3 の外形監視 Worker に吸収 |
+
+## 発見7: 公開面の Cloudflare 集約（Caddy 廃止の道筋）
+
+現在: Caddy（origin cert 手動管理）+ cloudflared tunnel の2系統が併存。
+- api.haroin57.com（happy-server）→ 発見1 の移行で Caddy の存在理由が消える
+- kanae-daily → C2 で Pages へ
+- 残る localhost サービス（web_api:3002 等）は tunnel ingress に一本化し、
+  **Cloudflare Access（ゼロトラスト）で保護** — fail2ban + origin cert 管理の
+  仕事が Cloudflare 側に移る
+
+## 発見8: embedding の Workers AI 化は「やらない」（棄却の明文化）
+
+OpenAI text-embedding-3-small → Workers AI（bge-m3 等）はコスト面で魅力だが、
+**既存 323MB のベクトル資産と互換がない**（モデルが違えば空間が違う）ため、
+全再埋め込み + recall 品質の再検証が必要。embedding 費用は現状月数十円レベルで
+移行コストに全く見合わない。**C6（Vectorize 移行）でも embedder は OpenAI のまま**
+とする。
+
+## 更新後の優先順位（SRE 追補込み）
+
+| # | 項目 | 効果 | 工数 |
+|---|---|---|---|
+| C0a | **ゾンビ cron 3本削除 + ashitabo-api を Workers 本デプロイ + tunnel ingress 修正**（発見2） | 運用債務解消 | 半日 |
+| C0b | **外形監視 Worker + Discord Webhook**（発見3） | 監視の共倒れ解消 | 半日 |
+| C1 | R2 バックアップ | DR | 半日 |
+| C2 | kanae-daily → Pages | -100MB | 半日 |
+| C3 | API プロキシ MCP → Workers | -400MB + spawn 消滅 | 1-2日 |
+| C4 | Browser Rendering | スパイク消滅 | 1-2日 |
+| C5 | second_opinion / oracle → Workers | -400MB | 1-2日 |
+| C6 | ChromaDB → Vectorize（PoC ゲート付き） | -402MB | 3-5日 |
+| C7 | BM25 → D1 or ハイブリッド | 耐久性 | 2-3日 |
+| C8 | スケジューラ → Cron Triggers | -80MB | 1日 |
+| C9 | **happy-server スタック移行**（発見1、要スコープ調査） | **-550MB + Docker 全廃** | 別途見積 |
+| C10 | AI Gateway（従量 API 呼び出しのみ、発見4） | 可観測性 | 1日 |
+
+全完了時の VPS 想定: **discord-bot 本体 + OAuth + JSONL + ローカル Claude CLI 系のみ
+（~600MB / 8GB）**。Docker・Caddy・ChromaDB・Node 常駐が全廃され、監視は外形化、
+バックアップは R2、公開面は Cloudflare Access に統一される。
