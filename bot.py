@@ -18,6 +18,7 @@ from discord.ext import commands
 
 import bot_commands
 import bot_preprocess
+import bot_record
 import bot_ui
 
 from config import (
@@ -1751,79 +1752,23 @@ async def on_message(message: discord.Message):
                 message.author.id,
             )
 
-        # --- Mem0: batch turn accumulation + per-turn kanae extract ---
+        # --- Mem0: batch turn accumulation (R4: body lives in bot_record) ---
         # Only admin callers may write to long-term memory. Non-admin writes
         # would let an attacker plant persistent "facts" that later sessions
-        # inject into the prompt (C-7 poisoning).
+        # inject into the prompt (C-7 poisoning). Collaborators are passed at
+        # call time so test patches on bot-module attributes keep working.
         if caller_is_admin:
-            from services.mem0.batch import (
-                append_turn as _batch_append_turn,
-                pop_batch as _batch_pop,
-                build_batch_summary as _build_batch_summary,
-                BATCH_SIZE as _BATCH_SIZE,
+            await bot_record.record_turn(
+                message=message,
+                raw_user_text=raw_user_text,
+                response_text=response_text,
+                mem0_user_id=mem0_user_id,
+                conv_context=conv_context,
+                add_memories=add_memories,
+                track_task=_track_task,
+                load_history_channel=load_history_channel,
+                is_force_record_request=_is_force_record_request,
             )
-
-            _turn_count = await asyncio.to_thread(
-                _batch_append_turn, STATE_DIR, message.channel.id,
-                raw_user_text, response_text,
-            )
-
-            _should_flush = (
-                _turn_count >= _BATCH_SIZE
-                or _is_force_record_request(raw_user_text)
-            )
-
-            # P1 (2026-05-12): system-message経路は廃止して複数人混入を遮断。
-            _ctx_for_mem0 = ""
-            if MEM0_LEGACY_CONTEXT:
-                _ctx_for_mem0 = conv_context or ""
-                if not _ctx_for_mem0:
-                    try:
-                        recent = await asyncio.to_thread(load_history_channel, message.channel.id)
-                        if recent:
-                            _ctx_for_mem0 = "\n".join(
-                                f"{m['role']}: {m['content'][:300]}" for m in recent[-10:]
-                            )
-                    except Exception:
-                        pass
-
-            if _should_flush:
-                _batch_turns, _ = await asyncio.to_thread(
-                    _batch_pop, STATE_DIR, message.channel.id,
-                )
-
-                async def _mem0_batch_store():
-                    try:
-                        ctx_hint = _ctx_for_mem0 if MEM0_LEGACY_CONTEXT else ""
-                        summary_text = _build_batch_summary(_batch_turns)
-                        log.info(
-                            "Mem0 batch ingest: uid=%s turns=%d chars=%d",
-                            mem0_user_id, len(_batch_turns), len(summary_text),
-                        )
-                        await add_memories(
-                            user_text=summary_text,
-                            assistant_text="",
-                            user_id=mem0_user_id,
-                            context_hint=ctx_hint,
-                            metadata={
-                                "channel_id": str(message.channel.id),
-                                "channel_name": getattr(message.channel, "name", "DM"),
-                                "batch_size": str(len(_batch_turns)),
-                            },
-                        )
-
-                    except Exception as exc:
-                        log.warning(
-                            "Mem0 batch store failed: %s (user=%s, channel=%s)",
-                            exc, mem0_user_id, message.channel.id,
-                        )
-
-                _track_task(_mem0_batch_store(), name="mem0_batch_store")
-            else:
-                log.debug(
-                    "Mem0 batch: ch=%s turns=%d/%d (waiting)",
-                    message.channel.id, _turn_count, _BATCH_SIZE,
-                )
 
         # Extract file paths from response. For non-admin sessions the
         # model has no file-system tools, so any path it "outputs" can only
