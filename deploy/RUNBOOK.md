@@ -230,3 +230,35 @@ traceback を `#bot-mcp-log`（channel_id 1522739163412168885）へ配信する�
   "error" 文字列を含むため無条件除外**してからマッチングする
 - traceback はレベル接頭辞が無いので形状（Traceback / File " / XxxError:）で拾う
 - 巨大行は300字で切る。Webhook URL は `.env.mcp-forward`（mode 600）
+
+## dev環境 + CI/CD (2026-07-04)
+
+### 構成
+- **本番**: /home/ubuntu/discord-bot (discord-bot.service, :3002, master ブランチ)
+- **開発**: /home/ubuntu/discord-bot-dev (discord-bot-dev.service, :3003, dev ブランチ、
+  bot は かなえdev id=1522741627662237866、mem0 は kanae_memories_dev コレクションで分離)
+
+### CI (.github/workflows/test.yml)
+- push (master/dev/feature/**) と PR で pytest 全 suite を GitHub ランナーで実行 (-n auto)
+- ダミー API キー env で全緑。GitHub Secrets 不要
+
+### 自動デプロイ (pull 型, scripts/auto_deploy.sh)
+- systemd timer (discord-bot-autodeploy.timer / -dev-autodeploy.timer, 5分毎)
+- origin を fetch → **CI (test.yml) が該当 SHA で conclusion=success の時のみ** ff pull + restart + /health ゲート
+- prod は health 失敗時に pre-deploy タグへ自動 rollback、通知は kanae-notify 経由
+- dev は rollback せず通知のみ (壊れてよい)
+
+### ブランチ保護 (pre-push hook)
+- **master / dev への直接 push はローカル hook がブロック**する。必ず feature ブランチ → PR 経由
+- dev を master に追随させる初期化のみ、gh api での ref 更新を使った (レビュー済み内容の ff)
+
+### 開発フロー
+1. feature ブランチで作業 → push → PR (base=dev)
+2. CI green → dev にマージ → dev push で CI 再走 → auto_deploy が dev bot を更新
+3. dev で検証 OK → dev を base に master へ PR → マージ → auto_deploy が本番を更新
+
+### 既知の運用メモ
+- dev bot の restart は kanae-systemd-forward に流れる (unit 名で判別可能。ノイズが増えたら
+  systemd_forward.py の BLOCK に discord-bot-dev を追加)
+- requirements.txt に未 pin の runtime 依存が ~23 個ある (dev クローン時に手動補完が必要)。
+  別途 pin する価値あり
