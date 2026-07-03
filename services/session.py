@@ -148,6 +148,23 @@ def _flatten_sessions(
     return flat
 
 
+# Process-wide channel→SessionInfo view (P4a). bot.py and web_api previously
+# each called load_sessions() and owned SEPARATE dicts hydrated from the same
+# sessions.json — every save from one clobbered updates held only by the
+# other (the split-brain the plan review flagged). One shared instance,
+# lazily loaded, ends that; update_session() mutations are visible to every
+# caller because they all hold the same object.
+_shared_channel_sessions: "OrderedDict[int, SessionInfo] | None" = None
+
+
+def shared_sessions() -> "OrderedDict[int, SessionInfo]":
+    """Return the single process-wide channel-session dict."""
+    global _shared_channel_sessions
+    if _shared_channel_sessions is None:
+        _shared_channel_sessions = load_sessions()
+    return _shared_channel_sessions
+
+
 def load_sessions() -> OrderedDict[int, SessionInfo]:
     try:
         with open(SESSIONS_PATH, encoding="utf-8") as f:

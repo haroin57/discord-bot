@@ -65,6 +65,13 @@ def _isolate_bot_state():
         cooldowns.clear()
     if daily_quota is not None:
         daily_quota.clear()
+    # P4a: bot.sessions is now the process-wide shared dict from
+    # services.session.shared_sessions(). Clear its CONTENTS (not rebind —
+    # bot.py and web_api hold references to the same object) so entries
+    # created by one test never leak into the next.
+    shared = getattr(_bot, "sessions", None)
+    if shared is not None:
+        shared.clear()
     yield
     if cooldowns is not None:
         cooldowns.clear()

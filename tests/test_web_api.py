@@ -25,7 +25,7 @@ def make_web_api():
     mock_bot = MagicMock()
 
     # Patch load_sessions so __init__ doesn't hit disk
-    with patch("web_api.load_sessions", return_value={}):
+    with patch("web_api.shared_sessions", return_value={}):
         # socketio.AsyncServer.attach touches aiohttp internals; mock it
         with patch("socketio.AsyncServer.attach"):
             from web_api import WebAPI
@@ -340,7 +340,7 @@ def make_api_with_captured_handlers():
     mock_bot = MagicMock()
     handlers = {}
 
-    with patch("web_api.load_sessions", return_value={}):
+    with patch("web_api.shared_sessions", return_value={}):
         with patch("socketio.AsyncServer.attach"):
             # We need sio.event to capture the decorated functions BEFORE
             # WebAPI.__init__ calls _register_events.
@@ -814,7 +814,7 @@ def test_cors_wildcard_rejected(monkeypatch):
     """WebAPI.__init__ raises RuntimeError when WEB_API_CORS_ORIGINS has '*'."""
     monkeypatch.setattr("web_api.WEB_API_CORS_ORIGINS", ["*", "http://localhost:3001"])
     with pytest.raises(RuntimeError, match="wildcards"):
-        with patch("web_api.load_sessions", return_value={}):
+        with patch("web_api.shared_sessions", return_value={}):
             with patch("socketio.AsyncServer.attach"):
                 from web_api import WebAPI
                 WebAPI(MagicMock())
@@ -824,7 +824,7 @@ def test_cors_empty_string_rejected(monkeypatch):
     """WebAPI.__init__ raises RuntimeError when WEB_API_CORS_ORIGINS has empty string."""
     monkeypatch.setattr("web_api.WEB_API_CORS_ORIGINS", [""])
     with pytest.raises(RuntimeError, match="wildcards"):
-        with patch("web_api.load_sessions", return_value={}):
+        with patch("web_api.shared_sessions", return_value={}):
             with patch("socketio.AsyncServer.attach"):
                 from web_api import WebAPI
                 WebAPI(MagicMock())

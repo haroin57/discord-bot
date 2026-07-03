@@ -79,7 +79,7 @@ from services.session import (
     clear_channel_context,
     get_session,
     load_history_channel,
-    load_sessions,
+    shared_sessions,
     update_session,
 )
 from services.prompt_builder import PromptBuilder
@@ -257,7 +257,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
-sessions = load_sessions()
+sessions = shared_sessions()
 cooldowns: OrderedDict[int, float] = OrderedDict()
 # 機能6: /model and /effort live overrides, keyed per (channel, user). Set by
 # the slash commands, consumed by call_with_tools below. In-memory only — a

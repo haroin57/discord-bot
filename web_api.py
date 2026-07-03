@@ -35,7 +35,7 @@ from config import (
 )
 from services.claude_api import call_with_tools
 from services.prompt_builder import PromptBuilder
-from services.session import load_history_channel, load_sessions, update_session
+from services.session import load_history_channel, shared_sessions, update_session
 try:
     from services.correlation import new_request_id, get_request_id
 except ImportError:  # pragma: no cover — defensive fallback
@@ -83,7 +83,7 @@ class WebAPI:
         self._daily_quota: OrderedDict[str, list[float]] = OrderedDict()
 
         # Shared sessions dict (channel_id -> sdk session_id) used by call_with_tools
-        self._sessions = load_sessions()
+        self._sessions = shared_sessions()
 
         # sid -> discord_id mapping (populated on connect)
         self._sid_to_user: dict[str, dict] = {}
