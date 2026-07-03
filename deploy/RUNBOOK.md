@@ -131,5 +131,25 @@ bot と運命を共にしない監視経路。**bot 完全死でもアラート�
 
 3回連続超過で WARN、2回連続回復で CLEAR（ヒステリシス幅でフラップ抑制）。
 継続 WARN 中は 30分毎に再通知。
+
+## journal ログ配信（C0d, 2026-07-04）
+
+discord-bot の journal のうち WARNING 以上を haroin サーバーの
+`#bot-journal-log`（channel_id 1522691767001157672）へリアルタイム配信する。
+
+- デーモン: `scripts/journal_forward.py`、systemd unit
+  `discord-bot-journal-forward.service`（`discord-bot.service` と同居、
+  stdlib のみで venv 非依存）
+- **選定基準は journalctl の `-p` ではない**: discord-bot は
+  `services.structured_log.JsonFormatter` で1行1JSONのログを出しており、
+  どのレベルも同じ syslog priority で出力されるため `journalctl -p warning`
+  は常に0件になる（実測: 24hで177件のWARNINGがあるのに `-p warning` は0件）。
+  正しくは journalctl をフィルタなしで流し、各行を JSON パースして
+  `level` フィールドで WARNING/ERROR/CRITICAL を選定する（`select_line()`）
+- バッチ処理: 5秒 or 1800文字でフラッシュ、コードブロックで送信
+- Webhook URL は `/home/ubuntu/discord-bot/.env.journal-forward`
+  （`JOURNAL_WEBHOOK_URL`、mode 600）
+- **既知の落とし穴**: urllib のデフォルト User-Agent は Discord/Cloudflare の
+  WAF に 403 で弾かれる。`User-Agent: kanae-journal-forward/1.0` を明示すること
 - **残項目**: Worker 自体の死の検知は Cloudflare ダッシュボードの Workers アラート
   設定 or 外部 SaaS（UptimeRobot 等）を追加すること（監視の監視）
