@@ -351,6 +351,7 @@ class LiveRenderer:
     DISCORD_HARD_CAP = 1990
     TOOL_BATCH_WINDOW_S = 0.08
     TOOL_NOTICE_MAX_LINES = 8
+    SCRATCH_PREVIEW_TAIL_CHARS = 1500
 
     def __init__(
         self,
@@ -379,6 +380,14 @@ class LiveRenderer:
 
         # ── parallel tool-call notice state ──────────────────────────────────
         self._tool_notice_state: dict = {"msg": None, "lines": [], "task": None}
+
+        # ── Scratchpad live-preview state ─────────────────────────────────────
+        # One live message per turn showing the in-progress Scratchpad write,
+        # throttled like stream_preview. On block close it collapses into a
+        # 1-line subtext summary instead of leaving the full draft behind.
+        self._scratch_state: dict = {
+            "msg": None, "last_edit": 0.0, "section": None, "summary": [],
+        }
 
     # ── public read-only accessors (bot.py reads these after the turn) ───────
     @property
@@ -656,3 +665,50 @@ class LiveRenderer:
         self._tool_notice_state["task"] = self._track_task(
             _delayed_flush(), name="tool_notice_flush"
         )
+
+    # ── Scratchpad live preview ──────────────────────────────────────────────
+    async def scratch_stream_preview(self, section: str, content: str, op: str) -> None:
+        """Live-render an in-progress Scratchpad write so the channel isn't
+        silent while the model works out its scratch notes (tool_loop.py
+        forwards ``input_json`` stream events here). Throttled the same as
+        prose streaming; a single message is edited in place per turn."""
+        now_mono = time.monotonic()
+        if (now_mono - self._scratch_state["last_edit"]) < self.STREAM_EDIT_INTERVAL_S:
+            return
+        self._scratch_state["last_edit"] = now_mono
+        self._scratch_state["section"] = section
+        tail = (content or "")[-self.SCRATCH_PREVIEW_TAIL_CHARS:]
+        quoted = "\n".join(f"> {line}" for line in tail.splitlines()) or "> …"
+        payload = self._disp(f"-# 💭 メモ「{section}」を記述中…\n{quoted}")
+        existing = self._scratch_state.get("msg")
+        try:
+            if existing is None:
+                self._scratch_state["msg"] = await self.message.channel.send(payload)
+                await self._status.reposition()
+                return
+            await existing.edit(content=payload)
+        except discord.errors.NotFound:
+            try:
+                self._scratch_state["msg"] = await self.message.channel.send(payload)
+                await self._status.reposition()
+            except Exception as exc:
+                log.warning("scratch preview re-post failed: %s", exc)
+        except Exception as exc:
+            log.warning("scratch preview send/edit failed: %s", exc)
+
+    async def scratch_finalize(self) -> None:
+        """Collapse the live Scratchpad draft into a 1-line subtext summary
+        once its content_block closes, so the finished write doesn't leave a
+        multi-line quote block cluttering the channel."""
+        section = self._scratch_state.get("section")
+        existing = self._scratch_state.get("msg")
+        if section is None or existing is None:
+            return
+        self._scratch_state["summary"].append(section)
+        lines = [f"-# 💭 メモ「{s}」" for s in self._scratch_state["summary"]]
+        payload = "\n".join(lines)
+        try:
+            await existing.edit(content=payload)
+        except Exception as exc:
+            log.warning("scratch preview collapse failed: %s", exc)
+        self._scratch_state["section"] = None

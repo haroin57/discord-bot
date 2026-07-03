@@ -16,19 +16,20 @@ main bot path uses (see services/claude_api/client.py + entry.py).
 
 from __future__ import annotations
 
+import logging
 import uuid as _uuid
 
 from services.claude_api.client import (
     CLI_DEFAULT_SYSTEM_PROMPT,
     CLI_IDENTITY_TEXT,
     MODEL_BETAS,
-    THINKING_CONFIG,
     USER_AGENT,
     _session_id,
     get_attribution_header_value,
     get_metadata,
-    supports_adaptive_thinking,
 )
+
+log = logging.getLogger(__name__)
 
 
 def cli_system(task_prompt: str) -> list[dict]:
@@ -113,29 +114,33 @@ async def cli_messages_create(
         metadata=get_metadata(),
         extra_headers=headers,
     )
-    # Only send adaptive thinking to models that support it. Haiku (every
-    # Mem0 helper's default) returns HTTP 400 on adaptive thinking, which was
-    # silently failing-open the entire query-expansion / dedup / conflict
-    # pipeline. Small Haiku extraction tasks don't need thinking anyway.
-    if supports_adaptive_thinking(model):
-        kwargs["thinking"] = THINKING_CONFIG
+    # Never send adaptive thinking to Mem0 helpers, regardless of model.
+    # Haiku returns HTTP 400 on it outright. Thinking-capable models (Sonnet,
+    # Opus) accept it but spend the helper's small max_tokens budget (200-500,
+    # sized for a short JSON reply) on thinking alone — the response then has
+    # zero TextBlocks (stop_reason=max_tokens), extract_text() returns "", and
+    # the caller's json.loads("") fails (observed 2026-07 as repeated
+    # "rerank_memories failed" / "rewrite_query failed" warnings after
+    # MEM0_RERANK_MODEL/MEM0_REWRITE_MODEL were switched to claude-sonnet-4-6).
+    # These are small classify/extract/rerank tasks — none need thinking.
     return await client.messages.create(**kwargs)
 
 
 def extract_text(resp) -> str:
     """Pull the first TextBlock out of a Claude API response.
 
-    When ``thinking`` is enabled (adaptive-thinking-capable models only — see
-    ``supports_adaptive_thinking``), the server prepends one or more
-    ``ThinkingBlock``s before the visible ``TextBlock``. Naively reading
-    ``resp.content[0].text`` then raises ``AttributeError`` on the leading
-    ThinkingBlock and the whole call path falls through to its except branch —
-    observed in production as repeated "rerank_memories failed: 'ThinkingBlock'
-    object has no attribute 'text'". Scanning for the first block with text
-    handles both the thinking-on (Opus) and thinking-off (Haiku) cases.
+    Mem0 helpers no longer request ``thinking`` (see ``cli_messages_create``),
+    but scanning for the first text-bearing block is kept defensive in case a
+    future response shape prepends non-text blocks again.
     """
     for block in getattr(resp, "content", []) or []:
         text = getattr(block, "text", None)
         if text:
             return text
+    if getattr(resp, "stop_reason", None) == "max_tokens":
+        log.warning(
+            "extract_text: no TextBlock, stop_reason=max_tokens "
+            "(output likely consumed by thinking; model=%s)",
+            getattr(resp, "model", "?"),
+        )
     return ""

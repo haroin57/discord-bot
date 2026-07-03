@@ -1333,6 +1333,8 @@ async def run_agent_loop(
     incremental_text_callback=None,   # async (text:str)->None  (per-turn final)
     text_stream_callback=None,        # async (partial_turn_text:str)->None
     tool_invocation_callback=None,    # async (name:str, args:dict)->None
+    scratch_stream_callback=None,     # async (section:str, content:str, op:str)->None
+    scratch_finalize_callback=None,   # async ()->None  (Scratchpad block closed)
     progress=None,                    # mutable {"tokens": int} for the live spinner
     max_turns: int,
     stall_watchdog: StallWatchdog,
@@ -1485,6 +1487,12 @@ async def run_agent_loop(
         # first event, so a slow first byte and a mid-stream stall look alike).
         request_start = time.monotonic()
         ttft_ms: int | None = None
+        # Tracks the tool_use block currently being streamed (its input
+        # arrives incrementally via "input_json" events, one block at a
+        # time since the API streams content_blocks sequentially). Reset on
+        # content_block_stop so a later text block after this tool doesn't
+        # inherit a stale tool identity.
+        cur_tool: dict | None = None
         try:
             async with api_client.beta.messages.stream(**stream_kwargs) as stream:
                 async for event in stream:
@@ -1535,6 +1543,7 @@ async def run_agent_loop(
                             tool_input = getattr(block, "input", None)
                             hint = _tool_input_hint(name, tool_input)
                             short_name = name.split("__", 2)[-1] if "__" in name else name
+                            cur_tool = {"name": name, "short": short_name}
                             # journal にも tool 名 + input を残す (audit / debug 用).
                             # input は最大 300 文字でクリップ。MCP 通信失敗時の切り分けに使う。
                             log.info(
@@ -1546,6 +1555,45 @@ async def run_agent_loop(
                             if hint:
                                 label += f" `{hint[:60]}`"
                             await _safe_status(status_callback, label)
+                        else:
+                            cur_tool = None
+                    elif etype == "input_json" and cur_tool is not None:
+                        # Synthesized by the SDK's beta stream helper from
+                        # input_json_delta events — event.snapshot is the
+                        # jiter-parsed dict-so-far of the tool_use input, so
+                        # no partial-JSON parsing is needed here.
+                        snapshot = getattr(event, "snapshot", None) or {}
+                        if isinstance(snapshot, dict):
+                            hint = _tool_input_hint(cur_tool["name"], snapshot)
+                            if hint:
+                                label = f"🔧 {cur_tool['short']}"
+                                label += f" `{hint[:60]}`"
+                                await _safe_status(status_callback, label)
+                            if (
+                                cur_tool["short"] == "Scratchpad"
+                                and scratch_stream_callback is not None
+                            ):
+                                section = snapshot.get("section")
+                                content = snapshot.get("content")
+                                op = snapshot.get("op")
+                                if section and content:
+                                    try:
+                                        await scratch_stream_callback(section, content, op)
+                                    except Exception as exc:
+                                        log.debug(
+                                            "scratch_stream_callback failed: %s", exc,
+                                        )
+                    elif etype == "content_block_stop":
+                        if (
+                            cur_tool is not None
+                            and cur_tool["short"] == "Scratchpad"
+                            and scratch_finalize_callback is not None
+                        ):
+                            try:
+                                await scratch_finalize_callback()
+                            except Exception as exc:
+                                log.debug("scratch_finalize_callback failed: %s", exc)
+                        cur_tool = None
                     elif etype == "message_delta":
                         # Live output-token count for the spinner: cumulative
                         # for this stream + already-completed turns.

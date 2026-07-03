@@ -42,6 +42,8 @@ def _tool_input_hint(name: str, inp: dict | None) -> str:
             return inp.get("query", "")
         if n in ("Agent",):
             return inp.get("description", "")
+        if n in ("Scratchpad",):
+            return inp.get("section", "")
         if n in ("TodoWrite",):
             todos = inp.get("todos") or []
             if not isinstance(todos, list):
@@ -74,7 +76,7 @@ _TOOL_EMOJI = {
     "WebSearch": "🔍", "brave_web_search": "🔍", "brave_local_search": "🔍",
     "brave_news_search": "📰", "tavily_search": "🔍", "tavily_extract": "🌐",
     "search_x": "🐦", "get_tweet": "🐦", "get_x_trends": "📈",
-    "TodoWrite": "🗒️", "Agent": "🤖",
+    "TodoWrite": "🗒️", "Agent": "🤖", "Scratchpad": "💭",
 }
 
 
