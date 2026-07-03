@@ -17,6 +17,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import bot_commands
+import bot_preprocess
 
 from config import (
     ADMIN_USER_IDS,
@@ -1210,161 +1211,49 @@ async def on_message(message: discord.Message):
 
     mem0_user_id = str(message.author.id)
     image_paths: list[str] = []
+    is_thread = isinstance(message.channel, discord.Thread)
     try:
-        # --- Parallel pre-processing ---
-        async def _fetch_reply():
-            if not (message.reference and message.reference.message_id):
-                return "", [], False
-            try:
-                ref_msg = message.reference.cached_message
-                if ref_msg is None:
-                    ref_msg = await message.channel.fetch_message(message.reference.message_id)
-                # For non-admins, refuse to inline admin messages — they may
-                # contain command output / secrets the attacker should not see.
-                if not caller_is_admin and ref_msg.author.id in ADMIN_USER_IDS:
-                    return "", [], False
-                body = _sanitize_untrusted_text(
-                    _cap_text(ref_msg.content or "(no text)", MAX_USER_MESSAGE_CHARS)
-                )
-                author = _sanitize_untrusted_text(ref_msg.author.display_name)
-                # An admin replying to admin- or bot-authored content is
-                # trusted context (own past instructions, kanae's prior
-                # output, b0nchichi's messages). Place it OUTSIDE
-                # <untrusted_user_input>. External authors stay inside.
-                is_trusted = caller_is_admin and (
-                    (bot.user is not None and ref_msg.author.id == bot.user.id)
-                    or ref_msg.author.id in ADMIN_USER_IDS
-                )
-                if is_trusted:
-                    ctx = (
-                        f"<replied_to_trusted_message author={author!r}>\n"
-                        f"{body}\n"
-                        f"</replied_to_trusted_message>\n\n"
-                    )
-                else:
-                    ctx = (
-                        f"<replied_to_message author={author!r}>\n"
-                        f"{body}\n"
-                        f"</replied_to_message>\n\n"
-                    )
-                return ctx, list(ref_msg.attachments), is_trusted
-            except Exception as e:
-                log.warning("Failed to fetch replied-to message: %s", e)
-                return "", [], False
-
-        is_thread = isinstance(message.channel, discord.Thread)
-        # If we expect to resume an existing session in this channel,
-        # skip fetching thread/channel context — Claude already has it
-        # in its context window. Saves tokens on every resumed turn.
-        # 機能1: resume 可否は (channel, user) 単位で判定する。同一チャンネルに
-        # 複数 admin がいても、相手のセッションを自分の resume 判定に使わない。
-        will_resume = (
-            caller_is_admin
-            and get_session(message.channel.id, message.author.id) is not None
-            and _is_session_fresh(message.channel.id, message.author.id)
+        # --- Parallel pre-processing (P2-a: launch lives in bot_preprocess) ---
+        # Collaborator functions are passed at call time so test patches on
+        # bot-module attributes (patch("bot.fetch_thread_context") etc.)
+        # keep working.
+        _ctx = bot_preprocess.launch_context_tasks(
+            bot=bot,
+            message=message,
+            prompt=prompt,
+            raw_user_text=raw_user_text,
+            caller_is_admin=caller_is_admin,
+            mem0_user_id=mem0_user_id,
+            sanitize=_sanitize_untrusted_text,
+            cap_text=_cap_text,
+            get_session=get_session,
+            is_session_fresh=_is_session_fresh,
+            fetch_thread_context=fetch_thread_context,
+            fetch_channel_context=fetch_channel_context,
+            resolve_message_links=resolve_message_links,
+            resolve_channel_mention_contexts=resolve_channel_mention_contexts,
+            search_memories_smart=search_memories_smart,
+            should_use_memory_llm_mode=should_use_memory_llm_mode,
+            admin_user_ids=ADMIN_USER_IDS,
+            max_user_message_chars=MAX_USER_MESSAGE_CHARS,
+            mem0_min_query_length=MEM0_MIN_QUERY_LENGTH,
+            mem0_smart_search=MEM0_SMART_SEARCH,
+            mem0_recall_limit=MEM0_RECALL_LIMIT,
+            mem0_recall_limit_restricted=MEM0_RECALL_LIMIT_RESTRICTED,
+            mem0_history_search_enabled=MEM0_HISTORY_SEARCH_ENABLED,
+            mem0_history_search_limit=MEM0_HISTORY_SEARCH_LIMIT,
+            mem0_history_embed_enabled=MEM0_HISTORY_EMBED_ENABLED,
+            mem0_history_embed_limit=MEM0_HISTORY_EMBED_LIMIT,
         )
-
-        async def _fetch_thread():
-            if will_resume:
-                return ""
-            if is_thread:
-                return await fetch_thread_context(
-                    message.channel, message, caller_is_admin=caller_is_admin,
-                )
-            return await fetch_channel_context(
-                message.channel, message, caller_is_admin=caller_is_admin,
-            )
-
-        reply_task = asyncio.create_task(_fetch_reply())
-        thread_task = asyncio.create_task(_fetch_thread())
-        link_task = asyncio.create_task(
-            resolve_message_links(bot, prompt, requester=message.author, caller_is_admin=caller_is_admin)
-        )
-        # Cross-thread context from channel mentions (<#id>)
-        cross_thread_task = asyncio.create_task(
-            resolve_channel_mention_contexts(
-                bot, prompt,
-                current_channel_id=message.channel.id,
-                requester=message.author,
-                caller_is_admin=caller_is_admin,
-            )
-        )
-        # Always recall Mem0 memories so Claude has long-term context,
-        # even on resumed sessions. Skip only for very short messages
-        # (stickers, "はい", "うん", etc.) where embedding search won't match.
-        history_search_task: asyncio.Task | None = None
-        history_embed_task: asyncio.Task | None = None
-        invest_kb_task: asyncio.Task | None = None
-        if len(raw_user_text) >= MEM0_MIN_QUERY_LENGTH:
-            mem0_llm_mode = should_use_memory_llm_mode(
-                raw_user_text, enabled=MEM0_SMART_SEARCH,
-            )
-            # Admins always rewrite+rerank so a multi-fact topic (the日経VI
-            # strategy ≈ 6 memories) surfaces, not only on explicit recall
-            # asks; the Haiku round-trip runs concurrently with prompt prep and
-            # is dwarfed by the main response. They also get a wider recall
-            # window. Non-admins keep the cheaper, narrower path.
-            if caller_is_admin and MEM0_SMART_SEARCH:
-                mem0_llm_mode = True
-            _recall_limit = (
-                MEM0_RECALL_LIMIT if caller_is_admin else MEM0_RECALL_LIMIT_RESTRICTED
-            )
-            mem0_task: asyncio.Task | None = asyncio.create_task(
-                search_memories_smart(
-                    raw_user_text, mem0_user_id, limit=_recall_limit,
-                    rewrite=mem0_llm_mode, rerank=mem0_llm_mode,
-                    include_core=True,
-                    current_channel_id=str(message.channel.id),
-                )
-            )
-
-            # invest_kb recall — neutral long-form investment knowledge stored
-            # in a separate LanceDB side-store. Gated by a cheap keyword
-            # check so chitchat doesn't spend Haiku budget on rewrite/HyDE/
-            # rerank. Admin-only: the KB itself is neutral but the recall
-            # latency would slow down non-admin restricted calls for no benefit.
-            invest_kb_task: asyncio.Task | None = None
-            if caller_is_admin:
-                from config import (
-                    INVEST_KB_ENABLED, INVEST_KB_LIMIT, INVEST_KB_QUERY_GATE,
-                )
-                if INVEST_KB_ENABLED:
-                    from services.invest_kb import is_investment_query, search_invest_kb
-                    gate = INVEST_KB_QUERY_GATE
-                    if gate == "always" or (gate == "auto" and is_investment_query(raw_user_text)):
-                        invest_kb_task = asyncio.create_task(
-                            search_invest_kb(raw_user_text, limit=INVEST_KB_LIMIT)
-                        )
-
-            # Per-turn literal-keyword recall over this channel's raw JSONL
-            # transcript — rescues exact terms (proper nouns mentioned once)
-            # that Mem0 curation dropped. Admin-only: the transcript has no
-            # author id, so surfacing it to a non-admin could leak admin lines.
-            if caller_is_admin and MEM0_HISTORY_SEARCH_ENABLED:
-                from services.mem0 import history_index
-                history_search_task = asyncio.create_task(
-                    asyncio.to_thread(
-                        history_index.search_history,
-                        raw_user_text, message.channel.id,
-                        MEM0_HISTORY_SEARCH_LIMIT,
-                    )
-                )
-
-            # Phase 5: semantic (vector) recall over the same raw transcript,
-            # run in parallel and merged with the keyword hits below. Self-gated
-            # (default OFF), admin-only (transcript may hold other admins' lines).
-            if caller_is_admin and MEM0_HISTORY_EMBED_ENABLED:
-                from services.mem0 import history_embed
-                history_embed_task = asyncio.create_task(
-                    asyncio.to_thread(
-                        history_embed.search_semantic,
-                        raw_user_text, message.channel.id,
-                        MEM0_HISTORY_EMBED_LIMIT,
-                    )
-                )
-        else:
-            mem0_task = None
-            invest_kb_task = None
+        will_resume = _ctx.will_resume
+        reply_task = _ctx.reply
+        thread_task = _ctx.thread
+        link_task = _ctx.links
+        cross_thread_task = _ctx.cross_thread
+        mem0_task = _ctx.mem0
+        invest_kb_task = _ctx.invest_kb
+        history_search_task = _ctx.history_search
+        history_embed_task = _ctx.history_embed
 
         reply_context, ref_attachments, reply_is_trusted = await reply_task
         all_attachments = list(message.attachments) + ref_attachments
