@@ -3,6 +3,8 @@ on:
   push:
     branches: [master, main]
   pull_request:
+  schedule:
+    - cron: '0 18 * * *'  # 03:00 JST nightly (legacy-inclusive full suite)
 
 jobs:
   test:
@@ -21,28 +23,44 @@ jobs:
           else
             pip install -r requirements.txt
           fi
-          pip install -r requirements-dev.txt 2>/dev/null || true
-      - name: pytest (security + SRE focused suite)
+          # No `|| true`: silently skipping dev deps made red tests invisible
+          # (backlog P2, fixed as part of P0.5-d).
+          pip install -r requirements-dev.txt
+      - name: pytest (full suite)
         env:
           DISCORD_TOKEN: dummy_test_token
           ADMIN_USER_IDS: "1234567890"
         run: |
-          # Include SRE remediation tests (signal handler, atomic write,
-          # health snapshot, structured log, render cleanup, etc.) so
-          # the C/H fixes have CI coverage going forward.
-          pytest tests/test_attachments.py tests/test_web_api.py \
-                 tests/test_session.py tests/test_sentinel.py \
-                 tests/test_rate_limit.py tests/test_mem0_extract_format.py \
-                 tests/test_mem0_search.py tests/test_discord_helpers.py \
-                 tests/test_correlation.py tests/test_correlation_integration.py \
-                 tests/test_health.py tests/test_structured_log.py \
-                 tests/test_render_cleanup.py tests/test_sre_critical_integration.py \
-                 tests/test_git_hooks.py tests/test_backup_state.py \
-                 tests/test_oauth_manager.py tests/test_main_async.py \
-                 -x -q
+          # Full suite replaced the old hand-maintained file list, which had
+          # drifted (fable fallback tests were never in CI — backlog P0).
+          # `legacy` + `integration` markers are excluded via pyproject addopts.
+          pytest -q -n 2
       - name: Conflict-marker scan
         run: |
           if grep -rn "^<<<<<<<\|^>>>>>>>" --include='*.py' --include='*.md' .; then
             echo "Merge conflict markers found"
             exit 1
           fi
+
+  # P0.5-d governance: legacy-marked tests still run nightly so the marker
+  # can't silently rot into a false-green CI. Failures here mean either the
+  # legacy test should be deleted (via review) or a regression slipped in.
+  nightly-full:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: '.python-version'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock || pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      - name: pytest (everything incl. legacy)
+        env:
+          DISCORD_TOKEN: dummy_test_token
+          ADMIN_USER_IDS: "1234567890"
+        run: pytest -q -n 2 -m "not integration"

@@ -11,12 +11,15 @@ asyncio_mode = "auto"
 # (the empty filter disables exclusion).
 markers = [
     "integration: real subprocess / network test, skipped by default",
+    "legacy: superseded mock-coupled test kept for reference; excluded from the default run (P0.5-d governance: count must not grow, replacement test link required, deleted only via review)",
 ]
 
 # Default to excluding `integration`-marked tests. The bot's test suite is
 # otherwise mock-heavy and runs in ~1-2 s; integration-marked tests
-# add ~10-25 s when included.
-addopts = "-m 'not integration'"
+# add ~10-25 s when included. `legacy` marks tests broken by refactor phases
+# that have a replacement characterization/contract test — they still run in
+# the nightly full suite (workflow: test.yml nightly-full job).
+addopts = "-m 'not integration and not legacy'"
 
 [tool.coverage.run]
 branch = true
