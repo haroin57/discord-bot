@@ -169,19 +169,14 @@ def _mark_mem0_recorded(channel_id: int) -> None:
     _last_mem0_record_at[channel_id] = time.time()
 
 
-# ---------------------------------------------------------------------------
-# Shared rate-limit module (H6) — defensive import with legacy fallback
-# ---------------------------------------------------------------------------
-try:
-    from services.rate_limit import (
-        check_cooldown as _rl_check_cooldown,
-        check_daily_quota as _rl_check_daily_quota,
-        daily_quota_reset_seconds as _rl_daily_quota_reset_seconds,
-    )
-    _USE_SHARED_RATE_LIMIT = True
-except ImportError:
-    _USE_SHARED_RATE_LIMIT = False
-    log.warning("services.rate_limit not available; using local cooldown/quota fallback")
+# Shared rate-limit ledger (P2.5 group-1): bot.py's local cooldown/quota
+# fallback duplicated services.rate_limit behind a defensive import that
+# could silently split the ledger again. The shared module is a hard dep.
+from services.rate_limit import (
+    check_cooldown as _rl_check_cooldown,
+    check_daily_quota as _rl_check_daily_quota,
+    daily_quota_reset_seconds as _rl_daily_quota_reset_seconds,
+)
 
 from services.job_state import (
     JobPhase,
@@ -260,7 +255,6 @@ except ImportError:
 # State
 # ---------------------------------------------------------------------------
 sessions = shared_sessions()
-cooldowns: OrderedDict[int, float] = OrderedDict()
 # 機能6: /model and /effort live overrides, keyed per (channel, user). Set by
 # the slash commands, consumed by call_with_tools below. In-memory only — a
 # restart clears overrides back to the env defaults intentionally; the commands
@@ -402,35 +396,6 @@ def _cap_text(text: str, limit: int) -> str:
 # ---------------------------------------------------------------------------
 # Daily quota tracking for non-admin callers (M-4)
 # ---------------------------------------------------------------------------
-_QUOTA_WINDOW_S = 24 * 60 * 60
-# user_id -> deque of request epoch seconds within the window. deque keeps
-# entries in insertion (= time) order, so we can popleft expired entries in
-# O(expired) instead of rebuilding a new list every call.
-_daily_quota: OrderedDict[int, deque[float]] = OrderedDict()
-
-
-def _check_daily_quota(user_id: int) -> tuple[bool, int]:
-    """Return (allowed, remaining). Evicts expired entries lazily."""
-    if RESTRICTED_DAILY_QUOTA <= 0:
-        return True, -1
-    now = time.time()
-    cutoff = now - _QUOTA_WINDOW_S
-    bucket = _daily_quota.get(user_id)
-    if bucket is None:
-        bucket = deque()
-        _daily_quota[user_id] = bucket
-    while bucket and bucket[0] < cutoff:
-        bucket.popleft()
-    if len(bucket) >= RESTRICTED_DAILY_QUOTA:
-        _daily_quota.move_to_end(user_id)
-        return False, 0
-    bucket.append(now)
-    _daily_quota.move_to_end(user_id)
-    while len(_daily_quota) > MAX_COOLDOWN_ENTRIES:
-        _daily_quota.popitem(last=False)
-    return True, RESTRICTED_DAILY_QUOTA - len(bucket)
-
-
 async def get_http_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
@@ -440,24 +405,6 @@ async def get_http_session() -> aiohttp.ClientSession:
 
 def is_admin(user: discord.User | discord.Member) -> bool:
     return user.id in ADMIN_USER_IDS
-
-
-
-def _purge_cooldowns() -> None:
-    """Drop expired cooldown entries.
-
-    `cooldowns` is an OrderedDict keyed by insertion order, but entries get
-    `move_to_end`'d on every new request, so the front of the dict really
-    is the oldest activity. We can therefore stop scanning the moment we
-    hit a non-expired entry instead of walking the entire dict each call.
-    """
-    now = time.time()
-    threshold = COOLDOWN_SECONDS * 10
-    while cooldowns:
-        oldest_uid, oldest_ts = next(iter(cooldowns.items()))
-        if now - oldest_ts <= threshold:
-            break
-        del cooldowns[oldest_uid]
 
 
 # ---------------------------------------------------------------------------
@@ -937,51 +884,28 @@ async def on_message(message: discord.Message):
     # per-channel semaphore already serialises admin work, so there's no flood
     # risk. Non-admins keep the cooldown so they can't flood the shared Claude
     # quota / memory budget — mirrors the admin-skip on the daily quota below.
-    _purge_cooldowns()
     if not caller_is_admin:
-        if _USE_SHARED_RATE_LIMIT:
-            _cd_allowed, _cd_wait = _rl_check_cooldown(str(message.author.id), caller_is_admin)
-            if not _cd_allowed:
-                await message.reply(
-                    f"⏳ クールダウン中です。あと{_cd_wait}秒"
-                    f"({_fmt_clock(time.time() + _cd_wait)} 頃に解除)で送信できます。"
-                )
-                return
-        else:
-            now = time.time()
-            last = cooldowns.get(message.author.id, 0)
-            if now - last < RESTRICTED_COOLDOWN_SECONDS:
-                remaining = int(RESTRICTED_COOLDOWN_SECONDS - (now - last))
-                await message.reply(
-                    f"⏳ クールダウン中です。あと{remaining}秒"
-                    f"({_fmt_clock(now + remaining)} 頃に解除)で送信できます。"
-                )
-                return
-            cooldowns[message.author.id] = now
-            cooldowns.move_to_end(message.author.id)
-            while len(cooldowns) > MAX_COOLDOWN_ENTRIES:
-                cooldowns.popitem(last=False)
+        _cd_allowed, _cd_wait = _rl_check_cooldown(str(message.author.id), caller_is_admin)
+        if not _cd_allowed:
+            await message.reply(
+                f"⏳ クールダウン中です。あと{_cd_wait}秒"
+                f"({_fmt_clock(time.time() + _cd_wait)} 頃に解除)で送信できます。"
+            )
+            return
 
-    # Daily quota (non-admin only).
-    if not caller_is_admin:
-        if _USE_SHARED_RATE_LIMIT:
-            _q_allowed, _q_remaining = _rl_check_daily_quota(str(message.author.id), caller_is_admin)
-        else:
-            _q_allowed, _q_remaining = _check_daily_quota(message.author.id)
+        # Daily quota (non-admin only).
+        _q_allowed, _q_remaining = _rl_check_daily_quota(str(message.author.id), caller_is_admin)
         if not _q_allowed:
             quota_msg = "⏳ 今日の利用上限に達しました。"
-            if _USE_SHARED_RATE_LIMIT:
-                reset_s = _rl_daily_quota_reset_seconds(
-                    str(message.author.id), caller_is_admin
+            reset_s = _rl_daily_quota_reset_seconds(
+                str(message.author.id), caller_is_admin
+            )
+            if reset_s > 0:
+                reset_at = time.time() + reset_s
+                quota_msg += (
+                    f"{time.strftime('%m/%d %H:%M', time.localtime(reset_at))}"
+                    " 頃に回復します。"
                 )
-                if reset_s > 0:
-                    reset_at = time.time() + reset_s
-                    quota_msg += (
-                        f"{time.strftime('%m/%d %H:%M', time.localtime(reset_at))}"
-                        " 頃に回復します。"
-                    )
-                else:
-                    quota_msg += "また明日来てください。"
             else:
                 quota_msg += "また明日来てください。"
             await message.reply(quota_msg)

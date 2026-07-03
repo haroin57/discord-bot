@@ -18,10 +18,10 @@ LONG = "VIストラテジーについて前に話したことを詳しく教え�
 @pytest.fixture(autouse=True)
 def _reset_bot_state(monkeypatch):
     import bot
-    bot.cooldowns.clear()
+    from services import rate_limit as _rl
+    _rl.reset_for_tests()
     bot._channel_semas.clear()
     monkeypatch.setattr("bot.BOT_ROLE_IDS", set())
-    monkeypatch.setattr("bot._USE_SHARED_RATE_LIMIT", False)
     mock_user = MagicMock()
     mock_user.id = 99900
     p = patch.object(type(bot.bot), "user", new_callable=PropertyMock, return_value=mock_user)

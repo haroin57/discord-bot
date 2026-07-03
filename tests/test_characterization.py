@@ -183,16 +183,13 @@ class _PatchStack:
 def _bot_state(monkeypatch):
     """Isolate bot.py module-level state and inject a mock bot.user."""
     import bot
-    bot.cooldowns.clear()
+    from services import rate_limit as _rl
+    _rl.reset_for_tests()
     bot._channel_semas.clear()
 
-    monkeypatch.setattr("bot.COOLDOWN_SECONDS", 5)
-    monkeypatch.setattr("bot.RESTRICTED_COOLDOWN_SECONDS", 60)
     monkeypatch.setattr("bot.ADMIN_USER_IDS", {ADMIN_USER_ID})
     monkeypatch.setattr("bot.BOT_KEYWORDS", ["かなえ"])
     monkeypatch.setattr("bot.BOT_ROLE_IDS", set())
-    monkeypatch.setattr("bot.MAX_COOLDOWN_ENTRIES", 1000)
-    monkeypatch.setattr("bot._USE_SHARED_RATE_LIMIT", False)
     # Make even short queries trigger Mem0 recall
     monkeypatch.setattr("bot.MEM0_MIN_QUERY_LENGTH", 1)
 
@@ -205,7 +202,7 @@ def _bot_state(monkeypatch):
     yield
     patcher.stop()
 
-    bot.cooldowns.clear()
+    _rl.reset_for_tests()
     bot._channel_semas.clear()
 
 

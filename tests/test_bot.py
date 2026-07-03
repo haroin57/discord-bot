@@ -86,68 +86,6 @@ class TestIsAdmin:
         assert is_admin(user) is False
 
 
-# ---------------------------------------------------------------------------
-# _purge_cooldowns
-# ---------------------------------------------------------------------------
-class TestPurgeCooldowns:
-    def test_removes_expired_entries(self, monkeypatch):
-        from bot import _purge_cooldowns
-        import bot
-
-        monkeypatch.setattr("bot.COOLDOWN_SECONDS", 5)
-
-        bot.cooldowns.clear()
-        now = time.time()
-        # Expired entry (older than COOLDOWN_SECONDS * 10 = 50s)
-        bot.cooldowns[1] = now - 100
-        # Recent entry
-        bot.cooldowns[2] = now - 1
-
-        _purge_cooldowns()
-
-        assert 1 not in bot.cooldowns
-        assert 2 in bot.cooldowns
-
-    def test_no_entries(self, monkeypatch):
-        from bot import _purge_cooldowns
-        import bot
-
-        monkeypatch.setattr("bot.COOLDOWN_SECONDS", 5)
-        bot.cooldowns.clear()
-        _purge_cooldowns()  # should not raise
-        assert len(bot.cooldowns) == 0
-
-    def test_all_recent(self, monkeypatch):
-        from bot import _purge_cooldowns
-        import bot
-
-        monkeypatch.setattr("bot.COOLDOWN_SECONDS", 5)
-        bot.cooldowns.clear()
-        now = time.time()
-        bot.cooldowns[10] = now
-        bot.cooldowns[20] = now - 1
-
-        _purge_cooldowns()
-
-        assert 10 in bot.cooldowns
-        assert 20 in bot.cooldowns
-
-    def test_all_expired(self, monkeypatch):
-        from bot import _purge_cooldowns
-        import bot
-
-        monkeypatch.setattr("bot.COOLDOWN_SECONDS", 1)
-        bot.cooldowns.clear()
-        now = time.time()
-        bot.cooldowns[1] = now - 100
-        bot.cooldowns[2] = now - 200
-
-        _purge_cooldowns()
-
-        assert len(bot.cooldowns) == 0
-
-
-# ---------------------------------------------------------------------------
 # get_http_session
 # ---------------------------------------------------------------------------
 class TestGetHttpSession:
@@ -205,16 +143,12 @@ class TestOnMessage:
     def _reset_bot_state(self, monkeypatch):
         """Clean state before each test."""
         import bot
-        bot.cooldowns.clear()
         bot._channel_semas.clear()
         monkeypatch.setattr("bot.COOLDOWN_SECONDS", 5)
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345})
         monkeypatch.setattr("bot.BOT_KEYWORDS", ["かなえ"])
         monkeypatch.setattr("bot.BOT_ROLE_IDS", set())
         monkeypatch.setattr("bot.MAX_COOLDOWN_ENTRIES", 1000)
-        # Always use local fallback in unit tests so the shared rate_limit
-        # module state doesn't bleed between tests.
-        monkeypatch.setattr("bot._USE_SHARED_RATE_LIMIT", False)
 
         # Mock bot.user — it's a property on discord.Client, so we patch at class level
         self._mock_bot_user = MagicMock()
@@ -340,8 +274,9 @@ class TestOnMessage:
         # author (12345 is the fixture's admin) to exercise the cooldown reply.
         monkeypatch.setattr("bot.RESTRICTED_COOLDOWN_SECONDS", 60)
 
-        # Simulate a recent cooldown for the non-admin sender
-        bot.cooldowns[88888] = time.time()
+        # Simulate a recent cooldown for the non-admin sender (shared ledger)
+        from services import rate_limit as _rl
+        _rl.check_cooldown("88888", False)
 
         msg = _make_message(content="かなえ hello", author_id=88888)
         await self._dispatch(msg)
@@ -564,35 +499,9 @@ class TestOnMessage:
              patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
             await self._dispatch(msg)
 
-            assert 77777 in bot.cooldowns
+            from services import rate_limit as _rl
+            assert "77777" in _rl._cooldowns
 
-    @pytest.mark.asyncio
-    async def test_cooldown_overflow_eviction(self, monkeypatch):
-        import bot
-        monkeypatch.setattr("bot.MAX_COOLDOWN_ENTRIES", 2)
-
-        # Fill cooldowns to capacity
-        bot.cooldowns[1] = time.time() - 1
-        bot.cooldowns[2] = time.time() - 0.5
-
-        msg = _make_message(content="かなえ hello", author_id=3)
-
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
-            await self._dispatch(msg)
-
-            assert len(bot.cooldowns) <= 2
-            assert 3 in bot.cooldowns  # newest should be kept
-
-    @pytest.mark.asyncio
     async def test_session_updated_when_returned(self, monkeypatch):
         import bot
 
@@ -1426,7 +1335,6 @@ async def test_rate_limit_uses_shared_module(monkeypatch):
         called_with.append((discord_id, is_admin))
         return (False, 30)  # deny immediately so handler exits early
 
-    monkeypatch.setattr("bot._USE_SHARED_RATE_LIMIT", True)
     monkeypatch.setattr("bot._rl_check_cooldown", fake_check_cooldown)
     monkeypatch.setattr("bot.ADMIN_USER_IDS", {99999})
     monkeypatch.setattr("bot.BOT_KEYWORDS", ["かなえ"])
@@ -1567,15 +1475,14 @@ class TestOnMessageAdminAndQuota:
     @pytest.fixture(autouse=True)
     def _reset_bot_state(self, monkeypatch):
         import bot
-        bot.cooldowns.clear()
+        from services import rate_limit as _rl
         bot._channel_semas.clear()
-        bot._daily_quota.clear()
+        _rl.reset_for_tests()
         monkeypatch.setattr("bot.COOLDOWN_SECONDS", 5)
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345})
         monkeypatch.setattr("bot.BOT_KEYWORDS", ["かなえ"])
         monkeypatch.setattr("bot.BOT_ROLE_IDS", set())
         monkeypatch.setattr("bot.MAX_COOLDOWN_ENTRIES", 1000)
-        monkeypatch.setattr("bot._USE_SHARED_RATE_LIMIT", False)
 
         self._mock_bot_user = MagicMock()
         self._mock_bot_user.id = 99900
@@ -1593,12 +1500,12 @@ class TestOnMessageAdminAndQuota:
     @pytest.mark.asyncio
     async def test_non_admin_gets_quota_denied(self, monkeypatch):
         """Non-admin user hitting daily quota gets rejection message."""
-        import bot
         monkeypatch.setattr("bot.ADMIN_USER_IDS", set())
-        monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 1)
+        monkeypatch.setattr("services.rate_limit.RESTRICTED_DAILY_QUOTA", 1)
 
-        # Exhaust quota for user 55555
-        bot._daily_quota[55555] = deque([time.time()])
+        # Exhaust quota for user 55555 in the shared ledger
+        from services import rate_limit as _rl
+        _rl.check_daily_quota("55555", False)
 
         msg = _make_message(content="かなえ hi", author_id=55555)
         await self._dispatch(msg)
@@ -1655,8 +1562,9 @@ class TestOnMessageAdminAndQuota:
         monkeypatch.setattr("bot.ADMIN_USER_IDS", set())
         monkeypatch.setattr("bot.RESTRICTED_COOLDOWN_SECONDS", 120)
 
-        # Place a fresh cooldown for non-admin user
-        bot.cooldowns[55555] = time.time()
+        # Place a fresh cooldown for non-admin user (shared ledger)
+        from services import rate_limit as _rl
+        _rl.check_cooldown("55555", False)
 
         msg = _make_message(content="かなえ hi", author_id=55555)
         await self._dispatch(msg)
@@ -1727,78 +1635,6 @@ class TestOnMessageAdminAndQuota:
         assert "notes.txt" in captured_prompt
         assert "secret content" in captured_prompt
 
-    @pytest.mark.asyncio
-    async def test_cooldown_eviction_bounded(self, monkeypatch):
-        """MAX_COOLDOWN_ENTRIES is respected by removing oldest entries."""
-        import bot
-        monkeypatch.setattr("bot.MAX_COOLDOWN_ENTRIES", 3)
-
-        for uid in [100, 200, 300]:
-            bot.cooldowns[uid] = time.time() - 1
-
-        msg = _make_message(content="かなえ hello", author_id=400)
-
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
-            await self._dispatch(msg)
-
-        assert len(bot.cooldowns) <= 3
-        assert 400 in bot.cooldowns
-
-
-# ---------------------------------------------------------------------------
-# _check_daily_quota unit tests
-# ---------------------------------------------------------------------------
-class TestCheckDailyQuota:
-    def test_allows_when_quota_disabled(self, monkeypatch):
-        import bot
-        monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 0)
-        allowed, remaining = bot._check_daily_quota(99999)
-        assert allowed is True
-        assert remaining == -1
-
-    def test_denies_when_quota_exhausted(self, monkeypatch):
-        import bot
-        monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 2)
-        bot._daily_quota.clear()
-        bot._daily_quota[77777] = deque([time.time(), time.time()])
-        allowed, remaining = bot._check_daily_quota(77777)
-        assert allowed is False
-        assert remaining == 0
-        bot._daily_quota.clear()
-
-    def test_counts_down_remaining(self, monkeypatch):
-        import bot
-        monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 3)
-        bot._daily_quota.clear()
-        allowed, remaining = bot._check_daily_quota(88888)
-        assert allowed is True
-        assert remaining == 2  # used 1 of 3
-        bot._daily_quota.clear()
-
-    def test_evicts_expired_entries(self, monkeypatch):
-        import bot
-        monkeypatch.setattr("bot.RESTRICTED_DAILY_QUOTA", 5)
-        bot._daily_quota.clear()
-        # Old entry outside the 24h window
-        bot._daily_quota[11111] = deque([time.time() - 90000])
-        allowed, remaining = bot._check_daily_quota(11111)
-        assert allowed is True
-        assert remaining == 4  # the expired entry was evicted
-        bot._daily_quota.clear()
-
-
-# ---------------------------------------------------------------------------
-# _cap_text unit tests
-# ---------------------------------------------------------------------------
 class TestCapText:
     def test_no_truncation_when_under_limit(self):
         from bot import _cap_text

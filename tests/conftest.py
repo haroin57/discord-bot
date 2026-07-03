@@ -59,12 +59,9 @@ def _isolate_bot_state():
     except Exception:
         yield
         return
-    cooldowns = getattr(_bot, "cooldowns", None)
-    daily_quota = getattr(_bot, "_daily_quota", None)
-    if cooldowns is not None:
-        cooldowns.clear()
-    if daily_quota is not None:
-        daily_quota.clear()
+    # P2.5 group-1: cooldown/quota now live only in the shared ledger.
+    from services import rate_limit as _rl
+    _rl.reset_for_tests()
     # P4a: bot.sessions is now the process-wide shared dict from
     # services.session.shared_sessions(). Clear its CONTENTS (not rebind —
     # bot.py and web_api hold references to the same object) so entries
@@ -73,7 +70,4 @@ def _isolate_bot_state():
     if shared is not None:
         shared.clear()
     yield
-    if cooldowns is not None:
-        cooldowns.clear()
-    if daily_quota is not None:
-        daily_quota.clear()
+    _rl.reset_for_tests()
