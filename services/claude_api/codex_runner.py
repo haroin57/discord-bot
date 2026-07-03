@@ -18,12 +18,10 @@ fail-open で吸収し、API 直（gpt-5）フォールバックへ回す。
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import shutil
 import tempfile
-import time
 
 from config import (
     CODEX_BIN,
@@ -31,6 +29,7 @@ from config import (
     CODEX_REASONING_EFFORT,
     CODEX_WORKDIR,
 )
+from services.claude_api._cli_runner import AvailabilityCache, clean_env, run_cli
 
 log = logging.getLogger(__name__)
 
@@ -38,35 +37,29 @@ log = logging.getLogger(__name__)
 # codex が ChatGPT 認証をバイパスして従量課金 API に流れ得る）
 _STRIP_ENV_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL")
 
-_avail_cache: "tuple[float, bool] | None" = None
-_AVAIL_TTL_S = 300.0
+_avail = AvailabilityCache()
 
 
 def _clean_env() -> dict:
-    env = dict(os.environ)
-    for k in _STRIP_ENV_KEYS:
-        env.pop(k, None)
-    return env
+    return clean_env(_STRIP_ENV_KEYS)
 
 
 async def is_codex_available() -> bool:
     """codex バイナリが存在し ChatGPT 認証済みかの軽量チェック（TTL キャッシュ）。"""
-    global _avail_cache
-    now = time.monotonic()
-    if _avail_cache is not None and now - _avail_cache[0] < _AVAIL_TTL_S:
-        return _avail_cache[1]
-    ok = False
-    if shutil.which(CODEX_BIN):
+
+    async def _probe() -> bool:
+        if not shutil.which(CODEX_BIN):
+            return False
         # ChatGPT ログイン済みか（auth.json の auth_mode）
         auth_path = os.path.expanduser("~/.codex/auth.json")
         try:
             import json
             with open(auth_path, encoding="utf-8") as f:
-                ok = json.load(f).get("auth_mode") == "chatgpt"
+                return json.load(f).get("auth_mode") == "chatgpt"
         except (OSError, ValueError):
-            ok = False
-    _avail_cache = (now, ok)
-    return ok
+            return False
+
+    return await _avail.get(_probe)
 
 
 async def ask_codex(prompt: str, *, timeout_s: int) -> str:
@@ -94,28 +87,15 @@ async def ask_codex(prompt: str, *, timeout_s: int) -> str:
         argv += ["-c", f"model_reasoning_effort={CODEX_REASONING_EFFORT}"]
     argv.append(prompt)
 
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdin=asyncio.subprocess.DEVNULL,  # MCP等でstdinがパイプだと子が入力待ちでハングする
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_clean_env(),          # サブスク枠強制（API キー除去）
-        start_new_session=True,
-        cwd=CODEX_WORKDIR,
-    )
     try:
-        _out_b, err_b = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await asyncio.gather(proc.wait(), return_exceptions=True)
+        returncode, _stdout, stderr = await run_cli(
+            argv, timeout_s=timeout_s, env=_clean_env(), cwd=CODEX_WORKDIR,
+            label="codex",
+        )
+    except RuntimeError:
         _safe_unlink(out_path)
-        raise RuntimeError(f"codex timed out after {timeout_s}s")
+        raise
 
-    stderr = (err_b or b"").decode("utf-8", "replace")
     try:
         answer = ""
         if os.path.isfile(out_path):
@@ -124,10 +104,10 @@ async def ask_codex(prompt: str, *, timeout_s: int) -> str:
     finally:
         _safe_unlink(out_path)
 
-    if proc.returncode != 0:
+    if returncode != 0:
         # 認証切れ・quota 切れ・非対応モデルはここ（stderr にメッセージ）
         raise RuntimeError(
-            f"codex exited {proc.returncode}: {stderr[-300:].strip()}")
+            f"codex exited {returncode}: {stderr[-300:].strip()}")
     if not answer:
         raise RuntimeError(
             f"codex produced no final message (stderr: {stderr[-200:].strip()})")
@@ -142,5 +122,4 @@ def _safe_unlink(path: str) -> None:
 
 
 def _reset_cache_for_test() -> None:
-    global _avail_cache
-    _avail_cache = None
+    _avail.reset()

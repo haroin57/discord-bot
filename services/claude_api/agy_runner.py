@@ -18,14 +18,13 @@ fail-open で吸収し、API 直フォールバックへ回す。
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import shutil
-import time
 
 from config import AGY_BIN, AGY_MODEL, AGY_TRANSCRIPT_ROOT, AGY_WORKDIR
+from services.claude_api._cli_runner import AvailabilityCache, clean_env, run_cli
 
 log = logging.getLogger(__name__)
 
@@ -37,16 +36,11 @@ _DONE_SOURCE = "MODEL"
 _DONE_STATUS = "DONE"
 _DONE_TYPE = "PLANNER_RESPONSE"
 
-# is_agy_available のキャッシュ（プロセス寿命、TTL 付き）
-_avail_cache: "tuple[float, bool] | None" = None
-_AVAIL_TTL_S = 300.0
+_avail = AvailabilityCache()
 
 
 def _clean_env() -> dict:
-    env = dict(os.environ)
-    for k in _STRIP_ENV_KEYS:
-        env.pop(k, None)
-    return env
+    return clean_env(_STRIP_ENV_KEYS)
 
 
 async def is_agy_available() -> bool:
@@ -55,28 +49,21 @@ async def is_agy_available() -> bool:
     `agy` が PATH に無ければ即 False。存在すれば `--version` 等で疎通確認する
     （認証状態の厳密判定は難しいので、実行時の失敗は ask_agy 側で捕捉する）。
     """
-    global _avail_cache
-    now = time.monotonic()
-    if _avail_cache is not None and now - _avail_cache[0] < _AVAIL_TTL_S:
-        return _avail_cache[1]
-    ok = False
-    if shutil.which(AGY_BIN):
+
+    async def _probe() -> bool:
+        if not shutil.which(AGY_BIN):
+            return False
         try:
-            proc = await asyncio.create_subprocess_exec(
-                AGY_BIN, "--version",
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_clean_env(),
-                start_new_session=True,
+            returncode, _out, _err = await run_cli(
+                [AGY_BIN, "--version"],
+                timeout_s=10, env=_clean_env(), cwd=None, label="agy",
             )
-            await asyncio.wait_for(proc.communicate(), timeout=10)
-            ok = proc.returncode == 0
+            return returncode == 0
         except Exception as exc:  # noqa: BLE001
             log.warning("agy availability check failed: %s", exc)
-            ok = False
-    _avail_cache = (now, ok)
-    return ok
+            return False
+
+    return await _avail.get(_probe)
 
 
 def _read_transcript_answer() -> "str | None":
@@ -156,33 +143,16 @@ async def ask_agy(prompt: str, *, timeout_s: int) -> str:
         cwd = AGY_WORKDIR
     except OSError:
         cwd = None
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdin=asyncio.subprocess.DEVNULL,  # MCP等でstdinがパイプだと子が入力待ちでハングする
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_clean_env(),          # OAuth 強制（API キー除去済み）
-        start_new_session=True,    # 新 POSIX セッションで detach（stdout バグ緩和）
-        cwd=cwd,                   # 副作用を隔離しつつ workspace 検出を安定させる
+    returncode, stdout, stderr = await run_cli(
+        argv, timeout_s=timeout_s, env=_clean_env(), cwd=cwd, label="agy",
     )
-    try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await asyncio.gather(proc.wait(), return_exceptions=True)
-        raise RuntimeError(f"agy timed out after {timeout_s}s")
+    stdout = stdout.strip()
+    stderr = stderr.strip()
 
-    stdout = (stdout_b or b"").decode("utf-8", "replace").strip()
-    stderr = (stderr_b or b"").decode("utf-8", "replace").strip()
-
-    if proc.returncode != 0:
+    if returncode != 0:
         # 認証切れ・quota 切れ等はここ（stderr にメッセージ）
         raise RuntimeError(
-            f"agy exited {proc.returncode}: {stderr[:300] or stdout[:300]}")
+            f"agy exited {returncode}: {stderr[:300] or stdout[:300]}")
 
     if stdout:
         return stdout
@@ -197,5 +167,4 @@ async def ask_agy(prompt: str, *, timeout_s: int) -> str:
 
 
 def _reset_cache_for_test() -> None:
-    global _avail_cache
-    _avail_cache = None
+    _avail.reset()
