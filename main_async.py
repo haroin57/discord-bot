@@ -20,7 +20,12 @@ from config import BOT_DIR, DISCORD_TOKEN, STATE_DIR, WEB_API_HOST, WEB_API_PORT
 
 _LOG_LEVEL = os.environ.get("BOT_LOG_LEVEL", "INFO").upper()
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
-_LOG_PATH = os.path.join(BOT_DIR, "bot.log")
+# BOT_LOG_PATH override exists so test runs can NEVER write to the production
+# bot.log, no matter which import path ends up calling _setup_logging().
+# tests/conftest.py sets it to a tmp file before collection; we observed
+# MagicMock tracebacks from pytest workers interleaved with live-bot lines
+# (2026-07-03, P0.25-d monitor false positive).
+_LOG_PATH = os.environ.get("BOT_LOG_PATH") or os.path.join(BOT_DIR, "bot.log")
 
 _log_listener: logging.handlers.QueueListener | None = None
 

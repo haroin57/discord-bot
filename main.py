@@ -15,7 +15,9 @@ from config import BOT_DIR, DISCORD_TOKEN, STATE_DIR, validate_discord_token
 
 _LOG_LEVEL = os.environ.get("BOT_LOG_LEVEL", "INFO").upper()
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
-_LOG_PATH = os.path.join(BOT_DIR, "bot.log")
+# See main_async.py: BOT_LOG_PATH lets tests redirect file logging away from
+# the production bot.log unconditionally.
+_LOG_PATH = os.environ.get("BOT_LOG_PATH") or os.path.join(BOT_DIR, "bot.log")
 
 # Hold a strong reference to the QueueListener so its background thread
 # isn't GC'd and can be cleanly stopped at process exit.

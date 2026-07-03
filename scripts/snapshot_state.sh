@@ -36,10 +36,12 @@ WORK=""
 verify_snapshot() {
     local snap="$1"
     [[ -d "${snap}" ]] || { echo "[verify] snapshot not found: ${snap}"; exit 2; }
-    # WORK is global: an EXIT trap fires after locals are gone (set -u would
-    # then die on the unbound name instead of cleaning up).
+    # WORK is global and the trap is registered at definition time with the
+    # value already expanded — an EXIT trap that references a function-local
+    # fires after locals are gone and dies under set -u instead of cleaning up.
     WORK="$(mktemp -d /tmp/state_restore_rehearsal.XXXXXX)"
-    trap '[[ -n "${WORK}" ]] && rm -rf "${WORK}"' EXIT
+    # shellcheck disable=SC2064  # early expansion is deliberate
+    trap "rm -rf '${WORK}'" EXIT
     local work="${WORK}"
     echo "[verify] restore rehearsal into ${work}"
     cp -a "${snap}/." "${work}/"

@@ -6,6 +6,15 @@ import tempfile
 
 import pytest
 
+# Redirect any file logging set up during tests away from the production
+# bot.log. Some tests exercise main/main_async._setup_logging(); without this
+# guard their RotatingFileHandler targets the live log and pytest tracebacks
+# get interleaved with real bot lines, poisoning the error-rate monitor
+# (observed 2026-07-03). Set at import time so it precedes ALL collection.
+os.environ.setdefault(
+    "BOT_LOG_PATH", os.path.join(tempfile.gettempdir(), "discord-bot-test.log")
+)
+
 
 @pytest.fixture
 def tmp_state_dir(tmp_path, monkeypatch):
