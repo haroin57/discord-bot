@@ -38,4 +38,8 @@ export ORACLE_MAX_OUTPUT_TOKENS="${ORACLE_MAX_OUTPUT_TOKENS:-24000}"
 # 検索が必要な consult だけ明示的に search:true を渡す。
 export ORACLE_DEFAULT_SEARCH="${ORACLE_DEFAULT_SEARCH:-off}"
 
+# ローカルパッチの自己修復（npm update で剥がれても次のスポーンで再適用）。
+# 正本: infra/oracle-patches/<version>/files/、手順: docs/oracle_mcp.md
+"$(dirname "${BASH_SOURCE[0]}")/oracle_apply_patches.sh" || true
+
 exec oracle-mcp "$@"

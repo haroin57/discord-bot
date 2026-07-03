@@ -1,0 +1,663 @@
+import chalk from "chalk";
+import kleur from "kleur";
+import fs from "node:fs/promises";
+import path from "node:path";
+import process from "node:process";
+import { performance } from "node:perf_hooks";
+import { DEFAULT_SYSTEM_PROMPT, TOKENIZER_OPTIONS } from "./config.js";
+import { readFiles } from "./files.js";
+import { buildPrompt, buildRequestBody } from "./request.js";
+import { estimateRequestTokens } from "./tokenEstimate.js";
+import { formatElapsed } from "./format.js";
+import { formatFinishLine } from "./finishLine.js";
+import { getFileTokenStats, printFileTokenStats } from "./tokenStats.js";
+import { OracleResponseError, OracleTransportError, PromptValidationError, describeTransportError, toTransportError, } from "./errors.js";
+import { isCustomBaseUrl } from "./baseUrl.js";
+import { createDefaultClientFactory } from "./client.js";
+import { maskApiKey } from "./logging.js";
+import { startHeartbeat } from "../heartbeat.js";
+import { startOscProgress } from "./oscProgress.js";
+import { createFsAdapter } from "./fsAdapter.js";
+import { resolveGeminiModelId } from "./gemini.js";
+import { resolveClaudeModelId } from "./claude.js";
+import { renderMarkdownAnsi } from "../cli/markdownRenderer.js";
+import { createMarkdownStreamer } from "markdansi";
+import { executeBackgroundResponse } from "./background.js";
+import { formatTokenEstimate, formatTokenValue, resolvePreviewMode } from "./runUtils.js";
+import { estimateUsdCost } from "tokentally";
+import { isOpenRouterBaseUrl, isProModel, resolveModelConfig } from "./modelResolver.js";
+import { validateProviderRouting } from "./providerRouting.js";
+import { formatRouteTargetForLog, resolveProviderRoute, } from "./providerRoutePlan.js";
+const isStdoutTty = process.stdout.isTTY && chalk.level > 0;
+const dim = (text) => (isStdoutTty ? kleur.dim(text) : text);
+// Default timeout for non-pro API runs (fast models) — give them up to 120s.
+const DEFAULT_TIMEOUT_NON_PRO_MS = 120_000;
+const DEFAULT_TIMEOUT_PRO_MS = 60 * 60 * 1000;
+// TPM-aware output clamp (local patch): keep estimated input + max_output_tokens
+// within the org's tokens-per-minute quota so requests are never dead-on-arrival.
+const TPM_SAFETY_MARGIN_TOKENS = 2000;
+const MIN_TPM_OUTPUT_TOKENS = 4000;
+function parsePositiveIntEnv(name) {
+    const raw = process.env[name]?.trim();
+    if (!raw) {
+        return undefined;
+    }
+    const value = Number.parseInt(raw, 10);
+    return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+const defaultWait = (ms) => new Promise((resolve) => {
+    setTimeout(resolve, ms);
+});
+function formatProviderRouteLogLine(route, keySource) {
+    if (route.isAzureOpenAI) {
+        return `Provider: Azure OpenAI | endpoint: ${formatRouteTargetForLog(route.azureEndpoint)} | deployment: ${route.azureDeploymentName || "none"} | key: ${keySource}`;
+    }
+    return `Provider: ${route.providerLabel} | base: ${route.base} | key: ${keySource}`;
+}
+function runtimeKeySource({ route, providerMode, optionsApiKey, }) {
+    if (optionsApiKey &&
+        (route.isAzureOpenAI ||
+            providerMode === "openai" ||
+            route.provider === "openai" ||
+            route.providerLabel === "OpenAI-compatible")) {
+        return "apiKey option";
+    }
+    if (route.isAzureOpenAI) {
+        return "AZURE_OPENAI_API_KEY|OPENAI_API_KEY";
+    }
+    if (providerMode === "openai") {
+        return "OPENAI_API_KEY";
+    }
+    if (isOpenRouterBaseUrl(route.baseUrl) || route.openRouterFallback || route.model.includes("/")) {
+        return "OPENROUTER_API_KEY";
+    }
+    if (route.model.startsWith("gpt"))
+        return "OPENAI_API_KEY";
+    if (route.model.startsWith("gemini"))
+        return "GEMINI_API_KEY";
+    if (route.model.startsWith("claude"))
+        return "ANTHROPIC_API_KEY";
+    if (route.model.startsWith("grok"))
+        return "XAI_API_KEY";
+    return optionsApiKey ? "apiKey option" : route.keySource;
+}
+export async function runOracle(options, deps = {}) {
+    const { apiKey: optionsApiKey = options.apiKey, cwd = process.cwd(), fs: fsModule = createFsAdapter(fs), log = console.log, write: sinkWrite = (_text) => true, allowStdout = true, stdoutWrite: stdoutWriteDep, now = () => performance.now(), clientFactory = createDefaultClientFactory(), client, wait = defaultWait, } = deps;
+    const stdoutWrite = allowStdout
+        ? (stdoutWriteDep ?? process.stdout.write.bind(process.stdout))
+        : () => true;
+    const isTty = allowStdout && isStdoutTty;
+    const previewMode = resolvePreviewMode(options.previewMode ?? options.preview);
+    const isPreview = Boolean(previewMode);
+    const providerMode = options.provider ?? "auto";
+    validateProviderRouting({
+        model: options.model,
+        providerMode,
+        azure: options.azure,
+    }, {
+        onAzureDeploymentMissing: (state) => {
+            if (!isPreview && !options.suppressHeader) {
+                log(dim(`Provider: Azure OpenAI | endpoint: ${formatRouteTargetForLog(state.azureEndpoint)} | deployment: none | key: ${optionsApiKey ? "apiKey option" : "AZURE_OPENAI_API_KEY|OPENAI_API_KEY"}`));
+            }
+        },
+    });
+    const route = resolveProviderRoute({
+        model: options.model,
+        providerMode,
+        azure: options.azure,
+        baseUrl: options.baseUrl,
+        apiKey: optionsApiKey,
+        env: process.env,
+    });
+    const { isAzureOpenAI, azureDeploymentName } = route;
+    const baseUrl = route.baseUrl;
+    const openRouterFallback = route.openRouterFallback;
+    const logVerbose = (message) => {
+        if (options.verbose) {
+            log(dim(`[verbose] ${message}`));
+        }
+    };
+    const apiKey = route.apiKey;
+    if (!apiKey) {
+        const envVar = isAzureOpenAI
+            ? "AZURE_OPENAI_API_KEY (or OPENAI_API_KEY)"
+            : providerMode === "openai"
+                ? "OPENAI_API_KEY"
+                : isOpenRouterBaseUrl(baseUrl) || openRouterFallback
+                    ? "OPENROUTER_API_KEY"
+                    : route.keySource;
+        const browserModeHint = options.model.startsWith("gpt")
+            ? ' If you have a ChatGPT Pro subscription, retry with --engine browser (or MCP engine:"browser" / preset:"chatgpt-pro-heavy"); browser mode uses your signed-in ChatGPT session instead of an API key.'
+            : "";
+        throw new PromptValidationError(`Missing ${envVar}. Set it via the environment or a .env file.${browserModeHint}`, {
+            env: envVar,
+        });
+    }
+    const envVar = runtimeKeySource({ route, providerMode, optionsApiKey });
+    const minPromptLength = Number.parseInt(process.env.ORACLE_MIN_PROMPT_CHARS ?? "10", 10);
+    const promptLength = options.prompt?.trim().length ?? 0;
+    // Enforce the short-prompt guardrail on pro-tier models because they're costly; cheaper models can run short prompts without blocking.
+    const isProTierModel = isProModel(options.model);
+    if (isProTierModel && !Number.isNaN(minPromptLength) && promptLength < minPromptLength) {
+        throw new PromptValidationError(`Prompt is too short (<${minPromptLength} chars). This was likely accidental; please provide more detail.`, { minPromptLength, promptLength });
+    }
+    const resolverOpenRouterApiKey = openRouterFallback || isOpenRouterBaseUrl(baseUrl) ? apiKey : undefined;
+    const modelConfig = await resolveModelConfig(options.model, {
+        baseUrl,
+        openRouterApiKey: resolverOpenRouterApiKey,
+    });
+    const isLongRunningModel = isProTierModel;
+    const supportsBackground = modelConfig.supportsBackground !== false;
+    const useBackground = supportsBackground ? (options.background ?? isLongRunningModel) : false;
+    const inputTokenBudget = options.maxInput ?? modelConfig.inputLimit;
+    const files = await readFiles(options.file ?? [], {
+        cwd,
+        fsModule,
+        maxFileSizeBytes: options.maxFileSizeBytes,
+    });
+    // LOCAL PATCH (2026-07-04, docs/oracle_mcp.md): ORACLE_DEFAULT_SEARCH=off で
+    // search を opt-in 化する。gpt-5.5-pro + TPM 50k の org では、search の多段
+    // ラウンドが同一 1分窓に admission 予約を積み上げて 429 → background ジョブ
+    // 即死する (18連敗の根本原因)。search が要る時は明示的に search:true を渡す。
+    const searchEnabled = process.env.ORACLE_DEFAULT_SEARCH === "off"
+        ? options.search === true
+        : options.search !== false;
+    logVerbose(`cwd: ${cwd}`);
+    let pendingNoFilesTip = null;
+    let pendingShortPromptTip = null;
+    if (files.length > 0) {
+        const displayPaths = files
+            .map((file) => path.relative(cwd, file.path) || file.path)
+            .slice(0, 10)
+            .join(", ");
+        const extra = files.length > 10 ? ` (+${files.length - 10} more)` : "";
+        logVerbose(`Attached files (${files.length}): ${displayPaths}${extra}`);
+    }
+    else {
+        logVerbose("No files attached.");
+        if (!isPreview) {
+            pendingNoFilesTip =
+                "Tip: no files attached — Oracle works best with project context. Add files via --file path/to/code or docs.";
+        }
+    }
+    const shortPrompt = (options.prompt?.trim().length ?? 0) < 80;
+    if (!isPreview && shortPrompt) {
+        pendingShortPromptTip =
+            "Tip: brief prompts often yield generic answers — aim for 6–30 sentences and attach key files.";
+    }
+    const fileTokenInfo = getFileTokenStats(files, {
+        cwd,
+        tokenizer: modelConfig.tokenizer,
+        tokenizerOptions: TOKENIZER_OPTIONS,
+        inputTokenBudget,
+    });
+    const totalFileTokens = fileTokenInfo.totalTokens;
+    logVerbose(`Attached files use ${totalFileTokens.toLocaleString()} tokens`);
+    const systemPrompt = options.system?.trim() || DEFAULT_SYSTEM_PROMPT;
+    const promptWithFiles = buildPrompt(options.prompt, files, cwd);
+    const fileCount = files.length;
+    const richTty = allowStdout && process.stdout.isTTY && chalk.level > 0;
+    const renderPlain = Boolean(options.renderPlain);
+    const timeoutSeconds = options.timeoutSeconds === undefined || options.timeoutSeconds === "auto"
+        ? isLongRunningModel
+            ? DEFAULT_TIMEOUT_PRO_MS / 1000
+            : DEFAULT_TIMEOUT_NON_PRO_MS / 1000
+        : options.timeoutSeconds;
+    const timeoutMs = timeoutSeconds * 1000;
+    const httpTimeoutMs = typeof options.httpTimeoutMs === "number" &&
+        Number.isFinite(options.httpTimeoutMs) &&
+        options.httpTimeoutMs > 0
+        ? options.httpTimeoutMs
+        : timeoutMs;
+    // Track the concrete model id we dispatch to (especially for Gemini preview aliases)
+    const effectiveModelId = azureDeploymentName ??
+        options.effectiveModelId ??
+        (options.model.startsWith("gemini")
+            ? resolveGeminiModelId(options.model)
+            : (modelConfig.apiModel ?? modelConfig.model));
+    if (!isPreview && options.previousResponseId) {
+        log(dim(`Continuing from response ${options.previousResponseId}`));
+    }
+    const requestBody = buildRequestBody({
+        modelConfig,
+        systemPrompt,
+        userPrompt: promptWithFiles,
+        searchEnabled,
+        maxOutputTokens: options.maxOutput ?? parsePositiveIntEnv("ORACLE_MAX_OUTPUT_TOKENS"),
+        background: useBackground,
+        // Storing makes follow-ups possible (Responses API chaining relies on stored response state).
+        storeResponse: useBackground || Boolean(options.previousResponseId),
+        previousResponseId: options.previousResponseId,
+    });
+    requestBody.model = effectiveModelId;
+    const estimatedInputTokens = estimateRequestTokens(requestBody, modelConfig);
+    // OpenAI's rate limiter reserves estimated input + max_output_tokens (or the model's
+    // full output limit when unset) against the org TPM quota. On low-TPM orgs an unset
+    // max_output_tokens makes pro-model requests exceed the quota outright, and the
+    // background queue then keeps the reservation alive, starving later requests too.
+    // When ORACLE_TPM_LIMIT is set, always send an explicit max_output_tokens that fits.
+    const tpmLimit = parsePositiveIntEnv("ORACLE_TPM_LIMIT");
+    if (tpmLimit) {
+        const outputBudget = tpmLimit - estimatedInputTokens - TPM_SAFETY_MARGIN_TOKENS;
+        if (outputBudget < MIN_TPM_OUTPUT_TOKENS) {
+            throw new PromptValidationError(`Estimated input (${estimatedInputTokens.toLocaleString()} tokens) leaves fewer than ${MIN_TPM_OUTPUT_TOKENS.toLocaleString()} output tokens under ORACLE_TPM_LIMIT=${tpmLimit.toLocaleString()}. Trim the prompt/files or raise ORACLE_TPM_LIMIT.`, { estimatedInputTokens, tpmLimit });
+        }
+        const requestedOutput = requestBody.max_output_tokens;
+        if (requestedOutput === undefined || requestedOutput > outputBudget) {
+            requestBody.max_output_tokens = outputBudget;
+            log(dim(`max_output_tokens ${requestedOutput === undefined ? "set" : `clamped from ${requestedOutput.toLocaleString()}`} to ${outputBudget.toLocaleString()} to fit ORACLE_TPM_LIMIT=${tpmLimit.toLocaleString()}.`));
+        }
+    }
+    const tokenLabel = formatTokenEstimate(estimatedInputTokens, (text) => richTty ? chalk.green(text) : text);
+    const fileLabel = richTty ? chalk.magenta(fileCount.toString()) : fileCount.toString();
+    const filesPhrase = fileCount === 0 ? "no files" : `${fileLabel} files`;
+    const headerModelLabelBase = richTty ? chalk.cyan(modelConfig.model) : modelConfig.model;
+    const headerModelSuffix = effectiveModelId !== modelConfig.model
+        ? richTty
+            ? chalk.gray(` (API: ${effectiveModelId})`)
+            : ` (API: ${effectiveModelId})`
+        : "";
+    const headerLine = `Calling ${headerModelLabelBase}${headerModelSuffix} — ${tokenLabel} tokens, ${filesPhrase}.`;
+    const shouldReportFiles = (options.filesReport || fileTokenInfo.totalTokens > inputTokenBudget) &&
+        fileTokenInfo.stats.length > 0;
+    if (!isPreview) {
+        if (!options.suppressHeader) {
+            log(headerLine);
+            log(dim(formatProviderRouteLogLine(route, envVar)));
+        }
+        const maskedKey = maskApiKey(apiKey);
+        if (maskedKey && options.verbose) {
+            const resolvedSuffix = effectiveModelId !== modelConfig.model ? ` (API: ${effectiveModelId})` : "";
+            log(dim(`Using ${envVar}=${maskedKey} for model ${modelConfig.model}${resolvedSuffix}`));
+        }
+        if (!options.suppressHeader &&
+            (modelConfig.model === "gpt-5.1-pro" || modelConfig.model === "gpt-5.2-pro") &&
+            effectiveModelId === "gpt-5.5-pro") {
+            log(dim(`Note: \`${modelConfig.model}\` is a stable CLI alias; OpenAI API uses \`gpt-5.5-pro\`.`));
+        }
+        if (effectiveModelId !== modelConfig.model) {
+            log(dim(`Resolved model: ${modelConfig.model} → ${effectiveModelId}`));
+        }
+        if (options.background && !supportsBackground) {
+            log(dim("Background runs are not supported for this model; streaming in foreground instead."));
+        }
+        if (!options.suppressTips) {
+            if (pendingNoFilesTip) {
+                log(dim(pendingNoFilesTip));
+            }
+            if (pendingShortPromptTip) {
+                log(dim(pendingShortPromptTip));
+            }
+        }
+        if (isLongRunningModel) {
+            log(dim("This model can take up to 60 minutes (usually replies much faster)."));
+        }
+        if (options.verbose || isLongRunningModel || httpTimeoutMs < timeoutMs) {
+            const timeoutLine = `Timeouts | overall: ${formatElapsed(timeoutMs)} | transport: ${formatElapsed(httpTimeoutMs)}`;
+            const timeoutNote = httpTimeoutMs < timeoutMs ? " | note: transport can fail before overall timeout" : "";
+            log(dim(`${timeoutLine}${timeoutNote}`));
+        }
+        if (options.verbose || isLongRunningModel) {
+            log(dim("Press Ctrl+C to cancel."));
+        }
+    }
+    if (shouldReportFiles) {
+        printFileTokenStats(fileTokenInfo, { inputTokenBudget, log });
+    }
+    if (estimatedInputTokens > inputTokenBudget) {
+        throw new PromptValidationError(`Input too large (${estimatedInputTokens.toLocaleString()} tokens). Limit is ${inputTokenBudget.toLocaleString()} tokens.`, { estimatedInputTokens, inputTokenBudget });
+    }
+    logVerbose(`Estimated tokens (request body): ${estimatedInputTokens.toLocaleString()}`);
+    if (isPreview && previewMode) {
+        if (previewMode === "json" || previewMode === "full") {
+            log("Request JSON");
+            log(JSON.stringify(requestBody, null, 2));
+            log("");
+        }
+        if (previewMode === "full") {
+            log("Assembled Prompt");
+            log(promptWithFiles);
+            log("");
+        }
+        log(`Estimated input tokens: ${estimatedInputTokens.toLocaleString()} / ${inputTokenBudget.toLocaleString()} (model: ${modelConfig.model})`);
+        return {
+            mode: "preview",
+            previewMode,
+            requestBody,
+            estimatedInputTokens,
+            inputTokenBudget,
+        };
+    }
+    const proxyCompatibleBaseUrl = !isAzureOpenAI && baseUrl && (isOpenRouterBaseUrl(baseUrl) || isCustomBaseUrl(baseUrl))
+        ? baseUrl
+        : undefined;
+    const apiEndpoint = isAzureOpenAI
+        ? undefined
+        : modelConfig.model.startsWith("gemini")
+            ? proxyCompatibleBaseUrl
+            : proxyCompatibleBaseUrl
+                ? proxyCompatibleBaseUrl
+                : modelConfig.model.startsWith("claude")
+                    ? baseUrl
+                    : baseUrl;
+    const clientInstance = client ??
+        clientFactory(apiKey, {
+            baseUrl: apiEndpoint,
+            azure: isAzureOpenAI ? options.azure : undefined,
+            model: options.model,
+            resolvedModelId: modelConfig.model.startsWith("claude")
+                ? resolveClaudeModelId(effectiveModelId)
+                : modelConfig.model.startsWith("gemini")
+                    ? resolveGeminiModelId(effectiveModelId)
+                    : effectiveModelId,
+            httpTimeoutMs,
+        });
+    logVerbose("Dispatching request to API...");
+    if (options.verbose) {
+        log(""); // ensure verbose section is separated from Answer stream
+    }
+    const stopOscProgress = startOscProgress({
+        label: useBackground ? "Waiting for API (background)" : "Waiting for API",
+        targetMs: useBackground ? timeoutMs : Math.min(timeoutMs, 10 * 60_000),
+        indeterminate: true,
+        write: sinkWrite,
+    });
+    const runStart = now();
+    let response = null;
+    let elapsedMs = 0;
+    let sawTextDelta = false;
+    let answerHeaderPrinted = false;
+    const allowAnswerHeader = options.suppressAnswerHeader !== true;
+    const timeoutExceeded = () => now() - runStart >= timeoutMs;
+    const throwIfTimedOut = () => {
+        if (timeoutExceeded()) {
+            throw new OracleTransportError("client-timeout", `Timed out waiting for API response after ${formatElapsed(timeoutMs)}.`);
+        }
+    };
+    const ensureAnswerHeader = () => {
+        if (options.silent || answerHeaderPrinted)
+            return;
+        // Always add a separating newline for readability; optionally include the label depending on caller needs.
+        log("");
+        if (allowAnswerHeader) {
+            log(chalk.bold("Answer:"));
+        }
+        answerHeaderPrinted = true;
+    };
+    try {
+        if (useBackground) {
+            response = await executeBackgroundResponse({
+                client: clientInstance,
+                requestBody,
+                log,
+                wait,
+                heartbeatIntervalMs: options.heartbeatIntervalMs,
+                now,
+                maxWaitMs: timeoutMs,
+            });
+            elapsedMs = now() - runStart;
+        }
+        else {
+            let stream;
+            try {
+                stream = await clientInstance.responses.stream(requestBody);
+            }
+            catch (streamInitError) {
+                const transportError = toTransportError(streamInitError, requestBody.model);
+                log(chalk.yellow(describeTransportError(transportError, timeoutMs)));
+                throw transportError;
+            }
+            let heartbeatActive = false;
+            let stopHeartbeat = null;
+            const stopHeartbeatNow = () => {
+                if (!heartbeatActive) {
+                    return;
+                }
+                heartbeatActive = false;
+                stopHeartbeat?.();
+                stopHeartbeat = null;
+            };
+            if (options.heartbeatIntervalMs && options.heartbeatIntervalMs > 0) {
+                heartbeatActive = true;
+                stopHeartbeat = startHeartbeat({
+                    intervalMs: options.heartbeatIntervalMs,
+                    log: (message) => log(message),
+                    isActive: () => heartbeatActive,
+                    makeMessage: (elapsedMs) => {
+                        const elapsedText = formatElapsed(elapsedMs);
+                        const remainingMs = Math.max(timeoutMs - elapsedMs, 0);
+                        const remainingLabel = remainingMs >= 60_000
+                            ? `${Math.ceil(remainingMs / 60_000)} min`
+                            : `${Math.max(1, Math.ceil(remainingMs / 1000))}s`;
+                        return `API connection active — ${elapsedText} elapsed. Timeout in ~${remainingLabel} if no response.`;
+                    },
+                });
+            }
+            let markdownStreamer = null;
+            const flushMarkdownStreamer = () => {
+                if (!markdownStreamer)
+                    return;
+                const rendered = markdownStreamer.finish();
+                markdownStreamer = null;
+                if (rendered) {
+                    stdoutWrite(rendered);
+                }
+            };
+            try {
+                markdownStreamer =
+                    isTty && !renderPlain
+                        ? createMarkdownStreamer({
+                            render: renderMarkdownAnsi,
+                            spacing: "single",
+                            mode: "hybrid",
+                        })
+                        : null;
+                for await (const event of stream) {
+                    throwIfTimedOut();
+                    const isTextDelta = event.type === "chunk" || event.type === "response.output_text.delta";
+                    if (!isTextDelta)
+                        continue;
+                    stopOscProgress();
+                    stopHeartbeatNow();
+                    sawTextDelta = true;
+                    ensureAnswerHeader();
+                    if (options.silent || typeof event.delta !== "string")
+                        continue;
+                    // Always keep the log/bookkeeping sink up to date.
+                    sinkWrite(event.delta);
+                    if (renderPlain) {
+                        // Plain mode: stream directly to stdout regardless of write sink.
+                        stdoutWrite(event.delta);
+                        continue;
+                    }
+                    if (markdownStreamer) {
+                        const rendered = markdownStreamer.push(event.delta);
+                        if (rendered) {
+                            stdoutWrite(rendered);
+                        }
+                        continue;
+                    }
+                    // Non-TTY streams should still surface output; fall back to raw stdout.
+                    stdoutWrite(event.delta);
+                }
+                flushMarkdownStreamer();
+                throwIfTimedOut();
+            }
+            catch (streamError) {
+                // stream.abort() is not available on the interface
+                flushMarkdownStreamer();
+                stopHeartbeatNow();
+                const transportError = toTransportError(streamError, requestBody.model);
+                log(chalk.yellow(describeTransportError(transportError, timeoutMs)));
+                throw transportError;
+            }
+            response = await stream.finalResponse();
+            throwIfTimedOut();
+            stopHeartbeatNow();
+            elapsedMs = now() - runStart;
+        }
+    }
+    finally {
+        stopOscProgress();
+    }
+    if (!response) {
+        throw new Error("API did not return a response.");
+    }
+    // We only add spacing when streamed text was printed.
+    if (sawTextDelta && !options.silent) {
+        if (renderPlain) {
+            // Plain streaming already wrote chunks; ensure clean separation.
+            stdoutWrite("\n");
+        }
+        else {
+            // Separate streamed output from logs.
+            log("");
+        }
+    }
+    logVerbose(`Response status: ${response.status ?? "completed"}`);
+    if (response.status && response.status !== "completed") {
+        // API can reply `in_progress` even after the stream closes; give it a brief grace poll.
+        if (response.id && response.status === "in_progress") {
+            const polishingStart = now();
+            const pollIntervalMs = 2_000;
+            const maxWaitMs = 180_000;
+            log(chalk.dim("Response still in_progress; polling until completion..."));
+            // Short polling loop — we don't want to hang forever, just catch late finalization.
+            while (now() - polishingStart < maxWaitMs) {
+                throwIfTimedOut();
+                await wait(pollIntervalMs);
+                const refreshed = await clientInstance.responses.retrieve(response.id);
+                if (refreshed.status === "completed") {
+                    response = refreshed;
+                    break;
+                }
+            }
+        }
+        if (response.status !== "completed") {
+            const detail = response.error?.message || response.incomplete_details?.reason || response.status;
+            log(chalk.yellow(`API ended the run early (status=${response.status}${response.incomplete_details?.reason ? `, reason=${response.incomplete_details.reason}` : ""}).`));
+            throw new OracleResponseError(`Response did not complete: ${detail}`, response);
+        }
+    }
+    const answerText = extractTextOutput(response);
+    if (!options.silent) {
+        // Flag flips to true when streaming events arrive.
+        if (sawTextDelta) {
+            // Already handled above (rendered or streamed); avoid double-printing.
+        }
+        else {
+            ensureAnswerHeader();
+            // Render markdown to ANSI in rich TTYs unless the caller opts out with --render-plain.
+            const printable = answerText
+                ? renderPlain || !richTty
+                    ? answerText
+                    : renderMarkdownAnsi(answerText)
+                : chalk.dim("(no text output)");
+            sinkWrite(printable);
+            if (!printable.endsWith("\n")) {
+                sinkWrite("\n");
+            }
+            stdoutWrite(printable);
+            if (!printable.endsWith("\n")) {
+                stdoutWrite("\n");
+            }
+            log("");
+        }
+    }
+    const usage = response.usage ?? {};
+    const inputTokens = usage.input_tokens ?? estimatedInputTokens;
+    const outputTokens = usage.output_tokens ?? 0;
+    const reasoningTokens = usage.reasoning_tokens ?? 0;
+    const totalTokens = usage.total_tokens ?? inputTokens + outputTokens + reasoningTokens;
+    const pricing = modelConfig.pricing ?? undefined;
+    const cost = pricing
+        ? estimateUsdCost({
+            usage: { inputTokens, outputTokens, reasoningTokens, totalTokens },
+            pricing: {
+                inputUsdPerToken: pricing.inputPerToken,
+                outputUsdPerToken: pricing.outputPerToken,
+            },
+        })?.totalUsd
+        : undefined;
+    const effortLabel = modelConfig.reasoning?.effort;
+    const modelLabel = effortLabel ? `${modelConfig.model}[${effortLabel}]` : modelConfig.model;
+    const sessionIdContainsModel = typeof options.sessionId === "string" &&
+        options.sessionId.toLowerCase().includes(modelConfig.model.toLowerCase());
+    const tokensDisplay = [inputTokens, outputTokens, reasoningTokens, totalTokens]
+        .map((value, index) => formatTokenValue(value, usage, index))
+        .join("/");
+    const tokensPart = (() => {
+        const parts = tokensDisplay.split("/");
+        if (parts.length !== 4)
+            return tokensDisplay;
+        return `↑${parts[0]} ↓${parts[1]} ↻${parts[2]} Δ${parts[3]}`;
+    })();
+    const modelPart = sessionIdContainsModel ? null : modelLabel;
+    const actualInput = usage.input_tokens;
+    const estActualPart = (() => {
+        if (!options.verbose)
+            return null;
+        if (actualInput === undefined)
+            return null;
+        const delta = actualInput - estimatedInputTokens;
+        const deltaText = delta === 0
+            ? ""
+            : delta > 0
+                ? ` (+${delta.toLocaleString()})`
+                : ` (${delta.toLocaleString()})`;
+        return `est→actual=${estimatedInputTokens.toLocaleString()}→${actualInput.toLocaleString()}${deltaText}`;
+    })();
+    const { line1, line2 } = formatFinishLine({
+        elapsedMs,
+        model: modelPart,
+        costUsd: cost ?? null,
+        tokensPart,
+        summaryExtraParts: options.sessionId ? [`sid=${options.sessionId}`] : null,
+        detailParts: [
+            estActualPart,
+            !searchEnabled ? "search=off" : null,
+            files.length > 0 ? `files=${files.length}` : null,
+        ],
+    });
+    if (!options.silent) {
+        log("");
+    }
+    log(chalk.blue(line1));
+    if (line2) {
+        log(dim(line2));
+    }
+    return {
+        mode: "live",
+        response,
+        usage: {
+            inputTokens,
+            outputTokens,
+            reasoningTokens,
+            totalTokens,
+            ...(cost != null ? { cost } : {}),
+        },
+        elapsedMs,
+    };
+}
+export function extractTextOutput(response) {
+    if (Array.isArray(response.output_text) && response.output_text.length > 0) {
+        return response.output_text.join("\n");
+    }
+    if (Array.isArray(response.output)) {
+        const segments = [];
+        for (const item of response.output) {
+            if (Array.isArray(item.content)) {
+                for (const chunk of item.content) {
+                    if (chunk && (chunk.type === "output_text" || chunk.type === "text") && chunk.text) {
+                        segments.push(chunk.text);
+                    }
+                }
+            }
+            else if (typeof item.text === "string") {
+                segments.push(item.text);
+            }
+        }
+        return segments.join("\n");
+    }
+    return "";
+}

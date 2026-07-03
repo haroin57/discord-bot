@@ -116,3 +116,26 @@ oracle session <slug>                             # detach したジョブの回
 - 中断したい background ジョブは `POST /v1/responses/{resp_id}/cancel` で殺せる
   （resp_id はセッションの output.log に記録される）。放置すると窓を占有し続け
   後続セッションまで連鎖死する
+
+## 追補2（2026-07-04）: パッチの永続化 — 自己修復機構
+
+「npm update でパッチが消える」問題を仕組みで解決した。**手動再適用は不要になった。**
+
+### 構造
+| 場所 | 役割 |
+|---|---|
+| `infra/oracle-patches/<version>/files/` | パッチ済みファイルの正本（バージョン別、git 管理）。0.15.0 は 5ファイル: run.js / consult.js / types.js / utils.js / sessionManager.js |
+| `infra/oracle-patches/<version>/oracle-<version>.diff` | 素の npm 版との差分（レビュー用文書。適用には使わない） |
+| `scripts/oracle_apply_patches.sh` | 正本をインストール先へ冪等コピー。volta shim を `volta which` で実体解決。**バージョン不一致なら適用せず警告**（壊れた適用より無パッチ優先） |
+| `scripts/oracle_mcp_launch.sh` | MCP スポーンのたびに apply を実行 → npm update で剥がれても**次回起動で自己修復** |
+
+### 検証済み（2026-07-04）
+- 素の run.js に戻す（npm update 相当）→ apply で復元・marker 復活・モジュールロード OK
+- 冪等（差分ゼロなら無出力・no-op）
+- launcher 経由のフルチェーン起動 OK
+
+### oracle をバージョンアップする時の手順
+1. `npm update -g @steipete/oracle` → 新バージョン確認
+2. `npm pack @steipete/oracle@<new>` で素を取得し、旧 diff（infra/oracle-patches/<old>/*.diff）を参考に同等パッチを新 dist へ移植
+3. `infra/oracle-patches/<new>/files/` に移植済みファイルを置き、素との diff も保存
+4. launcher 起動（または apply 手動実行）で適用確認 → commit

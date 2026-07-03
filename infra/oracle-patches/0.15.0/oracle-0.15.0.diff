@@ -1,0 +1,155 @@
+diff -ru package/dist/src/mcp/tools/consult.js /home/ubuntu/.volta/tools/image/packages/@steipete/oracle/lib/node_modules/@steipete/oracle/dist/src/mcp/tools/consult.js
+--- package/dist/src/mcp/tools/consult.js	1985-10-26 17:15:00.000000000 +0900
++++ /home/ubuntu/.volta/tools/image/packages/@steipete/oracle/lib/node_modules/@steipete/oracle/dist/src/mcp/tools/consult.js	2026-07-03 20:11:57.677881000 +0900
+@@ -104,6 +104,12 @@
+         .boolean()
+         .optional()
+         .describe("API-only: enable/disable the provider search tool (browser engine ignores this)."),
++    maxOutput: z
++        .number()
++        .int()
++        .positive()
++        .optional()
++        .describe("API-only: cap max_output_tokens for the response. Defaults to the ORACLE_MAX_OUTPUT_TOKENS env var; when ORACLE_TPM_LIMIT is set the value is also auto-clamped so input + output fits the org TPM quota."),
+     slug: z
+         .string()
+         .optional()
+@@ -390,7 +396,7 @@
+             content: textContent(error instanceof Error ? error.message : String(error)),
+         };
+     }
+-    const { prompt, files, model, models, engine, search, browserModelLabel, browserAttachments, browserBundleFiles, browserBundleFormat, browserThinkingTime, browserModelStrategy, browserResearchMode, browserArchive, browserFollowUps, browserKeepBrowser, generateImage, outputPath, dryRun, slug, } = parsedInput;
++    const { prompt, files, model, models, engine, search, maxOutput, browserModelLabel, browserAttachments, browserBundleFiles, browserBundleFormat, browserThinkingTime, browserModelStrategy, browserResearchMode, browserArchive, browserFollowUps, browserKeepBrowser, generateImage, outputPath, dryRun, slug, } = parsedInput;
+     const { config: userConfig } = await loadUserConfig();
+     let runOptions;
+     let resolvedEngine;
+@@ -402,6 +408,7 @@
+             models,
+             engine,
+             search,
++            maxOutput,
+             browserAttachments,
+             browserBundleFiles,
+             browserBundleFormat,
+diff -ru package/dist/src/mcp/types.js /home/ubuntu/.volta/tools/image/packages/@steipete/oracle/lib/node_modules/@steipete/oracle/dist/src/mcp/types.js
+--- package/dist/src/mcp/types.js	1985-10-26 17:15:00.000000000 +0900
++++ /home/ubuntu/.volta/tools/image/packages/@steipete/oracle/lib/node_modules/@steipete/oracle/dist/src/mcp/types.js	2026-07-03 20:11:42.489933277 +0900
+@@ -31,6 +31,7 @@
+     outputPath: z.string().optional(),
+     dryRun: z.boolean().optional(),
+     search: z.boolean().optional(),
++    maxOutput: z.number().int().positive().optional(),
+     slug: z.string().optional(),
+ })
+     .strict();
+diff -ru package/dist/src/mcp/utils.js /home/ubuntu/.volta/tools/image/packages/@steipete/oracle/lib/node_modules/@steipete/oracle/dist/src/mcp/utils.js
+--- package/dist/src/mcp/utils.js	1985-10-26 17:15:00.000000000 +0900
++++ /home/ubuntu/.volta/tools/image/packages/@steipete/oracle/lib/node_modules/@steipete/oracle/dist/src/mcp/utils.js	2026-07-03 20:12:07.101848565 +0900
+@@ -74,7 +74,7 @@
+     throw new Error(`MCP "${field}" must resolve under the generated output directory (${root}); got "${realTarget}". ` +
+         `Use a path under that directory, or set ${ALLOW_EXTERNAL_OUTPUT_ENV}=1 to allow external output paths.`);
+ }
+-export function mapConsultToRunOptions({ prompt, files, model, models, engine, search, browserAttachments, browserBundleFiles, browserBundleFormat, browserFollowUps, generateImage, outputPath, userConfig, env = process.env, }) {
++export function mapConsultToRunOptions({ prompt, files, model, models, engine, search, maxOutput, browserAttachments, browserBundleFiles, browserBundleFormat, browserFollowUps, generateImage, outputPath, userConfig, env = process.env, }) {
+     // Normalize CLI-style inputs through the shared resolver so config/env defaults apply,
+     // then overlay MCP-only overrides such as explicit search toggles.
+     const mergedModels = Array.isArray(models) && models.length > 0
+@@ -92,6 +92,9 @@
+     if (typeof search === "boolean") {
+         result.runOptions.search = search;
+     }
++    if (typeof maxOutput === "number" && Number.isFinite(maxOutput) && maxOutput > 0) {
++        result.runOptions.maxOutput = Math.floor(maxOutput);
++    }
+     if (browserAttachments) {
+         result.runOptions.browserAttachments = browserAttachments;
+     }
+diff -ru package/dist/src/oracle/run.js /home/ubuntu/.volta/tools/image/packages/@steipete/oracle/lib/node_modules/@steipete/oracle/dist/src/oracle/run.js
+--- package/dist/src/oracle/run.js	1985-10-26 17:15:00.000000000 +0900
++++ /home/ubuntu/.volta/tools/image/packages/@steipete/oracle/lib/node_modules/@steipete/oracle/dist/src/oracle/run.js	2026-07-04 06:47:46.019240355 +0900
+@@ -33,6 +33,18 @@
+ // Default timeout for non-pro API runs (fast models) — give them up to 120s.
+ const DEFAULT_TIMEOUT_NON_PRO_MS = 120_000;
+ const DEFAULT_TIMEOUT_PRO_MS = 60 * 60 * 1000;
++// TPM-aware output clamp (local patch): keep estimated input + max_output_tokens
++// within the org's tokens-per-minute quota so requests are never dead-on-arrival.
++const TPM_SAFETY_MARGIN_TOKENS = 2000;
++const MIN_TPM_OUTPUT_TOKENS = 4000;
++function parsePositiveIntEnv(name) {
++    const raw = process.env[name]?.trim();
++    if (!raw) {
++        return undefined;
++    }
++    const value = Number.parseInt(raw, 10);
++    return Number.isFinite(value) && value > 0 ? value : undefined;
++}
+ const defaultWait = (ms) => new Promise((resolve) => {
+     setTimeout(resolve, ms);
+ });
+@@ -143,7 +155,13 @@
+         fsModule,
+         maxFileSizeBytes: options.maxFileSizeBytes,
+     });
+-    const searchEnabled = options.search !== false;
++    // LOCAL PATCH (2026-07-04, docs/oracle_mcp.md): ORACLE_DEFAULT_SEARCH=off で
++    // search を opt-in 化する。gpt-5.5-pro + TPM 50k の org では、search の多段
++    // ラウンドが同一 1分窓に admission 予約を積み上げて 429 → background ジョブ
++    // 即死する (18連敗の根本原因)。search が要る時は明示的に search:true を渡す。
++    const searchEnabled = process.env.ORACLE_DEFAULT_SEARCH === "off"
++        ? options.search === true
++        : options.search !== false;
+     logVerbose(`cwd: ${cwd}`);
+     let pendingNoFilesTip = null;
+     let pendingShortPromptTip = null;
+@@ -205,7 +223,7 @@
+         systemPrompt,
+         userPrompt: promptWithFiles,
+         searchEnabled,
+-        maxOutputTokens: options.maxOutput,
++        maxOutputTokens: options.maxOutput ?? parsePositiveIntEnv("ORACLE_MAX_OUTPUT_TOKENS"),
+         background: useBackground,
+         // Storing makes follow-ups possible (Responses API chaining relies on stored response state).
+         storeResponse: useBackground || Boolean(options.previousResponseId),
+@@ -213,6 +231,23 @@
+     });
+     requestBody.model = effectiveModelId;
+     const estimatedInputTokens = estimateRequestTokens(requestBody, modelConfig);
++    // OpenAI's rate limiter reserves estimated input + max_output_tokens (or the model's
++    // full output limit when unset) against the org TPM quota. On low-TPM orgs an unset
++    // max_output_tokens makes pro-model requests exceed the quota outright, and the
++    // background queue then keeps the reservation alive, starving later requests too.
++    // When ORACLE_TPM_LIMIT is set, always send an explicit max_output_tokens that fits.
++    const tpmLimit = parsePositiveIntEnv("ORACLE_TPM_LIMIT");
++    if (tpmLimit) {
++        const outputBudget = tpmLimit - estimatedInputTokens - TPM_SAFETY_MARGIN_TOKENS;
++        if (outputBudget < MIN_TPM_OUTPUT_TOKENS) {
++            throw new PromptValidationError(`Estimated input (${estimatedInputTokens.toLocaleString()} tokens) leaves fewer than ${MIN_TPM_OUTPUT_TOKENS.toLocaleString()} output tokens under ORACLE_TPM_LIMIT=${tpmLimit.toLocaleString()}. Trim the prompt/files or raise ORACLE_TPM_LIMIT.`, { estimatedInputTokens, tpmLimit });
++        }
++        const requestedOutput = requestBody.max_output_tokens;
++        if (requestedOutput === undefined || requestedOutput > outputBudget) {
++            requestBody.max_output_tokens = outputBudget;
++            log(dim(`max_output_tokens ${requestedOutput === undefined ? "set" : `clamped from ${requestedOutput.toLocaleString()}`} to ${outputBudget.toLocaleString()} to fit ORACLE_TPM_LIMIT=${tpmLimit.toLocaleString()}.`));
++        }
++    }
+     const tokenLabel = formatTokenEstimate(estimatedInputTokens, (text) => richTty ? chalk.green(text) : text);
+     const fileLabel = richTty ? chalk.magenta(fileCount.toString()) : fileCount.toString();
+     const filesPhrase = fileCount === 0 ? "no files" : `${fileLabel} files`;
+diff -ru package/dist/src/sessionManager.js /home/ubuntu/.volta/tools/image/packages/@steipete/oracle/lib/node_modules/@steipete/oracle/dist/src/sessionManager.js
+--- package/dist/src/sessionManager.js	1985-10-26 17:15:00.000000000 +0900
++++ /home/ubuntu/.volta/tools/image/packages/@steipete/oracle/lib/node_modules/@steipete/oracle/dist/src/sessionManager.js	2026-07-03 20:12:23.924790669 +0900
+@@ -38,12 +38,9 @@
+     return slug.split("-").filter(Boolean).length;
+ }
+ function normalizeCustomSlug(candidate) {
+-    const slug = slugify(candidate, MAX_SLUG_WORDS);
+-    const wordCount = countSlugWords(slug);
+-    if (wordCount < MIN_CUSTOM_SLUG_WORDS || wordCount > MAX_SLUG_WORDS) {
+-        throw new Error(`Custom slug must include between ${MIN_CUSTOM_SLUG_WORDS} and ${MAX_SLUG_WORDS} words.`);
+-    }
+-    return slug;
++    // Local patch: accept any word count. slugify() already trims to MAX_SLUG_WORDS
++    // and falls back to DEFAULT_SLUG; rejecting short slugs only breaks MCP callers.
++    return slugify(candidate, MAX_SLUG_WORDS);
+ }
+ export function createSessionId(prompt, customSlug) {
+     if (customSlug) {
