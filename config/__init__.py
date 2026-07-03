@@ -376,27 +376,22 @@ MAX_FINAL_EMPTY_NUDGES = int(os.environ.get("MAX_FINAL_EMPTY_NUDGES", "1"))
 MAX_PAUSE_TURN_CONTINUES = int(os.environ.get("MAX_PAUSE_TURN_CONTINUES", "5"))
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths — split into config/paths.py (P5-c); re-exported for compatibility
 # ---------------------------------------------------------------------------
-BOT_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_DIR = os.path.join(BOT_DIR, ".state")
-HISTORY_DIR = os.path.join(STATE_DIR, "history")
-SESSIONS_PATH = os.path.join(STATE_DIR, "sessions.json")
-# Single source of truth for the session freshness window (機能2, 2026-06-17).
-# Previously split: claude_sdk.py read SESSION_TTL_S from env defaulting to 6h
-# (CLI legacy), while claude_api/session_store.py hard-coded 30m — so an env
-# override moved one but not the other. Both now import this. 60m (raised from
-# 30m on 2026-06-22, haroin) so a short break — lunch, a meeting — doesn't cold-
-# reset the session and re-fetch Mem0. This is the resume / Mem0-refetch-skip
-# window only; it does NOT change the replayed-tail size or per-turn token cost.
-SESSION_TTL_S = int(os.environ.get("SESSION_TTL_S", str(60 * 60)))
-# Where runtime_state.py persists in-memory state across restarts (機能2).
-RUNTIME_STATE_PATH = os.path.join(STATE_DIR, "runtime_state.json")
-# invest_kb (Phase A, 2026-06-17): LanceDB side-store for neutral investment
-# knowledge (EDINET narrative / CFA RPC markdown / hayatoito philosophy etc).
-# Separate from Mem0 because Mem0's 120-char fact compression discards
-# long-form documentary text.
-INVEST_KB_PATH = os.path.join(STATE_DIR, "invest_kb")
+from config.paths import (  # noqa: F401,E402
+    ATTACHMENT_DIR,
+    BOT_DIR,
+    CREDENTIALS_PATH,
+    HISTORY_DIR,
+    INVEST_KB_PATH,
+    RUNTIME_STATE_PATH,
+    SESSION_TTL_S,
+    SESSIONS_PATH,
+    SETTINGS_PATH,
+    STATE_DIR,
+    _ensure_mode_700,
+)
+
 INVEST_KB_ENABLED = os.environ.get("INVEST_KB_ENABLED", "1") not in ("0", "false", "False", "")
 INVEST_KB_LIMIT = int(os.environ.get("INVEST_KB_LIMIT", "3"))
 # auto | always | off — gate that decides whether to fire Haiku rewrite/HyDE/
@@ -409,20 +404,6 @@ INVEST_KB_QUERY_GATE = os.environ.get("INVEST_KB_QUERY_GATE", "auto")
 # so the noise band 0.30-0.36 (embedding fakehits on unrelated words) can be
 # cut more aggressively. Set to 0.0 to disable.
 INVEST_KB_MIN_SCORE = float(os.environ.get("INVEST_KB_MIN_SCORE", "0.45"))
-SETTINGS_PATH = os.path.join(BOT_DIR, ".claude", "settings.json")
-CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
-ATTACHMENT_DIR = os.path.join(tempfile.gettempdir(), "discord_bot_attachments")
-
-def _ensure_mode_700(path: str) -> None:
-    os.makedirs(path, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(path, 0o700)
-    except OSError:
-        pass
-
-_ensure_mode_700(STATE_DIR)
-_ensure_mode_700(HISTORY_DIR)
-_ensure_mode_700(ATTACHMENT_DIR)
 
 # ---------------------------------------------------------------------------
 # Limits (free-code: constants/limits)
