@@ -177,9 +177,7 @@ def _isolate_bot_state(monkeypatch):
     _restore_real_mem0_service()
     bot = _ensure_bot_module()
 
-    bot.cooldowns.clear()
     bot._channel_semas.clear()
-    bot._daily_quota.clear()
     monkeypatch.setattr("bot.ADMIN_USER_IDS", {ADMIN_ID})
     monkeypatch.setattr("bot.BOT_KEYWORDS", ["かなえ"])
     monkeypatch.setattr("bot.BOT_ROLE_IDS", set())
