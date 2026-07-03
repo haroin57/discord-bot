@@ -583,8 +583,17 @@ async def add_memories(
                 log.debug("Mem0(legacy) previews: %s", previews)
         return result
     except Exception as exc:
-        log.warning("Mem0 add error: %s", exc)
-        return None
+        # Surface the reason to callers (MCP server / /remember): the old
+        # bare None made every failure look identical and pointed users at
+        # "server logs" that a stdio MCP child never gets captured from
+        # (2026-07-04 incident: three adds failed invisibly around a bot
+        # restart and the WARNING below vanished into a dropped stderr).
+        log.warning("Mem0 add error: %s", exc, exc_info=True)
+        return {
+            "error": f"{type(exc).__name__}: {exc}",
+            "results": [], "kept": 0,
+            "skipped": {"low_importance": 0, "other_speaker": 0, "near_dup": 0},
+        }
 
 
 async def _archive_outdated_facts(mem, archive: list[tuple[str, str]]) -> int:

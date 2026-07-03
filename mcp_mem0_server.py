@@ -195,7 +195,9 @@ async def add(
     msgs.append({"role": "assistant", "content": assistant_message})
     result = await add_memories(msgs, user_id=user_id)
     if not result:
-        return "(mem0 add failed — see server logs)"
+        return "(mem0 add failed — pipeline unavailable, e.g. ChromaDB down or init cooldown)"
+    if isinstance(result, dict) and result.get("error"):
+        return f"(mem0 add failed: {result['error']})"
     count = len(result.get("results", [])) if isinstance(result, dict) else 0
     return f"stored {count} new memories for user={user_id}"
 

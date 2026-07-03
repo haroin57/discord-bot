@@ -92,6 +92,11 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
         if not result:
             await interaction.followup.send("記憶システムが利用できませんでした", ephemeral=True)
             return
+        if result.get("error"):
+            await interaction.followup.send(
+                f"記憶に失敗しました: {result['error']}", ephemeral=True,
+            )
+            return
         kept = result.get("kept", 0)
         if kept > 0:
             await interaction.followup.send(f"✅ {kept}件を記憶しました", ephemeral=True)

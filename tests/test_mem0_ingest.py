@@ -422,7 +422,11 @@ class TestEdgeCases:
 
     @pytest.mark.asyncio
     async def test_ensure_valid_token_exception_returns_none(self, mem_mock):
-        """If ensure_valid_token raises, the outer except returns None."""
+        """If ensure_valid_token raises, the outer except surfaces the error.
+
+        (2026-07-04: was `return None`, which made every failure invisible
+        through the MCP server — now the reason rides in an ``error`` key.)
+        """
         with (
             patch("services.mem0.ingest._get_mem0", return_value=mem_mock),
             patch("services.mem0.ingest._refresh_mem0_client_token"),
@@ -431,7 +435,8 @@ class TestEdgeCases:
             from services.mem0.ingest import add_memories
             result = await add_memories(user_text="test", user_id=USER_ID)
 
-        assert result is None
+        assert result["error"] == "RuntimeError: token fail"
+        assert result["kept"] == 0
 
     @pytest.mark.asyncio
     async def test_caller_metadata_allowed_keys_merged(self, patch_deps):
