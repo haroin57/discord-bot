@@ -758,32 +758,15 @@ def _merge_core_first(
     return core + main[:keep_main] + bundle
 
 
-async def search_memories_smart(
-    query: str, user_id: str, limit: int = 5,
-    rewrite: bool = True, rerank: bool = True,
-    include_core: bool = False,
-    current_channel_id: str | None = None,
-) -> list[dict]:
-    """Query-rewriting + re-ranking enhanced search.
+async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[str]:
+    """Phase A-1/B-1: build the multi-query set from one user query.
 
-    Behavior:
-      1. Expand the query into canonical / alias forms via the entity graph
-         (e.g. "クラナド" → ["CLANNAD"]). Catches cross-language hits.
-      2. Rewrite into ~3-5 canonical-keyword variants via Haiku (semantic).
-      3. Run search_memories_multi over [original + alias forms + variants].
-      4. Re-rank the merged top-20 by LLM-judged relevance, return top-`limit`.
-
-    Both ``rewrite`` and ``rerank`` can be disabled for plain search.
-    ``include_core=True`` merges the always-inject core facts (imp=5,
-    tier Live/Hot) at the head of the result, within the same ``limit``.
+    Layers, cheapest first: entity-graph alias expansion (sqlite lookup),
+    morphological content-word variant (Janome, no LLM), then — only when
+    ``rewrite`` — the Haiku trio (canonical-keyword rewrite, HyDE fact
+    paraphrase, LLM keyword extraction) run in parallel. Downstream merge
+    dedupes, so redundancy between layers is harmless.
     """
-    # core memory はクエリ検索と独立なので並行に走らせる（TTL cache 命中時は即返る）。
-    core_task = (
-        asyncio.create_task(
-            get_core_memories(user_id, current_channel_id=current_channel_id)
-        )
-        if include_core else None
-    )
     queries = [query]
     # Graph-based alias expansion runs even when LLM rewrite is disabled
     # — it's a cheap sqlite lookup, no extra Anthropic round-trip.
@@ -796,29 +779,18 @@ async def search_memories_smart(
         for a in alias_variants:
             if a not in queries:
                 queries.append(a)
-    # Phase A-1 follow-up: morphological content-word variant. ~ms-level
-    # cost, no LLM. Helps vector embedding too: "上伊那ぼたんで誰が一番
-    # 好き？" → "上伊那 ぼたん 一番 好き" weights the proper nouns rather
-    # than letting stop-particles (の は で が) drag the vector toward
-    # the question-form centroid.
+    # Morphological variant: "上伊那ぼたんで誰が一番好き？" → "上伊那 ぼたん
+    # 一番 好き" weights the proper nouns rather than letting stop-particles
+    # drag the vector toward the question-form centroid.
     morpho_variant = _expand_query_via_morpho(query)
     if morpho_variant and morpho_variant not in queries:
         log.info("morpho_expand: %r → %r", (query or "")[:60], morpho_variant)
         queries.append(morpho_variant)
     if rewrite:
-        # Phase B-1 + A-1 follow-up: run rewrite + HyDE + LLM keyword
-        # extraction in parallel.
-        #   - rewrite: canonical-label variants (toeic-prep / rust-async)
-        #   - HyDE: a fact-shaped paraphrase ("先輩は砺波いぶきが好き")
-        #   - llm_keywords: content-word extraction that respects new
-        #     proper nouns Janome doesn't know about ("砺波いぶき" intact)
-        # All three feed into the multi-query merge; the layers below
-        # dedupe and rerank so any redundancy is harmless.
-        variants_task = _rewrite_query(query)
-        hyde_task = _generate_hypothetical_fact(query)
-        llm_kw_task = _extract_keywords_via_llm(query)
         variants, hyde, llm_keywords = await asyncio.gather(
-            variants_task, hyde_task, llm_kw_task,
+            _rewrite_query(query),
+            _generate_hypothetical_fact(query),
+            _extract_keywords_via_llm(query),
         )
         for v in variants:
             if v and v not in queries:
@@ -832,6 +804,107 @@ async def search_memories_smart(
                 (query or "")[:60], llm_keywords[:120],
             )
             queries.append(llm_keywords)
+    return queries
+
+
+async def _expand_episode_bundle(
+    reranked: list[dict], user_id: str, current_channel_id: "str | None",
+) -> int:
+    """Phase C-3: append sibling facts from the top-1 hit's episode.
+
+    Mutates ``reranked`` in place and returns how many facts were appended.
+    Non-fatal on every failure path (fail-open, returns 0).
+    """
+    try:
+        from config import MEM0_EPISODE_BUNDLE_ENABLED, MEM0_EPISODE_BUNDLE_LIMIT
+    except Exception:
+        MEM0_EPISODE_BUNDLE_ENABLED, MEM0_EPISODE_BUNDLE_LIMIT = True, 5
+    if not (MEM0_EPISODE_BUNDLE_ENABLED and reranked):
+        return 0
+    try:
+        top_md = reranked[0].get("metadata") or {}
+        top_episode = top_md.get("episode_id")
+        if not top_episode:
+            return 0
+        bundle = await get_episode_facts(top_episode, user_id, limit=15)
+        seen = {r.get("id") for r in reranked if r.get("id")}
+        # Phase R: bundle 経路は search_memories の validity フィルタを
+        # 通らないので、ここで archived / 他会話 scope を落とす
+        # （bundle 経由の誤注入・archived 復活を防ぐ）。
+        extras = [
+            r for r in bundle
+            if r.get("id") and r.get("id") not in seen
+            and _is_fact_valid(r, current_channel_id)
+        ]
+        if not extras:
+            return 0
+        # Tag them so downstream prompt builders can render the bundle
+        # hint differently if desired.
+        for e in extras:
+            e["_episode_bundle"] = True
+            if e.get("score") is None:
+                e["score"] = 0.85
+        keep = extras[: max(int(MEM0_EPISODE_BUNDLE_LIMIT), 0)]
+        reranked.extend(keep)
+        log.info("episode_bundle: +%d facts from %s", len(keep), top_episode)
+        return len(keep)
+    except Exception as exc:
+        log.warning("episode_bundle expansion failed (non-fatal): %s", exc)
+        return 0
+
+
+def _log_smart_metrics(
+    query: str, candidates: list[dict], kept: int, bundle_added: int, *, rerank: bool,
+) -> None:
+    """Phase B-3: one-line metric so a week of journalctl reduces to
+    hit-rate stats with grep. Keys are positional for a simple regex."""
+    if rerank:
+        try:
+            from config import MEM0_HYBRID_ENABLED as _hyb
+            from config import MEM0_HYDE_ENABLED as _hyde
+        except Exception:
+            _hyb = _hyde = False
+        log.info(
+            "[MEM0_METRICS query_len=%d candidates=%d kept=%d bundle=%d "
+            "hybrid=%s hyde=%s rerank=on]",
+            len(query or ""), len(candidates), kept, bundle_added,
+            bool(_hyb), bool(_hyde),
+        )
+    else:
+        log.info(
+            "[MEM0_METRICS query_len=%d candidates=%d kept=%d "
+            "hybrid=plain hyde=off rerank=off]",
+            len(query or ""), len(candidates), kept,
+        )
+
+
+async def search_memories_smart(
+    query: str, user_id: str, limit: int = 5,
+    rewrite: bool = True, rerank: bool = True,
+    include_core: bool = False,
+    current_channel_id: str | None = None,
+) -> list[dict]:
+    """Query-rewriting + re-ranking enhanced search.
+
+    Orchestration only — each phase lives in its own helper (P5-a):
+      1. _expand_queries: graph alias + morpho + Haiku trio variants.
+      2. _search_multi_hybrid over the expanded query set.
+      3. _graph_expand_candidates: 1-hop entity sibling rescue.
+      4. rerank path: _rerank_memories + _expand_episode_bundle;
+         plain path: _apply_reinforcement_boost + distance gate.
+
+    Both ``rewrite`` and ``rerank`` can be disabled for plain search.
+    ``include_core=True`` merges the always-inject core facts (imp=5,
+    tier Live/Hot) at the head of the result, within the same ``limit``.
+    """
+    # core memory はクエリ検索と独立なので並行に走らせる（TTL cache 命中時は即返る）。
+    core_task = (
+        asyncio.create_task(
+            get_core_memories(user_id, current_channel_id=current_channel_id)
+        )
+        if include_core else None
+    )
+    queries = await _expand_queries(query, user_id, rewrite=rewrite)
     # Phase A-1: hybrid retrieval (vector + BM25 RRF fusion). Falls back to
     # vector-only when MEM0_HYBRID_ENABLED=false. Same return shape as
     # search_memories_multi, so the downstream rerank / graph_expand keep
@@ -864,60 +937,11 @@ async def search_memories_smart(
         # (incident 2026-05-19, ADR-0002). Plain-path callers below get a
         # loose sanity gate instead, since no LLM judge ran there.
         reranked = await _rerank_memories(query, candidates, top_k=limit)
-        # Phase C-3: episode bundle expansion. If the top-1 hit carries an
-        # episode_id, surface a handful of sibling facts from the same
-        # episode so the LLM gets the full topical context instead of one
-        # isolated fact. Cap at MEM0_EPISODE_BUNDLE_LIMIT so we don't
-        # blow MAX_PROMPT_CHARS.
-        bundle_added = 0
-        try:
-            from config import MEM0_EPISODE_BUNDLE_ENABLED, MEM0_EPISODE_BUNDLE_LIMIT
-        except Exception:
-            MEM0_EPISODE_BUNDLE_ENABLED, MEM0_EPISODE_BUNDLE_LIMIT = True, 5
-        if MEM0_EPISODE_BUNDLE_ENABLED and reranked:
-            try:
-                top_md = reranked[0].get("metadata") or {}
-                top_episode = top_md.get("episode_id")
-                if top_episode:
-                    bundle = await get_episode_facts(top_episode, user_id, limit=15)
-                    seen = {r.get("id") for r in reranked if r.get("id")}
-                    # Phase R: bundle 経路は search_memories の validity フィルタを
-                    # 通らないので、ここで archived / 他会話 scope を落とす
-                    # （bundle 経由の誤注入・archived 復活を防ぐ）。
-                    extras = [
-                        r for r in bundle
-                        if r.get("id") and r.get("id") not in seen
-                        and _is_fact_valid(r, current_channel_id)
-                    ]
-                    if extras:
-                        # Tag them so downstream prompt builders can render
-                        # the bundle hint differently if desired.
-                        for e in extras:
-                            e["_episode_bundle"] = True
-                            if e.get("score") is None:
-                                e["score"] = 0.85
-                        keep = extras[: max(int(MEM0_EPISODE_BUNDLE_LIMIT), 0)]
-                        bundle_added = len(keep)
-                        reranked.extend(keep)
-                        log.info(
-                            "episode_bundle: +%d facts from %s",
-                            bundle_added, top_episode,
-                        )
-            except Exception as exc:
-                log.warning("episode_bundle expansion failed (non-fatal): %s", exc)
-        # Phase B-3: one-line metric so a week of journalctl can be reduced
-        # to hit-rate stats with grep. Keys are positional so the regex
-        # downstream stays simple.
-        try:
-            from config import MEM0_HYBRID_ENABLED as _hyb
-            from config import MEM0_HYDE_ENABLED as _hyde
-        except Exception:
-            _hyb = _hyde = False
-        log.info(
-            "[MEM0_METRICS query_len=%d candidates=%d kept=%d bundle=%d "
-            "hybrid=%s hyde=%s rerank=on]",
-            len(query or ""), len(candidates), len(reranked), bundle_added,
-            bool(_hyb), bool(_hyde),
+        bundle_added = await _expand_episode_bundle(
+            reranked, user_id, current_channel_id,
+        )
+        _log_smart_metrics(
+            query, candidates, len(reranked), bundle_added, rerank=True,
         )
         if core_task is not None:
             reranked = _merge_core_first(await core_task, reranked, limit)
@@ -934,11 +958,7 @@ async def search_memories_smart(
         if r.get("score") is None
         or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
     ]
-    log.info(
-        "[MEM0_METRICS query_len=%d candidates=%d kept=%d "
-        "hybrid=plain hyde=off rerank=off]",
-        len(query or ""), len(candidates), len(filtered),
-    )
+    _log_smart_metrics(query, candidates, len(filtered), 0, rerank=False)
     if core_task is not None:
         filtered = _merge_core_first(await core_task, filtered, limit)
     return filtered
