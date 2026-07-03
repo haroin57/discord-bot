@@ -153,3 +153,49 @@ discord-bot の journal のうち WARNING 以上を haroin サーバーの
   WAF に 403 で弾かれる。`User-Agent: kanae-journal-forward/1.0` を明示すること
 - **残項目**: Worker 自体の死の検知は Cloudflare ダッシュボードの Workers アラート
   設定 or 外部 SaaS（UptimeRobot 等）を追加すること（監視の監視）
+
+## Cloudflareオフロード実装状況（Phase 0-2, 2026-07-04）
+
+計画: docs/2026-07-04-radical-cloudflare-outsourcing-plan.md
+
+### 完了
+- Phase 0 止血: mcp-brave-search / kanae-scheduler / mcp-chrome-devtools
+  (一度も動いたことがないゾンビと判明) 停止、kanae_daily cron 削除、
+  **backup_mem0.sh の毎日 bot 停止 cron 廃止** (R2 restore test 合格後)、
+  MEM0_HISTORY_EMBED_ENABLED=0
+- Phase 1: web_api/vscode_sync/music_analyzer/kanae-daily 削除 (/health は
+  services/health_server.py へ移設)、Chroma ダイエット (41,493→15,021 vectors、
+  recall 回帰 30/30 合格、cgroup 400M)、.state 2.4GB→299MB、死蔵22本掃除
+- Phase 1.5: 共有 MCP 4本 (:8013 mem0 / :8014 second-opinion / :8015 oracle /
+  :8016 x-scraper)。unit は infra/systemd/mcp-*-shared.service
+- Phase 2: kanae-notify Worker (通知プロキシ)、kanae-vi-signal +
+  kanae-intervention Worker (**シャドーモード DRY_RUN=1 で cron 稼働中**)
+
+### vi/intervention の本番切替手順 (シャドー検証後)
+1. 数日間、Worker の KV 記録 (`curl https://kanae-vi-signal.haroin57.workers.dev/` 等)
+   とローカル scheduler の判定を突き合わせる
+2. **vi-signal は切替前に要判断**: Worker 版はデータソースが日経VI→VIX に変わって
+   いる (Workers から indexes.nikkei.co.jp が不安定なため)。閾値 >=30 の意味が
+   変わるので、VIX 用に閾値を再調整するか日経VI の代替取得を実装するまで
+   ローカル版を止めないこと
+3. 切替: 通知先 webhook を作成 → `wrangler secret put WEBHOOK_VI_SIGNAL` (kanae-notify)
+   → 各 Worker に `wrangler secret put NOTIFY_URL` (= https://kanae-notify.haroin57.workers.dev)
+   → DRY_RUN=0 に → ローカル vi-signal / intervention-scheduler unit を disable
+4. ロールバック: DRY_RUN=1 に戻してローカル unit を re-enable
+
+### ブロック中 (要オーナー操作)
+- **Browser Rendering 置換 (Phase 2-1)**: 既存 cfut_ トークンに Browser Rendering
+  スコープが無い (全エンドポイント 401 を実測確認)。ダッシュボードで
+  「Account → Browser Rendering: Edit」権限のトークンを発行し、.env に
+  `CF_BROWSER_RENDERING_TOKEN=` として追加すれば再開可能。それまで
+  ローカル Puppeteer (browser_pool.py) が唯一の描画経路なので削除禁止
+
+### Workers 一覧 (ソース: ~/archives/cloudflare-workers-src-20260704/)
+| Worker | 役割 | 状態 |
+|---|---|---|
+| kanae-health-probe | 外形監視 (毎分) + リソース閾値 | 本番 |
+| kanae-mcp-brave | brave-search MCP (bot + Claude Code 共用) | 本番 |
+| kanae-notify | 通知プロキシ (X-Notify-Auth) | 本番 (health target のみ配線) |
+| kanae-vi-signal | 日次シグナル (0 9 * * 1-5 UTC) | シャドー |
+| kanae-intervention | 介入スコア (*/30) | シャドー |
+| kanae-egress-poc | egress 検証用 | 削除可 |
