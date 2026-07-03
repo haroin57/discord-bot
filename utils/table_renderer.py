@@ -1,8 +1,9 @@
-"""Render Markdown tables as PNG images using Puppeteer.
+"""Render Markdown tables as PNG images via Cloudflare Browser Rendering.
 
-Uses the puppeteer installation bundled with mermaid-cli (mmdc).
-Renders HTML tables with a Discord-style dark theme and captures
-a tight screenshot around the table element.
+Phase 2-1: the local Puppeteer daemon was replaced by the Cloudflare Browser
+Rendering REST screenshot API (utils/cf_browser.py). Renders HTML tables with a
+Discord-style dark theme and clips a tight screenshot around the table element
+(top-level ``selector``), so the output is the table box, not a full page.
 """
 
 import hashlib
@@ -11,7 +12,7 @@ import os
 
 import markdown
 
-from utils.browser_pool import render_with_browser_daemon
+from utils.cf_browser import render_screenshot
 
 __all__ = ["render_table_image"]
 
@@ -124,7 +125,7 @@ async def render_table_image(
     # PNGs that may have contained injected HTML are not served after the
     # bleach allowlist + caption escape was added. Bump _TEMPLATE_VERSION on
     # every sanitizer / template change.
-    _TEMPLATE_VERSION = "2"  # bumped when bleach + html.escape were added
+    _TEMPLATE_VERSION = "3"  # bumped: Puppeteer daemon -> Cloudflare Browser Rendering
     cache_key = f"v{_TEMPLATE_VERSION}:{md_table}:{caption}"
     table_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
     out_path = os.path.join(output_dir, f"table_{table_hash}.png")
@@ -146,22 +147,25 @@ async def render_table_image(
         table_html=table_html,
     )
 
+    # Keep the .html on disk for debugging/parity; the remote browser renders
+    # from the inlined string (it cannot see local files).
     html_path = os.path.join(output_dir, f"table_{table_hash}.html")
     with open(html_path, "w") as f:
         f.write(full_html)
 
+    # Clip to the table container so the PNG is the table box (not a full page).
+    # Tables use only local fonts + inline CSS, so no network wait is needed.
+    png_bytes = await render_screenshot(
+        full_html,
+        selector=".table-container",
+    )
+    if not png_bytes:
+        log.warning("Table render failed (Browser Rendering returned no image)")
+        return None
     try:
-        await render_with_browser_daemon(
-            html_path=html_path,
-            output_path=out_path,
-            selector=".table-container",
-            pad=20,
-            viewport={"width": 1400, "height": 900},
-        )
-        return out_path if os.path.isfile(out_path) else None
-    except TimeoutError:
-        log.error("Table render timed out")
+        with open(out_path, "wb") as f:
+            f.write(png_bytes)
+    except OSError as e:
+        log.error("Failed to write table PNG: %s", e)
         return None
-    except Exception as e:
-        log.error("Table render failed: %s", e)
-        return None
+    return out_path if os.path.isfile(out_path) else None

@@ -473,6 +473,45 @@ CLAUDE_MAX_PARALLEL = int(os.environ.get("CLAUDE_MAX_PARALLEL", "2"))
 RESTRICTED_CLAUDE_MAX_PARALLEL = int(os.environ.get("RESTRICTED_CLAUDE_MAX_PARALLEL", "1"))
 
 # ---------------------------------------------------------------------------
+# Cloudflare Browser Rendering (Phase 2-1 — replaces local Puppeteer for the
+# table / math renderers). The REST screenshot endpoint takes an HTML string
+# and returns PNG bytes directly, so the VPS no longer spawns Chromium for
+# table/math images. (mermaid stays on the local mmdc path — the LLM invokes
+# it from Bash and it does not go through these renderers.)
+#
+# CF_BROWSER_RENDERING_TOKEN is an API token with the Browser Rendering scope;
+# it lives in .env, never hard-coded here. CF_ACCOUNT_ID is the account that
+# owns the Browser Rendering binding. Both are required for remote rendering;
+# if the token is empty the renderers degrade to None (text fallback), same as
+# the old "KaTeX/daemon unavailable" path.
+# ---------------------------------------------------------------------------
+CF_BROWSER_RENDERING_TOKEN = os.environ.get("CF_BROWSER_RENDERING_TOKEN", "")
+CF_ACCOUNT_ID = os.environ.get(
+    "CF_ACCOUNT_ID", "8574821c4ec0b24f61d59c5a15dc31f4"
+)
+CF_BROWSER_RENDERING_URL = (
+    "https://api.cloudflare.com/client/v4/accounts/"
+    f"{CF_ACCOUNT_ID}/browser-rendering/screenshot"
+)
+# aiohttp total timeout for one screenshot call, plus one retry on transient
+# failure (network / 5xx / 429). Final failure returns None (text fallback).
+CF_BROWSER_RENDERING_TIMEOUT_S = float(
+    os.environ.get("CF_BROWSER_RENDERING_TIMEOUT_S", "30")
+)
+CF_BROWSER_RENDERING_RETRIES = int(
+    os.environ.get("CF_BROWSER_RENDERING_RETRIES", "1")
+)
+# KaTeX is loaded from a pinned jsDelivr CDN inside the remote browser (the old
+# file:// bundle is invisible to Cloudflare's browser). Pin a 0.16.x patch that
+# matches the local install's rendering (local is 0.16.44/45; 0.16.x is
+# render-stable across patches). Override via env if the CDN pin must change.
+KATEX_CDN_VERSION = os.environ.get("KATEX_CDN_VERSION", "0.16.22")
+KATEX_CDN_BASE = os.environ.get(
+    "KATEX_CDN_BASE",
+    f"https://cdn.jsdelivr.net/npm/katex@{KATEX_CDN_VERSION}/dist",
+)
+
+# ---------------------------------------------------------------------------
 # Music Analysis (Gemini primary, OpenAI fallback)
 # ---------------------------------------------------------------------------
 GOOGLE_AI_API_KEY = os.environ.get("GOOGLE_AI_API_KEY", "")

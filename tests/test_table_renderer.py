@@ -1,4 +1,4 @@
-"""Tests for utils/table_renderer.py."""
+"""Tests for utils/table_renderer.py (Cloudflare Browser Rendering backend)."""
 
 import hashlib
 import os
@@ -10,31 +10,31 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def _expected_hash(md_table: str, caption: str = "") -> str:
-    _TEMPLATE_VERSION = "2"
+    _TEMPLATE_VERSION = "3"
     cache_key = f"v{_TEMPLATE_VERSION}:{md_table}:{caption}"
     return hashlib.md5(cache_key.encode()).hexdigest()[:12]
 
 
-async def _render(monkeypatch, tmp_path, md_table, caption="", *, raise_exc=None):
-    """Call render_table_image with browser daemon mocked out."""
+async def _render(monkeypatch, tmp_path, md_table, caption="", *, png=b"\x89PNG\r\n"):
+    """Call render_table_image with the Browser Rendering client mocked out.
+
+    ``png`` is the fake PNG bytes returned by render_screenshot; pass None to
+    simulate a failed render (client returns no image).
+    """
     import utils.table_renderer as tr
 
     monkeypatch.setattr(tr, "TABLE_OUTPUT_DIR", str(tmp_path))
 
-    rendered_files = []
+    calls = []
 
-    async def _fake_render(*, html_path, output_path, selector, pad, viewport):
-        rendered_files.append(output_path)
-        if raise_exc is not None:
-            raise raise_exc
-        # Simulate the daemon writing the PNG
-        with open(output_path, "wb") as f:
-            f.write(b"\x89PNG\r\n")
+    async def _fake_render(html, *, selector=None, **kw):
+        calls.append({"html": html, "selector": selector, **kw})
+        return png
 
-    monkeypatch.setattr(tr, "render_with_browser_daemon", _fake_render)
+    monkeypatch.setattr(tr, "render_screenshot", _fake_render)
 
     result = await tr.render_table_image(md_table, caption, output_dir=str(tmp_path))
-    return result, rendered_files
+    return result, calls
 
 
 # ---------------------------------------------------------------------------
@@ -44,10 +44,15 @@ async def _render(monkeypatch, tmp_path, md_table, caption="", *, raise_exc=None
 @pytest.mark.asyncio
 async def test_returns_png_path(monkeypatch, tmp_path):
     md = "| A | B |\n|---|---|\n| 1 | 2 |"
-    result, _ = await _render(monkeypatch, tmp_path, md)
+    result, calls = await _render(monkeypatch, tmp_path, md)
     assert result is not None
     assert result.endswith(".png")
     assert os.path.isfile(result)
+    # PNG bytes returned by the client are what got written to disk.
+    with open(result, "rb") as f:
+        assert f.read() == b"\x89PNG\r\n"
+    # Clips to the table container (tight crop, not a full page).
+    assert calls[0]["selector"] == ".table-container"
 
 
 # ---------------------------------------------------------------------------
@@ -80,52 +85,30 @@ async def test_different_captions_produce_different_hashes(monkeypatch, tmp_path
 
 
 # ---------------------------------------------------------------------------
-# Caption reflection in HTML
+# Caption reflection in HTML (passed to render_screenshot)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_caption_written_to_html(monkeypatch, tmp_path):
-    import utils.table_renderer as tr
-
-    monkeypatch.setattr(tr, "TABLE_OUTPUT_DIR", str(tmp_path))
-
-    async def _fake_render(*, html_path, output_path, **kw):
-        with open(output_path, "wb") as f:
-            f.write(b"\x89PNG")
-
-    monkeypatch.setattr(tr, "render_with_browser_daemon", _fake_render)
-
     caption = "Sales Report"
     md = "| A |\n|---|\n| 1 |"
-    await tr.render_table_image(md, caption, output_dir=str(tmp_path))
+    result, calls = await _render(monkeypatch, tmp_path, md, caption)
 
+    # The HTML handed to the remote browser carries the escaped caption...
+    assert "Sales Report" in calls[0]["html"]
+    assert 'class="caption"' in calls[0]["html"]
+    # ...and it is also persisted to disk for debugging.
     table_hash = _expected_hash(md, caption)
     html_path = tmp_path / f"table_{table_hash}.html"
     assert html_path.exists()
-    content = html_path.read_text()
-    assert "Sales Report" in content
-    assert 'class="caption"' in content
+    assert "Sales Report" in html_path.read_text()
 
 
 @pytest.mark.asyncio
 async def test_no_caption_no_caption_div(monkeypatch, tmp_path):
-    import utils.table_renderer as tr
-
-    monkeypatch.setattr(tr, "TABLE_OUTPUT_DIR", str(tmp_path))
-
-    async def _fake_render(*, html_path, output_path, **kw):
-        with open(output_path, "wb") as f:
-            f.write(b"\x89PNG")
-
-    monkeypatch.setattr(tr, "render_with_browser_daemon", _fake_render)
-
     md = "| A |\n|---|\n| 1 |"
-    await tr.render_table_image(md, output_dir=str(tmp_path))
-
-    table_hash = _expected_hash(md, "")
-    html_path = tmp_path / f"table_{table_hash}.html"
-    content = html_path.read_text()
-    assert 'class="caption"' not in content
+    _, calls = await _render(monkeypatch, tmp_path, md)
+    assert 'class="caption"' not in calls[0]["html"]
 
 
 # ---------------------------------------------------------------------------
@@ -134,29 +117,16 @@ async def test_no_caption_no_caption_div(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_caption_html_escaped(monkeypatch, tmp_path):
-    import utils.table_renderer as tr
-
-    monkeypatch.setattr(tr, "TABLE_OUTPUT_DIR", str(tmp_path))
-
-    async def _fake_render(*, html_path, output_path, **kw):
-        with open(output_path, "wb") as f:
-            f.write(b"\x89PNG")
-
-    monkeypatch.setattr(tr, "render_with_browser_daemon", _fake_render)
-
     malicious_caption = '<script>alert("xss")</script>'
     md = "| A |\n|---|\n| 1 |"
-    await tr.render_table_image(md, malicious_caption, output_dir=str(tmp_path))
-
-    table_hash = _expected_hash(md, malicious_caption)
-    html_path = tmp_path / f"table_{table_hash}.html"
-    content = html_path.read_text()
-    assert "<script>" not in content
-    assert "&lt;script&gt;" in content
+    _, calls = await _render(monkeypatch, tmp_path, md, malicious_caption)
+    html = calls[0]["html"]
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
 
 
 # ---------------------------------------------------------------------------
-# Cache hit — browser daemon NOT called again
+# Cache hit — render client NOT called again
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -166,13 +136,12 @@ async def test_cache_hit_skips_render(monkeypatch, tmp_path):
     monkeypatch.setattr(tr, "TABLE_OUTPUT_DIR", str(tmp_path))
     call_count = 0
 
-    async def _fake_render(*, html_path, output_path, **kw):
+    async def _fake_render(html, *, selector=None, **kw):
         nonlocal call_count
         call_count += 1
-        with open(output_path, "wb") as f:
-            f.write(b"\x89PNG")
+        return b"\x89PNG"
 
-    monkeypatch.setattr(tr, "render_with_browser_daemon", _fake_render)
+    monkeypatch.setattr(tr, "render_screenshot", _fake_render)
 
     md = "| A |\n|---|\n| 1 |"
     r1 = await tr.render_table_image(md, output_dir=str(tmp_path))
@@ -205,18 +174,8 @@ async def test_large_table(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_empty_string_table(monkeypatch, tmp_path):
-    """Empty md_table should not crash — returns None (daemon writes nothing)."""
-    import utils.table_renderer as tr
-
-    monkeypatch.setattr(tr, "TABLE_OUTPUT_DIR", str(tmp_path))
-
-    async def _fake_render_no_file(*, html_path, output_path, **kw):
-        # Daemon produces no file (e.g. nothing to render)
-        pass
-
-    monkeypatch.setattr(tr, "render_with_browser_daemon", _fake_render_no_file)
-
-    result = await tr.render_table_image("", output_dir=str(tmp_path))
+    """Empty md_table → client returns no image → None (no crash)."""
+    result, _ = await _render(monkeypatch, tmp_path, "", png=None)
     assert result is None
 
 
@@ -233,44 +192,16 @@ async def test_header_only_table(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_script_tag_in_cell_stripped(monkeypatch, tmp_path):
-    import utils.table_renderer as tr
-
-    monkeypatch.setattr(tr, "TABLE_OUTPUT_DIR", str(tmp_path))
-
-    async def _fake_render(*, html_path, output_path, **kw):
-        with open(output_path, "wb") as f:
-            f.write(b"\x89PNG")
-
-    monkeypatch.setattr(tr, "render_with_browser_daemon", _fake_render)
-
     md = '| A |\n|---|\n| <script>alert(1)</script> |'
-    await tr.render_table_image(md, output_dir=str(tmp_path))
-
-    table_hash = _expected_hash(md)
-    html_path = tmp_path / f"table_{table_hash}.html"
-    content = html_path.read_text()
-    assert "<script>" not in content
+    _, calls = await _render(monkeypatch, tmp_path, md)
+    assert "<script>" not in calls[0]["html"]
 
 
 @pytest.mark.asyncio
 async def test_img_onerror_stripped(monkeypatch, tmp_path):
-    import utils.table_renderer as tr
-
-    monkeypatch.setattr(tr, "TABLE_OUTPUT_DIR", str(tmp_path))
-
-    async def _fake_render(*, html_path, output_path, **kw):
-        with open(output_path, "wb") as f:
-            f.write(b"\x89PNG")
-
-    monkeypatch.setattr(tr, "render_with_browser_daemon", _fake_render)
-
     md = '| A |\n|---|\n| <img src=x onerror=alert(1)> |'
-    await tr.render_table_image(md, output_dir=str(tmp_path))
-
-    table_hash = _expected_hash(md)
-    html_path = tmp_path / f"table_{table_hash}.html"
-    content = html_path.read_text()
-    assert "onerror" not in content
+    _, calls = await _render(monkeypatch, tmp_path, md)
+    assert "onerror" not in calls[0]["html"]
 
 
 @pytest.mark.asyncio
@@ -281,20 +212,14 @@ async def test_unicode_and_japanese_in_cells(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Error handling
+# Error handling — client returns None (failure) → None result
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_timeout_error_returns_none(monkeypatch, tmp_path):
-    result, _ = await _render(monkeypatch, tmp_path, "| A |\n|---|\n| 1 |",
-                               raise_exc=TimeoutError("timed out"))
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_generic_exception_returns_none(monkeypatch, tmp_path):
-    result, _ = await _render(monkeypatch, tmp_path, "| A |\n|---|\n| 1 |",
-                               raise_exc=RuntimeError("something broke"))
+async def test_render_failure_returns_none(monkeypatch, tmp_path):
+    result, _ = await _render(
+        monkeypatch, tmp_path, "| A |\n|---|\n| 1 |", png=None
+    )
     assert result is None
 
 
@@ -303,11 +228,10 @@ async def test_output_dir_created_if_missing(monkeypatch, tmp_path):
     new_dir = tmp_path / "nested" / "output"
     import utils.table_renderer as tr
 
-    async def _fake_render(*, html_path, output_path, **kw):
-        with open(output_path, "wb") as f:
-            f.write(b"\x89PNG")
+    async def _fake_render(html, *, selector=None, **kw):
+        return b"\x89PNG"
 
-    monkeypatch.setattr(tr, "render_with_browser_daemon", _fake_render)
+    monkeypatch.setattr(tr, "render_screenshot", _fake_render)
 
     result = await tr.render_table_image(
         "| A |\n|---|\n| 1 |", output_dir=str(new_dir)
