@@ -306,6 +306,28 @@ def _resolve_session(
 from services.claude_api.client_factory import make_api_client as _make_api_client
 
 
+async def _transient_backoff(
+    attempt: int,
+    backoff: float,
+    *,
+    status_callback,
+    label: str = "再試行中",
+) -> None:
+    """User-visible countdown + sleep for one transient-retry arm (P3-a).
+
+    All three except arms of the attempt loop (AnthropicError / bare
+    httpx.RequestError / TaskGroup-wrapped ExceptionGroup) ended in this
+    exact status+sleep dance; the backoff *value* stays caller-computed
+    because the Anthropic arm merges a server retry-after into it.
+    """
+    await _safe_status(
+        status_callback,
+        f"🔄 {label} ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})"
+        f"、次は約{int(round(backoff))}秒後",
+    )
+    await asyncio.sleep(backoff)
+
+
 async def call_with_tools(
     prompt: str,
     channel_id: int,
@@ -1080,12 +1102,9 @@ async def call_with_tools(
                                     continue
                                 return _classified_error_message(category, exc), None, resumable
                             backoff = max(backoff, retry_after)
-                        await _safe_status(
-                            status_callback,
-                            f"🔄 再試行中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})"
-                            f"、次は約{int(round(backoff))}秒後",
+                        await _transient_backoff(
+                            attempt, backoff, status_callback=status_callback,
                         )
-                        await asyncio.sleep(backoff)
                     except httpx.RequestError as exc:
                         # SSE streaming 中の HTTP/2 接続切断 (GOAWAY /
                         # RemoteProtocolError / ReadError 等) が、MCP の
@@ -1104,13 +1123,10 @@ async def call_with_tools(
                         )
                         if attempt >= TRANSIENT_MAX_ATTEMPTS - 1:
                             return _error_message("overloaded"), None, resumable
-                        backoff = compute_backoff(attempt)
-                        await _safe_status(
-                            status_callback,
-                            f"🔄 接続再試行中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})"
-                            f"、次は約{int(round(backoff))}秒後",
+                        await _transient_backoff(
+                            attempt, compute_backoff(attempt),
+                            status_callback=status_callback, label="接続再試行中",
                         )
-                        await asyncio.sleep(backoff)
                     except BaseExceptionGroup as eg:
                         # SSE streaming中に httpx 層で接続が切れると
                         # (e.g. HTTP/2 GOAWAY mid-stream), anthropic SDK は
@@ -1133,13 +1149,10 @@ async def call_with_tools(
                             raise rest
                         if attempt >= TRANSIENT_MAX_ATTEMPTS - 1:
                             return _error_message("overloaded"), None, resumable
-                        backoff = compute_backoff(attempt)
-                        await _safe_status(
-                            status_callback,
-                            f"🔄 接続再試行中 ({attempt + 1}/{TRANSIENT_MAX_ATTEMPTS})"
-                            f"、次は約{int(round(backoff))}秒後",
+                        await _transient_backoff(
+                            attempt, compute_backoff(attempt),
+                            status_callback=status_callback, label="接続再試行中",
                         )
-                        await asyncio.sleep(backoff)
 
             # --- 熟考 P2/P5: deliberate tier の 検証・修正パイプライン --------
             # AsyncExitStack 内（revise の _execute_tool が pool を掴むため）。

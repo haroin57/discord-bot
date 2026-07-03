@@ -970,6 +970,66 @@ class _RescuedToolUse:
     type: str = "tool_use"
 
 
+def _build_stream_kwargs(
+    *,
+    current_model: str,
+    cached_system: "list[dict]",
+    messages: "list[dict]",
+    extra_betas,
+    output_config_override,
+    refusal_fallback_model: "str | None",
+    tools_for_api,
+    extra_headers,
+    fallback_used: bool,
+) -> dict:
+    """Assemble the per-turn ``messages.stream`` kwargs (P3-b extraction).
+
+    Body fields the CLI pairs with its betas (mitm capture 2026-05-15,
+    docs/captures/A_one_shot/): output_config + context_management ride as
+    top-level body fields.
+
+    - output_config MUST be a direct kwarg, NOT nested in extra_body: the
+      anthropic SDK 0.88.0 beta streaming path silently drops it from
+      extra_body (verified by mitmproxy — effort never reached the wire),
+      which made the server see a contradictory request and return
+      stop_reason=refusal (ADR-0009). /effort override (機能6) takes
+      precedence per request; falls through to env-driven OUTPUT_CONFIG.
+    - Server-side model fallback (ADR-0015): when a refusal fallback model
+      is in play, declare it via the ``fallbacks`` body field so the server
+      switches mid-stream on a Fable refusal — no client-side second
+      request. SDK doesn't model ``fallbacks``, so it rides extra_body.
+    """
+    max_tokens = (
+        CLAUDE_MAX_TOKENS_OPUS if "opus" in (current_model or "").lower()
+        else CLAUDE_MAX_TOKENS
+    )
+    stream_kwargs = dict(
+        model=current_model,
+        max_tokens=max_tokens,
+        system=cached_system,
+        messages=messages,
+        betas=extra_betas,
+        metadata=get_metadata(),
+        thinking=THINKING_CONFIG,
+        output_config=output_config_override or OUTPUT_CONFIG,
+        extra_body={
+            "context_management": CONTEXT_MANAGEMENT_CONFIG,
+        },
+    )
+    if SERVER_SIDE_FALLBACK_ENABLED and refusal_fallback_model:
+        stream_kwargs["extra_body"]["fallbacks"] = [
+            {"model": refusal_fallback_model}
+        ]
+    if tools_for_api:
+        stream_kwargs["tools"] = tools_for_api
+    merged_headers = dict(extra_headers or {})
+    if fallback_used:
+        merged_headers[REFUSAL_FALLBACK_HEADER] = "true"
+    if merged_headers:
+        stream_kwargs["extra_headers"] = merged_headers
+    return stream_kwargs
+
+
 async def _run_one_tool(
     block,
     *,
@@ -1397,60 +1457,17 @@ async def run_agent_loop(
         # we're in the warning zone, so we don't trip the probabilistic throttle.
         await maybe_wait_before_request()
 
-        # Body fields the CLI pairs with its betas. Re-instated 2026-05-15
-        # after a fresh mitm capture (docs/captures/A_one_shot/) showed
-        # claude-cli 2.1.92 *does* send output_config + context_management
-        # as top-level body fields — the earlier "extra_body: null"
-        # reading was a misinterpretation of the Python SDK's wire format
-        # (extra_body is the SDK's own merge slot, not the field name
-        # the server sees). Without these, effort-2025-11-24 has nowhere
-        # to read its dial from, so the model behaves as if effort were
-        # unset.
-        max_tokens = (
-            CLAUDE_MAX_TOKENS_OPUS if "opus" in (current_model or "").lower()
-            else CLAUDE_MAX_TOKENS
-        )
-        stream_kwargs = dict(
-            model=current_model,
-            max_tokens=max_tokens,
-            system=cached_system,
+        stream_kwargs = _build_stream_kwargs(
+            current_model=current_model,
+            cached_system=cached_system,
             messages=messages,
-            betas=extra_betas,
-            metadata=get_metadata(),
-            thinking=THINKING_CONFIG,
-            # output_config MUST be a direct kwarg, NOT nested in extra_body.
-            # anthropic SDK 0.88.0's beta streaming path silently DROPS
-            # output_config when it's inside extra_body (verified by mitmproxy:
-            # effort never reached the wire), while context_management survives.
-            # With effort gone but the effort-2025-11-24 beta header still set,
-            # the server saw a contradictory request and returned
-            # stop_reason=refusal. Direct kwarg puts effort on the wire (ADR-0009).
-            # /effort override (機能6, 2026-06-17) takes precedence per request;
-            # falls through to OUTPUT_CONFIG (env-driven default).
-            output_config=output_config_override or OUTPUT_CONFIG,
-            extra_body={
-                "context_management": CONTEXT_MANAGEMENT_CONFIG,
-            },
+            extra_betas=extra_betas,
+            output_config_override=output_config_override,
+            refusal_fallback_model=refusal_fallback_model,
+            tools_for_api=tools_for_api,
+            extra_headers=extra_headers,
+            fallback_used=fallback_used,
         )
-        # Server-side model fallback (ADR-0015). When a refusal fallback model
-        # is in play (Fable primary + enabled; entry.py passes None once
-        # sticky-pinned to Opus, so this is auto-gated off there), declare it
-        # to the server via the `fallbacks` body field. The server switches to
-        # it mid-stream on a Fable refusal — no client-side second request. The
-        # SDK (0.88.0) doesn't model `fallbacks`, so it must ride extra_body;
-        # wire arrival is verified by mitm capture (plan gate A). The two
-        # required betas are already in MODEL_BETAS.
-        if SERVER_SIDE_FALLBACK_ENABLED and refusal_fallback_model:
-            stream_kwargs["extra_body"]["fallbacks"] = [
-                {"model": refusal_fallback_model}
-            ]
-        if tools_for_api:
-            stream_kwargs["tools"] = tools_for_api
-        merged_headers = dict(extra_headers or {})
-        if fallback_used:
-            merged_headers[REFUSAL_FALLBACK_HEADER] = "true"
-        if merged_headers:
-            stream_kwargs["extra_headers"] = merged_headers
 
         # Live token stream for the CURRENT turn's visible text. Accumulated
         # across text_delta events so text_stream_callback always receives the
