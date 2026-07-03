@@ -69,8 +69,12 @@ async def get_anthropic_client():
     await ensure_valid_token()
     token = get_access_token()
 
+    # Same fallback chain as _build_config / _get_mem0 (P1-e/P4b): both the
+    # direct-Haiku path here and Mem0's internal client follow one decision.
+    provider = _desired_llm_provider()
+
     # OAuth token available — use Anthropic directly.
-    if token:
+    if provider == "anthropic" and token:
         # Fast path: no rebuild needed.
         if _async_anthropic_client is not None and token == _async_anthropic_token:
             return _async_anthropic_client
@@ -86,7 +90,7 @@ async def get_anthropic_client():
 
     # OAuth unavailable — fall back to DeepSeek V4 Flash.
     # Tier 1: OpenRouter (explicit key). Tier 2: OpenCode Zen (free key).
-    if _OPENROUTER_API_KEY:
+    if provider == "openrouter":
         log.warning("get_anthropic_client: OAuth unavailable, using OpenRouter fallback (%s)", _DEEPSEEK_V4_FLASH)
         from openai import AsyncOpenAI
         return AsyncOpenAI(
@@ -94,7 +98,7 @@ async def get_anthropic_client():
             base_url="https://openrouter.ai/api/v1",
             default_headers={"HTTP-Referer": "https://discord-bot.kanae.local"},
         )
-    if _OPENCODE_API_KEY:
+    if provider == "opencode":
         log.warning("get_anthropic_client: OAuth unavailable, using OpenCode Zen fallback (%s)", _DEEPSEEK_V4_FLASH)
         from openai import AsyncOpenAI
         return AsyncOpenAI(
@@ -102,7 +106,8 @@ async def get_anthropic_client():
             base_url="https://api.opencode.ai/v1",
         )
 
-    # No auth at all.
+    # No auth at all (or an explicit non-anthropic MEM0_LLM_PROVIDER override
+    # that this direct-call path doesn't serve).
     return None
 
 
