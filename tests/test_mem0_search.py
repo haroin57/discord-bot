@@ -134,7 +134,7 @@ class TestSearchMemoriesMulti:
         unique = _make_memory("uniq", 0.5)
         call_count = 0
 
-        async def fake_search(q, uid, limit=8):
+        async def fake_search(q, uid, limit=8, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -152,7 +152,7 @@ class TestSearchMemoriesMulti:
     @pytest.mark.asyncio
     async def test_sorted_by_score_asc(self, monkeypatch):
         """score is distance (small = similar), so merged order is ascending."""
-        async def fake_search(q, uid, limit=8):
+        async def fake_search(q, uid, limit=8, **kwargs):
             return [_make_memory("a", 0.4), _make_memory("b", 0.9), _make_memory("c", 0.6)]
 
         monkeypatch.setattr(f"{_PATCH_BASE}.search_memories", fake_search)
@@ -166,7 +166,7 @@ class TestSearchMemoriesMulti:
     async def test_exception_in_one_query_is_skipped(self, monkeypatch):
         call_count = 0
 
-        async def fake_search(q, uid, limit=8):
+        async def fake_search(q, uid, limit=8, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -182,7 +182,7 @@ class TestSearchMemoriesMulti:
 
     @pytest.mark.asyncio
     async def test_respects_limit(self, monkeypatch):
-        async def fake_search(q, uid, limit=8):
+        async def fake_search(q, uid, limit=8, **kwargs):
             return [_make_memory(str(i), float(i) / 10) for i in range(10)]
 
         monkeypatch.setattr(f"{_PATCH_BASE}.search_memories", fake_search)

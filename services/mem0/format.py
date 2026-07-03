@@ -83,6 +83,18 @@ def _fact_meta_suffix(m: dict) -> str:
     )
     if date_str:
         bits.append(f"[{date_str}]")
+    # Phase R (Mem0 v5 T2): 保存時に構造化した condition/scope を注入時に
+    # 落とさない（flattening 防止）。「夜は紅茶」が条件を失って「紅茶が好き」
+    # として無条件注入されるのを防ぐ。metadata が無ければ何も足さない。
+    cond = md.get("condition")
+    if isinstance(cond, str) and cond.strip():
+        bits.append(f"[条件: {_scrub_fact_text(cond.strip()[:48])}]")
+    scope = md.get("scope")
+    if isinstance(scope, str):
+        if scope.startswith("conversation"):
+            bits.append("[この会話限定]")
+        elif scope == "meta":
+            bits.append("[メタ情報]")
     return (" " + " ".join(bits)) if bits else ""
 
 
@@ -93,7 +105,8 @@ def format_memories_for_prompt(memories: list[dict]) -> str:
 
     lines = [
         "[Mem0 — この人についての長期記憶]",
-        "(凡例: imp=重要度1-5 / Live>Hot>Warm>Cold=鮮度tier / [日付]=最終確認日)",
+        "(凡例: imp=重要度1-5 / Live>Hot>Warm>Cold=鮮度tier / [日付]=最終確認日 / "
+        "[条件: ...]=その条件下でのみ成り立つ事実)",
     ]
     # core memory（常時注入枠）を先頭に固定し、クエリ依存の recall と区別する。
     ordered = sorted(

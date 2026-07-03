@@ -1,0 +1,98 @@
+{
+  "description": "Mem0 v4/v5 回帰評価シナリオ (T8b)。4類型×3ケース。conflict 系は existing+candidate を決定ルートに流し archive 判定を、scope 系は _is_fact_valid の可視性を期待値と突き合わせる。",
+  "scenarios": [
+    {
+      "id": "attr-update-1",
+      "type": "attribute_update",
+      "existing": {"id": "e1", "memory": "体重は60kg", "metadata": {"attribute": "weight"}},
+      "candidate": {"text": "体重は58kgになった", "attribute": "weight", "condition": "", "scope": "global"},
+      "llm_conflict_type": "update",
+      "expect": {"archived": true}
+    },
+    {
+      "id": "attr-update-2",
+      "type": "attribute_update",
+      "existing": {"id": "e2", "memory": "東京に住んでいる", "metadata": {"attribute": "residence"}},
+      "candidate": {"text": "大阪に引っ越した", "attribute": "residence", "condition": "", "scope": "global"},
+      "llm_conflict_type": "update",
+      "expect": {"archived": true}
+    },
+    {
+      "id": "attr-update-3-correction",
+      "type": "attribute_update",
+      "existing": {"id": "e3", "memory": "職業は学生", "metadata": {"attribute": "occupation"}},
+      "candidate": {"text": "正しくは大学院生", "attribute": "occupation", "condition": "", "scope": "global"},
+      "llm_conflict_type": "correction",
+      "expect": {"archived": true}
+    },
+    {
+      "id": "cond-habit-1-disjoint",
+      "type": "conditional_habit",
+      "existing": {"id": "c1", "memory": "朝はコーヒーを飲む", "metadata": {"attribute": "habit.drink", "condition": "time:morning"}},
+      "candidate": {"text": "夜は紅茶を飲む", "attribute": "habit.drink", "condition": "time:night", "scope": "global"},
+      "llm_conflict_type": "update",
+      "expect": {"archived": false, "classify_called": false}
+    },
+    {
+      "id": "cond-habit-2-same-setlike",
+      "type": "conditional_habit",
+      "existing": {"id": "c2", "memory": "朝はコーヒーを飲む", "metadata": {"attribute": "habit.drink", "condition": "time:morning"}},
+      "candidate": {"text": "朝は緑茶に変えた", "attribute": "habit.drink", "condition": "time:morning", "scope": "global"},
+      "llm_conflict_type": "update",
+      "expect": {"archived": false, "classify_called": true}
+    },
+    {
+      "id": "cond-habit-3-single-updates",
+      "type": "conditional_habit",
+      "existing": {"id": "c3", "memory": "平日は長野で過ごす", "metadata": {"attribute": "residence", "condition": "context:weekday"}},
+      "candidate": {"text": "平日は東京で過ごすようになった", "attribute": "residence", "condition": "context:weekday", "scope": "global"},
+      "llm_conflict_type": "update",
+      "expect": {"archived": true}
+    },
+    {
+      "id": "scope-leak-1-other-channel",
+      "type": "scope_leak",
+      "fact": {"id": "s1", "memory": "このスレでは英語で答えて", "metadata": {"scope": "conversation:123"}},
+      "query_channel": "999",
+      "expect": {"visible": false}
+    },
+    {
+      "id": "scope-leak-2-home-channel",
+      "type": "scope_leak",
+      "fact": {"id": "s2", "memory": "このスレでは英語で答えて", "metadata": {"scope": "conversation:123"}},
+      "query_channel": "123",
+      "expect": {"visible": true}
+    },
+    {
+      "id": "scope-leak-3-global-everywhere",
+      "type": "scope_leak",
+      "fact": {"id": "s3", "memory": "ウィスキーが好き", "metadata": {"scope": "global"}},
+      "query_channel": "999",
+      "expect": {"visible": true}
+    },
+    {
+      "id": "multi-value-1-hobby-added",
+      "type": "multi_value_protect",
+      "existing": {"id": "m1", "memory": "UK Garageを聴く", "metadata": {"attribute": "preference.music"}},
+      "candidate": {"text": "最近はJungleも聴く", "attribute": "preference.music", "condition": "", "scope": "global"},
+      "llm_conflict_type": "update",
+      "expect": {"archived": false}
+    },
+    {
+      "id": "multi-value-2-possession-added",
+      "type": "multi_value_protect",
+      "existing": {"id": "m2", "memory": "Denon AH-D5200を持っている", "metadata": {"attribute": "possession.headphones"}},
+      "candidate": {"text": "HD650も買った", "attribute": "possession.headphones", "condition": "", "scope": "global"},
+      "llm_conflict_type": "update",
+      "expect": {"archived": false}
+    },
+    {
+      "id": "multi-value-3-custom-protected",
+      "type": "multi_value_protect",
+      "existing": {"id": "m3", "memory": "猫アレルギーがある", "metadata": {"attribute": "custom:allergy"}},
+      "candidate": {"text": "花粉症もある", "attribute": "custom:allergy", "condition": "", "scope": "global"},
+      "llm_conflict_type": "addition",
+      "expect": {"archived": false}
+    }
+  ]
+}

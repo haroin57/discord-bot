@@ -33,18 +33,43 @@ def should_use_memory_llm_mode(query: str, *, enabled: bool = True) -> bool:
     return bool(_MEMORY_LLM_INTENT_RE.search(query or ""))
 
 
-def _is_fact_valid(r: dict) -> bool:
+def _is_fact_valid(
+    r: dict, current_channel_id=None, *, check_scope: bool = True,
+) -> bool:
     """Phase B-2: hide facts that the conflict-detection layer
     soft-archived (valid_to <= now). The flag MEM0_HIDE_ARCHIVED is the
     one-shot rollback knob — flip false to re-surface every archived row.
+
+    Phase C/R: conversation スコープの fact は、その会話(channel)でだけ有効。
+    現在の channel_id が一致しなければ汎用検索から除外して誤注入を防ぐ。
+    MEM0_SCOPE_FILTER_ENABLED=False(既定)なら scope 判定は完全に skip。
+
+    ``check_scope=False`` は get_core_memories のキャッシュ計算用: キャッシュは
+    user 単位で channel 横断共有なので、scope 判定はキャッシュ取り出し後に
+    channel 付きで行う（内側でやるとチャンネル間でキャッシュ汚染する）。
     """
+    md = r.get("metadata") or {}
+    # Phase C/R: scope フィルタ（conversation 限定 fact の誤注入防止）
+    try:
+        from config import MEM0_SCOPE_FILTER_ENABLED
+    except Exception:
+        MEM0_SCOPE_FILTER_ENABLED = False
+    if MEM0_SCOPE_FILTER_ENABLED and check_scope:
+        scope = md.get("scope") or "global"
+        if scope.startswith("conversation"):
+            want = (
+                f"conversation:{current_channel_id}"
+                if current_channel_id else ""
+            )
+            if scope != want:
+                return False
+    # Phase B-2: valid_to soft-archive
     try:
         from config import MEM0_HIDE_ARCHIVED
     except Exception:
         MEM0_HIDE_ARCHIVED = True
     if not MEM0_HIDE_ARCHIVED:
         return True
-    md = r.get("metadata") or {}
     vt = md.get("valid_to")
     if not vt:
         return True
@@ -57,6 +82,7 @@ def _is_fact_valid(r: dict) -> bool:
 async def search_memories(
     query: str, user_id: str, limit: int = 8,
     *, apply_distance_filter: bool = True,
+    current_channel_id: str | None = None,
 ) -> list[dict]:
     """Semantic search for relevant memories with relevance filtering.
 
@@ -64,6 +90,10 @@ async def search_memories(
     rerank 前に cosine 距離で pre-filter すると「遠いが関連ある」候補が
     reranker に届かないため、そこでは距離ゲートを外す（archived 事実の
     ``_is_fact_valid`` フィルタは常時適用）。
+
+    ``current_channel_id`` (Phase R): conversation スコープ fact の適用先
+    channel。未指定(None)なら scope フィルタ有効時に conversation fact は
+    全て除外される（安全側）。
     """
     # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
     mem = await asyncio.to_thread(_get_mem0)
@@ -87,7 +117,7 @@ async def search_memories(
                 or r.get("score") is None
                 or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
             )
-            and _is_fact_valid(r)
+            and _is_fact_valid(r, current_channel_id)
         ]
         return filtered
     except Exception as exc:
@@ -96,12 +126,18 @@ async def search_memories(
 
 
 async def search_memories_multi(
-    queries: list[str], user_id: str, limit: int = 8
+    queries: list[str], user_id: str, limit: int = 8,
+    *, current_channel_id: str | None = None,
 ) -> list[dict]:
     """Search with multiple queries and merge deduplicated results."""
     if not queries:
         return []
-    tasks = [search_memories(q, user_id, limit=limit) for q in queries]
+    tasks = [
+        search_memories(
+            q, user_id, limit=limit, current_channel_id=current_channel_id,
+        )
+        for q in queries
+    ]
     all_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     seen_ids: set[str] = set()
@@ -127,6 +163,7 @@ async def search_memories_multi(
 async def search_memories_hybrid(
     query: str, user_id: str, limit: int = 8,
     *, apply_distance_filter: bool = True,
+    current_channel_id: str | None = None,
 ) -> list[dict]:
     """Run vector search and BM25 in parallel, fuse via Reciprocal Rank Fusion.
 
@@ -146,12 +183,14 @@ async def search_memories_hybrid(
         return await search_memories(
             query, user_id, limit=limit,
             apply_distance_filter=apply_distance_filter,
+            current_channel_id=current_channel_id,
         )
 
     from services.mem0 import bm25_index
     vector_task = search_memories(
         query, user_id, limit=limit,
         apply_distance_filter=apply_distance_filter,
+        current_channel_id=current_channel_id,
     )
     bm25_task = asyncio.to_thread(
         bm25_index.search_bm25, query, user_id, MEM0_BM25_LIMIT,
@@ -179,6 +218,7 @@ async def search_memories_hybrid(
 async def _search_multi_hybrid(
     queries: list[str], user_id: str, limit: int = 8,
     *, apply_distance_filter: bool = True,
+    current_channel_id: str | None = None,
 ) -> list[dict]:
     """Multi-query merge that uses ``search_memories_hybrid`` per query.
 
@@ -193,6 +233,7 @@ async def _search_multi_hybrid(
         search_memories_hybrid(
             q, user_id, limit=limit,
             apply_distance_filter=apply_distance_filter,
+            current_channel_id=current_channel_id,
         )
         for q in queries
     ]
@@ -634,12 +675,19 @@ _CORE_CACHE: dict[str, tuple[float, list[dict]]] = {}
 _CORE_CACHE_KEEP = 10  # キャッシュに保持する上限（取り出しは max_items で切る）
 
 
-async def get_core_memories(user_id: str, max_items: int = 3) -> list[dict]:
+async def get_core_memories(
+    user_id: str, max_items: int = 3,
+    *, current_channel_id: str | None = None,
+) -> list[dict]:
     """常時注入すべきコア事実（imp=5, tier∈{Live,Hot}）を返す。
 
     返り値の各 dict には ``_core=True`` フラグが付く（format 側の先頭固定と
     smart マージの dedup 判定に使う）。失敗時は空リスト（recall 全体を
     巻き込まない）。
+
+    Phase R: scope 判定はキャッシュ取り出し後に channel 付きで行う。
+    キャッシュは user 単位で channel 横断共有なので、内側で scope を落とすと
+    チャンネル間でキャッシュ汚染する（キャッシュ計算は check_scope=False）。
     """
     try:
         from config import MEM0_CORE_MEMORY_ENABLED, MEM0_CORE_CACHE_TTL_S
@@ -650,7 +698,10 @@ async def get_core_memories(user_id: str, max_items: int = 3) -> list[dict]:
     now = time.monotonic()
     hit = _CORE_CACHE.get(user_id)
     if hit is not None and now - hit[0] < MEM0_CORE_CACHE_TTL_S:
-        return [dict(m) for m in hit[1][:max_items]]
+        return [
+            dict(m) for m in hit[1]
+            if _is_fact_valid(m, current_channel_id)
+        ][:max_items]
     try:
         from services.mem0.client import get_all_memories
         all_mems = await get_all_memories(user_id)
@@ -665,7 +716,8 @@ async def get_core_memories(user_id: str, max_items: int = 3) -> list[dict]:
                 continue
             if imp < 5 or md.get("tier") not in (0, 1):
                 continue
-            if not _is_fact_valid(m):
+            # scope はここで判定しない（キャッシュ汚染防止）。valid_to のみ。
+            if not _is_fact_valid(m, check_scope=False):
                 continue
             core.append(m)
         # tier 昇順（Live が先）→ 直近 reinforce 降順。importance は全件 5。
@@ -679,7 +731,10 @@ async def get_core_memories(user_id: str, max_items: int = 3) -> list[dict]:
         for m in core:
             m["_core"] = True
         _CORE_CACHE[user_id] = (now, core)
-        return [dict(m) for m in core[:max_items]]
+        return [
+            dict(m) for m in core
+            if _is_fact_valid(m, current_channel_id)
+        ][:max_items]
     except Exception as exc:
         log.warning("core memory fetch failed (non-fatal): %s", exc)
         return []
@@ -707,6 +762,7 @@ async def search_memories_smart(
     query: str, user_id: str, limit: int = 5,
     rewrite: bool = True, rerank: bool = True,
     include_core: bool = False,
+    current_channel_id: str | None = None,
 ) -> list[dict]:
     """Query-rewriting + re-ranking enhanced search.
 
@@ -723,7 +779,9 @@ async def search_memories_smart(
     """
     # core memory はクエリ検索と独立なので並行に走らせる（TTL cache 命中時は即返る）。
     core_task = (
-        asyncio.create_task(get_core_memories(user_id))
+        asyncio.create_task(
+            get_core_memories(user_id, current_channel_id=current_channel_id)
+        )
         if include_core else None
     )
     queries = [query]
@@ -785,6 +843,7 @@ async def search_memories_smart(
     candidates = await _search_multi_hybrid(
         queries, user_id, limit=20,
         apply_distance_filter=not rerank,
+        current_channel_id=current_channel_id,
     )
 
     # Graph expansion (Obsidian-style 1-hop): for each top-3 candidate,
@@ -792,7 +851,9 @@ async def search_memories_smart(
     # entity. This rescues facts that share an entity with the user's
     # intent but didn't make the cosine cut. Non-fatal on failure.
     try:
-        candidates = await _graph_expand_candidates(candidates, user_id)
+        candidates = await _graph_expand_candidates(
+            candidates, user_id, current_channel_id=current_channel_id,
+        )
     except Exception as exc:
         log.warning("graph_expand failed (non-fatal): %s", exc)
 
@@ -820,9 +881,13 @@ async def search_memories_smart(
                 if top_episode:
                     bundle = await get_episode_facts(top_episode, user_id, limit=15)
                     seen = {r.get("id") for r in reranked if r.get("id")}
+                    # Phase R: bundle 経路は search_memories の validity フィルタを
+                    # 通らないので、ここで archived / 他会話 scope を落とす
+                    # （bundle 経由の誤注入・archived 復活を防ぐ）。
                     extras = [
                         r for r in bundle
                         if r.get("id") and r.get("id") not in seen
+                        and _is_fact_valid(r, current_channel_id)
                     ]
                     if extras:
                         # Tag them so downstream prompt builders can render
@@ -881,6 +946,7 @@ async def search_memories_smart(
 
 async def _graph_expand_candidates(
     candidates: list[dict], user_id: str, *, top_seed: int = 3, per_entity: int = 3,
+    current_channel_id: str | None = None,
 ) -> list[dict]:
     """1-hop graph expansion via services.mem0.graph.
 
@@ -931,7 +997,12 @@ async def _graph_expand_candidates(
     for fid in sibling_ids:
         try:
             fact = await _asyncio.to_thread(mem.get, fid)
-            if isinstance(fact, dict) and fact.get("memory"):
+            # Phase R: graph 経由の sibling は search_memories の validity
+            # フィルタを通らないので、archived / 他会話 scope をここで落とす。
+            if (
+                isinstance(fact, dict) and fact.get("memory")
+                and _is_fact_valid(fact, current_channel_id)
+            ):
                 # Sibling facts pulled by graph expansion don't carry a
                 # cosine score. Assign a neutral mid-range distance so they
                 # don't crowd out actual top-cosine matches but still get

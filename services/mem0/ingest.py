@@ -99,6 +99,10 @@ async def add_memories(
         MEM0_DEDUP_TWO_STAGE, MEM0_DEDUP_SEARCH_LIMIT, MEM0_DEDUP_DRY_RUN,
         MEM0_CONFLICT_DETECTION_ENABLED, MEM0_DEDUP_SUPERSET_MERGE,
         MEM0_RELATION_EXTRACT_ENABLED,
+        MEM0_ATTRIBUTE_ENABLED, MEM0_ATTRIBUTE_CONFLICT_ENABLED,  # Phase A
+        MEM0_CONDITION_ENABLED, MEM0_SCOPE_ENABLED,  # Phase B/C
+        MEM0_TYPED_VALUE_ENABLED,  # v5 T7
+        MEM0_FACT_STORE_ENABLED,  # v5 T8a
     )
 
     try:
@@ -207,8 +211,19 @@ async def add_memories(
             kept: list[dict] = candidates
             if MEM0_CLIENT_DEDUP_ENABLED and candidates:
                 search_limit = MEM0_DEDUP_SEARCH_LIMIT
+                # Phase R: scope フィルタ有効時に conversation fact が dedup
+                # 候補から消えると同一会話内の兄弟と dedup できなくなるので、
+                # この ingest の会話 channel_id を渡す。
+                _dedup_ch = base_meta.get("channel_id")
+                _dedup_ch = str(_dedup_ch) if _dedup_ch else None
                 dedup_results = await asyncio.gather(
-                    *(search_memories(f["text"], user_id, limit=search_limit) for f in candidates),
+                    *(
+                        search_memories(
+                            f["text"], user_id, limit=search_limit,
+                            current_channel_id=_dedup_ch,
+                        )
+                        for f in candidates
+                    ),
                     return_exceptions=True,
                 )
 
@@ -329,6 +344,34 @@ async def add_memories(
                     "tier":        tier,
                     "tags":        tags_csv,
                 })
+                # Phase A: attribute(統制語彙)を付与。決定的 conflict ルートの
+                # キー。空文字列は付けない(ChromaDB metadata を無駄に増やさない)。
+                _attr = f.get("attribute") or ""
+                if MEM0_ATTRIBUTE_ENABLED and _attr:
+                    fact_meta["attribute"] = _attr
+                # v5 T7: typed value（quantity）。ChromaDB は dict を持てないので
+                # JSON 文字列で保存。読む側は json.loads。
+                _val = f.get("value")
+                if MEM0_TYPED_VALUE_ENABLED and isinstance(_val, dict):
+                    import json as _json_mod
+                    fact_meta["value_json"] = _json_mod.dumps(
+                        _val, ensure_ascii=False)
+                # Phase B: condition(time:/context:)を付与。
+                _cond = f.get("condition") or ""
+                if MEM0_CONDITION_ENABLED and _cond:
+                    fact_meta["condition"] = _cond
+                # Phase C: scope。global は既定なので保存しない(metadata を節約)。
+                # conversation scope には channel_id を紐付け、どの会話限定かを
+                # 読み出し時に照合できるようにする。
+                _scope = f.get("scope") or ""
+                if MEM0_SCOPE_ENABLED and _scope and _scope != "global":
+                    if _scope == "conversation":
+                        _ch = base_meta.get("channel_id")
+                        fact_meta["scope"] = (
+                            f"conversation:{_ch}" if _ch else "conversation"
+                        )
+                    else:
+                        fact_meta["scope"] = _scope
                 # Final guard: drop any None values base_meta might still
                 # contain (e.g. channel_id when called from a script).
                 fact_meta = {k: v for k, v in fact_meta.items() if v is not None}
@@ -385,7 +428,50 @@ async def add_memories(
                                 )
                 except Exception as e:
                     log.warning("bm25 index update failed (non-fatal): %s", e)
+                # v5 T8a: structured fact layer への導出インデックス登録
+                # （attribute 付き fact のみ）。正本は Chroma、こちらは best-effort。
+                try:
+                    if (
+                        MEM0_FACT_STORE_ENABLED
+                        and _attr
+                        and isinstance(res, dict)
+                    ):
+                        from services.mem0 import fact_store
+                        for r in (res.get("results") or []):
+                            fid = r.get("id") if isinstance(r, dict) else None
+                            if fid:
+                                await asyncio.to_thread(
+                                    fact_store.record_fact,
+                                    fid, str(user_id), _attr,
+                                    value_text=f.get("text", ""),
+                                    value_json=fact_meta.get("value_json"),
+                                    condition=f.get("condition") or "",
+                                    scope=fact_meta.get("scope", ""),
+                                    source_conversation_id=(
+                                        str(base_meta.get("channel_id"))
+                                        if base_meta.get("channel_id") else None
+                                    ),
+                                )
+                except Exception as e:
+                    log.warning("fact_store record failed (non-fatal): %s", e)
                 return res
+
+            # Phase A-3: 決定的 conflict ルート。dedup の embedding 近傍ゲート
+            # (距離≤0.35)をすり抜けた属性更新(文面の離れた数値更新等)を、
+            # attribute 完全一致で捕捉する。dedup が既に archive 対象にした
+            # existing_id は二重に積まない。
+            if MEM0_ATTRIBUTE_CONFLICT_ENABLED and kept:
+                _already = (
+                    {eid for eid, _ in conflict_archive}
+                    if 'conflict_archive' in locals() else set()
+                )
+                _attr_pairs = await _attribute_conflict_check(
+                    mem, user_id, kept, exclude_ids=_already,
+                )
+                if _attr_pairs:
+                    if 'conflict_archive' not in locals():
+                        conflict_archive = []
+                    conflict_archive.extend(_attr_pairs)
 
             insert_results = await asyncio.gather(*(_insert_one(f) for f in kept)) if kept else []
             results = [r for r in insert_results if r is not None]
@@ -536,6 +622,15 @@ async def _archive_outdated_facts(mem, archive: list[tuple[str, str]]) -> int:
                 "[CONFLICT_ARCHIVE existing_id=%s conflict_type=%s valid_to=%d]",
                 existing_id, ctype, now,
             )
+            # v5 T8a: fact_store 側も supersede（Chroma soft-archive と対）。
+            try:
+                from config import MEM0_FACT_STORE_ENABLED as _fs_on
+                if _fs_on:
+                    from services.mem0 import fact_store
+                    await asyncio.to_thread(
+                        fact_store.supersede_fact, existing_id)
+            except Exception as exc2:  # noqa: BLE001
+                log.warning("fact_store supersede failed (non-fatal): %s", exc2)
             success += 1
         except Exception as exc:
             log.warning(
@@ -543,3 +638,186 @@ async def _archive_outdated_facts(mem, archive: list[tuple[str, str]]) -> int:
                 existing_id, ctype, exc,
             )
     return success
+
+
+async def _get_facts_by_attribute(mem, user_id, attribute: str) -> list[dict]:
+    """Phase A-3: attribute 完全一致の valid な既存 fact を取得。
+
+    v5 T8a: MEM0_FACT_STORE_ENABLED なら SQL 索引 (fact_store) を一次に使い、
+    行を Chroma 互換 shape ({"id", "memory", "metadata"}) へ変換して返す。
+    store が空/未整備なら従来の Chroma 経路へフォールバック（漏れ防止）。
+
+    Chroma 経路: get_episode_facts(search.py) と同じく filters を試し、SDK
+    非対応(TypeError) なら全件取得 + Python フィルタにフォールバック。
+    valid_to 済み(soft-archive)は除外する。
+    """
+    if not attribute:
+        return []
+    try:
+        from config import MEM0_FACT_STORE_ENABLED as _fs_on
+    except Exception:
+        _fs_on = False
+    if _fs_on:
+        try:
+            from services.mem0 import fact_store
+            rows = await asyncio.to_thread(
+                fact_store.get_active_facts, str(user_id), attribute)
+            if rows:
+                return [
+                    {
+                        "id": r.get("fact_id"),
+                        "memory": r.get("value_text") or "",
+                        "metadata": {
+                            "attribute": r.get("attribute"),
+                            "condition": r.get("condition") or "",
+                            "value_json": r.get("value_json"),
+                        },
+                    }
+                    for r in rows
+                ]
+            # store が空 → Chroma へフォールバック（backfill 前の期間の保険）
+        except Exception as exc:
+            log.warning("fact_store lookup failed, falling back: %s", exc)
+    import time as _time
+    try:
+        raw = await asyncio.to_thread(
+            mem.get_all, user_id=user_id,
+            filters={"attribute": attribute}, limit=50,
+        )
+    except TypeError:
+        # SDK が filters を受け付けない → 全件 + Python フィルタ
+        try:
+            raw = await asyncio.to_thread(mem.get_all, user_id=user_id, limit=1000)
+        except Exception as exc:
+            log.warning("attr conflict get_all fallback failed: %s", exc)
+            return []
+    except Exception as exc:
+        log.warning("attr conflict get_all failed: %s", exc)
+        return []
+    rows = raw.get("results", []) if isinstance(raw, dict) else (raw or [])
+    now = int(_time.time())
+    out: list[dict] = []
+    for r in rows:
+        md = r.get("metadata") or {}
+        if md.get("attribute") != attribute:
+            continue
+        vt = md.get("valid_to")
+        if vt:
+            try:
+                if int(vt) <= now:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        out.append(r)
+    return out
+
+
+def _compare_typed_values_shadow(ex: dict, cand: dict, attr: str) -> None:
+    """v5 T7: 数値属性のシャドー比較ログ（挙動には影響しない）。
+
+    既存 fact の metadata.value_json と候補 fact の value が両方 quantity で
+    単位が一致するとき、same/changed を [ATTR_VALUE_COMPARE] で記録する。
+    単位が違う場合は unit_mismatch（換算は将来。今は観測のみ）。
+    """
+    try:
+        import json as _json_mod
+        cand_val = cand.get("value")
+        if not isinstance(cand_val, dict) or cand_val.get("type") != "quantity":
+            return
+        raw = (ex.get("metadata") or {}).get("value_json")
+        if not raw:
+            return
+        ex_val = _json_mod.loads(raw)
+        if not isinstance(ex_val, dict) or ex_val.get("type") != "quantity":
+            return
+        if ex_val.get("unit") != cand_val.get("unit"):
+            verdict = "unit_mismatch"
+        elif float(ex_val.get("value")) == float(cand_val.get("value")):
+            verdict = "same"
+        else:
+            verdict = "changed"
+        log.info(
+            "[ATTR_VALUE_COMPARE attribute=%s verdict=%s existing=%s%s "
+            "candidate=%s%s]",
+            attr, verdict,
+            ex_val.get("value"), ex_val.get("unit"),
+            cand_val.get("value"), cand_val.get("unit"),
+        )
+    except Exception as exc:  # noqa: BLE001 - 観測用、絶対に本流を壊さない
+        log.debug("typed value compare failed (non-fatal): %s", exc)
+
+
+async def _attribute_conflict_check(
+    mem, user_id, kept: list[dict], *, exclude_ids: set,
+) -> list[tuple[str, str]]:
+    """Phase A-3: 決定的 conflict ルート（embedding 距離に依存しない）。
+
+    kept の各 fact の attribute で既存 valid fact を metadata 照会し、
+    classify_conflict が update/correction を返したら (existing_id, ctype) を
+    集めて返す。dedup が既に処理した existing_id は exclude_ids で除く。
+    失敗は非致命(空を返す) — 新 fact は既に保存されるので archive は best-effort。
+    """
+    from services.mem0.conflict import classify_conflict
+    from services.mem0.attribute_registry import (
+        conditions_are_conflict_candidate, get_conflict_group,
+        is_update_cardinality,
+    )
+    out: list[tuple[str, str]] = []
+    seen = set(exclude_ids)
+    for f in kept:
+        attr = f.get("attribute") or ""
+        if not attr:
+            continue
+        cand_text = f.get("text") or ""
+        if not cand_text:
+            continue
+        # v5 T4: 同一 attribute だけでなく conflict group のメンバー全員を照会
+        # (likes_coffee vs avoids_caffeine のような cross-attribute 矛盾)。
+        # group 未定義なら {attr} 単独で従来挙動。
+        existing: list[dict] = []
+        try:
+            for group_attr in sorted(get_conflict_group(attr)):
+                existing.extend(
+                    await _get_facts_by_attribute(mem, user_id, group_attr)
+                )
+        except Exception as exc:
+            log.warning("attr conflict lookup failed (non-fatal): %s", exc)
+            continue
+        for ex in existing:
+            eid = ex.get("id")
+            if not eid or eid in seen:
+                continue
+            ex_text = ex.get("memory") or ex.get("text") or ""
+            if not ex_text or ex_text == cand_text:
+                continue
+            # Phase B+/v5: condition 互換判定。disjoint(別条件下=朝の habit vs
+            # 夜の habit)なら矛盾ではないので archive しない。same/subset/superset/
+            # unknown は重なりうるので conflict 判定へ進める(gpt-5.5-pro 指摘4)。
+            ex_cond = (ex.get("metadata") or {}).get("condition") or ""
+            cand_cond = f.get("condition") or ""
+            if not conditions_are_conflict_candidate(ex_cond, cand_cond):
+                continue
+            # v5 T7: typed value のシャドー数値比較。両者が quantity なら結果を
+            # ログに残す（classify_conflict の判定と突き合わせて精度を観測し、
+            # 将来 LLM 判定の置換可否を決める。今は挙動に影響させない）。
+            _compare_typed_values_shadow(ex, f, attr)
+            try:
+                cls = await classify_conflict(ex_text, cand_text)
+            except Exception as exc:
+                log.warning("attr conflict classify failed (non-fatal): %s", exc)
+                continue
+            ctype = cls.get("conflict_type", "addition")
+            # v5: cardinality が set_like の attribute は追加型。update 判定でも
+            # archive しない(既存の趣味・好みを新しい追加で消さない。gpt-5.5-pro 指摘3)。
+            # 判断基準は「消される側=既存 fact」の attribute (group 越しで候補と
+            # 異なりうる)。無ければ候補側にフォールバック。
+            _ex_attr = (ex.get("metadata") or {}).get("attribute") or attr
+            if ctype in ("update", "correction") and is_update_cardinality(_ex_attr):
+                log.info(
+                    "[ATTR_CONFLICT attribute=%s conflict_type=%s existing_id=%s "
+                    "cand=%r]",
+                    attr, ctype, eid, cand_text[:60],
+                )
+                out.append((eid, ctype))
+                seen.add(eid)
+    return out
