@@ -29,7 +29,7 @@ async def test_non_admin_rejected():
 
     interaction = _make_interaction(user_id=999)
     with patch.object(bot, "ADMIN_USER_IDS", {123}):
-        cb = bot.vscode_sync_cmd.callback
+        cb = bot.bot.tree.get_command("vscode-sync").callback
         await cb(interaction, _make_choice("on"))
 
     interaction.response.send_message.assert_called_once()
@@ -44,7 +44,7 @@ async def test_admin_status():
     interaction = _make_interaction(user_id=123)
     with patch.object(bot, "ADMIN_USER_IDS", {123}), \
          patch.object(bot.vscode_sync, "is_running", return_value=False):
-        cb = bot.vscode_sync_cmd.callback
+        cb = bot.bot.tree.get_command("vscode-sync").callback
         await cb(interaction, _make_choice("status"))
 
     interaction.response.defer.assert_called_once_with(ephemeral=True)
@@ -70,10 +70,10 @@ async def test_admin_on_starts_daemon():
     fake_callback = AsyncMock()
     with patch.object(bot, "ADMIN_USER_IDS", {123}), \
          patch.object(bot.vscode_sync, "is_running", return_value=False), \
-         patch.object(bot, "VSCODE_SYNC_THREAD_ID", 999), \
-         patch.object(bot, "_track_task", side_effect=fake_track), \
-         patch.object(bot, "make_post_callback", return_value=fake_callback):
-        cb = bot.vscode_sync_cmd.callback
+         patch("bot_commands.misc.VSCODE_SYNC_THREAD_ID", 999), \
+         patch.object(bot._command_deps, "track_task", side_effect=fake_track), \
+         patch("bot_commands.misc.make_post_callback", return_value=fake_callback):
+        cb = bot.bot.tree.get_command("vscode-sync").callback
         await cb(interaction, _make_choice("on"))
 
     assert tracked == ["vscode_sync"]
@@ -93,8 +93,8 @@ async def test_admin_on_already_running():
 
     with patch.object(bot, "ADMIN_USER_IDS", {123}), \
          patch.object(bot.vscode_sync, "is_running", return_value=True), \
-         patch.object(bot, "_track_task", side_effect=fake_track):
-        cb = bot.vscode_sync_cmd.callback
+         patch.object(bot._command_deps, "track_task", side_effect=fake_track):
+        cb = bot.bot.tree.get_command("vscode-sync").callback
         await cb(interaction, _make_choice("on"))
 
     assert tracked == []
@@ -114,9 +114,9 @@ async def test_admin_on_missing_thread_id():
 
     with patch.object(bot, "ADMIN_USER_IDS", {123}), \
          patch.object(bot.vscode_sync, "is_running", return_value=False), \
-         patch.object(bot, "VSCODE_SYNC_THREAD_ID", 0), \
-         patch.object(bot, "_track_task", side_effect=fake_track):
-        cb = bot.vscode_sync_cmd.callback
+         patch("bot_commands.misc.VSCODE_SYNC_THREAD_ID", 0), \
+         patch.object(bot._command_deps, "track_task", side_effect=fake_track):
+        cb = bot.bot.tree.get_command("vscode-sync").callback
         await cb(interaction, _make_choice("on"))
 
     assert tracked == []
@@ -132,7 +132,7 @@ async def test_admin_off_stops_daemon():
 
     with patch.object(bot, "ADMIN_USER_IDS", {123}), \
          patch.object(bot.vscode_sync, "stop_daemon", stop_mock):
-        cb = bot.vscode_sync_cmd.callback
+        cb = bot.bot.tree.get_command("vscode-sync").callback
         await cb(interaction, _make_choice("off"))
 
     stop_mock.assert_awaited_once()
