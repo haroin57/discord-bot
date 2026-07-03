@@ -670,34 +670,10 @@ def make_async_oauth_client(**kwargs):
     return anthropic.AsyncAnthropic(**kwargs)
 
 
-def make_async_api_key_client(api_key: str, **kwargs):
-    """Build an AsyncAnthropic that bills against a separate API key.
-
-    Used by the restricted-mode path so non-admin calls do not consume the
-    OAuth subscription quota. Does NOT go through the sync-side OAuth patch
-    and does NOT add OAUTH_BETA_HEADER (subscriber-tier only). Same
-    Stainless-header-sanitizing http_client hook as the OAuth path.
-    """
-    import anthropic
-    kwargs.pop("auth_token", None)  # never mix
-    kwargs["api_key"] = api_key
-    kwargs.setdefault("http_client", _make_http_client_with_hook())
-    return anthropic.AsyncAnthropic(**kwargs)
-
-
-def make_sync_api_key_client(api_key: str, **kwargs):
-    """Build a sync ``Anthropic`` client bypassing the OAuth patch.
-
-    Kept for legacy ``call_direct``-style callers that still use the sync
-    SDK and need a different billing account from OAuth.
-    """
-    import anthropic
-    if _orig_anthropic_init is None:
-        # Patch not installed yet — fall back to plain constructor.
-        return anthropic.Anthropic(api_key=api_key, **kwargs)
-    client = anthropic.Anthropic.__new__(anthropic.Anthropic)
-    _orig_anthropic_init(client, api_key=api_key, **kwargs)
-    return client
+# make_async_api_key_client / make_sync_api_key_client were removed
+# 2026-07-04: the restricted static-API-key billing route was never
+# configured (BOT_RESTRICTED_ANTHROPIC_API_KEY unset everywhere), so all
+# calls use the OAuth subscriber flow.
 
 
 # ---------------------------------------------------------------------------

@@ -473,12 +473,6 @@ CLAUDE_MAX_PARALLEL = int(os.environ.get("CLAUDE_MAX_PARALLEL", "2"))
 # never starve the admin pool (H-3 DoS mitigation).
 RESTRICTED_CLAUDE_MAX_PARALLEL = int(os.environ.get("RESTRICTED_CLAUDE_MAX_PARALLEL", "1"))
 
-# Optional dedicated Anthropic API key used ONLY for restricted (non-admin)
-# Claude CLI invocations. If set, the subprocess env will carry this key
-# instead of relying on the shared OAuth token, so a hostile non-admin
-# cannot burn through the owner's subscription quota.
-RESTRICTED_ANTHROPIC_API_KEY = os.environ.get("BOT_RESTRICTED_ANTHROPIC_API_KEY", "")
-
 # ---------------------------------------------------------------------------
 # Music Analysis (Gemini primary, OpenAI fallback)
 # ---------------------------------------------------------------------------

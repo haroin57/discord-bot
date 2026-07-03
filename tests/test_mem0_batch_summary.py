@@ -27,10 +27,13 @@ _ensure_stub("services.oauth_manager",
              get_access_token=MagicMock(return_value="tok"),
              init=MagicMock(),
              make_async_oauth_client=MagicMock(),
-             make_async_api_key_client=MagicMock(),
-             make_sync_api_key_client=MagicMock(),
              prime_subscriber_session=AsyncMock(),
-             get_client=MagicMock())
+             get_client=MagicMock(),
+             OAuthRefreshFailed=type("OAuthRefreshFailed", (Exception,), {}),
+             failback_to_primary=MagicMock(),
+             failover_to_secondary=AsyncMock(),
+             get_active_account=MagicMock(return_value="primary"),
+             maybe_restore_primary=AsyncMock())
 
 from services.mem0.batch import build_batch_summary  # noqa: E402
 

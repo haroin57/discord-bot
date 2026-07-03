@@ -66,49 +66,14 @@ class TestBuildCliHeaders:
 # make_api_client
 # ---------------------------------------------------------------------------
 class TestMakeApiClient:
-    async def test_make_api_client_restricted_with_key(self, monkeypatch):
-        """When restricted=True and RESTRICTED_ANTHROPIC_API_KEY is set,
-        make_async_api_key_client is called, OAuth flow is skipped."""
-        import services.claude_api.client_factory as mod
-
-        fake_client = MagicMock()
-        fake_key_client = MagicMock(return_value=fake_client)
-
-        monkeypatch.setattr(mod, "RESTRICTED_ANTHROPIC_API_KEY", "sk-test-restricted")
-        monkeypatch.setattr(mod, "make_async_api_key_client", fake_key_client)
-
-        mock_oauth_init = MagicMock()
-        mock_ensure = AsyncMock()
-        mock_prime = AsyncMock()
-        mock_oauth_client = MagicMock()
-        monkeypatch.setattr(mod, "oauth_init", mock_oauth_init)
-        monkeypatch.setattr(mod, "ensure_valid_token", mock_ensure)
-        monkeypatch.setattr(mod, "prime_subscriber_session", mock_prime)
-        monkeypatch.setattr(mod, "make_async_oauth_client", mock_oauth_client)
-
-        result = await mod.make_api_client(restricted=True)
-
-        assert result is fake_client
-        fake_key_client.assert_called_once()
-        call_kwargs = fake_key_client.call_args
-        assert call_kwargs.args[0] == "sk-test-restricted"
-        assert "default_headers" in call_kwargs.kwargs
-
-        mock_oauth_init.assert_not_called()
-        mock_ensure.assert_not_called()
-        mock_prime.assert_not_called()
-        mock_oauth_client.assert_not_called()
-
     async def test_make_api_client_restricted_no_key_falls_through_to_oauth(
         self, monkeypatch
     ):
-        """When restricted=True but no RESTRICTED_ANTHROPIC_API_KEY, use OAuth."""
+        """restricted=True uses OAuth (the API-key route was removed 2026-07-04)."""
         import services.claude_api.client_factory as mod
 
         fake_client = MagicMock()
 
-        monkeypatch.setattr(mod, "RESTRICTED_ANTHROPIC_API_KEY", "")
-        monkeypatch.setattr(mod, "make_async_api_key_client", MagicMock())
 
         mock_oauth_init = MagicMock()
         mock_ensure = AsyncMock()
@@ -148,8 +113,6 @@ class TestMakeApiClient:
             call_order.append("make_async_oauth_client")
             return fake_client
 
-        monkeypatch.setattr(mod, "RESTRICTED_ANTHROPIC_API_KEY", "")
-        monkeypatch.setattr(mod, "make_async_api_key_client", MagicMock())
         monkeypatch.setattr(mod, "oauth_init", _oauth_init)
         monkeypatch.setattr(mod, "ensure_valid_token", _ensure)
         monkeypatch.setattr(mod, "prime_subscriber_session", _prime)
@@ -175,8 +138,6 @@ class TestMakeApiClient:
             captured_kwargs.update(kwargs)
             return MagicMock()
 
-        monkeypatch.setattr(mod, "RESTRICTED_ANTHROPIC_API_KEY", "")
-        monkeypatch.setattr(mod, "make_async_api_key_client", MagicMock())
         monkeypatch.setattr(mod, "oauth_init", MagicMock())
         monkeypatch.setattr(mod, "ensure_valid_token", AsyncMock())
         monkeypatch.setattr(mod, "prime_subscriber_session", AsyncMock())
