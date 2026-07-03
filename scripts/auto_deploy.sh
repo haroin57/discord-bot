@@ -50,8 +50,10 @@ notify() {
 }
 
 # ─── dev: graceful skip if service doesn't exist yet ─────────────────────────
+# unit ファイルの存在で判定する。list-units + grep は先頭マーカー(●)や
+# 同名 prefix (discord-bot-dev-autodeploy) の混入で誤爆するため使わない。
 if [[ "${ENV}" == "dev" ]]; then
-    if ! systemctl list-units --type=service --all --no-legend | grep -q "^[[:space:]]*${SERVICE}\.service"; then
+    if ! systemctl cat "${SERVICE}.service" >/dev/null 2>&1; then
         log "Service ${SERVICE}.service not found (dev env not provisioned yet); skipping"
         exit 0
     fi
