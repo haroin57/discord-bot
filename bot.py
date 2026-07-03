@@ -6,6 +6,7 @@ Matches free-code QueryEngine pattern: orchestrates services and utils.
 import asyncio
 import io
 import logging
+import os
 import re
 import time
 from collections import OrderedDict, deque

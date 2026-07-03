@@ -17,3 +17,9 @@ pytest-xdist>=3.5,<4.0
 
 # Audit tooling for ad-hoc CVE checks (also used by the security workflow).
 pip-audit>=2.7,<3.0
+
+# Lint / type-check — baseline policy in pyproject.toml (P0-d of the
+# 2026-07-03 grand refactor plan). Rules limited to definite-bug tier;
+# mypy runs scoped to the `files` list only.
+ruff>=0.15,<0.16
+mypy>=2.1,<3.0

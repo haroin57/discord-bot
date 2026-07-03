@@ -27,3 +27,34 @@ omit = [
     ".venv/*",
     "*.bak.*",
 ]
+
+# --- Lint / type-check (P0-d of docs/2026-07-03-grand-refactor-plan.md) ---
+# Baseline policy: rules limited to "definitely a bug" tier so the existing
+# 120k-line codebase passes without touching it. Widening the rule set is a
+# deliberate per-phase decision, not an ambient default.
+#   - F821/F811/E9 catch what AI-agent edits break most: undefined names,
+#     lost imports after refactors, duplicate defs, syntax errors.
+#   - F401/F841/F541 (183/26/8 pre-existing hits) stay ignored until the
+#     owning module is refactored; re-audit at each phase boundary.
+
+[tool.ruff]
+target-version = "py313"
+extend-exclude = [".claude", ".state", ".omc", "frontend"]
+
+[tool.ruff.lint]
+select = ["F", "E9"]
+ignore = ["F401", "F841", "F541"]
+
+[tool.mypy]
+python_version = "3.13"
+# Scoped adoption: only the paths listed in `files` are checked. New boundary
+# code (MessageContext / gateways / state classes) must be added here as it
+# is created; legacy modules join when they are refactored.
+files = [
+    "services/correlation.py",
+    "services/structured_log.py",
+    "utils/atomic_write.py",
+]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
