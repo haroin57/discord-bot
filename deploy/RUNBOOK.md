@@ -100,3 +100,18 @@ scripts/bot-rollback.sh refactor-base-20260703   # tag へ即時 rollback + rest
   `_bool_env()` を使って定義する（例: `REFACTOR_SENDER_NEW`）
 - デフォルトは**旧経路**。新経路が観察期間を通過したらデフォルト反転 → 次のフェーズで旧経路削除
 - フラグの寿命は最長1フェーズ。恒久 config 化しない
+
+## 外形監視（C0b, 2026-07-04）
+
+bot と運命を共にしない監視経路。**bot 完全死でもアラートが届く**。
+
+- probe: Cloudflare Worker `kanae-health-probe`（毎分 cron）→
+  https://health.haroin57.com/health（cloudflared tunnel、/health のみ path 公開）
+- 判定: 3回連続失敗で DOWN、2回連続成功で復帰（フラップ抑制）。HTTP 200 でも
+  body の status≠"ok"（degraded）は失敗扱い
+- 通知: Discord Webhook → #kanae-monitoring（「おはなし」サーバー）。DOWN 継続中は
+  30分毎に再通知
+- 状態確認: https://kanae-health-probe.haroin57.workers.dev/ （現在の KV 状態を返す）
+- ソース: /tmp/kanae-health-probe（wrangler プロジェクト。恒久保管先は要検討）
+- **残項目**: Worker 自体の死の検知は Cloudflare ダッシュボードの Workers アラート
+  設定 or 外部 SaaS（UptimeRobot 等）を追加すること（監視の監視）
