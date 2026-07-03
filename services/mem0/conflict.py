@@ -26,6 +26,7 @@ costs us a real fact.
 from __future__ import annotations
 
 import logging
+from services.mem0.format import strip_json_fence
 import os
 
 log = logging.getLogger(__name__)
@@ -81,12 +82,7 @@ async def classify_conflict(existing_text: str, candidate_text: str) -> dict:
                 "complements an existing fact. Return JSON only."
             ),
         )
-        text = extract_text(resp).strip()
-        if text.startswith("```"):
-            text = text.split("```", 2)[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.rsplit("```", 1)[0].strip()
+        text = strip_json_fence(extract_text(resp))
         import json as _json
         data = _json.loads(text)
         ctype = data.get("conflict_type", "addition")

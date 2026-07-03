@@ -1,6 +1,7 @@
 """Haiku-based fact extraction & metadata classification for ingestion."""
 
 import logging
+from services.mem0.format import strip_json_fence
 import os
 import re
 
@@ -491,12 +492,7 @@ async def extract_full_signals(
                 user_message=user_message,
                 task_prompt=task_prompt,
             )
-            text = extract_text(resp).strip()
-            if text.startswith("```"):
-                text = text.split("```", 2)[1]
-                if text.startswith("json"):
-                    text = text[4:]
-                text = text.rsplit("```", 1)[0].strip()
+            text = strip_json_fence(extract_text(resp))
             stop_reason = getattr(resp, "stop_reason", "?")
             if not text:
                 log.warning(
@@ -738,12 +734,7 @@ async def extract_kanae_signals(
                 "about Kanae (the AI bot) from her own utterances. Return JSON only."
             ),
         )
-        text = extract_text(resp).strip()
-        if text.startswith("```"):
-            text = text.split("```", 2)[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.rsplit("```", 1)[0].strip()
+        text = strip_json_fence(extract_text(resp))
         if not text:
             log.warning(
                 "extract_kanae_signals: empty TextBlock (stop_reason=%s)",

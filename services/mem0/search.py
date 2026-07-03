@@ -6,6 +6,8 @@ import os
 import re
 import time
 
+from services.mem0.format import strip_json_fence
+
 from services.mem0.client import (
     MEM0_RELEVANCE_MAX_DISTANCE,
     _get_mem0,
@@ -346,12 +348,7 @@ async def _extract_keywords_via_llm(query: str) -> str:
                 "query. Return JSON only."
             ),
         )
-        text = extract_text(resp).strip()
-        if text.startswith("```"):
-            text = text.split("```", 2)[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.rsplit("```", 1)[0].strip()
+        text = strip_json_fence(extract_text(resp))
         import json as _json
         data = _json.loads(text)
         kws = [str(k).strip() for k in data.get("keywords", []) if str(k).strip()]
@@ -406,12 +403,7 @@ async def _generate_hypothetical_fact(query: str) -> str:
                 "would answer the user's question. Return JSON only."
             ),
         )
-        text = extract_text(resp).strip()
-        if text.startswith("```"):
-            text = text.split("```", 2)[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.rsplit("```", 1)[0].strip()
+        text = strip_json_fence(extract_text(resp))
         import json as _json
         out = _json.loads(text).get("hypothetical", "")
         if isinstance(out, str):
@@ -445,12 +437,7 @@ async def _rewrite_query(query: str) -> list[str]:
                 "Return JSON only."
             ),
         )
-        text = extract_text(resp).strip()
-        if text.startswith("```"):
-            text = text.split("```", 2)[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.rsplit("```", 1)[0].strip()
+        text = strip_json_fence(extract_text(resp))
         import json as _json
         data = _json.loads(text)
         out = data.get("queries", [])
@@ -534,12 +521,7 @@ async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> 
                 "original query. Return JSON only."
             ),
         )
-        text = extract_text(resp).strip()
-        if text.startswith("```"):
-            text = text.split("```", 2)[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.rsplit("```", 1)[0].strip()
+        text = strip_json_fence(extract_text(resp))
         import json as _json
         idxs = _json.loads(text).get("top", [])
         picked = []
