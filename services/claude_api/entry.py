@@ -870,6 +870,7 @@ async def call_with_tools(
                             scratch_finalize_callback=scratch_finalize_callback,
                             progress=progress,
                             max_turns=max_turns,
+                            budget_role="restricted" if restricted else "admin",  # ADR-0036
                             stall_watchdog=watchdog,
                             api_client=api_client,
                             model=effective_model,
