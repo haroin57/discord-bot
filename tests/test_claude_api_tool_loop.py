@@ -332,12 +332,14 @@ class TestRunAgentLoop:
     @pytest.mark.asyncio
     async def test_max_turns_exhausted(self, watchdog):
         # Each turn requests another tool; we never see end_turn.
+        # Distinct inputs so the loop detector doesn't fire — we want to test the
+        # emergency turn-ceiling path specifically (ADR-0036).
         responses = []
         for _ in range(3):
             responses.append((
                 [],
                 _final_msg(
-                    [_block("tool_use", id=f"t{_}", name="Read", input={})],
+                    [_block("tool_use", id=f"t{_}", name="Read", input={"p": _})],
                     "tool_use",
                 ),
             ))
@@ -356,9 +358,88 @@ class TestRunAgentLoop:
             model="claude-opus-4-6",
             extra_betas=[],
         )
-        # Hit turn cap → synthetic_session_id is None
-        assert result.synthetic_session_id is None
-        assert "ターン上限" in result.text
+        # ADR-0036: hitting the emergency turn ceiling is now a graceful
+        # checkpoint — work is preserved (real session id) and the reply is a
+        # non-sentinel resume note, not the discard-everything sentinel.
+        assert result.synthetic_session_id is not None
+        assert result.paused_reason == "turn_ceiling"
+        assert "続けて" in result.text
+
+    @pytest.mark.asyncio
+    async def test_tool_loop_detected_checkpoints(self, watchdog):
+        # Same tool + same args repeated → loop detector breaks with a graceful
+        # checkpoint before the (large) turn ceiling (ADR-0036). Write is not a
+        # read-only tool, so the break threshold is the base value (5).
+        responses = []
+        for i in range(8):
+            responses.append((
+                [],
+                _final_msg(
+                    [_block("tool_use", id=f"t{i}", name="Write",
+                            input={"path": "a", "content": "x"})],
+                    "tool_use",
+                ),
+            ))
+        client = _make_client(*responses)
+        execute = AsyncMock(return_value="ok")
+        history: list[dict] = []
+        result = await run_agent_loop(
+            "spin", channel_id=1, history=history,
+            system_prompt="sys", tools_for_api=[],
+            can_use_tool=_allow_all,
+            execute_tool=execute,
+            status_callback=_noop_status,
+            max_turns=100,
+            stall_watchdog=watchdog,
+            api_client=client,
+            model="claude-opus-4-6",
+            extra_betas=[],
+        )
+        assert result.paused_reason == "tool_loop"
+        assert result.synthetic_session_id is not None
+        # Broke at the repeat threshold, well before max_turns=100.
+        assert execute.await_count <= 6
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_streams_resume_note(self, watchdog):
+        # ADR-0036: in streaming mode the prose is delivered live, so the
+        # checkpoint must stream the trailing "続けて" resume hint too (the final
+        # flush renders `committed`, which otherwise wouldn't include the note).
+        responses = []
+        for i in range(8):
+            responses.append((
+                [],
+                _final_msg(
+                    [
+                        _block("text", text=f"進捗{i}"),
+                        _block("tool_use", id=f"t{i}", name="Write",
+                               input={"path": "a", "content": "x"}),
+                    ],
+                    "tool_use",
+                ),
+            ))
+        client = _make_client(*responses)
+        streamed: list[str] = []
+
+        async def _capture(text):
+            streamed.append(text)
+
+        result = await run_agent_loop(
+            "spin", channel_id=1, history=[],
+            system_prompt="sys", tools_for_api=[],
+            can_use_tool=_allow_all,
+            execute_tool=AsyncMock(return_value="ok"),
+            status_callback=_noop_status,
+            incremental_text_callback=_capture,
+            max_turns=100,
+            stall_watchdog=watchdog,
+            api_client=client,
+            model="claude-opus-4-6",
+            extra_betas=[],
+        )
+        assert result.paused_reason == "tool_loop"
+        # The resume hint reached the user via the live stream.
+        assert any("続けて" in s for s in streamed)
 
     @pytest.mark.asyncio
     async def test_unexpected_stop_reason_returns_text(self, watchdog):
