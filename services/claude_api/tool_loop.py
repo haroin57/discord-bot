@@ -46,6 +46,10 @@ from config import (
     TOOL_CALL_TIMEOUT_S,
     TOOL_ERROR_MIN_REPLY_CHARS,
 )
+from services.claude_api.loop_guard import (  # ADR-0036
+    RequestBudget,
+    ToolLoopDetector,
+)
 
 from services.claude_api.client import (
     CLAUDE_MAX_TOKENS_OPUS,
@@ -97,6 +101,11 @@ class AgentLoopResult:
     # tokens). Surfaced to bot.py via SessionInfo.last_usage so /context can
     # show "how much room is left before the 500K compaction trigger".
     usage_total: dict | None = None
+    # ADR-0036: set when the loop stopped at a resource guard rather than a
+    # natural end_turn — one of "turn_ceiling" / "wallclock" / "output_tokens"
+    # / "tool_loop". None on clean completion. The reply text and session are
+    # still preserved (graceful checkpoint), so "続けて" resumes seamlessly.
+    paused_reason: str | None = None
 
 
 # Header the official CLI sets on every API request once a refusal fallback
@@ -151,6 +160,72 @@ _TOOL_ERROR_NUDGE = (
 _FINAL_EMPTY_NUDGE = (
     "応答が空のようです。ここまでで分かったことだけでも要約して返してください。"
 )
+# ADR-0036: soft-budget wrap-up nudge. Injected once into a tool_results user
+# turn when RequestBudget crosses the soft threshold, so the model produces a
+# clean hand-off summary before the hard limit forces a checkpoint.
+_BUDGET_WRAP_UP_NUDGE = (
+    "⏳ このリクエストの実行予算が上限に近づいています。ここまでの成果・現在の状態・"
+    "残っているタスクを簡潔にまとめ、新しい重い作業は始めずに一旦区切ってください。"
+)
+# ADR-0036: loop-detector warn nudge. Injected once when the same tool is being
+# called with the same arguments repeatedly (no apparent progress).
+_TOOL_LOOP_WARN_NUDGE = (
+    "⚠️ 同じツールを同じ引数で繰り返しているようです。進んでいないので、"
+    "別のアプローチに切り替えるか、ここまでで分かったことを整理してください。"
+)
+# ADR-0036: subtext note appended to a graceful checkpoint reply so the user
+# knows work was saved and can resume. NOT a NON_PERSISTABLE sentinel — the
+# reply carries real prose + full tool context, so it persists and resumes.
+_CHECKPOINT_NOTE = (
+    "-# ⏸️ 作業が長くなったのでここまでを保存しました。「続けて」で同じ文脈から再開できます。"
+)
+
+
+def _build_checkpoint_result(
+    *,
+    text_across_turns: list[str],
+    last_text: str,
+    fallback_used: bool,
+    fallback_note_sent_live: bool,
+    current_model: str,
+    active_mcp_keys: list[str],
+    prior_len: int | None,
+    usage_totals: dict,
+    paused_reason: str,
+) -> "AgentLoopResult":
+    """Graceful checkpoint (ADR-0036): preserve work instead of discarding it.
+
+    Unlike the pre-ADR-0036 max_turns path (synthetic_session_id=None + a
+    NON_PERSISTABLE sentinel, which threw away the whole transcript), this
+    returns a REAL session id and a non-sentinel reply. entry.py's existing
+    persistence (set_session + JSONL slice) then saves the full structured
+    transcript verbatim, so "続けて" resumes with all tool context intact.
+    """
+    accumulated = "\n\n".join(t for t in text_across_turns if t)
+    body = accumulated or last_text
+    if body:
+        text = body + "\n\n" + _CHECKPOINT_NOTE
+    else:
+        # Model ran tools but emitted no prose — still give the user a handle.
+        text = "⏸️ 作業をここまで保存しました。「続けて」で同じ文脈から再開できます。"
+    if fallback_used and not fallback_note_sent_live and body:
+        text = _fallback_alert(current_model) + "\n\n" + text
+    return AgentLoopResult(
+        text=text,
+        synthetic_session_id=uuid.uuid4().hex,
+        active_mcp_keys=active_mcp_keys,
+        fallback_model=current_model if fallback_used else None,
+        prior_len=prior_len,
+        usage_total=dict(usage_totals),
+        paused_reason=paused_reason,
+    )
+
+
+# Read-only tools whose repeated identical calls are less alarming (status
+# checks, re-reads). Loop detector gives these extra slack. Distinct from
+# CONCURRENCY_SAFE_TOOLS (which includes Agent — repeated identical subagent
+# spawns ARE suspicious, so Agent is intentionally excluded here).
+_LOOP_READONLY_TOOLS = frozenset({"Read", "Glob", "Grep"})
 
 
 def _observe_response_headers(source) -> None:
@@ -1349,6 +1424,9 @@ async def run_agent_loop(
     output_config_override: dict | None = None,  # /effort per-request override
     tool_search_enabled: bool = False,  # Tool Search Tool (defer_loading) 有効時 True
     evidence=None,  # services.claude_api.evidence.EvidenceIndex | None（熟考P1）
+    budget_role: str = "admin",  # ADR-0036: "admin"/"restricted"/"subagent"
+    request_budget=None,  # ADR-0036: RequestBudget override (else built from role)
+    loop_detector=None,  # ADR-0036: ToolLoopDetector override (else built from role)
 ) -> AgentLoopResult:
     """Run the streaming + tool-use loop. See module docstring for invariants.
 
@@ -1438,7 +1516,59 @@ async def run_agent_loop(
     # そのまま再送する continue の暴走防止（MAX_PAUSE_TURN_CONTINUES で打ち切り）。
     pause_turn_continues = 0
 
+    # ADR-0036: 予算 + ループ検知。回数上限は非常停止に格下げし、これらが実務上の
+    # リミッタになる。呼び出し側が override を渡さなければ role から構築する。
+    budget = request_budget or RequestBudget.for_role(budget_role)
+    detector = loop_detector or ToolLoopDetector.for_role(
+        budget_role, readonly_names=_LOOP_READONLY_TOOLS,
+    )
+    # soft 予算到達で1回だけ立てる。次の tool_results ターンに wrap-up nudge を混ぜる。
+    wrap_up_requested = False
+    wrap_up_injected = False
+
+    async def _emit_checkpoint(paused_reason: str) -> AgentLoopResult:
+        """ADR-0036: graceful checkpoint を組み立てて返す。streaming 時は本文が
+        既にライブ配信済みなので、末尾の resume ノートだけを追加でライブ送信して
+        ユーザーに「続けて」導線を見せる（fallback_alert と同じ流儀）。"""
+        _log_total_usage(channel_id, usage_totals)
+        result = _build_checkpoint_result(
+            text_across_turns=text_across_turns,
+            last_text=last_text,
+            fallback_used=fallback_used,
+            fallback_note_sent_live=fallback_note_sent_live,
+            current_model=current_model,
+            active_mcp_keys=active_mcp_keys,
+            prior_len=prior_len,
+            usage_totals=usage_totals,
+            paused_reason=paused_reason,
+        )
+        if incremental_text_callback is not None:
+            _accumulated = "\n\n".join(t for t in text_across_turns if t)
+            _note = _CHECKPOINT_NOTE if _accumulated else result.text
+            try:
+                await incremental_text_callback(_note)
+            except Exception as exc:  # noqa: BLE001 — 表示失敗で loop を殺さない
+                log.warning("[ch=%d] checkpoint note stream failed: %s", channel_id, exc)
+        return result
+
     for turn in range(max_turns):
+        # ADR-0036: リクエスト予算のチェック（API 呼び出し前）。hard は即 checkpoint、
+        # soft は wrap-up を1回予約。前ターンまでの出力トークンと経過時間を反映。
+        _bstatus = budget.status()
+        if _bstatus.state == "hard":
+            log.warning(
+                "[ch=%d] turn=%d request budget hard limit → checkpoint: %s",
+                channel_id, turn, _bstatus.reason,
+            )
+            _paused = "wallclock" if "wallclock" in _bstatus.reason else "output_tokens"
+            return await _emit_checkpoint(_paused)
+        if _bstatus.state == "soft" and not wrap_up_requested:
+            wrap_up_requested = True
+            log.info(
+                "[ch=%d] turn=%d request budget soft → wrap-up requested: %s",
+                channel_id, turn, _bstatus.reason,
+            )
+
         messages = _normalize_history_for_api(
             history, strip_tool_search=not tool_search_enabled,
         )
@@ -1637,9 +1767,12 @@ async def run_agent_loop(
                 )
                 # Fold this turn's output into the running spinner total so the
                 # next turn's live count continues from here.
-                _tok_base += _usage_number(
+                _this_turn_output = _usage_number(
                     getattr(final_msg, "usage", None), "output_tokens",
                 )
+                _tok_base += _this_turn_output
+                # ADR-0036: feed the output-token budget (checked at loop top).
+                budget.add_output_tokens(_this_turn_output)
                 if progress is not None:
                     progress["tokens"] = _tok_base
                 if getattr(final_msg, "stop_reason", None) == "refusal":
@@ -2067,12 +2200,47 @@ async def run_agent_loop(
                 usage_total=dict(usage_totals),
             )
         consecutive_empty = 0
-        history.append({"role": "user", "content": tool_results})
+
+        # ADR-0036: ループ検知。このターンで実行した各ツールを記録し、同一
+        # (tool, 引数) の反復（進捗ゼロの堂々巡り）を検出する。break は work を
+        # 保存してから抜けるため、tool_results を append した後に離脱する。
+        _loop_break = False
+        _loop_warn = False
+        for _tb in tool_blocks:
+            _sig = detector.record(
+                getattr(_tb, "name", "") or "",
+                getattr(_tb, "input", None),
+            )
+            if _sig.action == "break":
+                _loop_break = True
+                log.warning(
+                    "[ch=%d] turn=%d tool loop detected → checkpoint: %s",
+                    channel_id, turn + 1, _sig.reason,
+                )
+            elif _sig.action == "warn":
+                _loop_warn = True
+                log.info(
+                    "[ch=%d] turn=%d tool loop warn: %s",
+                    channel_id, turn + 1, _sig.reason,
+                )
+
+        # tool_results ユーザーターンに nudge を混ぜる（別の user ターンを足すと
+        # 連続 user ターンで 400 になるため、同一ターンの text ブロックとして注入）。
+        _content = list(tool_results)
+        if _loop_warn and not _loop_break:
+            _content.append({"type": "text", "text": _TOOL_LOOP_WARN_NUDGE})
+        if wrap_up_requested and not wrap_up_injected:
+            _content.append({"type": "text", "text": _BUDGET_WRAP_UP_NUDGE})
+            wrap_up_injected = True
+        history.append({"role": "user", "content": _content})
         # (B) Remember whether this batch errored so the end_turn branch can
         # nudge once if the model then gives up with a thin reply.
         last_turn_had_tool_error = any(
             r.get("is_error") for r in tool_results
         )
+
+        if _loop_break:
+            return await _emit_checkpoint("tool_loop")
 
         # Sticky 昇格: このターンで実際に呼ばれた MCP サーバーを active_mcp_keys
         # に合流させる。entry.py が SessionInfo.mcp_server_keys へ永続化する
@@ -2128,23 +2296,15 @@ async def run_agent_loop(
                 history[:prior_len] = new_prior
                 prior_len = len(new_prior)
 
-    # Reached max_turns.
-    log.warning("agent loop exhausted max_turns=%d for ch=%d", max_turns, channel_id)
-    _log_total_usage(channel_id, usage_totals)
-    accumulated = "\n\n".join(text_across_turns)
-    if fallback_used and not fallback_note_sent_live and accumulated:
-        accumulated = (
-            _fallback_alert(current_model) + "\n\n"
-            + accumulated
-        )
-    return AgentLoopResult(
-        text=accumulated or last_text or "🔄 ターン上限に達しました。もう一度話しかけてください。",
-        synthetic_session_id=None,
-        active_mcp_keys=active_mcp_keys,
-        fallback_model=current_model if fallback_used else None,
-        prior_len=prior_len,
-        usage_total=dict(usage_totals),
+    # Reached the emergency turn ceiling (ADR-0036). This is now a rare backstop
+    # — RequestBudget / ToolLoopDetector normally stop the loop first. Graceful
+    # checkpoint instead of the old synthetic_session_id=None sentinel that
+    # discarded the whole transcript: preserve work + let "続けて" resume.
+    log.warning(
+        "agent loop hit emergency turn ceiling max_turns=%d for ch=%d → checkpoint",
+        max_turns, channel_id,
     )
+    return await _emit_checkpoint("turn_ceiling")
 
 
 def kill_orphan_claude_cli() -> int:

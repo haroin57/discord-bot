@@ -313,6 +313,7 @@ async def run_subagent(
                     tool_invocation_callback=tool_invocation_callback,
                     text_stream_callback=text_stream_callback,
                     max_turns=defn.max_tool_turns,
+                    budget_role="subagent",  # ADR-0036
                     stall_watchdog=watchdog,
                     api_client=api_client,
                     model=model,

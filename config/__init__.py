@@ -317,11 +317,13 @@ SLOW_FIRST_BYTE_MS = int(os.environ.get("CLAUDE_SLOW_FIRST_BYTE_MS", "30000"))
 # via beta.messages.stream, so up to 128k is safe; Discord splits long output at
 # 2000 chars/message anyway. SSoT is .env CLAUDE_MAX_TOKENS.
 CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "64000"))
-# Per-request turn ceiling for admin (trusted) callers. Was hard-coded to 999
-# which let a single CLI invocation hold ~500MB of node/MCP child processes
-# for the full CLAUDE_TIMEOUT window. 100 covers heavy image-review workflows
-# (10+ slide screenshots, multi-file edits); bump via env when truly needed.
-ADMIN_MAX_TURNS = int(os.environ.get("ADMIN_MAX_TURNS", "100"))
+# Per-request turn ceiling for admin (trusted) callers. As of ADR-0036 this is
+# no longer the primary limiter — RequestBudget (wall-clock + output tokens) and
+# ToolLoopDetector (no-progress repetition) gate the loop, and this stays only as
+# an absolute emergency backstop. Raised 100→400 so genuinely long, productive
+# agentic work runs to completion (budgets trip first for runaway cost). Bump via
+# env when truly needed.
+ADMIN_MAX_TURNS = int(os.environ.get("ADMIN_MAX_TURNS", "400"))
 
 # ---------------------------------------------------------------------------
 # Agent tool（メインパイプラインの subagent。CLI 純正の Agent tool と足並みを揃える）
@@ -339,6 +341,35 @@ SUBAGENT_MAX_DEPTH = int(os.environ.get("SUBAGENT_MAX_DEPTH", "2"))
 SUBAGENT_MAX_TURNS = int(os.environ.get("SUBAGENT_MAX_TURNS", "20"))
 # subagent の StallWatchdog idle timeout（長考も許容）。
 SUBAGENT_IDLE_TIMEOUT_S = int(os.environ.get("SUBAGENT_IDLE_TIMEOUT_S", "300"))
+
+# ---------------------------------------------------------------------------
+# 動的ツールループ: 予算 + ループ検知 (ADR-0036)
+# ---------------------------------------------------------------------------
+# 回数上限を主制御から外し、これらを実務上のリミッタにする。services/claude_api/
+# loop_guard.py が実装、tool_loop.py が消費する。全て env で調整可能。
+#
+# ループ検知: 同一 (tool_name, 正規化引数) の反復を検知する。読み取り系ツール
+# (CONCURRENCY_SAFE_TOOLS) は確認系の反復が正常なので閾値を緩める。
+TOOL_LOOP_WINDOW = int(os.environ.get("TOOL_LOOP_WINDOW", "12"))
+# 同一呼び出しが WARN 回 → 「アプローチを変えて」nudge を1回注入。
+TOOL_LOOP_REPEAT_WARN = int(os.environ.get("TOOL_LOOP_REPEAT_WARN", "3"))
+# BREAK 回 → 進捗ゼロと判断し graceful checkpoint で離脱。
+TOOL_LOOP_REPEAT_BREAK = int(os.environ.get("TOOL_LOOP_REPEAT_BREAK", "5"))
+# 読み取り系ツールの反復許容の上乗せ (WARN/BREAK にこの値を加算)。
+TOOL_LOOP_READONLY_SLACK = int(os.environ.get("TOOL_LOOP_READONLY_SLACK", "3"))
+#
+# リクエスト予算: ウォールクロック + 累積出力トークン。soft 閾値で「まとめて停止」
+# nudge を1回、hard で即 checkpoint 離脱。0 以下なら該当予算を無効化。
+# ウォールクロック (秒)。admin は長時間の自律作業を許容、restricted は厳格。
+REQUEST_WALLCLOCK_BUDGET_S = int(os.environ.get("REQUEST_WALLCLOCK_BUDGET_S", "1800"))
+RESTRICTED_WALLCLOCK_BUDGET_S = int(os.environ.get("RESTRICTED_WALLCLOCK_BUDGET_S", "120"))
+SUBAGENT_WALLCLOCK_BUDGET_S = int(os.environ.get("SUBAGENT_WALLCLOCK_BUDGET_S", "600"))
+# 累積出力トークン (footprint 上限)。Anthropic はサブスク OAuth 枠なのでドル予算では
+# なく footprint を有界に保つ意味。
+REQUEST_OUTPUT_TOKEN_BUDGET = int(os.environ.get("REQUEST_OUTPUT_TOKEN_BUDGET", "800000"))
+RESTRICTED_OUTPUT_TOKEN_BUDGET = int(os.environ.get("RESTRICTED_OUTPUT_TOKEN_BUDGET", "40000"))
+# soft 閾値 = 予算 * この係数。到達で1回だけ wrap-up nudge。
+REQUEST_BUDGET_SOFT_RATIO = float(os.environ.get("REQUEST_BUDGET_SOFT_RATIO", "0.8"))
 
 # ---------------------------------------------------------------------------
 # Tool-call recovery (2026-06-21). The model occasionally emits a tool call as
