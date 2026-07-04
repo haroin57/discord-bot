@@ -11,22 +11,22 @@ jobs:
   discord:
     runs-on: ubuntu-latest
     steps:
-      - name: Notify branch-specific Discord channel
+      - name: Notify branch-specific Discord channels
         env:
+          # ブランチごとに複数サーバーへミラーする。webhook を増やすときは
+          # secret を足して下の配列に追記するだけ (_2 = あしたぼ開発サーバー)。
           WEBHOOK_MASTER: ${{ secrets.DISCORD_WEBHOOK_MASTER }}
+          WEBHOOK_MASTER_2: ${{ secrets.DISCORD_WEBHOOK_MASTER_2 }}
           WEBHOOK_DEV: ${{ secrets.DISCORD_WEBHOOK_DEV }}
+          WEBHOOK_DEV_2: ${{ secrets.DISCORD_WEBHOOK_DEV_2 }}
         run: |
           set -euo pipefail
           BRANCH="${GITHUB_REF##*/}"
           case "${BRANCH}" in
-            master) WEBHOOK="${WEBHOOK_MASTER}"; COLOR=3066993 ;;   # 緑
-            dev)    WEBHOOK="${WEBHOOK_DEV}";    COLOR=15105570 ;;  # 橙
+            master) WEBHOOKS=("${WEBHOOK_MASTER}" "${WEBHOOK_MASTER_2}"); COLOR=3066993 ;;   # 緑
+            dev)    WEBHOOKS=("${WEBHOOK_DEV}" "${WEBHOOK_DEV_2}");       COLOR=15105570 ;;  # 橙
             *)      echo "unexpected branch ${BRANCH}"; exit 0 ;;
           esac
-          if [ -z "${WEBHOOK}" ]; then
-            echo "webhook secret for ${BRANCH} not set; skipping"
-            exit 0
-          fi
           # event JSON から embed を組む。commits は先頭10件、超過は要約1行。
           PAYLOAD="$(jq -c --argjson color "${COLOR}" '
             (.commits | length) as $total
@@ -51,7 +51,12 @@ jobs:
                   )
                 }]
               }' "${GITHUB_EVENT_PATH}")"
-          code="$(curl -s -o /dev/null -w '%{http_code}' \
-            -H 'Content-Type: application/json' -d "${PAYLOAD}" "${WEBHOOK}")"
-          echo "Discord webhook responded ${code}"
-          [ "${code}" = "204" ] || { echo "notification failed"; exit 1; }
+          rc=0
+          for WEBHOOK in "${WEBHOOKS[@]}"; do
+            [ -z "${WEBHOOK}" ] && continue   # 未設定 secret はスキップ
+            code="$(curl -s -o /dev/null -w '%{http_code}' \
+              -H 'Content-Type: application/json' -d "${PAYLOAD}" "${WEBHOOK}")"
+            echo "Discord webhook responded ${code}"
+            [ "${code}" = "204" ] || rc=1
+          done
+          exit "${rc}"
