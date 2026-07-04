@@ -1,0 +1,57 @@
+name: notify-push
+
+# master / dev への push を、ブランチ別の Discord チャンネルへ通知する。
+# GitHub の native webhook は全ブランチが1 URL に来て振り分けられないため、
+# Actions 側で GITHUB_REF を見て対応する webhook secret を選ぶ。
+on:
+  push:
+    branches: [master, dev]
+
+jobs:
+  discord:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify branch-specific Discord channel
+        env:
+          WEBHOOK_MASTER: ${{ secrets.DISCORD_WEBHOOK_MASTER }}
+          WEBHOOK_DEV: ${{ secrets.DISCORD_WEBHOOK_DEV }}
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_REF##*/}"
+          case "${BRANCH}" in
+            master) WEBHOOK="${WEBHOOK_MASTER}"; COLOR=3066993 ;;   # 緑
+            dev)    WEBHOOK="${WEBHOOK_DEV}";    COLOR=15105570 ;;  # 橙
+            *)      echo "unexpected branch ${BRANCH}"; exit 0 ;;
+          esac
+          if [ -z "${WEBHOOK}" ]; then
+            echo "webhook secret for ${BRANCH} not set; skipping"
+            exit 0
+          fi
+          # event JSON から embed を組む。commits は先頭10件、超過は要約1行。
+          PAYLOAD="$(jq -c --argjson color "${COLOR}" '
+            (.commits | length) as $total
+            | {
+                username: "GitHub",
+                embeds: [{
+                  author: { name: (.pusher.name // "unknown") },
+                  title: (($total | tostring) + " commit(s) → "
+                          + .repository.full_name + ":"
+                          + (.ref | sub("refs/heads/"; ""))),
+                  url: .compare,
+                  color: $color,
+                  timestamp: (.head_commit.timestamp // null),
+                  description: (
+                    ([ .commits[0:10][]
+                       | "[`" + (.id[0:7]) + "`](" + .url + ") "
+                         + ((.message | split("\n")[0])[0:100])
+                         + " — " + .author.name ] | join("\n"))
+                    + (if $total > 10
+                       then "\n… and " + (($total - 10) | tostring) + " more"
+                       else "" end)
+                  )
+                }]
+              }' "${GITHUB_EVENT_PATH}")"
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'Content-Type: application/json' -d "${PAYLOAD}" "${WEBHOOK}")"
+          echo "Discord webhook responded ${code}"
+          [ "${code}" = "204" ] || { echo "notification failed"; exit 1; }
