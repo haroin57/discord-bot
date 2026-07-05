@@ -36,6 +36,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from typing import Iterable
 
@@ -60,6 +61,14 @@ _FTS_SPECIAL_RE = re.compile(r'["\(\)\*\^:]')
 
 _db_lock = threading.Lock()
 _db_path: str | None = None
+# Path for which journal_mode=WAL + schema have been applied. journal_mode is a
+# persistent DB-level property whose lock is NOT governed by busy_timeout, so
+# running `PRAGMA journal_mode=WAL` on every (concurrent) connection made ~30%
+# of concurrent index_line() writes fail with "database is locked" — silently
+# dropping a history-search FTS row (observed in prod). We now apply it exactly
+# once per DB file, serialized under _db_lock. Keyed on path so a test tempfile
+# swap or a reindex_all wipe re-initialises automatically.
+_wal_ready_path: str | None = None
 
 
 def _resolve_db_path() -> str:
@@ -76,27 +85,32 @@ def _resolve_db_path() -> str:
 
 def _reset_db_path_for_test(path: str | None) -> None:
     """Test hook — pytest fixtures point the module at a tempfile."""
-    global _db_path
+    global _db_path, _wal_ready_path
     _db_path = path
+    _wal_ready_path = None  # new DB file → re-init WAL + schema on next _conn()
 
 
 @contextmanager
 def _conn():
+    global _wal_ready_path
     path = _resolve_db_path()
-    # timeout=5.0 makes sqlite3 wait (and internally retry) up to 5s for a
-    # write lock instead of raising "database is locked" immediately. WAL is
-    # already on, but WAL still serializes *writers*, so concurrent indexing
-    # of two messages would otherwise lose a row to a hard lock error (the row
-    # is silently dropped from the history-search FTS index). busy_timeout is
-    # the SQLite-level equivalent and is set explicitly so it applies even if
-    # the connection timeout is bypassed (ADR-0007).
+    # timeout=5.0 makes sqlite3 wait up to 5s for a write lock. busy_timeout is
+    # the SQLite-level equivalent, set on every connection (it is connection-
+    # local and lock-free, so it never contends). journal_mode=WAL, by contrast,
+    # is DB-level and its lock IGNORES busy_timeout — running it concurrently was
+    # the "database is locked" row-drop bug (ADR-0007). Apply WAL + schema once
+    # per DB file, serialized under _db_lock, with a double-check so exactly one
+    # thread runs it.
     c = sqlite3.connect(path, check_same_thread=False, timeout=5.0)
     c.row_factory = sqlite3.Row
     try:
-        c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA busy_timeout=5000")
-        with _db_lock:
-            c.executescript(_SCHEMA)
+        if _wal_ready_path != path:
+            with _db_lock:
+                if _wal_ready_path != path:
+                    c.execute("PRAGMA journal_mode=WAL")
+                    c.executescript(_SCHEMA)
+                    _wal_ready_path = path
         yield c
     finally:
         c.close()
@@ -135,23 +149,35 @@ def index_line(channel_id: int, ts: str, role: str, text: str, author: str = "")
     ts = ts or ""
     author = author or ""
     tokenized = _tokenize(text)
-    try:
-        with _conn() as c, _db_lock:
-            c.execute(
-                "DELETE FROM history_fts WHERE channel_id = ? AND ts = ? "
-                "AND role = ? AND orig_text = ?",
-                (str(channel_id), ts, role, text),
-            )
-            c.execute(
-                "INSERT INTO history_fts(channel_id, ts, role, author, orig_text, text) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (str(channel_id), ts, role, author, text, tokenized),
-            )
-            c.commit()
-            return True
-    except Exception as exc:
-        log.warning("history index_line(ch=%s) failed: %s", channel_id, exc)
-        return False
+    # Retry on transient "database is locked": WAL still serializes writers and
+    # a checkpoint can briefly hold the lock past busy_timeout. Bounded (4 tries,
+    # ~0.05/0.1/0.15s backoff) so a genuinely stuck DB returns False rather than
+    # blocking the caller. Belt-and-suspenders on top of the WAL-once fix.
+    for attempt in range(4):
+        try:
+            with _conn() as c, _db_lock:
+                c.execute(
+                    "DELETE FROM history_fts WHERE channel_id = ? AND ts = ? "
+                    "AND role = ? AND orig_text = ?",
+                    (str(channel_id), ts, role, text),
+                )
+                c.execute(
+                    "INSERT INTO history_fts(channel_id, ts, role, author, orig_text, text) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (str(channel_id), ts, role, author, text, tokenized),
+                )
+                c.commit()
+                return True
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() and attempt < 3:
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            log.warning("history index_line(ch=%s) failed: %s", channel_id, exc)
+            return False
+        except Exception as exc:
+            log.warning("history index_line(ch=%s) failed: %s", channel_id, exc)
+            return False
+    return False
 
 
 def search_history(query: str, channel_id: int, limit: int = 5) -> list[dict]:
@@ -225,6 +251,7 @@ def reindex_all(lines: Iterable[tuple[int, str, str, str, str]]) -> int:
     siblings and let the next ``_conn()`` recreate them under the current
     ``_SCHEMA``. Returns the row count inserted.
     """
+    global _wal_ready_path
     path = _resolve_db_path()
     with _db_lock:
         for suffix in ("", "-wal", "-shm"):
@@ -235,6 +262,7 @@ def reindex_all(lines: Iterable[tuple[int, str, str, str, str]]) -> int:
             except OSError as exc:
                 log.warning("history reindex_all: unlink %s%s failed: %s",
                             path, suffix, exc)
+        _wal_ready_path = None  # DB wiped → next _conn() recreates WAL + schema
 
     count = 0
     try:
