@@ -4,6 +4,9 @@ Matches free-code QueryEngine pattern: orchestrates services and utils.
 """
 
 import asyncio
+import ctypes
+import ctypes.util
+import gc
 import io
 import logging
 import os
@@ -442,6 +445,43 @@ bot.close = _patched_close
 # ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Memory hygiene (ADR-0037 follow-up). glibc frees large transient allocations
+# (PIL image processing, big tool-loop message lists loaded for the API call)
+# into its arenas but does NOT return them to the OS, so RSS creeps over a long
+# uptime (measured 181→238MB / 37d, no OOM). malloc_trim(0) forces glibc to
+# hand the free arena top back; gc.freeze() (in on_ready) moves the static
+# startup heap out of gc's scan set so collections stay cheap and don't churn.
+# ---------------------------------------------------------------------------
+try:
+    _libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+except Exception:  # pragma: no cover — non-glibc / musl: no malloc_trim
+    _libc = None
+
+
+def _malloc_trim() -> None:
+    """Return glibc free-arena memory to the OS. No-op off glibc."""
+    if _libc is None:
+        return
+    try:
+        _libc.malloc_trim(0)
+    except Exception:  # noqa: BLE001 — best-effort, never fatal
+        pass
+
+
+async def _periodic_memory_trim(interval_s: float = 300.0) -> None:
+    """Every ``interval_s`` reclaim post-spike memory: collect cyclic garbage,
+    then hand free arenas back to the OS. Cheap after gc.freeze() — only the
+    young (non-frozen) generation is scanned."""
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            gc.collect()
+            _malloc_trim()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 @bot.event
 async def on_ready():
     for guild in bot.guilds:
@@ -504,6 +544,11 @@ async def on_ready():
             asyncio.to_thread(cleanup_stale_attachments),
             name="cleanup_stale_attachments",
         )
+        # Memory hygiene (ADR-0037 follow-up): freeze the static startup heap so
+        # gc stops rescanning it, then start the periodic OS-return trim.
+        gc.collect()
+        gc.freeze()
+        _track_task(_periodic_memory_trim(), name="memory_trim")
 
 
 # ---------------------------------------------------------------------------
