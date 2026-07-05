@@ -117,6 +117,76 @@ oracle session <slug>                             # detach したジョブの回
   （resp_id はセッションの output.log に記録される）。放置すると窓を占有し続け
   後続セッションまで連鎖死する
 
+### 修正（2026-07-04 追加検証）: env だけでは MCP 経路で効かない → `~/.oracle/config.json` が正本
+`ORACLE_DEFAULT_SEARCH=off`（run.js パッチ + launcher export）だけでは **MCP 経由の
+consult で search が復活する**再発を確認した。原因は `dist/src/cli/runOptions.js:54`:
+
+```js
+const search = userConfig?.search !== "off";  // config 不在なら true を「明示」生成
+```
+
+MCP 経路（`mcp/utils.js` → `resolveRunOptionsFromConfig`）はこの行で undefined を
+**明示的 `true` に実体化してから** run.js へ渡すため、run.js 側の「`search===true` の
+時だけ opt-in」ゲートが「ユーザーが明示的に search を要求した」と誤認して素通りする。
+CLI 直叩きは undefined のまま届くのでこの経路差で前回の概念検証をすり抜けていた。
+
+**正本は `~/.oracle/config.json` の `{"search": "off"}`**。runOptions.js:54 がまさに
+この userConfig を読むので、shared daemon / 野良 stdio / CLI の**全経路のデフォルトが
+一括で off** になる。env とパッチはフォールバックとして残すが、実効的なスイッチは
+この config ファイル。パッケージ更新でも消えない（インストール先ではなく HOME 配下）。
+
+## 追補3（2026-07-04）: supergateway 切断時クラッシュのパッチ
+
+oracle の shared daemon（`mcp-oracle-shared`, supergateway 3.4.3 で stdio→HTTP 中継）が
+今日 2 回 exit-code で死んだ。systemd `Restart=always` で復帰するが、`KillMode=control-group`
+のため**巻き添えで in-flight の background ジョブが孤児化**する。
+
+### メカニズム
+- gpt-5.5-pro consult は数分かかる。その間にクライアントが接続を切る（キャンセル/中断）
+- 遅れて oracle 子プロセスが最終応答を返すと、supergateway が閉じた接続へ `transport.send()`
+  しようとする。`dist/gateways/stdioToStatelessStreamableHttp.js:120` の send は **async
+  なのに同期 try/catch しか無く**、`Error: No connection established for request ID: N` が
+  **unhandled rejection として throw → node プロセスごと死亡**
+- `dist/gateways/stdioToSse.js` の `session.transport.send()` も同型（`mcp-papermcp` が SSE 使用）
+
+### パッチと永続化
+| 場所 | 役割 |
+|---|---|
+| `infra/supergateway-patches/3.4.3/files/dist/gateways/` | パッチ済み 2 gateway の正本（git 管理）。async send の rejection を `.catch()` で捕捉しログに落とす |
+| `infra/supergateway-patches/3.4.3/supergateway-3.4.3.diff` | 素との差分（レビュー用） |
+| `scripts/supergateway_apply_patches.sh` | 正本をインストール先へ冪等コピー。node バージョン glob で全 image を走査し version 一致分のみ適用。oracle-patches と同じ自己修復パターン |
+| `scripts/oracle_mcp_launch.sh` | oracle apply の直後に supergateway apply も実行 → 更新で剥がれても次回スポーンで自己修復 |
+
+### 検証済み（2026-07-04）
+- 再現テスト: consult 呼び出しを 0.5s で切断 → `No connection established for request ID: 77`
+  が発生するも `Failed to send to StreamableHttp (async)` としてログ捕捉され、**unit は
+  落ちなかった**（NRestarts=0 維持、起動時刻不変）。パッチ前は同一エラーで即死していた
+
+## 追補4（2026-07-04）: search off でも gpt-5.5-pro が完走しない構造的理由
+
+追補（search off）と追補3（クラッシュ）を両方入れた後で gpt-5.5-pro consult を再試行したら、
+**search off（response の `tools: []` を API で確認済み）にもかかわらず 429 で失敗した**。
+つまり「search を切れば pro が使える」という理解は**不完全**だった。
+
+### 新しい失敗メカニズム（search とは無関係）
+- 失敗レスポンスの構成: `reasoning: {effort: "xhigh", mode: "pro"}`, `max_output_tokens: 24000`,
+  `tools: []`（search off 確定）
+- ジョブは `in_progress` で **5分間** xhigh 推論を回し、その reasoning トークンが 60秒 TPM
+  窓に蓄積（`Used 26007`）。最終生成の admission 予約（`Requested 35950` ＝ input + max_output）
+  と合算で 50,000 を超過して 429
+- effort は `dist/src/oracle/config.js` にモデル別ハードコード（pro = xhigh、env override なし）。
+  下げると Pro の意味を失う。max_output を削っても reasoning 26k の窓占有が本質なので 50k の縁で
+  綱渡りになるだけ
+- **結論: gpt-5.5-pro[xhigh] は 50k TPM org では substantial output を構造的に返せない。**
+  TPM 上限を上げる（OpenAI 申請＝オーナー操作）まで、実務では **gpt-5.5(非Pro) に逃がす**か
+  SecondOpinion（サブスク枠）を使う。過去実績も非Pro 2/2 完走・pro 18連敗と整合
+
+### 併せて発見: 非Pro consult の keepalive パーサbug
+`gpt-5.5`(非Pro) consult が `Session ... failed: Unhandled response stream event:
+{"type":"keepalive","sequence_number":N}` で落ちるケースを確認。oracle の Responses API
+ストリームパーサが `keepalive` イベント型を未処理で例外化している疑い。未修正（要調査）。
+当座は SecondOpinion 経由で外部モデル意見を採るのが確実（今日のブレストもそれで実施）。
+
 ## 追補2（2026-07-04）: パッチの永続化 — 自己修復機構
 
 「npm update でパッチが消える」問題を仕組みで解決した。**手動再適用は不要になった。**

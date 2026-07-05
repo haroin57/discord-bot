@@ -55,9 +55,11 @@ from config import (
     TOOL_SEARCH_ENABLED,
 )
 from services.claude_api.compaction import (
+    RECOVERY_DIRECTIVE,
     compact_channel_history,
     compact_threshold_tokens,
     estimate_replay_chars,
+    pop_pending_recovery,
     record_proactive_compaction,
     reset_rapid_refill,
 )
@@ -781,6 +783,11 @@ async def call_with_tools(
                         scratchpad_available=DELIB_SCRATCHPAD_ENABLED,
                     )
 
+            # Phase 2 (ADR-0037): consume the post-compaction recovery flag
+            # ONCE for this request (not per attempt), so every retry re-injects
+            # the directive but the turn after compaction does not (no amnesia).
+            _inject_recovery = (not restricted) and pop_pending_recovery(channel_id)
+
             for attempt in range(TRANSIENT_MAX_ATTEMPTS):
                 if attempt > 0 and not check_and_record_retry_budget(channel_id):
                     log.warning("Retry budget exhausted for ch=%d", channel_id)
@@ -819,6 +826,14 @@ async def call_with_tools(
                             log.info(
                                 "[PROMPT_BREAKDOWN ch=%d] context_snapshot re-injected: chars=%d resumable=%s",
                                 channel_id, len(latest_context_snapshot), resumable,
+                            )
+                        # Phase 2 (ADR-0037): one-shot post-compaction recovery
+                        # directive at the very front of the user turn (system
+                        # stays byte-stable for cache reuse). Re-applied every
+                        # attempt; the flag was already consumed above.
+                        if _inject_recovery:
+                            user_content_for_loop = _prepend_context_snapshot(
+                                user_content_for_loop, RECOVERY_DIRECTIVE,
                             )
                         # Measure final payload going to the Messages API
                         if isinstance(user_content_for_loop, str):
@@ -926,10 +941,24 @@ async def call_with_tools(
                                     channel_id, result.fallback_model, user_id
                                 )
                         break
-                    except asyncio.CancelledError:
-                        # Stall watchdog fired or shutdown — surface as timeout.
-                        log.warning("[ch=%d] cancelled during agent loop", channel_id)
-                        return f"⏰ タイムアウトしました", None, False
+                    except asyncio.CancelledError as _cancel:
+                        # ADR-0038: the outer StallWatchdog cancels with
+                        # "stream idle" — a wedge the in-loop stream guard
+                        # didn't catch (e.g. a hung tool call). Surface that as
+                        # a timeout. A bare cancel is a real /abort or shutdown:
+                        # re-raise so bot.py shows "⏹️ 中断" instead of
+                        # mislabeling the user's own abort as a timeout.
+                        if _cancel.args and _cancel.args[0] == "stream idle":
+                            log.warning(
+                                "[ch=%d] stream idle backstop → timeout",
+                                channel_id,
+                            )
+                            return "⏰ タイムアウトしました", None, False
+                        log.info(
+                            "[ch=%d] agent loop cancelled (abort/shutdown)",
+                            channel_id,
+                        )
+                        raise
                     except anthropic.AnthropicError as exc:
                         category = classify_anthropic_error(exc)
                         log.error(

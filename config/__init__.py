@@ -278,6 +278,14 @@ PROACTIVE_COMPACT_ENABLED = os.environ.get(
 PROACTIVE_COMPACT_TRIGGER_TOKENS = int(
     os.environ.get("PROACTIVE_COMPACT_TRIGGER_TOKENS", "500000")
 )
+# In-loop proactive compaction HARD ceiling (ADR-0037 Phase 3), as a percent of
+# the effective context window. The in-loop mid-turn fold is a last-resort
+# circuit breaker: boundary compaction (compact_threshold_tokens, off last
+# turn's usage) handles the common case at the turn boundary; the in-loop fold
+# only fires when a SINGLE turn balloons past this percent of the window before
+# reaching a boundary (e.g. a giant tool_result). Kept high so we prefer clean
+# boundary folds and only fold mid-turn to dodge an overflow/crash.
+PROACTIVE_COMPACT_HARD_PCT = int(os.environ.get("PROACTIVE_COMPACT_HARD_PCT", "97"))
 # Time-based microcompact (ported from Claude Code CLI $F_/wF_). On an idle
 # gap >= MICROCOMPACT_GAP_MIN minutes, the bodies of all but the last
 # MICROCOMPACT_KEEP_RECENT tool_result blocks in the replayed transcript are
@@ -568,6 +576,22 @@ CLAUDE_MAX_BACKOFF_S = int(os.environ.get("CLAUDE_MAX_BACKOFF_S", "60"))
 # headroom without unbounded waits.
 STREAM_STALL_THRESHOLD_S = int(os.environ.get("STREAM_STALL_THRESHOLD_S", "30"))
 STREAM_IDLE_TIMEOUT_S = int(os.environ.get("STREAM_IDLE_TIMEOUT_S", "300"))
+# ADR-0038: per-turn stream stall → in-place recovery (retry / checkpoint)
+# instead of letting StallWatchdog cancel the whole task. STREAM_STALL_RETRY_S
+# is the idle window (no SSE event at all) that trips a single-turn abort.
+# Kept deliberately generous: adaptive extended thinking can leave the stream
+# silent well past 90s while the model is still working (see the IDLE_TIMEOUT
+# note above), so a shorter window would false-positive on legitimate slow
+# turns. Anything past ~120s of *total* silence is a genuinely wedged upstream
+# (the 2026-07-05 incident sat dead for 183s on an HTTP-200 stream). On trip we
+# re-issue the SAME request up to STREAM_STALL_MAX_RETRIES times — but only for
+# a clean pre-first-byte stall (no prose streamed yet, nothing appended to
+# history), so the retry can never duplicate visible output. Past that budget,
+# or on a mid-stream stall, we emit a graceful checkpoint ("続けて" resumes)
+# rather than dying. STREAM_IDLE_TIMEOUT_S stays as the outer hard backstop for
+# wedges the stream guard can't see (e.g. a hung tool call).
+STREAM_STALL_RETRY_S = int(os.environ.get("STREAM_STALL_RETRY_S", "120"))
+STREAM_STALL_MAX_RETRIES = int(os.environ.get("STREAM_STALL_MAX_RETRIES", "1"))
 
 # Status-spinner rendering mode (see services/claude_api/progress.py +
 # spinner_gif.py). "text" = 1 char/sec bold shimmer as message text + animated
