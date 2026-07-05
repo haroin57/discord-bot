@@ -1,5 +1,6 @@
 """Tests for services.claude_api.tool_loop.run_agent_loop."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -65,6 +66,114 @@ def _make_client(*responses):
         return _FakeStream(events, final)
     client.beta.messages.stream = stream_factory
     return client
+
+
+class _StallStream:
+    """Stream that accepts the request (HTTP 200) but never delivers an event —
+    simulates the ADR-0038 upstream stall the idle guard must catch."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    def __aiter__(self):
+        return self._aiter()
+
+    async def _aiter(self):
+        await asyncio.Event().wait()  # hang forever; wait_for cancels this
+        yield  # pragma: no cover — unreachable
+
+    async def get_final_message(self):
+        await asyncio.Event().wait()  # pragma: no cover
+
+
+def _make_client_streams(*streams):
+    """Client whose stream() returns each preset stream object in order (one
+    per API call, including stall retries)."""
+    it = iter(streams)
+    client = MagicMock()
+    def stream_factory(**_kwargs):
+        return next(it)
+    client.beta.messages.stream = stream_factory
+    return client
+
+
+# --- ADR-0038: stream stall in-loop recovery ------------------------------
+
+
+@pytest.fixture
+async def _inert_watchdog():
+    async with StallWatchdog(
+        channel_id=1, status_callback=None,
+        stall_threshold_s=999, idle_timeout_s=999, poll_interval_s=10,
+    ) as wd:
+        yield wd
+
+
+@pytest.mark.asyncio
+async def test_idle_guarded_yields_events():
+    from services.claude_api.tool_loop import _idle_guarded
+
+    stream = _FakeStream([_block("e", v=1), _block("e", v=2)], None)
+    got = [ev async for ev in _idle_guarded(stream, 5.0)]
+    assert [ev.v for ev in got] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_idle_guarded_raises_timeout_on_stall():
+    from services.claude_api.tool_loop import _idle_guarded
+
+    with pytest.raises(TimeoutError):
+        async for _ in _idle_guarded(_StallStream(), 0.1):
+            pass  # pragma: no cover — never yields
+
+
+@pytest.mark.asyncio
+async def test_stream_stall_ttfb_retries_then_succeeds(_inert_watchdog, monkeypatch):
+    # A clean pre-first-byte stall on turn 0 must re-issue the SAME request and
+    # recover — not die, not checkpoint.
+    import services.claude_api.tool_loop as tl
+
+    monkeypatch.setattr(tl, "STREAM_STALL_RETRY_S", 0.1)
+    monkeypatch.setattr(tl, "STREAM_STALL_MAX_RETRIES", 1)
+    client = _make_client_streams(
+        _StallStream(),  # turn 0: upstream stall
+        _FakeStream([], _final_msg([_block("text", text="recovered!")], "end_turn")),
+    )
+    history: list[dict] = []
+    result = await run_agent_loop(
+        "hi", channel_id=1, history=history, system_prompt="sys",
+        tools_for_api=[], can_use_tool=_allow_all, execute_tool=AsyncMock(),
+        status_callback=_noop_status, max_turns=5, stall_watchdog=_inert_watchdog,
+        api_client=client, model="claude-opus-4-6", extra_betas=[],
+    )
+    assert result.text == "recovered!"
+    assert result.paused_reason is None  # recovered, not a checkpoint
+    # The stalled attempt appended nothing, so the retry is a clean re-send.
+    assert [h["role"] for h in history] == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_stream_stall_exhausted_checkpoints(_inert_watchdog, monkeypatch):
+    # With the retry budget spent (0), a stall must fall through to a graceful
+    # checkpoint — preserve + resume, never "⏹️ 中断".
+    import services.claude_api.tool_loop as tl
+
+    monkeypatch.setattr(tl, "STREAM_STALL_RETRY_S", 0.1)
+    monkeypatch.setattr(tl, "STREAM_STALL_MAX_RETRIES", 0)
+    client = _make_client_streams(_StallStream())
+    history: list[dict] = []
+    result = await run_agent_loop(
+        "hi", channel_id=1, history=history, system_prompt="sys",
+        tools_for_api=[], can_use_tool=_allow_all, execute_tool=AsyncMock(),
+        status_callback=_noop_status, max_turns=5, stall_watchdog=_inert_watchdog,
+        api_client=client, model="claude-opus-4-6", extra_betas=[],
+    )
+    assert result.paused_reason == "stream_stall"
+    assert result.synthetic_session_id is not None  # persists → "続けて" resumes
+
 
 
 def _allow_all(name, inp):
@@ -1609,7 +1718,7 @@ class TestInLoopProactiveCompaction:
     async def test_compacts_and_rebases_prior_window(self, watchdog, monkeypatch):
         import services.claude_api.tool_loop as tl
         monkeypatch.setattr(tl, "PROACTIVE_COMPACT_ENABLED", True)
-        monkeypatch.setattr("services.claude_api.compaction.compact_threshold_tokens", lambda: 100)
+        monkeypatch.setattr("services.claude_api.compaction.proactive_hard_threshold_tokens", lambda: 100)
         client = _make_client(*self._turns(self._usage(200)))
         prior = [
             {"role": "user", "content": "old q"},
@@ -1637,7 +1746,7 @@ class TestInLoopProactiveCompaction:
     async def test_below_floor_never_compacts(self, watchdog, monkeypatch):
         import services.claude_api.tool_loop as tl
         monkeypatch.setattr(tl, "PROACTIVE_COMPACT_ENABLED", True)
-        monkeypatch.setattr("services.claude_api.compaction.compact_threshold_tokens", lambda: 10**9)
+        monkeypatch.setattr("services.claude_api.compaction.proactive_hard_threshold_tokens", lambda: 10**9)
         client = _make_client(*self._turns(self._usage(200)))
         compact_cb = AsyncMock()
         prior = [{"role": "user", "content": "old"}]
@@ -1658,7 +1767,7 @@ class TestInLoopProactiveCompaction:
     async def test_callback_failure_is_nonfatal(self, watchdog, monkeypatch):
         import services.claude_api.tool_loop as tl
         monkeypatch.setattr(tl, "PROACTIVE_COMPACT_ENABLED", True)
-        monkeypatch.setattr("services.claude_api.compaction.compact_threshold_tokens", lambda: 100)
+        monkeypatch.setattr("services.claude_api.compaction.proactive_hard_threshold_tokens", lambda: 100)
         client = _make_client(*self._turns(self._usage(200)))
         compact_cb = AsyncMock(side_effect=RuntimeError("summary failed"))
         prior = [{"role": "user", "content": "old"}]

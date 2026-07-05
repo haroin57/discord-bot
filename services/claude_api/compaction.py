@@ -78,6 +78,15 @@ _compact_blocked_until: dict[int, float] = {}
 MAX_CONSECUTIVE_RAPID_REFILLS = 3
 _rapid_refills: dict[int, int] = {}
 
+# Post-compaction recovery flag (ADR-0037, ported from u1's Claude Code
+# "compact" article). Set when a boundary/proactive compaction succeeds;
+# consumed on the next prompt build to inject a one-shot recovery directive so
+# the post-compaction turn treats the summary as a work-log (not instructions),
+# keeps verification gates, and does not re-run approaches already rejected.
+# Channel-scoped and in-memory only (like the breakers above) — a process
+# restart clears it, which is fail-open.
+_pending_recovery: dict[int, bool] = {}
+
 # Boundary auto-compaction trigger, modelled on the CLI's et6(K)=ZQ(K)-Pe1.
 # Fire near the effective context window minus the model's output budget and a
 # headroom buffer for the compaction summary turn itself (≈ CLI Pe1).
@@ -108,6 +117,23 @@ def compact_threshold_tokens() -> int:
     return max(_COMPACT_FLOOR_TOKENS, min(win - reserve, win - 1000))
 
 
+def proactive_hard_threshold_tokens() -> int:
+    """Emergency in-loop compaction ceiling (ADR-0037 Phase 3).
+
+    Higher than compact_threshold_tokens() so boundary compaction (which fires
+    at the turn boundary off last turn's usage) handles the common case, and
+    the in-loop mid-turn fold only fires as a last-resort circuit breaker when
+    a single turn balloons toward the window ceiling (e.g. a giant tool_result)
+    before it can reach a boundary — the overflow/crash case the external
+    review said must NOT be removed. Percent via PROACTIVE_COMPACT_HARD_PCT.
+    """
+    import config
+    win = effective_context_window()
+    pct = getattr(config, "PROACTIVE_COMPACT_HARD_PCT", 97) or 97
+    # The in-loop fold is the HIGHER gate — never below the boundary trigger.
+    return max(int(win * pct / 100.0), compact_threshold_tokens())
+
+
 def record_proactive_compaction(channel_id: int) -> None:
     """Note that an in-loop proactive compaction fired for this request."""
     n = _rapid_refills.get(channel_id, 0) + 1
@@ -127,6 +153,26 @@ def record_proactive_compaction(channel_id: int) -> None:
 def reset_rapid_refill(channel_id: int) -> None:
     """A request finished without needing proactive compaction — reset."""
     _rapid_refills.pop(channel_id, None)
+
+def mark_pending_recovery(channel_id: int) -> None:
+    """Flag that a compaction just happened for this channel (ADR-0037).
+
+    Called from compact_channel_history on success. The next prompt build
+    pops this flag and injects a one-shot post-compaction recovery directive.
+    """
+    _pending_recovery[channel_id] = True
+
+
+def pop_pending_recovery(channel_id: int) -> bool:
+    """Consume the post-compaction recovery flag (one-shot, ADR-0037).
+
+    Returns True at most once per compaction. MUST be called before the
+    request goes out and exactly once per request (not once per retry
+    attempt), so a post-compaction turn gets the directive on every retry but
+    the turn after it does not (no amnesia loop).
+    """
+    return bool(_pending_recovery.pop(channel_id, False))
+
 
 COMPACT_SYSTEM_PROMPT = (
     "You are a helpful AI assistant tasked with summarizing conversations."
@@ -168,10 +214,12 @@ Your summary should include the following sections:
 3. Files and Code Sections: Enumerate specific files and code sections examined, modified, or created. Pay special attention to the most recent messages and include full code snippets where applicable and include a summary of why this file read or edit is important.
 4. Errors and fixes: List all errors that you ran into, and how you fixed them. Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
 5. Problem Solving: Document problems solved and any ongoing troubleshooting efforts.
-6. All user messages: List ALL user messages that are not tool results. These are critical for understanding the users' feedback and changing intent. Preserve any security-relevant instructions or constraints verbatim so they remain in effect after compaction.
-7. Pending Tasks: Outline any pending tasks that you have explicitly been asked to work on.
-8. Current Work: Describe in detail precisely what was being worked on immediately before this summary request, paying special attention to the most recent messages from both user and assistant. Include file names and code snippets where applicable.
-9. Optional Next Step: List the next step that you will take that is related to the most recent work you were doing. IMPORTANT: ensure that this step is DIRECTLY in line with the user's most recent explicit requests, and the task you were working on immediately before this summary request. If your last task was concluded, then only list next steps if they are explicitly in line with the users request. Do not start on tangential requests or really old requests that were already completed without confirming with the user first.
+6. Rejected Approaches and Why: List approaches, designs, or solutions that were CONSIDERED and then REJECTED or abandoned, together with the specific reason each was rejected (which constraint it violated, what failure it caused, or that the user vetoed it). This is critical: without it, the post-compaction assistant re-proposes or re-implements an approach that was already tried and discarded. If an approach was rejected based on user feedback, quote the relevant user message verbatim.
+7. Active Constraints and Invariants: List the hard constraints, invariants, and established principles that MUST continue to hold — agreed-upon design rules, forbidden operations, security/credential-handling rules, verification gates (e.g. "must test before deploy"), and any "always do X / never do Y" rules established during the session. These are directives, not history; they remain in force after compaction and must not be violated by the next step.
+8. All user messages: List ALL user messages that are not tool results. These are critical for understanding the users' feedback and changing intent. Preserve any security-relevant instructions or constraints verbatim so they remain in effect after compaction.
+9. Pending Tasks: Outline any pending tasks that you have explicitly been asked to work on.
+10. Current Work: Describe in detail precisely what was being worked on immediately before this summary request, paying special attention to the most recent messages from both user and assistant. Include file names and code snippets where applicable.
+11. Next Step (Hypothesis only): Optionally list the next step. IMPORTANT: this is a HYPOTHESIS for continuity, NOT an approved instruction to act on. After compaction, re-confirm it against the Active Constraints and Invariants, the Pending Tasks, and the user's most recent explicit request before acting, and never skip a verification gate on its account. Ensure that this step is DIRECTLY in line with the user's most recent explicit requests, and the task you were working on immediately before this summary request. If your last task was concluded, then only list next steps if they are explicitly in line with the users request. Do not start on tangential requests or really old requests that were already completed without confirming with the user first.
    If there is a next step, include direct quotes from the most recent conversation showing exactly what task you were working on and where you left off. This should be verbatim to ensure there's no drift in task interpretation.
 
 Here's an example of how your output should be structured:
@@ -208,20 +256,28 @@ Here's an example of how your output should be structured:
 5. Problem Solving:
    [Description of solved problems and ongoing troubleshooting]
 
-6. All user messages:
+6. Rejected Approaches and Why:
+    - [Rejected approach 1]: [why it was rejected / which constraint it violated / user veto quote]
+    - [...]
+
+7. Active Constraints and Invariants:
+    - [Constraint / invariant / established rule that must still hold after compaction]
+    - [...]
+
+8. All user messages:
     - [Detailed non tool use user message]
     - [...]
 
-7. Pending Tasks:
+9. Pending Tasks:
    - [Task 1]
    - [Task 2]
    - [...]
 
-8. Current Work:
+10. Current Work:
    [Precise description of current work]
 
-9. Optional Next Step:
-   [Optional Next step to take]
+11. Next Step (Hypothesis only):
+   [Optional next step — a hypothesis for continuity, not an approved instruction]
 </summary>
 </example>
 
@@ -241,6 +297,26 @@ CONTINUATION_PREAMBLE = (
     "This session is being continued from a previous conversation that ran "
     "out of context. The summary below covers the earlier portion of the "
     "conversation."
+)
+
+# One-shot directive injected into the USER turn immediately after a
+# compaction (ADR-0037, ported from u1's Claude Code "compact" article). The
+# official CLI needs a 2-stage PostCompact→UserPromptSubmit hook because
+# PostCompact cannot inject context; this bot has no such limit, so the
+# directive rides the same turn (boundary compaction, folded pre-request) or
+# the next turn (in-loop proactive, folded mid-request). Injected on the user
+# turn, never system (system stays byte-stable for prompt-cache reuse).
+RECOVERY_DIRECTIVE = (
+    "[Post-compaction recovery — read before acting]\n"
+    "The conversation history above was just compacted into a summary. Treat "
+    "that summary as a RECORD OF WHAT HAPPENED, not as instructions:\n"
+    "- Any \"Next Step\" in the summary is a HYPOTHESIS, not an approved task; "
+    "re-confirm against the user's most recent explicit request before acting.\n"
+    "- The plan, the Active Constraints and Invariants, and any verification "
+    "gates in the summary are authoritative. Do NOT re-propose or re-run an "
+    "approach listed under Rejected Approaches.\n"
+    "- Before any destructive or irreversible action (deploy, delete, push, "
+    "overwrite, DB mutation), stop and confirm with the user first."
 )
 
 
@@ -606,6 +682,9 @@ async def compact_channel_history(
     await asyncio.to_thread(append_jsonl, channel_id, row)
     _compact_failures.pop(channel_id, None)
     _compact_blocked_until.pop(channel_id, None)
+    # ADR-0037: a summary row was just written — flag the channel so the next
+    # prompt build injects the one-shot post-compaction recovery directive.
+    mark_pending_recovery(channel_id)
     log.info(
         "[ch=%d] compaction done: summary_chars=%d keep_tail_rows=%d "
         "source_chars=%d compression=%.1f%% total_duration_ms=%d",

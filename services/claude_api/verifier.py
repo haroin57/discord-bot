@@ -12,6 +12,8 @@ fail-open 原則: verifier 自身の失敗（parse 不能・timeout・API 障害
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -135,24 +137,57 @@ async def verify_draft(
         )
         # context-1m は不要（verifier 入力は小さい）— subagent と同じ絞り
         betas = [b for b in extra_betas if not b.startswith("context-1m")]
-        async with StallWatchdog(
-            channel_id, None, idle_timeout_s=180,
-        ) as watchdog:
-            result = await run_agent_loop(
-                briefing,
-                channel_id,
-                history=[],
-                system_prompt=_VERIFIER_SYSTEM,
-                tools_for_api=tools,
-                can_use_tool=can_use,
-                execute_tool=_exec,
-                status_callback=status_callback,
-                max_turns=DELIB_VERIFIER_MAX_TURNS,
-                stall_watchdog=watchdog,
-                api_client=api_client,
-                model=model,
-                extra_betas=betas,
-            )
+
+        # ADR-0038: run the verifier mini-loop in its OWN task so its
+        # StallWatchdog can only cancel the verifier, never the caller.
+        # verify_draft is awaited inline inside on_message; without this
+        # isolation a verifier stall's task-cancel would nuke the whole request
+        # and throw away an already-finished draft (2026-07-05 incident).
+        # CancelledError is a BaseException, so the `except Exception` fail-open
+        # below can't catch it — the isolation is what turns a verifier stall
+        # into fail-open. (run_agent_loop's own stream guard usually checkpoints
+        # a stall before the watchdog fires; this is the backstop.)
+        async def _run_verify_loop():
+            async with StallWatchdog(
+                channel_id, None, idle_timeout_s=180,
+            ) as watchdog:
+                return await run_agent_loop(
+                    briefing,
+                    channel_id,
+                    history=[],
+                    system_prompt=_VERIFIER_SYSTEM,
+                    tools_for_api=tools,
+                    can_use_tool=can_use,
+                    execute_tool=_exec,
+                    status_callback=status_callback,
+                    max_turns=DELIB_VERIFIER_MAX_TURNS,
+                    stall_watchdog=watchdog,
+                    api_client=api_client,
+                    model=model,
+                    extra_betas=betas,
+                )
+
+        verify_task = asyncio.create_task(_run_verify_loop())
+        try:
+            result = await verify_task
+        except asyncio.CancelledError:
+            if verify_task.cancelled():
+                # The verifier's own watchdog stalled it out — skip verification
+                # and accept the draft (fail-open, same as the exception path).
+                log.warning(
+                    "[ch=%d] delib_verify stream stalled (idle); failing open",
+                    channel_id,
+                )
+                return Verdict(
+                    ok=True, degraded=True,
+                    raw="verifier stream stall (fail-open)",
+                )
+            # A real cancel from the caller (/abort, shutdown): tear the
+            # verifier down cleanly and propagate.
+            verify_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await verify_task
+            raise
         verdict = _parse_verdict(result.text)
         log.info(
             "[ch=%d] delib_verify ok=%s issues=%d degraded=%s",
