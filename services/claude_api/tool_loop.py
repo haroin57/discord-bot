@@ -42,6 +42,8 @@ from config import (
     PROACTIVE_COMPACT_TRIGGER_TOKENS,
     SERVER_SIDE_FALLBACK_ENABLED,
     SLOW_FIRST_BYTE_MS,
+    STREAM_STALL_MAX_RETRIES,
+    STREAM_STALL_RETRY_S,
     TEXT_INVOKE_RESCUE_ENABLED,
     TOOL_CALL_TIMEOUT_S,
     TOOL_ERROR_MIN_REPLY_CHARS,
@@ -226,6 +228,29 @@ def _build_checkpoint_result(
 # CONCURRENCY_SAFE_TOOLS (which includes Agent — repeated identical subagent
 # spawns ARE suspicious, so Agent is intentionally excluded here).
 _LOOP_READONLY_TOOLS = frozenset({"Read", "Glob", "Grep"})
+
+
+async def _idle_guarded(stream, idle_s: float):
+    """Yield SSE events from ``stream``, raising ``TimeoutError`` if no event
+    arrives within ``idle_s`` seconds.
+
+    ADR-0038: the anthropic beta stream can wedge after the server accepts the
+    POST (HTTP 200) yet delivers zero events — an upstream stall the
+    StallWatchdog only ever answered by cancelling the whole task, throwing
+    away even an already-finished draft (2026-07-05 incident). Surfacing the
+    stall as a catchable ``TimeoutError`` at the consumption site lets the tool
+    loop recover in place (re-issue a clean pre-first-byte stall, else
+    checkpoint). Cancelling the pending ``__anext__`` is safe: the caller
+    abandons this stream — its ``async with`` closes the HTTP connection — and
+    either sends a fresh request or returns a graceful checkpoint.
+    """
+    ait = stream.__aiter__()
+    while True:
+        try:
+            event = await asyncio.wait_for(ait.__anext__(), idle_s)
+        except StopAsyncIteration:
+            return
+        yield event
 
 
 def _observe_response_headers(source) -> None:
@@ -1551,6 +1576,11 @@ async def run_agent_loop(
                 log.warning("[ch=%d] checkpoint note stream failed: %s", channel_id, exc)
         return result
 
+    # ADR-0038: total clean-TTFB stream-stall retries across all turns. A
+    # clean stall re-issues the same request via `continue` (see the stream
+    # TimeoutError handler below); capped so a persistently dead upstream falls
+    # through to a graceful checkpoint instead of looping forever.
+    stall_retries = 0
     for turn in range(max_turns):
         # ADR-0036: リクエスト予算のチェック（API 呼び出し前）。hard は即 checkpoint、
         # soft は wrap-up を1回予約。前ターンまでの出力トークンと経過時間を反映。
@@ -1625,7 +1655,11 @@ async def run_agent_loop(
         cur_tool: dict | None = None
         try:
             async with api_client.beta.messages.stream(**stream_kwargs) as stream:
-                async for event in stream:
+                # ADR-0038: idle-guard each event so a wedged upstream raises a
+                # catchable TimeoutError here instead of tripping the outer
+                # StallWatchdog's task-cancel. The heartbeat still feeds the
+                # watchdog backstop for stalls this guard can't see.
+                async for event in _idle_guarded(stream, STREAM_STALL_RETRY_S):
                     stall_watchdog.heartbeat()
                     if ttft_ms is None:
                         ttft_ms = int((time.monotonic() - request_start) * 1000)
@@ -1745,7 +1779,9 @@ async def run_agent_loop(
                                     await text_stream_callback(live_turn_text)
                                 except Exception as exc:
                                     log.debug("text_stream_callback failed: %s", exc)
-                final_msg = await stream.get_final_message()
+                final_msg = await asyncio.wait_for(
+                    stream.get_final_message(), STREAM_STALL_RETRY_S,
+                )
                 request_id = ""
                 try:
                     _resp = getattr(stream, "response", None)
@@ -1842,6 +1878,40 @@ async def run_agent_loop(
                                 log.warning(
                                     "server fallback alert callback failed: %s", exc
                                 )
+        except TimeoutError:
+            # ADR-0038: no SSE event for STREAM_STALL_RETRY_S — the upstream
+            # stream is wedged (server took the POST but streamed nothing).
+            # Recover here instead of letting the StallWatchdog cancel the whole
+            # task. A clean pre-first-byte stall (no prose streamed this turn,
+            # so nothing was appended to `history` — the user turn was appended
+            # once before the loop) is re-issued as the SAME request via
+            # `continue`; it cannot duplicate visible output. Once prose has
+            # streamed, or the retry budget is spent, preserve the work with a
+            # graceful checkpoint ("続けて" resumes) rather than dying.
+            _produced = bool(live_turn_text.strip())
+            if not _produced and stall_retries < STREAM_STALL_MAX_RETRIES:
+                stall_retries += 1
+                _backoff = min(2 ** stall_retries, 8)
+                log.warning(
+                    "[ch=%d] turn=%d stream stall (idle ≥%ds) → retry %d/%d "
+                    "after %ds",
+                    channel_id, turn + 1, STREAM_STALL_RETRY_S,
+                    stall_retries, STREAM_STALL_MAX_RETRIES, _backoff,
+                )
+                await _safe_status(status_callback, "⏳ 応答待ち・再試行中")
+                await asyncio.sleep(_backoff)
+                continue
+            if _produced:
+                # Fold the partial prose already shown to the user into the
+                # transcript so the checkpoint isn't missing this turn's head.
+                text_across_turns.append(live_turn_text)
+            log.warning(
+                "[ch=%d] turn=%d stream stall (idle ≥%ds, produced=%s, "
+                "retries=%d) → graceful checkpoint",
+                channel_id, turn + 1, STREAM_STALL_RETRY_S, _produced,
+                stall_retries,
+            )
+            return await _emit_checkpoint("stream_stall")
         except anthropic.AnthropicError as exc:
             category = classify_anthropic_error(exc)
             log.error("agent loop API error turn=%d category=%s: %s",
@@ -2269,7 +2339,13 @@ async def run_agent_loop(
         # Model-window-based trigger (CLI et6(K) port), unified with the
         # boundary trigger so the in-loop fold doesn't pre-empt it at a lower
         # flat constant. HISTORY_COMPACT_PCT_OVERRIDE dials both.
-        from services.claude_api.compaction import compact_threshold_tokens
+        # Phase 3 (ADR-0037): fire on the HARD ceiling, NOT the boundary
+        # trigger. Boundary compaction handles the normal case at the turn
+        # boundary; this in-loop fold is the last-resort mid-turn breaker
+        # for a single huge turn (giant tool_result) -- kept per external
+        # review to avoid an overflow/crash, but gated higher so it rarely
+        # pre-empts the boundary fold.
+        from services.claude_api.compaction import proactive_hard_threshold_tokens
         if (
             PROACTIVE_COMPACT_ENABLED
             and proactive_compact is not None
@@ -2277,7 +2353,7 @@ async def run_agent_loop(
             and _context_tokens({
                 f: _usage_number(getattr(final_msg, "usage", None), f)
                 for f in _USAGE_FIELDS
-            }) > compact_threshold_tokens()
+            }) > proactive_hard_threshold_tokens()
         ):
             try:
                 new_prior = await proactive_compact()

@@ -231,6 +231,16 @@ traceback を `#bot-mcp-log`（channel_id 1522739163412168885）へ配信する�
 - traceback はレベル接頭辞が無いので形状（Traceback / File " / XxxError:）で拾う
 - 巨大行は300字で切る。Webhook URL は `.env.mcp-forward`（mode 600）
 
+### 既知バグ: supergateway 切断時クラッシュ（パッチ済み 2026-07-04）
+`mcp-oracle-shared` / `mcp-papermcp` が使う supergateway 3.4.3 は、クライアント切断後に
+子プロセスが応答を返すと async な `transport.send()` の rejection を捕捉できず
+`Error: No connection established for request ID: N` で **node ごと死ぬ**（今日 2 回発生）。
+`Restart=always` で復帰するが in-flight ジョブが孤児化する。両 gateway に rejection を
+`.catch()` するローカルパッチを適用し、`scripts/supergateway_apply_patches.sh` で自己修復
+（oracle パッチと同じ機構、launcher が毎回再適用）。詳細は `docs/oracle_mcp.md` 追補3。
+なお oracle の search デフォルト off は `~/.oracle/config.json {"search":"off"}` が正本
+（env だけでは MCP 経路で復活する。同 doc 参照）。
+
 ## dev環境 + CI/CD (2026-07-04)
 
 ### 構成
@@ -262,3 +272,24 @@ traceback を `#bot-mcp-log`（channel_id 1522739163412168885）へ配信する�
   systemd_forward.py の BLOCK に discord-bot-dev を追加)
 - requirements.txt に未 pin の runtime 依存が ~23 個ある (dev クローン時に手動補完が必要)。
   別途 pin する価値あり
+
+## 動的ツールループの予算 (ADR-0036)
+
+ツールループは回数上限 (`ADMIN_MAX_TURNS`, 既定 400 に格上げ) を「非常停止」に
+格下げし、実務上のリミッタを **リクエスト予算 + ループ検知** に移した
+(`services/claude_api/loop_guard.py`)。上限・予算・ループ検知のいずれで抜けても
+**作業は破棄されず** graceful checkpoint (本物の session + 進捗要約) として保存され、
+「続けて」で full context から再開できる。`AgentLoopResult.paused_reason` に離脱理由
+(`turn_ceiling` / `wallclock` / `output_tokens` / `tool_loop`) が入る。
+
+チューニング用 env (全て `config/__init__.py`、既定で運用可):
+- ウォールクロック予算(秒): `REQUEST_WALLCLOCK_BUDGET_S`=1800 (admin) /
+  `RESTRICTED_WALLCLOCK_BUDGET_S`=120 / `SUBAGENT_WALLCLOCK_BUDGET_S`=600
+- 累積出力トークン予算: `REQUEST_OUTPUT_TOKEN_BUDGET`=800000 /
+  `RESTRICTED_OUTPUT_TOKEN_BUDGET`=40000 (footprint 上限。OAuth 枠なのでドル予算ではない)
+- soft 閾値比: `REQUEST_BUDGET_SOFT_RATIO`=0.8 (到達で「まとめて停止」nudge を1回)
+- ループ検知: `TOOL_LOOP_WINDOW`=12 / `TOOL_LOOP_REPEAT_WARN`=3 (nudge) /
+  `TOOL_LOOP_REPEAT_BREAK`=5 (checkpoint) / `TOOL_LOOP_READONLY_SLACK`=3
+  (Read/Glob/Grep の反復許容上乗せ)
+- ログ: 予算 hard / ループ break は WARNING で journal に出る (#bot-journal-log に流れる)。
+  頻発したら該当予算を上げるかループ検知閾値を見直す

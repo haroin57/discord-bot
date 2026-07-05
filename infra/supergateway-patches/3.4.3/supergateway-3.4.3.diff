@@ -1,0 +1,41 @@
+--- /tmp/supergateway-orig/stdioToStatelessStreamableHttp.js	2026-07-04 10:16:29.189258245 +0900
++++ /home/ubuntu/.volta/tools/image/node/24.14.1/lib/node_modules/supergateway/dist/gateways/stdioToStatelessStreamableHttp.js	2026-07-04 10:16:36.131197996 +0900
+@@ -117,7 +117,16 @@
+                             }
+                         }
+                         try {
+-                            transport.send(jsonMsg);
++                            // LOCAL PATCH (2026-07-04, docs/oracle_mcp.md): transport.send は
++                            // async。クライアント切断後の応答で unhandled rejection になり
++                            // node ごと死ぬ (No connection established for request ID) ため
++                            // rejection を捕捉してログに落とす。
++                            const sendResult = transport.send(jsonMsg);
++                            if (sendResult && typeof sendResult.catch === 'function') {
++                                sendResult.catch((e) => {
++                                    logger.error(`Failed to send to StreamableHttp (async)`, e);
++                                });
++                            }
+                         }
+                         catch (e) {
+                             logger.error(`Failed to send to StreamableHttp`, e);
+--- /tmp/supergateway-orig/stdioToSse.js	2026-07-04 10:16:29.189342583 +0900
++++ /home/ubuntu/.volta/tools/image/node/24.14.1/lib/node_modules/supergateway/dist/gateways/stdioToSse.js	2026-07-04 10:16:39.800192924 +0900
+@@ -114,7 +114,17 @@
+                 logger.info('Child → SSE:', jsonMsg);
+                 for (const [sid, session] of Object.entries(sessions)) {
+                     try {
+-                        session.transport.send(jsonMsg);
++                        // LOCAL PATCH (2026-07-04, docs/oracle_mcp.md): transport.send は
++                        // async。クライアント切断後の応答で unhandled rejection になり
++                        // node ごと死ぬ (No connection established for request ID) ため
++                        // rejection を捕捉してログに落とす。
++                        const sendResult = session.transport.send(jsonMsg);
++                        if (sendResult && typeof sendResult.catch === 'function') {
++                            sendResult.catch((err) => {
++                                logger.error(`Failed to send to session ${sid} (async):`, err);
++                                delete sessions[sid];
++                            });
++                        }
+                     }
+                     catch (err) {
+                         logger.error(`Failed to send to session ${sid}:`, err);

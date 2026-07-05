@@ -9,6 +9,10 @@
 # 認証: OPENAI_API_KEY(必須, gpt系) / GOOGLE_AI_API_KEY(任意, gemini系) を .env から。
 # ChatGPT browser 自動化モードは使わない前提（Responses API 直＝規約クリーン）。
 set -euo pipefail
+# ADR-0037: ジョブコントロールを明示 off。非対話ではデフォルト off だが、
+# supergateway 側の detached:true プロセスグループ kill が確実に効くよう、
+# 子(oracle-mcp)が別プロセスグループへ逃げないことを保証する保険。
+set +m
 
 export PATH="$HOME/.volta/bin:$PATH"
 ENV_FILE="/home/ubuntu/discord-bot/.env"
@@ -41,5 +45,8 @@ export ORACLE_DEFAULT_SEARCH="${ORACLE_DEFAULT_SEARCH:-off}"
 # ローカルパッチの自己修復（npm update で剥がれても次のスポーンで再適用）。
 # 正本: infra/oracle-patches/<version>/files/、手順: docs/oracle_mcp.md
 "$(dirname "${BASH_SOURCE[0]}")/oracle_apply_patches.sh" || true
+# supergateway の unhandled-rejection クラッシュパッチも同時に自己修復。
+# 正本: infra/supergateway-patches/<version>/files/、手順: docs/oracle_mcp.md
+"$(dirname "${BASH_SOURCE[0]}")/supergateway_apply_patches.sh" || true
 
 exec oracle-mcp "$@"

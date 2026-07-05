@@ -1576,19 +1576,34 @@ async def on_message(message: discord.Message):
             except discord.errors.HTTPException:
                 pass
 
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as _cancel:
         job.phase = JobPhase.FAILED
-        log.info(
-            "[rid=%s] on_message cancelled via /abort (channel=%s, user=%s)",
-            get_request_id(), message.channel.id, message.author.id,
-        )
+        # ADR-0038: distinguish a real /abort (job.task.cancel() with no
+        # message — services/job_state.py) from a StallWatchdog backstop firing
+        # (cancel("stream idle")). tool_loop's stream guard normally recovers a
+        # stall before this, so reaching here on a stall means an outer wedge —
+        # label it honestly instead of blaming a "/abort" that never happened.
+        _reason = _cancel.args[0] if _cancel.args else ""
+        if _reason == "stream idle":
+            log.warning(
+                "[rid=%s] on_message cancelled: stream idle backstop "
+                "(channel=%s, user=%s)",
+                get_request_id(), message.channel.id, message.author.id,
+            )
+            _final_note = "⏰ 応答待ちが続いたため中断しました"
+        else:
+            log.info(
+                "[rid=%s] on_message cancelled via /abort (channel=%s, user=%s)",
+                get_request_id(), message.channel.id, message.author.id,
+            )
+            _final_note = "⏹️ 中断しました"
         # Leave a short note on the status message instead of deleting it
         # (P0: errors keep a brief explanation; success deletes).
         try:
             if status.status_msg is not None:
-                await status.edit_final("⏹️ 中断しました")
+                await status.edit_final(_final_note)
             else:
-                await message.channel.send("⏹️ 中断しました")
+                await message.channel.send(_final_note)
         except Exception:
             pass
     except OAuthRefreshFailed:
