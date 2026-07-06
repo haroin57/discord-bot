@@ -389,6 +389,15 @@ class LiveRenderer:
             "msg": None, "last_edit": 0.0, "section": None, "summary": [],
         }
 
+        # ── Plan/Verify live-preview state ───────────────────────────────────
+        # One live message showing the in-progress thinking (計画) or verifier
+        # (検証) narration, throttled like scratch. On block close it collapses
+        # into 1-line subtext summaries (capped) instead of leaving raw
+        # reasoning behind.
+        self._plan_state: dict = {
+            "msg": None, "last_edit": 0.0, "kind": None, "summary": [],
+        }
+
     # ── public read-only accessors (bot.py reads these after the turn) ───────
     @property
     def live_sent_any(self) -> bool:
@@ -712,3 +721,59 @@ class LiveRenderer:
         except Exception as exc:
             log.warning("scratch preview collapse failed: %s", exc)
         self._scratch_state["section"] = None
+
+    # ── Plan / Verify live preview ───────────────────────────────────────────
+    async def plan_stream_preview(self, text: str, kind: str) -> None:
+        """Live-render the model's in-progress thinking (kind="計画") or the
+        verifier's narration (kind="検証") so the channel isn't silent during
+        deliberate planning/verification. Throttled the same as scratch; a
+        single message is edited in place. Raw reasoning shows live, then
+        ``plan_finalize`` collapses it into a capped 1-line subtext summary."""
+        now_mono = time.monotonic()
+        if (now_mono - self._plan_state["last_edit"]) < self.STREAM_EDIT_INTERVAL_S:
+            return
+        self._plan_state["last_edit"] = now_mono
+        self._plan_state["kind"] = kind
+        emoji = "🔎" if kind == "検証" else "🧠"
+        tail = (text or "")[-self.SCRATCH_PREVIEW_TAIL_CHARS:]
+        quoted = "\n".join(f"> {line}" for line in tail.splitlines()) or "> …"
+        payload = self._disp(f"-# {emoji} {kind}中…\n{quoted}")
+        existing = self._plan_state.get("msg")
+        try:
+            if existing is None:
+                self._plan_state["msg"] = await self.message.channel.send(payload)
+                await self._status.reposition()
+                return
+            await existing.edit(content=payload)
+        except discord.errors.NotFound:
+            try:
+                self._plan_state["msg"] = await self.message.channel.send(payload)
+                await self._status.reposition()
+            except Exception as exc:
+                log.warning("plan preview re-post failed: %s", exc)
+        except Exception as exc:
+            log.warning("plan preview send/edit failed: %s", exc)
+
+    async def plan_finalize(self) -> None:
+        """Collapse the live plan/verify draft into capped 1-line subtext
+        summaries once its content_block closes, so raw reasoning doesn't stay
+        in the channel. Repeated blocks of the same kind fold into ``×N``."""
+        kind = self._plan_state.get("kind")
+        existing = self._plan_state.get("msg")
+        if kind is None or existing is None:
+            return
+        self._plan_state["summary"].append(kind)
+        kinds = self._plan_state["summary"]
+        lines = []
+        for k in ("計画", "検証"):
+            n = kinds.count(k)
+            if n:
+                emoji = "🔎" if k == "検証" else "🧠"
+                suffix = f" ×{n}" if n > 1 else ""
+                lines.append(f"-# {emoji} {k}{suffix}")
+        payload = "\n".join(lines) or f"-# 🧠 {kind}"
+        try:
+            await existing.edit(content=payload)
+        except Exception as exc:
+            log.warning("plan preview collapse failed: %s", exc)
+        self._plan_state["kind"] = None

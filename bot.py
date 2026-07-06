@@ -52,6 +52,7 @@ from config import (
     MEM0_RECALL_LIMIT,
     MEM0_RECALL_LIMIT_RESTRICTED,
     MEM0_SMART_SEARCH,
+    PLAN_STREAM_ENABLED,
     RESTRICTED_COOLDOWN_SECONDS,
     RESTRICTED_DAILY_QUOTA,
     SCRATCHPAD_STREAM_ENABLED,
@@ -1329,6 +1330,23 @@ async def on_message(message: discord.Message):
         # verified-final-text-only policy stays intact.
         _scratch_stream = _renderer.scratch_stream_preview if SCRATCHPAD_STREAM_ENABLED else None
         _scratch_finalize = _renderer.scratch_finalize if SCRATCHPAD_STREAM_ENABLED else None
+        # Plan/verify live preview: stream the model's thinking (計画) and the
+        # verifier's narration (検証) into a throttled side message that collapses
+        # to a 1-line subtext on close. Wired in ALL tiers (thinking is captured
+        # independently of prose streaming, so deliberate's no-prose-stream policy
+        # is unaffected). One flag gates both; verify uses a kind="検証" wrapper.
+        if PLAN_STREAM_ENABLED:
+            def _plan_stream(text: str):
+                return _renderer.plan_stream_preview(text, "計画")
+
+            def _verify_stream(text: str):
+                return _renderer.plan_stream_preview(text, "検証")
+
+            _plan_finalize = _renderer.plan_finalize
+        else:
+            _plan_stream = None
+            _verify_stream = None
+            _plan_finalize = None
         # Stable speaker label (e.g. "先輩") for resume-history attribution.
         # "" when the sender has no configured label — recorded as no
         # attribution, which keeps the pre-existing behaviour.
@@ -1367,6 +1385,10 @@ async def on_message(message: discord.Message):
                 tool_invocation_callback=_tool_invocation_send,
                 scratch_stream_callback=_scratch_stream,
                 scratch_finalize_callback=_scratch_finalize,
+                thinking_stream_callback=_plan_stream,
+                thinking_finalize_callback=_plan_finalize,
+                verify_stream_callback=_verify_stream,
+                verify_finalize_callback=_plan_finalize,
                 progress=status.prog,
                 tier=_tier,
                 route_judgment=_route_judgment,

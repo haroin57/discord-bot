@@ -31,8 +31,6 @@ MODEL_BETAS = [
     "mid-conversation-system-2026-04-07",
     "advanced-tool-use-2025-11-20",
     "effort-2025-11-24",
-    "server-side-fallback-2026-06-01",
-    "fallback-credit-2026-06-01",
     "extended-cache-ttl-2025-04-11",
 ]
 CLI_IDENTITY_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."

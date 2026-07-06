@@ -37,6 +37,7 @@ from config import (
     HISTORY_COMPACT_EFFORT,
     HISTORY_COMPACT_ENABLED,
     HISTORY_COMPACT_KEEP_CHARS,
+    HISTORY_COMPACT_MAX_TOKENS,
     HISTORY_COMPACT_MODEL,
     HISTORY_COMPACT_TRIGGER_CHARS,
 )
@@ -60,8 +61,12 @@ log = logging.getLogger(__name__)
 # Cap on the flattened conversation fed to the summarizer; oldest text is cut
 # first. ~600K chars ≈ 150-250K tokens, inside Opus's window.
 MAX_SUMMARY_INPUT_CHARS = 600_000
-# The official CLI's summary is long-form (9 mandatory sections).
-MAX_SUMMARY_OUTPUT_TOKENS = 16384
+# The official CLI's summary is long-form (9 mandatory sections). Env-tunable
+# (config.HISTORY_COMPACT_MAX_TOKENS, default 48000) because at effort=max the
+# <analysis> scratchpad alone burns ~15K tokens; too low a cap and the <summary>
+# is truncated to nothing (stop_reason=max_tokens, empty body — the 2026-07-06
+# compaction-failure loop). See config comment for the incident.
+MAX_SUMMARY_OUTPUT_TOKENS = HISTORY_COMPACT_MAX_TOKENS
 
 # Circuit breaker (per process): after this many consecutive failures on a
 # channel, skip compaction for the cooldown window instead of re-paying a
@@ -288,6 +293,7 @@ Additional Instructions:
 This is a Discord conversation transcript (mostly Japanese) between admin users and the assistant 佐藤かなえ — it is not always a coding session. When summarizing:
 - preserve who said what: keep the [発言者: ...] speaker labels attached to the key statements and requests;
 - preserve decisions, promises, and pending requests made in conversation;
+- CRITICAL — preserve EXACT numeric facts verbatim, attributed to the person they belong to: holdings and order quantities (口数/株数/枚数), prices (取得単価/約定価格/現在値), amounts (金額/評価額/損益), ticker/fund codes (例: 1570), rates, dates, and times. Copy the figures and units EXACTLY as stated — NEVER round, approximate, bucket ("約〜"/"数百口"), or convert them. These are financial records the user relies on after compaction; a wrong 口数 or price is a correctness bug, not a stylistic loss. If a figure was later corrected in the conversation, keep the latest value and note it superseded the earlier one;
 - preserve the relational/emotional thread of the conversation where it matters for continuity;
 - write the summary in Japanese where the source conversation is Japanese, keeping code, file paths, and identifiers verbatim."""
 
@@ -677,11 +683,24 @@ async def compact_channel_history(
     # Same validity bar as the official CLI ("response did not contain valid
     # text content"): require an actual <summary> block, not just prose.
     if "<summary>" not in (text or ""):
-        log.warning(
-            "[ch=%d] compaction failed: no <summary> block in response "
-            "(len=%d, head=%r)",
-            channel_id, len(text or ""), (text or "")[:120],
-        )
+        _stop = getattr(resp, "stop_reason", None)
+        if _stop == "max_tokens":
+            # Budget-exhaustion pattern (2026-07-06): at effort=max the adaptive
+            # <analysis> ate the whole output cap before <summary> was emitted.
+            # Distinct from a genuine summarizer refusal so a re-tightened cap is
+            # obvious in the logs. Raise HISTORY_COMPACT_MAX_TOKENS if this recurs.
+            log.warning(
+                "[ch=%d] compaction failed: output budget exhausted "
+                "(stop_reason=max_tokens, cap=%d, no <summary> — <analysis> "
+                "consumed the whole budget). Raise HISTORY_COMPACT_MAX_TOKENS.",
+                channel_id, MAX_SUMMARY_OUTPUT_TOKENS,
+            )
+        else:
+            log.warning(
+                "[ch=%d] compaction failed: no <summary> block in response "
+                "(stop_reason=%s, len=%d, head=%r)",
+                channel_id, _stop, len(text or ""), (text or "")[:120],
+            )
         _record_compact_failure(channel_id)
         return None
     log.info(
