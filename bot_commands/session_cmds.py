@@ -32,17 +32,35 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
             from services.claude_api.compaction import compact_channel_history
 
             api_client = await make_api_client(restricted=False)
-            ok = await compact_channel_history(channel_id, api_client, force=True)
+            # 圧縮前の観測トークン（直近ターンの入力側合計）を CLI 風出力に添える。
+            _sess = get_session(channel_id, interaction.user.id)
+            _usage = getattr(_sess, "last_usage", None) if _sess else None
+            before_tok = 0
+            if _usage:
+                before_tok = (
+                    int(_usage.get("input_tokens", 0) or 0)
+                    + int(_usage.get("cache_read_input_tokens", 0) or 0)
+                    + int(_usage.get("cache_creation_input_tokens", 0) or 0)
+                )
+            result = await compact_channel_history(channel_id, api_client, force=True)
         except Exception as exc:
             await interaction.followup.send(f"圧縮に失敗しました: {exc}", ephemeral=True)
             return
-        if ok:
+        if result:
+            tok_line = f"- 圧縮前の直近文脈: ~{before_tok:,} tok\n" if before_tok else ""
             await interaction.followup.send(
-                "✅ 会話履歴を圧縮しました（次ターンから反映されます）", ephemeral=True,
+                "🗜️ **会話履歴を圧縮しました**（次ターンから反映）\n"
+                f"{tok_line}"
+                f"- 畳んだターン: **{result.summarized_rows}** → 要約1件 ＋ verbatim "
+                f"{result.kept_rows}件保持\n"
+                f"- 文字数: {result.source_chars:,} → {result.retained_chars:,} "
+                f"(**-{100 - result.compression_pct:.1f}%** / ~-{result.reclaimed_chars:,}字)\n"
+                f"- 所要 {result.duration_ms / 1000:.1f}s",
+                ephemeral=True,
             )
         else:
             await interaction.followup.send(
-                "圧縮は実行されませんでした（無効・circuit breaker 開放・対象が小さい等）",
+                "圧縮は実行されませんでした（無効 / circuit breaker 開放 / 対象が小さい / 閾値未満 等）",
                 ephemeral=True,
             )
 
