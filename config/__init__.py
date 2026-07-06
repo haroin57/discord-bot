@@ -254,6 +254,17 @@ HISTORY_COMPACT_MODEL = os.environ.get(
 # effort dial (low < medium < high < xhigh < max), unlike the main loop which
 # sits at "medium" for predictable per-turn latency.
 HISTORY_COMPACT_EFFORT = os.environ.get("HISTORY_COMPACT_EFFORT", "max")
+# Output-token ceiling for the summary call. The summary is an <analysis>
+# scratchpad (~15K tokens at effort=max) FOLLOWED BY a 9-section <summary>
+# (~16K+); the old 16384 cap let adaptive thinking at effort=max consume the
+# ENTIRE budget on <analysis> and hit stop_reason=max_tokens with the <summary>
+# never emitted (observed 2026-07-06 on the 594K-token investment channel:
+# every compaction 429/empty'd → circuit breaker → the raw window kept
+# stalling). 48000 leaves room for both and stays under CLAUDE_MAX_TOKENS_OPUS
+# (64000). Env-tunable so a future effort/model change can re-balance it.
+HISTORY_COMPACT_MAX_TOKENS = int(
+    os.environ.get("HISTORY_COMPACT_MAX_TOKENS", "48000")
+)
 # Token-based compaction trigger (CLI-parity, 2026-06-13 audit #7). The char
 # trigger above stays as a cold-start fallback, but chars over-estimate JP/code
 # transcripts by 2-4x; once a turn has reported real usage we gate on tokens.
@@ -591,7 +602,13 @@ STREAM_IDLE_TIMEOUT_S = int(os.environ.get("STREAM_IDLE_TIMEOUT_S", "300"))
 # rather than dying. STREAM_IDLE_TIMEOUT_S stays as the outer hard backstop for
 # wedges the stream guard can't see (e.g. a hung tool call).
 STREAM_STALL_RETRY_S = int(os.environ.get("STREAM_STALL_RETRY_S", "120"))
-STREAM_STALL_MAX_RETRIES = int(os.environ.get("STREAM_STALL_MAX_RETRIES", "1"))
+# Bumped 1 → 2 (2026-07-06): on the largest channels a slow first-byte (cache
+# creation on a big prompt) can trip the idle guard before ANY event; one retry
+# gave only 2 attempts before a checkpoint. The real fix is not sending a 500K+
+# context (P0 compaction + P1 emergency microcompact), but a second retry buys
+# resilience for a genuinely slow-but-alive upstream. Only clean pre-first-byte
+# stalls retry, so this can never duplicate visible output.
+STREAM_STALL_MAX_RETRIES = int(os.environ.get("STREAM_STALL_MAX_RETRIES", "2"))
 
 # Status-spinner rendering mode (see services/claude_api/progress.py +
 # spinner_gif.py). "text" = 1 char/sec bold shimmer as message text + animated
@@ -700,6 +717,13 @@ DELIB_SCRATCHPAD_ENABLED = (
 # Scratchpad handler 自体は不変（表示専用のトグル）。false で即座に無効化できる。
 SCRATCHPAD_STREAM_ENABLED = (
     os.environ.get("SCRATCHPAD_STREAM_ENABLED", "true").lower() == "true"
+)
+
+# モデルの thinking（計画）と verifier（検証）の途中経過を Discord へライブ
+# プレビュー表示するか。ストリーム中は展開、完了で 1 行サブテキストに畳む。
+# 全 tier 対象（deliberate は本文非streamだが thinking 経路は独立）。表示専用トグル。
+PLAN_STREAM_ENABLED = (
+    os.environ.get("PLAN_STREAM_ENABLED", "true").lower() == "true"
 )
 
 # P4: 他社モデルへの相談 tool（GPT-5 + DeepSeek 並列）と Anthropic Advisor tool

@@ -824,7 +824,15 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
         description=(
             "**Tool name is exactly `Bash`** (PascalCase, single word — "
             "NOT `bash`, NOT `shell`). "
-            "Run a command via /bin/bash -c with a per-call timeout."
+            "Run a command via /bin/bash -c with a per-call timeout. "
+            "Each call is an INDEPENDENT subprocess: the working directory is "
+            "reset to the same fixed directory every call, and shell state "
+            "(`cd`, exported env vars, shell functions) does NOT persist "
+            "between calls — unlike Claude Code, where the cwd carries over. "
+            "Chain related steps in one command (`cd x && ...`) or use absolute "
+            "paths. Files written to disk (including `/tmp`) DO persist across "
+            "calls, so persistence failures mean a stale relative path/cwd "
+            "assumption, not an ephemeral filesystem."
         ),
         input_schema={
             "type": "object",

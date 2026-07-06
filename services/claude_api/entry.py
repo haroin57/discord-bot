@@ -340,6 +340,10 @@ async def call_with_tools(
     tool_invocation_callback=None,
     scratch_stream_callback=None,
     scratch_finalize_callback=None,
+    thinking_stream_callback=None,     # async (partial_thinking:str)->None  (計画 preview)
+    thinking_finalize_callback=None,   # async ()->None  (thinking block closed)
+    verify_stream_callback=None,       # async (partial_thinking:str)->None  (検証 preview)
+    verify_finalize_callback=None,     # async ()->None  (verifier thinking block closed)
     progress: "dict | None" = None,
     restricted: bool = False,
     raw_user_text: str = "",
@@ -683,6 +687,7 @@ async def call_with_tools(
                     _compact_trigger = compact_threshold_tokens()
                     _last_tokens = get_last_context_tokens(channel_id)
                     over_tokens = _last_tokens > _compact_trigger
+                    _reduced = False
                     if over_tokens:
                         log.info(
                             "[ch=%d] boundary compaction trigger: "
@@ -711,6 +716,30 @@ async def call_with_tools(
                                 estimate_replay_chars(reloaded),
                             )
                             prior_history = reloaded
+                            _reduced = True
+                    # P1 (2026-07-06): compaction wanted to fire but couldn't
+                    # shrink the window — the LLM summary failed or the circuit
+                    # breaker is open (30-min cooldown). Sending the raw 500K+
+                    # context now stalls on TTFB → graceful checkpoint (the
+                    # "すぐタイムアウト" symptom). Fall back to a STRUCTURE-SAFE,
+                    # no-LLM emergency microcompact: clear OLD tool_result bodies
+                    # (message order/roles/tool_use↔tool_result pairing preserved,
+                    # so replay stays API-valid) so at least the tool-output bulk
+                    # is reclaimed instead of riding into a stall.
+                    if over_tokens and not _reduced and MICROCOMPACT_ENABLED:
+                        prior_history, _emg_saved = microcompact_tool_results(
+                            prior_history,
+                            gap_minutes=MICROCOMPACT_GAP_MIN + 1.0,
+                            gap_threshold_min=MICROCOMPACT_GAP_MIN,
+                            keep_recent=MICROCOMPACT_KEEP_RECENT,
+                        )
+                        if _emg_saved > 0:
+                            log.warning(
+                                "[ch=%d] emergency microcompact (boundary "
+                                "compaction unavailable): ~%d tokens reclaimed "
+                                "from old tool_results",
+                                channel_id, _emg_saved,
+                            )
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
                         "[ch=%d] history compaction failed (non-fatal): %s",
@@ -883,6 +912,8 @@ async def call_with_tools(
                             tool_invocation_callback=tool_invocation_callback,
                             scratch_stream_callback=scratch_stream_callback,
                             scratch_finalize_callback=scratch_finalize_callback,
+                            thinking_stream_callback=thinking_stream_callback,
+                            thinking_finalize_callback=thinking_finalize_callback,
                             progress=progress,
                             max_turns=max_turns,
                             budget_role="restricted" if restricted else "admin",  # ADR-0036
@@ -1207,6 +1238,8 @@ async def call_with_tools(
                     execute_tool=_execute_tool,
                     status_callback=status_callback,
                     tool_invocation_callback=tool_invocation_callback,
+                    thinking_stream_callback=thinking_stream_callback,
+                    thinking_finalize_callback=thinking_finalize_callback,
                     max_turns=max_turns,
                     api_client=api_client,
                     model=effective_model,
@@ -1296,6 +1329,9 @@ async def call_with_tools(
                             channel_id=channel_id,
                             model=_v_model,
                             extra_betas=MODEL_BETAS,
+                            status_callback=status_callback,
+                            thinking_stream_callback=verify_stream_callback,
+                            thinking_finalize_callback=verify_finalize_callback,
                         )
                         if verdict.ok or verdict.degraded:
                             break
