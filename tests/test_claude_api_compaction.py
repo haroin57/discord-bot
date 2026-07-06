@@ -166,7 +166,7 @@ class TestCompactChannelHistory:
         client = _fake_client("<analysis>a</analysis><summary>the summary</summary>")
 
         ok = await compact_channel_history(CHANNEL, client)
-        assert ok is True
+        assert ok is not None
         assert len(appended) == 1
         row = appended[0]
         assert row["is_compact_summary"] is True
@@ -187,7 +187,7 @@ class TestCompactChannelHistory:
     async def test_below_trigger_is_noop(self, monkeypatch):
         _patch_rows(monkeypatch, [_row("user", 10)])
         client = _fake_client("<summary>s</summary>")
-        assert await compact_channel_history(CHANNEL, client) is False
+        assert await compact_channel_history(CHANNEL, client) is None
         client.beta.messages.create.assert_not_called()
 
     @pytest.mark.asyncio
@@ -198,7 +198,7 @@ class TestCompactChannelHistory:
         _patch_rows(monkeypatch, rows)
         monkeypatch.setattr(comp, "HISTORY_COMPACT_TRIGGER_CHARS", 100_000)
         client = _fake_client("no tags here")
-        assert await compact_channel_history(CHANNEL, client) is False
+        assert await compact_channel_history(CHANNEL, client) is None
         assert comp._compact_failures[CHANNEL] == 1
 
     @pytest.mark.asyncio
@@ -212,18 +212,18 @@ class TestCompactChannelHistory:
             create=AsyncMock(side_effect=RuntimeError("boom")),
         )))
         for _ in range(comp.MAX_CONSECUTIVE_COMPACT_FAILURES):
-            assert await compact_channel_history(CHANNEL, client) is False
+            assert await compact_channel_history(CHANNEL, client) is None
         assert comp._compact_blocked_until.get(CHANNEL, 0) > time.monotonic()
         # breaker open -> no further API calls
         calls_before = client.beta.messages.create.await_count
-        assert await compact_channel_history(CHANNEL, client) is False
+        assert await compact_channel_history(CHANNEL, client) is None
         assert client.beta.messages.create.await_count == calls_before
 
     @pytest.mark.asyncio
     async def test_disabled_is_noop(self, monkeypatch):
         monkeypatch.setattr(comp, "HISTORY_COMPACT_ENABLED", False)
         client = _fake_client("<summary>s</summary>")
-        assert await compact_channel_history(CHANNEL, client) is False
+        assert await compact_channel_history(CHANNEL, client) is None
 
 
 class TestForceBypass:
@@ -240,7 +240,7 @@ class TestForceBypass:
         monkeypatch.setattr(comp, "append_jsonl", lambda cid, e: appended.append(e))
         client = _fake_client("<summary>compact body</summary>")
         ok = await compact_channel_history(CHANNEL, client, force=True)
-        assert ok is True
+        assert ok is not None
         assert appended and appended[0]["is_compact_summary"] is True
 
     @pytest.mark.asyncio
@@ -248,7 +248,7 @@ class TestForceBypass:
         _patch_rows(monkeypatch, [_row("user", 500)])
         monkeypatch.setattr(comp, "HISTORY_COMPACT_TRIGGER_CHARS", 10**9)
         client = _fake_client("<summary>x</summary>")
-        assert await compact_channel_history(CHANNEL, client) is False
+        assert await compact_channel_history(CHANNEL, client) is None
 
 
 class TestRapidRefillBreaker:
@@ -279,7 +279,7 @@ class TestRapidRefillBreaker:
             comp.record_proactive_compaction(CHANNEL)
         _patch_rows(monkeypatch, [_row("user", 10**6)])
         client = _fake_client("<summary>x</summary>")
-        assert await compact_channel_history(CHANNEL, client, force=True) is False
+        assert await compact_channel_history(CHANNEL, client, force=True) is None
 
 
 class TestApiMessagesFallback:
