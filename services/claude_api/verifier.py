@@ -100,6 +100,8 @@ async def verify_draft(
     model: str,
     extra_betas: list[str],
     status_callback=None,
+    thinking_stream_callback=None,     # async (partial_thinking:str)->None  (検証 preview)
+    thinking_finalize_callback=None,   # async ()->None  (verifier thinking closed)
 ) -> Verdict:
     """fresh-context 検証。失敗は常に fail-open（ok=True, degraded=True）。"""
     try:
@@ -160,6 +162,8 @@ async def verify_draft(
                     can_use_tool=can_use,
                     execute_tool=_exec,
                     status_callback=status_callback,
+                    thinking_stream_callback=thinking_stream_callback,
+                    thinking_finalize_callback=thinking_finalize_callback,
                     max_turns=DELIB_VERIFIER_MAX_TURNS,
                     stall_watchdog=watchdog,
                     api_client=api_client,

@@ -2273,3 +2273,86 @@ class TestStickyPromotion:
         )
         assert "scholarly" in result.active_mcp_keys
         assert "mem0" in result.active_mcp_keys
+
+
+class TestThinkingStreaming:
+    """thinking_delta events forward the model's in-progress thinking to
+    thinking_stream_callback (accumulated per block) and collapse it via
+    thinking_finalize_callback on block close. Must fire even when
+    text_stream_callback is None (deliberate tier), where the branch used to
+    be gated off entirely."""
+
+    @pytest.mark.asyncio
+    async def test_thinking_callbacks_fire_and_accumulate(self, watchdog):
+        think_start = _block(
+            "content_block_start", content_block=_block("thinking"),
+        )
+        d1 = SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="thinking_delta", thinking="計画A"),
+        )
+        d2 = SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="thinking_delta", thinking="計画B"),
+        )
+        block_stop = SimpleNamespace(type="content_block_stop")
+
+        client = _make_client((
+            [think_start, d1, d2, block_stop],
+            _final_msg(
+                [_block("thinking", thinking="計画A計画B"),
+                 _block("text", text="done")],
+                "end_turn",
+            ),
+        ))
+        think_calls: list[str] = []
+        finalize_calls: list[bool] = []
+
+        async def _think_cb(text):
+            think_calls.append(text)
+
+        async def _finalize_cb():
+            finalize_calls.append(True)
+
+        result = await run_agent_loop(
+            "plan something", channel_id=1, history=[],
+            system_prompt="sys", tools_for_api=[],
+            can_use_tool=_allow_all,
+            execute_tool=AsyncMock(),
+            status_callback=_noop_status,
+            text_stream_callback=None,  # deliberate tier: prose stream off
+            thinking_stream_callback=_think_cb,
+            thinking_finalize_callback=_finalize_cb,
+            max_turns=5,
+            stall_watchdog=watchdog,
+            api_client=client,
+            model="claude-opus-4-6",
+            extra_betas=[],
+        )
+        assert result.text == "done"
+        # accumulated block-so-far each delta, not per-piece
+        assert think_calls == ["計画A", "計画A計画B"]
+        assert finalize_calls == [True]
+
+    @pytest.mark.asyncio
+    async def test_thinking_without_callback_is_safe(self, watchdog):
+        think_start = _block(
+            "content_block_start", content_block=_block("thinking"),
+        )
+        d1 = SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="thinking_delta", thinking="x"),
+        )
+        block_stop = SimpleNamespace(type="content_block_stop")
+        client = _make_client((
+            [think_start, d1, block_stop],
+            _final_msg([_block("text", text="ok")], "end_turn"),
+        ))
+        result = await run_agent_loop(
+            "hi", channel_id=1, history=[], system_prompt="sys",
+            tools_for_api=[], can_use_tool=_allow_all,
+            execute_tool=AsyncMock(), status_callback=_noop_status,
+            max_turns=5, stall_watchdog=watchdog, api_client=client,
+            model="claude-opus-4-6", extra_betas=[],
+        )
+        assert result.text == "ok"

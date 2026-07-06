@@ -1435,6 +1435,8 @@ async def run_agent_loop(
     tool_invocation_callback=None,    # async (name:str, args:dict)->None
     scratch_stream_callback=None,     # async (section:str, content:str, op:str)->None
     scratch_finalize_callback=None,   # async ()->None  (Scratchpad block closed)
+    thinking_stream_callback=None,    # async (partial_thinking_text:str)->None
+    thinking_finalize_callback=None,  # async ()->None  (thinking block closed)
     progress=None,                    # mutable {"tokens": int} for the live spinner
     max_turns: int,
     stall_watchdog: StallWatchdog,
@@ -1636,6 +1638,11 @@ async def run_agent_loop(
         # full prose-so-far (bot.py edits one draft message, throttled). Reset
         # each turn so a new turn starts a fresh partial.
         live_turn_text = ""
+        # Live thinking stream for the CURRENT thinking block (計画/検証 preview).
+        # thinking_delta events carry the extended-thinking text; accumulate so
+        # thinking_stream_callback always gets the block-so-far. Reset per block.
+        live_thinking = ""
+        in_thinking = False
         # Server-side fallback detection (ADR-0015). The server signals a
         # mid-stream model switch via a content_block_start whose content_block
         # type is "fallback" (carrying from.model / to.model). SDK 0.88.0 does
@@ -1690,6 +1697,8 @@ async def run_agent_loop(
                                 )
                             continue
                         if btype == "thinking":
+                            in_thinking = True
+                            live_thinking = ""
                             await _safe_status(status_callback, "💭 thinking…")
                         elif btype == "text":
                             await _safe_status(status_callback, "📝 応答を生成中")
@@ -1757,6 +1766,15 @@ async def run_agent_loop(
                                 await scratch_finalize_callback()
                             except Exception as exc:
                                 log.debug("scratch_finalize_callback failed: %s", exc)
+                        if in_thinking:
+                            in_thinking = False
+                            if thinking_finalize_callback is not None:
+                                try:
+                                    await thinking_finalize_callback()
+                                except Exception as exc:
+                                    log.debug(
+                                        "thinking_finalize_callback failed: %s", exc,
+                                    )
                         cur_tool = None
                     elif etype == "message_delta":
                         # Live output-token count for the spinner: cumulative
@@ -1767,9 +1785,14 @@ async def run_agent_loop(
                                 progress["tokens"] = _tok_base + _usage_number(
                                     _u, "output_tokens",
                                 )
-                    elif etype == "content_block_delta" and text_stream_callback is not None:
+                    elif etype == "content_block_delta":
+                        # NB: no text_stream_callback gate on the branch itself —
+                        # thinking capture must work in deliberate tier too, where
+                        # text_stream_callback is None but thinking_stream_callback
+                        # is wired for the 計画/検証 preview.
                         delta = getattr(event, "delta", None)
-                        if getattr(delta, "type", None) == "text_delta":
+                        _dtype = getattr(delta, "type", None)
+                        if _dtype == "text_delta" and text_stream_callback is not None:
                             piece = getattr(delta, "text", "") or ""
                             if piece:
                                 live_turn_text += piece
@@ -1779,6 +1802,21 @@ async def run_agent_loop(
                                     await text_stream_callback(live_turn_text)
                                 except Exception as exc:
                                     log.debug("text_stream_callback failed: %s", exc)
+                        elif (
+                            _dtype == "thinking_delta"
+                            and thinking_stream_callback is not None
+                        ):
+                            piece = getattr(delta, "thinking", "") or ""
+                            if piece:
+                                live_thinking += piece
+                                # Same throttle discipline as prose; a UI hiccup
+                                # must never abort the tool loop.
+                                try:
+                                    await thinking_stream_callback(live_thinking)
+                                except Exception as exc:
+                                    log.debug(
+                                        "thinking_stream_callback failed: %s", exc,
+                                    )
                 final_msg = await asyncio.wait_for(
                     stream.get_final_message(), STREAM_STALL_RETRY_S,
                 )
