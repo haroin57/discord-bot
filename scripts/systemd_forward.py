@@ -39,6 +39,10 @@ BLOCK = re.compile(
     r"|snapd\.|fwupd|e2scrub|dpkg-db-backup|systemd-tmpfiles"
     r"|session-\d+\.scope|user@\d+\.service|user-runtime-dir"
     r"|run-r[0-9a-f]+|sleep\.target|suspend\.target"
+    # 5分毎に timer 起動する pull-based autodeploy の Starting/Stopping は純ノイズ。
+    # 実デプロイの成否は auto_deploy.sh 自身の notify() が別途通知するので、
+    # systemd レベルのライフサイクルはここで落とす（prod / dev 両方）。
+    r"|-autodeploy\.service"
 )
 
 EMOJI = [
