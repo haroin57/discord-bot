@@ -31,6 +31,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 
 from config import (
     HISTORY_COMPACT_EFFORT,
@@ -493,13 +494,38 @@ def _record_compact_failure(channel_id: int) -> None:
         )
 
 
+@dataclass
+class CompactionResult:
+    """Metrics from a successful compact_channel_history run (surfaced by
+    /compact, CLI-style: how much of the replay window was folded)."""
+    summarized_rows: int   # 畳んだ古い replay ターン数
+    kept_rows: int         # verbatim で残した末尾ターン数
+    source_chars: int      # 畳む前の対象総文字数
+    summary_chars: int     # 生成された要約の文字数
+    kept_chars: int        # verbatim 保持分の文字数
+    duration_ms: int
+
+    @property
+    def retained_chars(self) -> int:
+        return self.summary_chars + self.kept_chars
+
+    @property
+    def reclaimed_chars(self) -> int:
+        return max(0, self.source_chars - self.retained_chars)
+
+    @property
+    def compression_pct(self) -> float:
+        """圧縮後に残った割合（小さいほど圧縮された）。"""
+        return (self.retained_chars / self.source_chars * 100) if self.source_chars else 0.0
+
+
 async def compact_channel_history(
     channel_id: int,
     api_client,
     status_callback=None,
     *,
     force: bool = False,
-) -> bool:
+) -> "CompactionResult | None":
     """Summarize the older replay window into a compact-summary JSONL row.
 
     Returns True when a summary row was appended — the caller should reload
@@ -515,7 +541,7 @@ async def compact_channel_history(
     """
     if not HISTORY_COMPACT_ENABLED:
         log.info("[ch=%d] compaction skipped: disabled via env", channel_id)
-        return False
+        return None
     blocked_until = _compact_blocked_until.get(channel_id, 0.0)
     if blocked_until > time.monotonic():
         log.info(
@@ -524,7 +550,7 @@ async def compact_channel_history(
             channel_id, blocked_until - time.monotonic(),
             _compact_failures.get(channel_id, 0),
         )
-        return False
+        return None
 
     rows = await asyncio.to_thread(load_compaction_rows, channel_id)
     total_chars = sum(_row_chars(r) for r in rows)
@@ -533,7 +559,7 @@ async def compact_channel_history(
             "[ch=%d] compaction below trigger: chars=%d <= %d",
             channel_id, total_chars, HISTORY_COMPACT_TRIGGER_CHARS,
         )
-        return False
+        return None
     log.info(
         "[ch=%d] compaction trigger: chars=%d trigger=%d force=%s rows=%d",
         channel_id, total_chars, HISTORY_COMPACT_TRIGGER_CHARS, force,
@@ -548,7 +574,7 @@ async def compact_channel_history(
             "summarize (keep_chars=%d)",
             channel_id, boundary, HISTORY_COMPACT_KEEP_CHARS,
         )
-        return False
+        return None
     old_chars = sum(_row_chars(r) for r in old_rows)
     keep_chars = sum(_row_chars(r) for r in keep_rows)
     log.info(
@@ -564,7 +590,7 @@ async def compact_channel_history(
             "[ch=%d] compaction skipped: flattened transcript is empty "
             "(old_rows had no string content)", channel_id,
         )
-        return False
+        return None
     log.info(
         "[ch=%d] compaction input: flat_chars=%d (cap=%d, truncated=%s)",
         channel_id, len(flat), MAX_SUMMARY_INPUT_CHARS,
@@ -646,7 +672,7 @@ async def compact_channel_history(
             _compact_failures.get(channel_id, 0) + 1, exc,
         )
         _record_compact_failure(channel_id)
-        return False
+        return None
 
     # Same validity bar as the official CLI ("response did not contain valid
     # text content"): require an actual <summary> block, not just prose.
@@ -657,7 +683,7 @@ async def compact_channel_history(
             channel_id, len(text or ""), (text or "")[:120],
         )
         _record_compact_failure(channel_id)
-        return False
+        return None
     log.info(
         "[ch=%d] compaction extraction: raw_chars=%d has_analysis=%s",
         channel_id, len(text), "<analysis>" in text,
@@ -692,4 +718,11 @@ async def compact_channel_history(
         (len(wrapped) + keep_chars) / total_chars * 100 if total_chars else 0.0,
         int((time.monotonic() - call_start) * 1000),
     )
-    return True
+    return CompactionResult(
+        summarized_rows=len(old_rows),
+        kept_rows=len(keep_rows),
+        source_chars=total_chars,
+        summary_chars=len(wrapped),
+        kept_chars=keep_chars,
+        duration_ms=int((time.monotonic() - call_start) * 1000),
+    )
