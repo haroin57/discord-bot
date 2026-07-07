@@ -32,15 +32,16 @@ def _make_interaction(*, channel_id=CHANNEL, uid=UID):
     return SimpleNamespace(response=resp, user=user, channel_id=channel_id)
 
 
-def _register(is_admin=True):
+def _register(is_admin=True, command="model"):
     tree = _FakeTree()
     deps = SimpleNamespace(
         is_admin=lambda u: is_admin,
         model_overrides={},
         effort_overrides={},
+        tier_overrides={},
     )
     model_cmds.register(tree, deps)
-    return tree.cmds["model"], deps
+    return tree.cmds[command], deps
 
 
 def _choice(name, value):
@@ -119,4 +120,48 @@ class TestModelCommand:
         interaction = _make_interaction(channel_id=None)
         await cmd(interaction, model=_choice("Fable 5", "claude-fable-5"))
         args, kwargs = interaction.response.send_message.call_args
+        assert "チャンネル外" in args[0]
+
+
+class TestTierCommand:
+    """/tier — 熟考モードの明示制御（2026-07-08、自動分岐廃止とセット）。"""
+
+    async def test_non_admin_blocked(self):
+        cmd, deps = _register(is_admin=False, command="tier")
+        interaction = _make_interaction()
+        await cmd(interaction, mode=_choice("熟考モード固定", "deliberate"))
+        interaction.response.send_message.assert_awaited_once_with(
+            "admin only", ephemeral=True,
+        )
+        assert deps.tier_overrides == {}
+
+    async def test_force_deliberate(self):
+        cmd, deps = _register(command="tier")
+        interaction = _make_interaction()
+        await cmd(interaction, mode=_choice("熟考モード固定", "deliberate"))
+        assert deps.tier_overrides[(CHANNEL, UID)] == "deliberate"
+        args, kwargs = interaction.response.send_message.call_args
+        assert "熟考モード固定" in args[0]
+        assert kwargs["ephemeral"] is True
+
+    async def test_force_chat(self):
+        cmd, deps = _register(command="tier")
+        interaction = _make_interaction()
+        await cmd(interaction, mode=_choice("会話モード固定", "chat"))
+        assert deps.tier_overrides[(CHANNEL, UID)] == "chat"
+
+    async def test_clear(self):
+        cmd, deps = _register(command="tier")
+        deps.tier_overrides[(CHANNEL, UID)] = "deliberate"
+        interaction = _make_interaction()
+        await cmd(interaction, mode=_choice("解除", "clear"))
+        assert (CHANNEL, UID) not in deps.tier_overrides
+        args, _ = interaction.response.send_message.call_args
+        assert "解除" in args[0]
+
+    async def test_outside_channel(self):
+        cmd, _ = _register(command="tier")
+        interaction = _make_interaction(channel_id=None)
+        await cmd(interaction, mode=_choice("熟考モード固定", "deliberate"))
+        args, _ = interaction.response.send_message.call_args
         assert "チャンネル外" in args[0]

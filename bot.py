@@ -261,6 +261,10 @@ sessions = shared_sessions()
 # are cheap to re-issue.
 _MODEL_OVERRIDES: dict[tuple[int, int], str] = {}
 _EFFORT_OVERRIDES: dict[tuple[int, int], str] = {}
+# /tier live override（2026-07-08）: "deliberate"（熟考固定）| "chat"（会話固定）。
+# 未設定ならルーター判定（既定は明示マーカーのみ — DELIB_ROUTER_AUTO_ENABLED
+# が false の間、スコアによる自動昇格はしない）。
+_TIER_OVERRIDES: dict[tuple[int, int], str] = {}
 # SRE-H1: gate bot.tree.sync() to once per process (not per Discord reconnect).
 _tree_synced: bool = False
 # LRU-bounded: evict least-recently-used channel sema when over MAX_CHANNEL_SEMAS.
@@ -673,6 +677,7 @@ _command_deps = bot_commands.CommandDeps(
     get_http_session=get_http_session,
     model_overrides=_MODEL_OVERRIDES,
     effort_overrides=_EFFORT_OVERRIDES,
+    tier_overrides=_TIER_OVERRIDES,
 )
 bot_commands.register_all(bot.tree, _command_deps)
 
@@ -1354,19 +1359,34 @@ async def on_message(message: discord.Message):
         # 熟考 P2: tier 判定（admin のみ）。deliberate では incremental streaming
         # を切り、planner→executor→verifier→revise の検証済み最終文を一括送信する
         # （callbacks 非配線 → 既存の非 streaming 送信経路に自然に落ちる）。
+        # 2026-07-08: スコアによる自動昇格は既定 OFF（数分級パイプラインに勝手に
+        # 入るのは UX が悪いというユーザー決定）。deliberate に入る経路は
+        # (a) /tier コマンドの強制指定、(b) 文中の明示マーカー（「熟考」等）、
+        # (c) DELIB_ROUTER_AUTO_ENABLED=true を明示した場合の従来スコア判定。
         _tier = None
         _route_judgment = False
         if caller_is_admin and DELIB_ROUTER_ENABLED:
             try:
+                from config import DELIB_ROUTER_AUTO_ENABLED
                 from services.claude_api.router import decide_tier
                 _decision = await decide_tier(
                     raw_user_text,
                     has_attachments=bool(
                         image_paths or text_attachments or arbitrary_attachments
                     ),
+                    auto_enabled=DELIB_ROUTER_AUTO_ENABLED,
                 )
-                _tier = _decision.tier
                 _route_judgment = _decision.judgment
+                _tier_override = _TIER_OVERRIDES.get(
+                    (message.channel.id, message.author.id)
+                )
+                if _tier_override in ("deliberate", "chat"):
+                    _tier = _tier_override
+                    log.info(
+                        "delib_router overridden by /tier: %s", _tier_override,
+                    )
+                else:
+                    _tier = _decision.tier
             except Exception as exc:
                 log.warning("delib_router failed (chat 扱い): %s", exc)
         _delib = _tier == "deliberate"

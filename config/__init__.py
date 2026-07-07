@@ -679,13 +679,21 @@ DELIB_DISTILL_TIMEOUT_S = int(os.environ.get("DELIB_DISTILL_TIMEOUT_S", "20"))
 DELIB_DISTILL_MAX_PARALLEL = int(
     os.environ.get("DELIB_DISTILL_MAX_PARALLEL", "3"))
 
-# P2: tier router（積極自動 — ユーザー決定 2026-07-02）+ verifier + judge-lite
+# P2: tier router + verifier + judge-lite
 DELIB_ROUTER_ENABLED = (
     os.environ.get("DELIB_ROUTER_ENABLED", "false").lower() == "true"
 )
 DELIB_ROUTER_MODE = os.environ.get("DELIB_ROUTER_MODE", "heuristic").strip().lower()
 DELIB_ROUTER_MIN_CHARS = int(os.environ.get("DELIB_ROUTER_MIN_CHARS", "120"))
-# 積極自動: 依頼型キーワード単発（+2）で deliberate に届く閾値
+# スコアベースの自動 deliberate 昇格。2026-07-02 に「積極自動」で導入したが、
+# 依頼型キーワード単発で数分級のパイプラインに勝手に入るのは UX が悪すぎる
+# とのユーザー決定（2026-07-08）で既定 OFF に反転。OFF でも明示マーカー
+# （「熟考」「じっくり」等の文中指定）と /tier コマンドの強制指定は生きる —
+# 消えるのはヒューリスティックの自動分岐だけ。
+DELIB_ROUTER_AUTO_ENABLED = (
+    os.environ.get("DELIB_ROUTER_AUTO_ENABLED", "false").lower() == "true"
+)
+# 自動昇格時の閾値（DELIB_ROUTER_AUTO_ENABLED=true のときのみ意味を持つ）
 DELIB_ROUTER_SCORE_THRESHOLD = float(
     os.environ.get("DELIB_ROUTER_SCORE_THRESHOLD", "1.0"))
 

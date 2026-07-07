@@ -58,8 +58,15 @@ _JUDGMENT_RE = re.compile(
 
 def route_request(
     raw_user_text: str, *, has_attachments: bool = False,
+    auto_enabled: bool = True,
 ) -> RouteDecision:
-    """ヒューリスティック tier 判定（純関数・同期）。"""
+    """ヒューリスティック tier 判定（純関数・同期）。
+
+    ``auto_enabled=False``（既定運用、2026-07-08 ユーザー決定）ではスコア
+    ベースの自動昇格を行わない — deliberate に入るのは明示マーカー
+    （「熟考」「じっくり」等）か /tier コマンドの強制指定（呼び出し側で
+    処理）だけ。judgment フラグは tier と独立に返す（MAGI-lite の材料）。
+    """
     text = (raw_user_text or "").strip()
     lower = text.lower()
     judgment = bool(_JUDGMENT_RE.search(text))
@@ -71,6 +78,9 @@ def route_request(
     for m in _FORCE_DELIB:
         if m in text:
             return RouteDecision(TIER_DELIBERATE, 99.0, f"force_delib:{m}", judgment)
+
+    if not auto_enabled:
+        return RouteDecision(TIER_CHAT, 0.0, "auto_routing_disabled", judgment)
 
     score = 0.0
     hits = [kw for kw in _TASK_KEYWORDS if kw in lower]
@@ -105,11 +115,16 @@ def route_request(
 
 async def decide_tier(
     raw_user_text: str, *, has_attachments: bool = False,
+    auto_enabled: bool = True,
 ) -> RouteDecision:
     """判定の呼び出し口（最初から async — 将来の LLM 分類差し替えのため）。"""
-    decision = route_request(raw_user_text, has_attachments=has_attachments)
+    decision = route_request(
+        raw_user_text, has_attachments=has_attachments,
+        auto_enabled=auto_enabled,
+    )
     log.info(
-        "delib_router tier=%s score=%.1f judgment=%s reason=%s",
+        "delib_router tier=%s score=%.1f judgment=%s reason=%s auto=%s",
         decision.tier, decision.score, decision.judgment, decision.reason,
+        auto_enabled,
     )
     return decision
