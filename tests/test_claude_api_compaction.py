@@ -176,12 +176,22 @@ class TestCompactChannelHistory:
         assert row["keep_tail_rows"] >= 1
         # success resets breaker state
         assert comp._compact_failures == {}
-        # recursive call ran at Opus max effort (the whole point of the
-        # quality dial) — output_config.effort must reach the wire.
+        # the configured effort dial must reach the wire (default "medium"
+        # since the 2026-07-08 runtime optimization; env-tunable either way).
         _, kwargs = client.beta.messages.create.call_args
         assert kwargs["output_config"] == {"effort": comp.HISTORY_COMPACT_EFFORT}
         assert kwargs["model"] == comp.HISTORY_COMPACT_MODEL
         assert "effort-2025-11-24" in kwargs["betas"]
+
+    def test_instructions_request_summary_only(self):
+        # Runtime optimization (2026-07-08): the throwaway <analysis>
+        # scratchpad is no longer requested — the response must be a single
+        # <summary> block, with the checklist done in private reasoning.
+        assert "single <summary> block" in comp.COMPACT_INSTRUCTIONS
+        assert "wrap your analysis in <analysis> tags" not in comp.COMPACT_INSTRUCTIONS
+        # extract_summary keeps stripping a stray <analysis> defensively.
+        out = extract_summary("<analysis>x</analysis><summary>s</summary>")
+        assert "x" not in out
 
     @pytest.mark.asyncio
     async def test_below_trigger_is_noop(self, monkeypatch):
@@ -336,3 +346,138 @@ class TestApiMessagesFallback:
         }
         text = comp._api_messages_text_fallback(row)
         assert len(text) <= comp._API_MSG_FALLBACK_CHARS + 20  # cap + 省略記号
+
+
+def _ts_row(role, chars, ts):
+    return {"role": role, "content": "x" * chars, "timestamp": ts}
+
+
+class TestBackgroundCompaction:
+    """2026-07-08 runtime optimization: boundary compaction runs off the
+    critical path, and the summary row's keep_tail_rows is re-anchored at
+    append time so rows appended during the minutes-long summary call land in
+    the verbatim tail instead of being dropped from replay."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_bg_state(self):
+        comp._bg_tasks.clear()
+        comp._compact_locks.clear()
+        yield
+        comp._bg_tasks.clear()
+        comp._compact_locks.clear()
+
+    @pytest.mark.asyncio
+    async def test_spawns_once_per_channel(self, monkeypatch):
+        import asyncio
+        release = asyncio.Event()
+        started = asyncio.Event()
+
+        async def _slow_compact(cid, client, cb=None, *, force=False):
+            started.set()
+            await release.wait()
+            return None
+
+        monkeypatch.setattr(comp, "compact_channel_history", _slow_compact)
+
+        assert comp.start_background_compaction(CHANNEL, object()) is True
+        await started.wait()
+        # Second dispatch while the first is in flight must be refused.
+        assert comp.start_background_compaction(CHANNEL, object()) is False
+        release.set()
+        await comp._bg_tasks[CHANNEL] if CHANNEL in comp._bg_tasks else None
+        # After completion the slot frees up.
+        for _ in range(10):
+            if CHANNEL not in comp._bg_tasks:
+                break
+            await asyncio.sleep(0)
+        assert comp.start_background_compaction(CHANNEL, object()) is True
+        release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_append_recomputes_tail(self, monkeypatch):
+        """Rows appended while the summary call is in flight must be counted
+        into keep_tail_rows — the stale pre-call count would drop real tail
+        rows from the replay view."""
+        rows_v1 = [
+            _ts_row("user", 60_000, "t1"), _ts_row("assistant", 80_000, "t2"),
+            _ts_row("user", 60_000, "t3"), _ts_row("assistant", 30_000, "t4"),
+        ]
+        # Two rows land while the LLM call runs.
+        rows_v2 = rows_v1 + [
+            _ts_row("user", 10, "t5"), _ts_row("assistant", 10, "t6"),
+        ]
+        calls = {"n": 0}
+
+        def _fake_load(cid):
+            calls["n"] += 1
+            return rows_v1 if calls["n"] == 1 else rows_v2
+
+        monkeypatch.setattr(comp, "load_compaction_rows", _fake_load)
+        monkeypatch.setattr(comp, "HISTORY_COMPACT_TRIGGER_CHARS", 100_000)
+        monkeypatch.setattr(comp, "HISTORY_COMPACT_KEEP_CHARS", 40_000)
+        appended: list[dict] = []
+        monkeypatch.setattr(comp, "append_jsonl", lambda cid, e: appended.append(e))
+        client = _fake_client("<summary>the summary</summary>")
+
+        ok = await compact_channel_history(CHANNEL, client)
+        assert ok is not None
+        assert calls["n"] == 2  # snapshot + append-time re-anchor
+        row = appended[0]
+        # Original tail (2 rows) + 2 concurrently-appended rows.
+        assert row["keep_tail_rows"] == 4
+        assert ok.kept_rows == 4
+
+    @pytest.mark.asyncio
+    async def test_anchor_missing_aborts_append(self, monkeypatch):
+        """If the summarized boundary row vanished from the window mid-run
+        (head-trim), the summary is discarded rather than appended with a
+        misaligned tail — and the failure breaker is NOT bumped (the LLM call
+        itself succeeded)."""
+        rows_v1 = [
+            _ts_row("user", 60_000, "t1"), _ts_row("assistant", 80_000, "t2"),
+            _ts_row("user", 60_000, "t3"), _ts_row("assistant", 30_000, "t4"),
+        ]
+        rows_v2 = [  # boundary row (t2) gone entirely
+            _ts_row("user", 60_000, "t3"), _ts_row("assistant", 30_000, "t4"),
+        ]
+        calls = {"n": 0}
+
+        def _fake_load(cid):
+            calls["n"] += 1
+            return rows_v1 if calls["n"] == 1 else rows_v2
+
+        monkeypatch.setattr(comp, "load_compaction_rows", _fake_load)
+        monkeypatch.setattr(comp, "HISTORY_COMPACT_TRIGGER_CHARS", 100_000)
+        monkeypatch.setattr(comp, "HISTORY_COMPACT_KEEP_CHARS", 40_000)
+        appended: list[dict] = []
+        monkeypatch.setattr(comp, "append_jsonl", lambda cid, e: appended.append(e))
+        client = _fake_client("<summary>the summary</summary>")
+
+        assert await compact_channel_history(CHANNEL, client) is None
+        assert appended == []
+        assert comp._compact_failures == {}
+
+    @pytest.mark.asyncio
+    async def test_duplicate_tail_rows_do_not_confuse_anchor(self, monkeypatch):
+        """A tail row value-identical to the boundary row (same second, same
+        role, same text) must not be mistaken for the anchor — the search is
+        capped at the original boundary index."""
+        dup = {"role": "assistant", "content": "x" * 500, "timestamp": "same"}
+        rows = [
+            _ts_row("user", 500, "t1"), dict(dup),
+            _ts_row("user", 500, "t3"), dict(dup),
+        ]
+        monkeypatch.setattr(comp, "load_compaction_rows", lambda cid: rows)
+        monkeypatch.setattr(comp, "HISTORY_COMPACT_TRIGGER_CHARS", 10**9)
+        monkeypatch.setattr(comp, "HISTORY_COMPACT_KEEP_CHARS", 600)
+        appended: list[dict] = []
+        monkeypatch.setattr(comp, "append_jsonl", lambda cid, e: appended.append(e))
+        client = _fake_client("<summary>compact body</summary>")
+
+        ok = await compact_channel_history(CHANNEL, client, force=True)
+        assert ok is not None
+        # boundary=2 -> tail is rows[2:]; the duplicate at index 3 must not
+        # shrink the tail to 0.
+        assert appended[0]["keep_tail_rows"] == 2

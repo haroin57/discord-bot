@@ -62,6 +62,7 @@ from services.claude_api.compaction import (
     pop_pending_recovery,
     record_proactive_compaction,
     reset_rapid_refill,
+    start_background_compaction,
 )
 from services.claude_api.microcompact import microcompact_tool_results
 from services.mcp_selector import (
@@ -687,46 +688,49 @@ async def call_with_tools(
                     _compact_trigger = compact_threshold_tokens()
                     _last_tokens = get_last_context_tokens(channel_id)
                     over_tokens = _last_tokens > _compact_trigger
-                    _reduced = False
                     if over_tokens:
-                        log.info(
-                            "[ch=%d] boundary compaction trigger: "
-                            "last_context_tokens=%d (trigger=%d) force=True",
-                            channel_id,
-                            _last_tokens,
-                            _compact_trigger,
-                        )
-                    if (
-                        over_tokens
-                        and await compact_channel_history(
-                            channel_id, api_client, status_callback,
-                            force=True,
-                        )
-                    ):
-                        reloaded, _snap, _ts = await asyncio.to_thread(
-                            load_api_replay_channel, channel_id
-                        )
-                        if reloaded:
-                            log.info(
-                                "[ch=%d] boundary compaction reload: "
-                                "replay %d → %d turns, %d → %d chars",
-                                channel_id,
-                                len(prior_history), len(reloaded),
-                                estimate_replay_chars(prior_history),
-                                estimate_replay_chars(reloaded),
+                        # Runtime opt (2026-07-08): the summary call takes
+                        # minutes (measured 4.4-8.2 min at effort=max), so the
+                        # boundary path no longer awaits it. Dispatch to a
+                        # background task; THIS turn rides the raw window
+                        # (immediate relief via the microcompact below) and the
+                        # NEXT turn's normal replay load picks up the summary
+                        # row. Guard against stale-usage thrash: after the
+                        # summary lands, last_context_tokens stays high until a
+                        # turn completes on the collapsed window — if the
+                        # replay we just loaded is already small in chars, the
+                        # token gate fired on stale usage and compacting again
+                        # would summarize the summary.
+                        from config import HISTORY_COMPACT_TRIGGER_CHARS
+                        _replay_chars = estimate_replay_chars(prior_history)
+                        if _replay_chars > HISTORY_COMPACT_TRIGGER_CHARS:
+                            _spawned = start_background_compaction(
+                                channel_id, api_client,
                             )
-                            prior_history = reloaded
-                            _reduced = True
-                    # P1 (2026-07-06): compaction wanted to fire but couldn't
-                    # shrink the window — the LLM summary failed or the circuit
-                    # breaker is open (30-min cooldown). Sending the raw 500K+
-                    # context now stalls on TTFB → graceful checkpoint (the
-                    # "すぐタイムアウト" symptom). Fall back to a STRUCTURE-SAFE,
-                    # no-LLM emergency microcompact: clear OLD tool_result bodies
-                    # (message order/roles/tool_use↔tool_result pairing preserved,
-                    # so replay stays API-valid) so at least the tool-output bulk
-                    # is reclaimed instead of riding into a stall.
-                    if over_tokens and not _reduced and MICROCOMPACT_ENABLED:
+                            log.info(
+                                "[ch=%d] boundary compaction trigger: "
+                                "last_context_tokens=%d (trigger=%d) — "
+                                "dispatched to background (spawned=%s)",
+                                channel_id, _last_tokens, _compact_trigger,
+                                _spawned,
+                            )
+                        else:
+                            log.info(
+                                "[ch=%d] boundary compaction skipped: token "
+                                "gate is stale (tokens=%d > trigger=%d but "
+                                "replay is only %d chars — already collapsed)",
+                                channel_id, _last_tokens, _compact_trigger,
+                                _replay_chars,
+                            )
+                            over_tokens = False
+                    # Structure-safe, no-LLM relief for THIS turn while the
+                    # summary runs in the background (and the only relief when
+                    # the summary failed or the circuit breaker is open — the
+                    # P1 2026-07-06 stall case). Clears OLD tool_result bodies
+                    # (message order/roles/tool_use↔tool_result pairing
+                    # preserved, so replay stays API-valid) so the tool-output
+                    # bulk is reclaimed instead of riding into a TTFB stall.
+                    if over_tokens and MICROCOMPACT_ENABLED:
                         prior_history, _emg_saved = microcompact_tool_results(
                             prior_history,
                             gap_minutes=MICROCOMPACT_GAP_MIN + 1.0,
@@ -734,10 +738,10 @@ async def call_with_tools(
                             keep_recent=MICROCOMPACT_KEEP_RECENT,
                         )
                         if _emg_saved > 0:
-                            log.warning(
-                                "[ch=%d] emergency microcompact (boundary "
-                                "compaction unavailable): ~%d tokens reclaimed "
-                                "from old tool_results",
+                            log.info(
+                                "[ch=%d] microcompact while boundary "
+                                "compaction runs in background: ~%d tokens "
+                                "reclaimed from old tool_results",
                                 channel_id, _emg_saved,
                             )
                 except Exception as exc:  # noqa: BLE001

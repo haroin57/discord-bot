@@ -248,20 +248,25 @@ HISTORY_COMPACT_KEEP_CHARS = int(
 HISTORY_COMPACT_MODEL = os.environ.get(
     "HISTORY_COMPACT_MODEL", FABLE_REFUSAL_FALLBACK_MODEL
 )
-# Compaction is a recursive Claude call whose single job is to losslessly
-# distill a whole conversation — quality matters far more than latency here
-# (it fires rarely, only past the trigger). Run it at the top of Anthropic's
-# effort dial (low < medium < high < xhigh < max), unlike the main loop which
-# sits at "medium" for predictable per-turn latency.
-HISTORY_COMPACT_EFFORT = os.environ.get("HISTORY_COMPACT_EFFORT", "max")
-# Output-token ceiling for the summary call. The summary is an <analysis>
-# scratchpad (~15K tokens at effort=max) FOLLOWED BY a 9-section <summary>
-# (~16K+); the old 16384 cap let adaptive thinking at effort=max consume the
-# ENTIRE budget on <analysis> and hit stop_reason=max_tokens with the <summary>
-# never emitted (observed 2026-07-06 on the 594K-token investment channel:
-# every compaction 429/empty'd → circuit breaker → the raw window kept
-# stalling). 48000 leaves room for both and stays under CLAUDE_MAX_TOKENS_OPUS
-# (64000). Env-tunable so a future effort/model change can re-balance it.
+# Effort dial for the compaction call (low < medium < high < xhigh < max).
+# Was "max" ("quality matters far more than latency"), but production numbers
+# (2026-07-05..07 journal) showed what that actually buys: 26-28K output
+# tokens per compact of which the usable <summary> is 3-4K — the other ~85%
+# is adaptive thinking that scales with effort — for 4.4-8.2 MINUTES of
+# wall-clock per run, and a 5-run failure loop when thinking alone exhausted
+# the output cap (~25 min producing zero bytes). "medium" keeps adaptive
+# thinking for the distillation but at the same tier the main loop trusts
+# for every user-facing answer; combined with the summary-only response
+# format (compaction.py no longer requests the throwaway <analysis> block)
+# the run drops to minutes→~1-2min. Env-tunable for A/B either direction.
+HISTORY_COMPACT_EFFORT = os.environ.get("HISTORY_COMPACT_EFFORT", "medium")
+# Output-token ceiling for the summary call. History: a 16384 cap let
+# adaptive thinking at effort=max consume the ENTIRE budget before the
+# <summary> was emitted (2026-07-06 investment-channel incident: every
+# compaction empty'd → circuit breaker → the raw window kept stalling).
+# The response format is now summary-only (no <analysis> scratchpad) and the
+# default effort is "medium", so real usage sits well under this — 48000 is
+# retained as generous headroom, under CLAUDE_MAX_TOKENS_OPUS (64000).
 HISTORY_COMPACT_MAX_TOKENS = int(
     os.environ.get("HISTORY_COMPACT_MAX_TOKENS", "48000")
 )
