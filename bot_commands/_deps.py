@@ -26,3 +26,6 @@ class CommandDeps:
     # dicts until P2.5 moves them into an OverrideState.
     model_overrides: dict
     effort_overrides: dict
+    # /tier (2026-07-08): "deliberate"（熟考固定）| "chat"（会話固定）。
+    # 未設定はルーター判定（既定は明示マーカーのみ）。
+    tier_overrides: dict
