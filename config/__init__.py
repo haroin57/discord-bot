@@ -270,6 +270,24 @@ HISTORY_COMPACT_EFFORT = os.environ.get("HISTORY_COMPACT_EFFORT", "medium")
 HISTORY_COMPACT_MAX_TOKENS = int(
     os.environ.get("HISTORY_COMPACT_MAX_TOKENS", "48000")
 )
+# ADR-0040: graceful checkpoint (ADR-0036) の自動継続。従来は turn 上限・実行
+# 予算・stream 停止で checkpoint すると、ユーザーが手で「続けて」と打つまで
+# 作業が止まっていた（UX 最悪、2026-07-08 指摘）。entry.py が paused_reason を
+# 見て自動で継続ターンを注入する。理由別ポリシー:
+#   turn_ceiling / stream_stall → CHECKPOINT_AUTO_RESUME_MAX 回まで
+#   wallclock / output_tokens（予算 hard）→ CHECKPOINT_AUTO_RESUME_BUDGET_MAX 回
+#     まで（予算はコスト暴走ガードなので無制限に延長しない）
+#   tool_loop → 自動継続しない（ループ検知で止まったのに続けたら再開するだけ）
+# restricted ユーザーは常に対象外。上限到達後は従来の「続けて」導線に戻る。
+CHECKPOINT_AUTO_RESUME_ENABLED = os.environ.get(
+    "CHECKPOINT_AUTO_RESUME_ENABLED", "1"
+).lower() not in ("0", "false", "no", "off", "")
+CHECKPOINT_AUTO_RESUME_MAX = int(
+    os.environ.get("CHECKPOINT_AUTO_RESUME_MAX", "2")
+)
+CHECKPOINT_AUTO_RESUME_BUDGET_MAX = int(
+    os.environ.get("CHECKPOINT_AUTO_RESUME_BUDGET_MAX", "1")
+)
 # Token-based compaction trigger (CLI-parity, 2026-06-13 audit #7). The char
 # trigger above stays as a cold-start fallback, but chars over-estimate JP/code
 # transcripts by 2-4x; once a turn has reported real usage we gate on tokens.
