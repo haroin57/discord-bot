@@ -1197,3 +1197,274 @@ class TestMergeCoreFirst:
         from services.mem0.search import _merge_core_first
         results = [{"id": "q1"}]
         assert _merge_core_first([], results, limit=5) is results
+
+
+class TestFireRecallReinforcement:
+    """Phase ①: search-time reinforcement gate + core/bundle exclusion."""
+
+    @pytest.mark.asyncio
+    async def test_noop_when_flag_disabled(self, monkeypatch):
+        import asyncio
+        import config
+        monkeypatch.setattr(config, "MEM0_RECALL_REINFORCE_ENABLED", False, raising=False)
+        calls = []
+
+        async def _fake_reinforce_on_recall(mem, memory_id):
+            calls.append(memory_id)
+            return True
+
+        monkeypatch.setattr(
+            "services.mem0.reinforce.reinforce_on_recall", _fake_reinforce_on_recall,
+        )
+        from services.mem0.search import _fire_recall_reinforcement
+        _fire_recall_reinforcement([{"id": "real1"}])
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_skips_core_and_episode_bundle_entries(self, monkeypatch):
+        import asyncio
+        import config
+        monkeypatch.setattr(config, "MEM0_RECALL_REINFORCE_ENABLED", True, raising=False)
+        monkeypatch.setattr(f"{_PATCH_BASE}._get_mem0", lambda: object())
+        monkeypatch.setattr(f"{_PATCH_BASE}.ensure_valid_token", AsyncMock())
+        monkeypatch.setattr(f"{_PATCH_BASE}._refresh_mem0_client_token", lambda: None)
+
+        calls = []
+
+        async def _fake_reinforce_on_recall(mem, memory_id):
+            calls.append(memory_id)
+            return True
+
+        monkeypatch.setattr(
+            "services.mem0.reinforce.reinforce_on_recall", _fake_reinforce_on_recall,
+        )
+        from services.mem0.search import _fire_recall_reinforcement
+        results = [
+            {"id": "core1", "_core": True},
+            {"id": "bundle1", "_episode_bundle": True},
+            {"id": "real1"},
+            {"id": "real2"},
+        ]
+        _fire_recall_reinforcement(results)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert sorted(calls) == ["real1", "real2"]
+
+
+class TestGraphExpandCandidates:
+    """Phase ④: multi-hop spreading-activation graph expansion, with
+    priming buffer integration."""
+
+    def _wire_graph(self, monkeypatch, *, fact_entities, co_occurring, related_facts):
+        entity_cls = type("E", (), {})
+
+        def _entity(eid):
+            e = entity_cls()
+            e.id = eid
+            return e
+
+        monkeypatch.setattr(
+            "services.mem0.graph.get_fact_entities",
+            lambda fid: [_entity(eid) for eid in fact_entities.get(fid, [])],
+        )
+        monkeypatch.setattr(
+            "services.mem0.graph.get_co_occurring_entities",
+            lambda eid, limit=5: co_occurring.get(eid, []),
+        )
+        monkeypatch.setattr(
+            "services.mem0.graph.get_related_facts",
+            lambda eid, limit=5, exclude_fact_ids=(): [
+                f for f in related_facts.get(eid, []) if f not in set(exclude_fact_ids)
+            ],
+        )
+
+    def _fake_mem(self, facts: dict):
+        mem = MagicMock()
+        facts_with_id = {fid: {"id": fid, **body} for fid, body in facts.items()}
+        mem.get.side_effect = lambda fid: facts_with_id.get(fid)
+        return mem
+
+    @pytest.mark.asyncio
+    async def test_no_candidates_returns_immediately(self):
+        from services.mem0.search import _graph_expand_candidates
+        assert await _graph_expand_candidates([], "u1") == []
+
+    @pytest.mark.asyncio
+    async def test_spreads_activation_across_two_hops_and_scores_by_distance(self, monkeypatch):
+        from services.mem0 import priming as priming_mod
+        priming_mod.clear()
+        monkeypatch.setattr(
+            "services.mem0.client._get_mem0",
+            lambda: self._fake_mem({
+                "s1": {"memory": "sibling1", "metadata": {}},
+                "s2": {"memory": "sibling2", "metadata": {}},
+            }),
+        )
+        self._wire_graph(
+            monkeypatch,
+            fact_entities={"c1": [1]},
+            co_occurring={1: [(2, 0.8)], 2: []},
+            related_facts={1: ["s1"], 2: ["s2"]},
+        )
+        from services.mem0.search import _GRAPH_SIBLING_MIN_DISTANCE, _graph_expand_candidates
+
+        candidates = [{"id": "c1", "score": 0.1}]
+        result = await _graph_expand_candidates(candidates, "u1", current_channel_id=None)
+
+        by_id = {r["id"]: r for r in result if r.get("_graph_expanded")}
+        assert set(by_id) == {"s1", "s2"}
+        # s1 reached via the seed entity directly (hop 0) -> higher
+        # activation -> lower (closer) distance than s2 (hop-1 decay).
+        assert by_id["s1"]["score"] < by_id["s2"]["score"]
+        assert by_id["s1"]["_graph_activation"] > by_id["s2"]["_graph_activation"]
+        assert by_id["s1"]["score"] >= _GRAPH_SIBLING_MIN_DISTANCE
+
+    @pytest.mark.asyncio
+    async def test_seed_entities_are_recorded_in_priming_buffer(self, monkeypatch):
+        from services.mem0 import priming as priming_mod
+        priming_mod.clear()
+        monkeypatch.setattr(
+            "services.mem0.client._get_mem0",
+            lambda: self._fake_mem({"s1": {"memory": "sibling1", "metadata": {}}}),
+        )
+        self._wire_graph(
+            monkeypatch,
+            fact_entities={"c1": [42]},
+            co_occurring={42: []},
+            related_facts={42: ["s1"]},
+        )
+        from services.mem0.search import _graph_expand_candidates
+        candidates = [{"id": "c1", "score": 0.2}]
+        await _graph_expand_candidates(candidates, "u1", current_channel_id="ch1")
+
+        assert priming_mod.get_primed_entities("u1", "ch1") == {42}
+
+    @pytest.mark.asyncio
+    async def test_primed_entities_get_activation_top_up(self, monkeypatch):
+        from services.mem0 import priming as priming_mod
+        monkeypatch.setattr(
+            "services.mem0.client._get_mem0",
+            lambda: self._fake_mem({"s1": {"memory": "sibling1", "metadata": {}}}),
+        )
+        self._wire_graph(
+            monkeypatch,
+            fact_entities={"c1": [1]},
+            co_occurring={1: [(2, 0.5)]},
+            related_facts={2: ["s1"]},
+        )
+        from services.mem0.search import _graph_expand_candidates
+        candidates = [{"id": "c1", "score": 0.5}]
+
+        priming_mod.clear()
+        baseline = await _graph_expand_candidates(list(candidates), "u1", current_channel_id="ch1")
+        baseline_score = next(r["score"] for r in baseline if r["id"] == "s1")
+
+        priming_mod.clear()
+        priming_mod.touch("u1", "ch1", [2])  # entity 2 was primed by a prior turn
+        boosted = await _graph_expand_candidates(list(candidates), "u1", current_channel_id="ch1")
+        boosted_score = next(r["score"] for r in boosted if r["id"] == "s1")
+
+        assert boosted_score < baseline_score  # priming makes the distance smaller
+
+    @pytest.mark.asyncio
+    async def test_archived_sibling_is_filtered_out(self, monkeypatch):
+        import time
+        from services.mem0 import priming as priming_mod
+        priming_mod.clear()
+        monkeypatch.setattr(
+            "services.mem0.client._get_mem0",
+            lambda: self._fake_mem({
+                "s1": {"memory": "old fact", "metadata": {"valid_to": int(time.time()) - 10}},
+            }),
+        )
+        self._wire_graph(
+            monkeypatch,
+            fact_entities={"c1": [1]},
+            co_occurring={1: []},
+            related_facts={1: ["s1"]},
+        )
+        from services.mem0.search import _graph_expand_candidates
+        candidates = [{"id": "c1", "score": 0.2}]
+        result = await _graph_expand_candidates(candidates, "u1")
+        assert result == candidates  # archived sibling excluded
+
+
+class TestAssessRecallConfidence:
+    """Phase ⑦: feeling-of-knowing gate — pure scoring logic."""
+
+    def test_confident_when_best_distance_is_close(self):
+        from services.mem0.search import assess_recall_confidence
+        result = assess_recall_confidence([{"score": 0.1}, {"score": 0.5}])
+        assert result["status"] == "confident"
+        assert result["best_distance"] == 0.1
+        assert result["candidate_count"] == 2
+
+    def test_weak_when_best_distance_is_middling(self):
+        from services.mem0.search import assess_recall_confidence
+        result = assess_recall_confidence([{"score": 0.9}])
+        assert result["status"] == "weak"
+
+    def test_no_memory_when_best_distance_exceeds_threshold(self):
+        from services.mem0.search import assess_recall_confidence
+        result = assess_recall_confidence([{"score": 1.3}])
+        assert result["status"] == "no_memory"
+
+    def test_no_memory_when_candidates_empty(self):
+        from services.mem0.search import assess_recall_confidence
+        result = assess_recall_confidence([])
+        assert result["status"] == "no_memory"
+        assert result["best_distance"] is None
+        assert result["candidate_count"] == 0
+
+    def test_no_memory_when_all_scores_missing(self):
+        from services.mem0.search import assess_recall_confidence
+        result = assess_recall_confidence([{"id": "f1"}, {"id": "f2"}])
+        assert result["status"] == "no_memory"
+        assert result["best_distance"] is None
+
+    def test_ignores_non_numeric_scores(self):
+        from services.mem0.search import assess_recall_confidence
+        result = assess_recall_confidence([{"score": None}, {"score": 0.2}])
+        assert result["status"] == "confident"
+        assert result["best_distance"] == 0.2
+
+
+class TestFinalizeSmartResult:
+    """Phase ⑦: core-memory merge + sentinel injection."""
+
+    @pytest.mark.asyncio
+    async def test_no_fok_block_returns_plain_results(self):
+        from services.mem0.search import _finalize_smart_result
+        results = [{"id": "f1", "memory": "text"}]
+        out = await _finalize_smart_result(
+            results, None, 5, {"best_distance": 0.1}, fok_block=False,
+        )
+        assert out == results
+
+    @pytest.mark.asyncio
+    async def test_fok_block_appends_sentinel(self):
+        from services.mem0.search import _finalize_smart_result
+        out = await _finalize_smart_result(
+            [], None, 5, {"best_distance": 1.4}, fok_block=True,
+        )
+        assert len(out) == 1
+        assert out[0]["_fok_no_memory"] is True
+        assert out[0]["best_distance"] == 1.4
+
+    @pytest.mark.asyncio
+    async def test_fok_block_still_includes_core_memories(self):
+        import asyncio
+        from services.mem0.search import _finalize_smart_result
+
+        async def _core_task():
+            return [{"id": "core1", "memory": "coreことば", "_core": True}]
+
+        task = asyncio.ensure_future(_core_task())
+        out = await _finalize_smart_result(
+            [], task, 5, {"best_distance": 1.4}, fok_block=True,
+        )
+        ids = {m.get("id") for m in out}
+        assert "core1" in ids
+        assert any(m.get("_fok_no_memory") for m in out)
