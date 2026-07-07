@@ -22,6 +22,7 @@ from services.mem0.format import (
 )
 from services.mem0.ingest import add_memories
 from services.mem0.search import (
+    assess_recall_confidence,
     search_memories,
     search_memories_multi,
     search_memories_smart,
@@ -32,6 +33,7 @@ __all__ = [
     "MEM0_RELEVANCE_MAX_DISTANCE",
     "MEM0_RELEVANCE_THRESHOLD",
     "add_memories",
+    "assess_recall_confidence",
     "delete_memory",
     "extract_facts_for_self",
     "format_history_for_prompt",

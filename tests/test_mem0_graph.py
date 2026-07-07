@@ -388,3 +388,69 @@ class TestEntityRelations:
         graph_mod.add_relation(src, "loves", dst, "uid-1")
         s = graph_mod.stats("uid-1")
         assert s["relations"] == 1
+
+
+class TestCoOccurringEntities:
+    """Phase ④: degree-normalized co-occurrence weights (spreading activation)."""
+
+    def _entity(self, name, etype="media"):
+        return graph_mod.upsert_entity(name, etype, "u1")
+
+    def test_entity_degree_counts_linked_facts(self):
+        a = self._entity("Rust")
+        graph_mod.add_edge("f1", a)
+        graph_mod.add_edge("f2", a)
+        assert graph_mod.get_entity_degree(a) == 2
+
+    def test_entity_degree_zero_for_unlinked_entity(self):
+        a = self._entity("Unlinked")
+        assert graph_mod.get_entity_degree(a) == 0
+
+    def test_finds_shared_fact_partners(self):
+        rust = self._entity("Rust")
+        async_ = self._entity("async")
+        unrelated = self._entity("Unrelated")
+        graph_mod.add_edge("f1", rust)
+        graph_mod.add_edge("f1", async_)  # f1 mentions both -> co-occurrence
+        graph_mod.add_edge("f2", unrelated)
+
+        results = graph_mod.get_co_occurring_entities(rust)
+        ids = [r[0] for r in results]
+        assert async_ in ids
+        assert unrelated not in ids
+
+    def test_weight_normalized_by_degree(self):
+        """A high-degree hub entity should NOT dominate purely from size —
+        its normalized weight to a low-degree partner should be lower than a
+        symmetric pair with equal degree."""
+        hub = self._entity("Hub")
+        partner = self._entity("Partner")
+        for i in range(10):
+            graph_mod.add_edge(f"hub_only_{i}", hub)  # inflate hub's degree
+        graph_mod.add_edge("shared1", hub)
+        graph_mod.add_edge("shared1", partner)  # single shared fact
+
+        sym_a = self._entity("SymA")
+        sym_b = self._entity("SymB")
+        graph_mod.add_edge("sym_shared", sym_a)
+        graph_mod.add_edge("sym_shared", sym_b)  # equal, low degree (1 each)
+
+        hub_weight = dict(graph_mod.get_co_occurring_entities(hub)).get(partner)
+        sym_weight = dict(graph_mod.get_co_occurring_entities(sym_a)).get(sym_b)
+
+        assert hub_weight is not None and sym_weight is not None
+        assert hub_weight < sym_weight
+
+    def test_empty_for_isolated_entity(self):
+        solo = self._entity("Solo")
+        graph_mod.add_edge("f1", solo)
+        assert graph_mod.get_co_occurring_entities(solo) == []
+
+    def test_respects_limit(self):
+        center = self._entity("Center")
+        for i in range(5):
+            other = self._entity(f"Other{i}")
+            graph_mod.add_edge("shared_fact", center)
+            graph_mod.add_edge("shared_fact", other)
+        results = graph_mod.get_co_occurring_entities(center, limit=2)
+        assert len(results) <= 2

@@ -120,9 +120,12 @@ async def add_memories(
         # because ChromaDB rejects list-valued metadata (see the tags
         # handling in _insert_one below); the caller is responsible for
         # the CSV conversion.
+        # `derived_from` (Phase ③b) records the comma-joined source fact ids
+        # a consolidation-generated schema fact was generalized from, so a
+        # schema row's provenance is inspectable without a separate table.
         _ALLOWED_CALLER_META = {
             "channel_id", "channel_name", "source",
-            "persona", "episode_id", "interest_tags",
+            "persona", "episode_id", "interest_tags", "derived_from",
         }
         base_meta = {
             "timestamp": int(_time.time()),
@@ -396,6 +399,7 @@ async def add_memories(
                                 fact_ids.append(fid)
                         if fact_ids:
                             from services.mem0 import graph
+                            linked_eids: list[int] = []
                             for ent in entities:
                                 if not isinstance(ent, dict):
                                     continue
@@ -409,8 +413,20 @@ async def add_memories(
                                     name, etype, str(user_id), aliases=aliases,
                                 )
                                 if eid:
+                                    linked_eids.append(eid)
                                     for fid in fact_ids:
                                         await asyncio.to_thread(graph.add_edge, fid, eid)
+                            # Phase ④: entities just mentioned prime this
+                            # session's next search (see services/mem0/
+                            # priming.py) — ingest and search share the same
+                            # buffer so either side of a turn can prime the
+                            # other.
+                            if linked_eids:
+                                from services.mem0 import priming
+                                priming.touch(
+                                    str(user_id), base_meta.get("channel_id"),
+                                    linked_eids,
+                                )
                 except Exception as e:
                     log.warning("graph update failed (non-fatal): %s", e)
                 # Phase A-1: index the new fact in the BM25 FTS5 store so
