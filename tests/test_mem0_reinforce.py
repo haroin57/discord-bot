@@ -9,7 +9,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from services.mem0.reinforce import (
-    MAX_IMPORTANCE,
     MAX_REINFORCED_HISTORY,
     reinforce_existing_sync,
     reinforcement_boost,
@@ -33,7 +32,10 @@ class TestReinforceExistingSync:
         assert kwargs["data"] == "先輩は Rust が好き"
         # Partial update — only changed keys are sent
         assert partial["mention_count"] == 2
-        assert partial["importance"] == 4
+        # Bugfix: importance must NOT be touched by reinforcement (it used
+        # to bump +1 per reinforcement and inflate trivial facts into
+        # importance=5 "core memory" status).
+        assert "importance" not in partial
         assert len(partial["reinforced_at"]) == 1
         assert partial["last_reinforced_at"] == partial["reinforced_at"][0]
         assert "category" not in partial  # preserved server-side
@@ -53,17 +55,20 @@ class TestReinforceExistingSync:
         reinforce_existing_sync(mem, "m1")
         partial = mem.update.call_args.kwargs["metadata"]
         assert partial["mention_count"] == 6
-        assert partial["importance"] == 5  # bumped
+        assert "importance" not in partial
         assert len(partial["reinforced_at"]) == 4
         assert partial["last_reinforced_at"] > 300
 
-    def test_importance_caps_at_five(self):
+    def test_importance_untouched_even_at_five(self):
+        # Regression guard for the old "capped at 5" bump behavior: even a
+        # fact already at importance=5 must not have reinforce.py rewrite
+        # importance at all (not bump, not re-affirm — just leave it alone).
         mem = MagicMock()
         mem.get.return_value = {
             "id": "m1", "memory": "x", "metadata": {"importance": 5},
         }
         reinforce_existing_sync(mem, "m1")
-        assert mem.update.call_args.kwargs["metadata"]["importance"] == MAX_IMPORTANCE
+        assert "importance" not in mem.update.call_args.kwargs["metadata"]
 
     def test_reinforced_at_trims_to_max_history(self):
         existing = list(range(20))  # 20 entries already
@@ -182,6 +187,114 @@ class TestReinforcementBoost:
         # → 0.54 ish. Asserting < 1.0 prevents future regressions where
         # someone bumps α coefficients without thinking about totals.
         assert 0.3 < b < 1.0
+
+
+class TestReinforceOnRecallSync:
+    """Phase ①: testing-effect reinforcement on search-time surfacing."""
+
+    def test_bumps_recall_count_not_mention_count(self):
+        from services.mem0.reinforce import reinforce_on_recall_sync
+        mem = MagicMock()
+        mem.get.return_value = {
+            "id": "m1", "memory": "Rust が好き",
+            "metadata": {"mention_count": 1, "recall_count": 0},
+        }
+        ok = reinforce_on_recall_sync(mem, "m1")
+        assert ok is True
+        partial = mem.update.call_args.kwargs["metadata"]
+        assert partial["recall_count"] == 1
+        assert "mention_count" not in partial  # separate exposure channel
+        assert "importance" not in partial
+
+    def test_rate_limited_within_spacing_window(self):
+        from services.mem0.reinforce import reinforce_on_recall_sync
+        now = int(time.time())
+        mem = MagicMock()
+        mem.get.return_value = {
+            "id": "m1", "memory": "x",
+            "metadata": {"recall_count": 1, "last_recalled_at": now},
+        }
+        ok = reinforce_on_recall_sync(mem, "m1")
+        assert ok is False
+        mem.update.assert_not_called()
+
+    def test_allowed_after_spacing_window(self):
+        from services.mem0.reinforce import reinforce_on_recall_sync
+        stale = int(time.time()) - 7 * 3600  # older than the 6h default window
+        mem = MagicMock()
+        mem.get.return_value = {
+            "id": "m1", "memory": "x",
+            "metadata": {"recall_count": 1, "last_recalled_at": stale},
+        }
+        ok = reinforce_on_recall_sync(mem, "m1")
+        assert ok is True
+        assert mem.update.call_args.kwargs["metadata"]["recall_count"] == 2
+
+
+class TestActrActivation:
+    """Phase ②: ACT-R base-level activation boost."""
+
+    def test_no_presentations_returns_neg_inf(self):
+        from services.mem0.reinforce import _actr_activation
+        result = _actr_activation(0, [], mention_count=0, recall_count=0, now=time.time())
+        assert result == float("-inf")
+
+    def test_single_recent_presentation_beats_single_old_one(self):
+        from services.mem0.reinforce import _actr_activation
+        now = time.time()
+        recent = _actr_activation(int(now - 3600), [], mention_count=1, recall_count=0, now=now)
+        old = _actr_activation(int(now - 86400 * 365), [], mention_count=1, recall_count=0, now=now)
+        assert recent > old
+
+    def test_more_presentations_increase_activation(self):
+        from services.mem0.reinforce import _actr_activation
+        now = time.time()
+        created = int(now - 86400 * 10)
+        few = _actr_activation(created, [int(now - 3600)], mention_count=2, recall_count=0, now=now)
+        many = _actr_activation(
+            created, [int(now - 3600 * h) for h in (1, 2, 3, 4, 5)],
+            mention_count=6, recall_count=0, now=now,
+        )
+        assert many > few
+
+    def test_evicted_history_approximation_is_finite_and_monotonic(self):
+        from services.mem0.reinforce import _actr_activation
+        now = time.time()
+        created = int(now - 86400 * 60)
+        known = [int(now - 86400 * d) for d in (50, 40, 30, 20, 10, 5, 4, 3, 2, 1)]
+        low_n = _actr_activation(created, known, mention_count=10, recall_count=0, now=now)
+        high_n = _actr_activation(created, known, mention_count=40, recall_count=0, now=now)
+        assert math.isfinite(low_n)
+        assert math.isfinite(high_n)
+        assert high_n >= low_n
+
+    def test_boost_dispatch_default_is_legacy(self, monkeypatch):
+        monkeypatch.delenv("MEM0_BOOST_MODE", raising=False)
+        val = reinforcement_boost({"mention_count": 5, "last_reinforced_at": int(time.time())})
+        assert val > 0.0
+
+    def test_boost_dispatch_actr_mode(self, monkeypatch):
+        from services.mem0.reinforce import _actr_reinforcement_boost
+        monkeypatch.setenv("MEM0_BOOST_MODE", "actr")
+        now = time.time()
+        md = {
+            "timestamp": int(now - 86400 * 5),
+            "mention_count": 3, "recall_count": 1,
+            "reinforced_at": [int(now - 3600)],
+        }
+        val = reinforcement_boost(md)
+        assert math.isclose(val, _actr_reinforcement_boost(md), rel_tol=1e-6)
+
+    def test_actr_boost_in_valid_range(self):
+        from services.mem0.reinforce import _actr_reinforcement_boost
+        now = time.time()
+        md = {
+            "timestamp": int(now - 86400 * 5),
+            "mention_count": 3, "recall_count": 2,
+            "reinforced_at": [int(now - 3600), int(now - 7200)],
+        }
+        boost = _actr_reinforcement_boost(md)
+        assert 0.0 < boost < 0.2 + 1e-9
 
 
 class TestDedupSignatureChange:
