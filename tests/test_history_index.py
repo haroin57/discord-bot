@@ -206,3 +206,36 @@ class TestFormatHistoryForPrompt:
         # The closing tag from the raw line must be redacted, not passed through.
         body = out.split("\n", 1)[1] if "\n" in out else out
         assert "</history_search>" not in body
+
+
+class TestGetLinesSince:
+    """Phase ③ replay: chronological raw-line walk from a cursor."""
+
+    def test_returns_lines_in_chronological_order(self, fresh_history_db):
+        from services.mem0 import history_index
+        history_index.index_line(123, "2026-06-08T10:00:00+0900", "user", "こんにちは")
+        history_index.index_line(123, "2026-06-08T10:01:00+0900", "assistant", "やあ")
+        lines = history_index.get_lines_since(123)
+        assert [l["text"] for l in lines] == ["こんにちは", "やあ"]
+
+    def test_since_ts_excludes_earlier_lines(self, fresh_history_db):
+        from services.mem0 import history_index
+        history_index.index_line(123, "2026-06-08T10:00:00+0900", "user", "先")
+        history_index.index_line(123, "2026-06-08T10:01:00+0900", "user", "後")
+        lines = history_index.get_lines_since(123, since_ts="2026-06-08T10:00:00+0900")
+        assert [l["text"] for l in lines] == ["後"]
+
+    def test_scoped_to_channel(self, fresh_history_db):
+        from services.mem0 import history_index
+        history_index.index_line(123, "2026-06-08T10:00:00+0900", "user", "channel A")
+        history_index.index_line(456, "2026-06-08T10:00:00+0900", "user", "channel B")
+        lines = history_index.get_lines_since(123)
+        assert [l["text"] for l in lines] == ["channel A"]
+
+    def test_empty_for_unknown_channel(self, fresh_history_db):
+        from services.mem0 import history_index
+        assert history_index.get_lines_since(999) == []
+
+    def test_none_channel_id_returns_empty(self, fresh_history_db):
+        from services.mem0 import history_index
+        assert history_index.get_lines_since(None) == []

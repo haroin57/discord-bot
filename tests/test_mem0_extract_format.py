@@ -666,3 +666,30 @@ class TestFormatMetaSuffix:
         fact_lines = [l for l in result.split("\n") if l.startswith("- ")]
         assert fact_lines[0].startswith("- コア事実")
         assert fact_lines[1].startswith("- クエリ依存の事実")
+
+
+# ---------------------------------------------------------------------------
+# format_memories_for_prompt — Phase ⑦ feeling-of-knowing sentinel
+# ---------------------------------------------------------------------------
+class TestFormatFokSentinel:
+    def test_renders_no_memory_notice(self):
+        result = format_memories_for_prompt(
+            [{"_fok_no_memory": True, "best_distance": 1.3}]
+        )
+        assert "見つからなかった" in result
+        assert "[Mem0 — この人についての長期記憶]" in result
+        assert "[End of Mem0 memories]" in result
+
+    def test_renders_core_facts_alongside_no_memory_notice(self):
+        mems = [
+            {"id": "core1", "memory": "誕生日は1月1日", "_core": True, "metadata": {}},
+            {"_fok_no_memory": True, "best_distance": 1.3},
+        ]
+        result = format_memories_for_prompt(mems)
+        assert "誕生日は1月1日" in result
+        assert "見つからなかった" in result
+
+    def test_normal_facts_unaffected_by_sentinel_logic(self):
+        result = format_memories_for_prompt([{"id": "f1", "memory": "Rustが好き"}])
+        assert "Rustが好き" in result
+        assert "見つからなかった" not in result

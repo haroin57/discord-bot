@@ -1477,6 +1477,53 @@ MEM0_TYPED_VALUE_ENABLED = _bool_env("MEM0_TYPED_VALUE_ENABLED", False)
 # に切り替わり、supersede 連鎖で属性履歴が追える。
 MEM0_FACT_STORE_ENABLED = _bool_env("MEM0_FACT_STORE_ENABLED", False)
 
+# --- Human-memory-inspired retrieval/consolidation (Phase ①②③④⑦) ---------
+# Phase ①: reinforce a fact when it is actually surfaced by search, not just
+# when a near-dup is caught at ingest time (testing effect). Off by default —
+# rolled out after the importance-inflation bugfix (reinforce.py) landed
+# everywhere, otherwise recall reinforcement would compound the old bug faster.
+MEM0_RECALL_REINFORCE_ENABLED = _bool_env("MEM0_RECALL_REINFORCE_ENABLED", False)
+
+# Phase ②: nightly tier decay (reclassify Live/Hot/Warm/Cold from current
+# ACT-R activation) and gist compression (collapse decayed fact clusters into
+# fewer, detail-poorer summaries). Both dry-run by default — see
+# services/mem0/decay.py and scripts/mem0_tier_decay.py. Enable the dry-run
+# flag first, review a week of [TIER_DECAY]/[GIST_COMPRESS] logs, then flip
+# the *_ENABLED write gate.
+MEM0_TIER_DECAY_ENABLED = _bool_env("MEM0_TIER_DECAY_ENABLED", False)
+MEM0_TIER_DECAY_DRY_RUN = _bool_env("MEM0_TIER_DECAY_DRY_RUN", True)
+MEM0_GIST_COMPRESS_ENABLED = _bool_env("MEM0_GIST_COMPRESS_ENABLED", False)
+MEM0_GIST_COMPRESS_DRY_RUN = _bool_env("MEM0_GIST_COMPRESS_DRY_RUN", True)
+
+# Phase ③: nightly replay (retroactive re-extraction of old raw history with
+# the current entity dictionary) and schema abstraction (generalize clusters
+# of independent instance facts). See services/mem0/replay.py and
+# scripts/mem0_replay.py. NOT the same system as scripts/mem0_consolidate.py
+# (ADR-0016's embedding near-dup clustering) — these two are complementary,
+# not overlapping: consolidate merges near-duplicate wording, replay recovers
+# facts the extractor missed the first time, schema abstraction generalizes
+# across distinct instances.
+MEM0_REPLAY_ENABLED = _bool_env("MEM0_REPLAY_ENABLED", False)
+MEM0_REPLAY_DRY_RUN = _bool_env("MEM0_REPLAY_DRY_RUN", True)
+MEM0_SCHEMA_ABSTRACT_ENABLED = _bool_env("MEM0_SCHEMA_ABSTRACT_ENABLED", False)
+MEM0_SCHEMA_ABSTRACT_DRY_RUN = _bool_env("MEM0_SCHEMA_ABSTRACT_DRY_RUN", True)
+
+# Phase ④: multi-hop spreading-activation graph expansion (replaces the old
+# flat 1-hop/uniform-score expansion) and its session-scoped priming buffer
+# (services/mem0/priming.py). Spreading activation itself is not separately
+# flagged (it's a strict refinement of graph expansion, which was always on);
+# only priming's TTL/size knobs are exposed, in reinforce.py/priming.py style
+# (module-owned env reads, not config.py constants) since they're fine-tuning
+# parameters rather than an on/off feature switch.
+#
+# Phase ⑦: feeling-of-knowing gate. When the whole candidate pool's best raw
+# distance exceeds MEM0_FOK_NO_MEMORY_DISTANCE (search.py), return a
+# calibrated "no relevant memory" sentinel instead of letting a rerank pick
+# from noise. Off by default — search.py logs [FOK ...] unconditionally so
+# real query outcomes can calibrate the distance thresholds before this is
+# enabled.
+MEM0_FOK_ENABLED = _bool_env("MEM0_FOK_ENABLED", False)
+
 # Stable namespace for kanae's own Mem0 entries. The bot's runtime hook
 # (bot.py) writes to this user_id. Falls back to `str(bot.user.id)` if
 # unset, matching historical behavior.
