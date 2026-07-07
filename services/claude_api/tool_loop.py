@@ -181,6 +181,22 @@ _TOOL_LOOP_WARN_NUDGE = (
 _CHECKPOINT_NOTE = (
     "-# ⏸️ 作業が長くなったのでここまでを保存しました。「続けて」で同じ文脈から再開できます。"
 )
+# ADR-0040: variant of the checkpoint note used when entry.py's policy
+# (``should_auto_resume``) says this request is about to be auto-resumed —
+# the user sees a "continuing…" line instead of being asked to type
+# 「続けて」 themselves.
+_AUTO_RESUME_NOTE = (
+    "-# ⏳ 作業が長くなったので一旦区切りました。続きを自動で実行します…"
+)
+# ADR-0040: synthetic user turn entry.py injects to continue a checkpointed
+# request. Worded as a user instruction because it IS one — it rides the same
+# persisted history the manual 「続けて」 would, so resume semantics are
+# byte-identical to the manual path.
+AUTO_RESUME_DIRECTIVE = (
+    "（自動継続）直前の応答は長さ上限で一旦区切られました。保存済みの文脈から"
+    "作業をそのまま続けてください。挨拶・状況の再説明・完了済み作業のやり直しは"
+    "不要です。残りを終えたら通常どおり結果をまとめてください。"
+)
 
 
 def _build_checkpoint_result(
@@ -194,6 +210,7 @@ def _build_checkpoint_result(
     prior_len: int | None,
     usage_totals: dict,
     paused_reason: str,
+    auto_resume_planned: bool = False,
 ) -> "AgentLoopResult":
     """Graceful checkpoint (ADR-0036): preserve work instead of discarding it.
 
@@ -202,14 +219,24 @@ def _build_checkpoint_result(
     returns a REAL session id and a non-sentinel reply. entry.py's existing
     persistence (set_session + JSONL slice) then saves the full structured
     transcript verbatim, so "続けて" resumes with all tool context intact.
+
+    ``auto_resume_planned`` (ADR-0040): entry.py's policy already committed to
+    continuing this request automatically — swap the 「続けて」 ask for a
+    "continuing…" note so the user is not prompted for an action that is about
+    to happen on its own.
     """
     accumulated = "\n\n".join(t for t in text_across_turns if t)
     body = accumulated or last_text
     if body:
-        text = body + "\n\n" + _CHECKPOINT_NOTE
+        note = _AUTO_RESUME_NOTE if auto_resume_planned else _CHECKPOINT_NOTE
+        text = body + "\n\n" + note
     else:
         # Model ran tools but emitted no prose — still give the user a handle.
-        text = "⏸️ 作業をここまで保存しました。「続けて」で同じ文脈から再開できます。"
+        text = (
+            "⏳ 作業をここまで保存しました。続きを自動で実行します…"
+            if auto_resume_planned
+            else "⏸️ 作業をここまで保存しました。「続けて」で同じ文脈から再開できます。"
+        )
     if fallback_used and not fallback_note_sent_live and body:
         text = _fallback_alert(current_model) + "\n\n" + text
     return AgentLoopResult(
@@ -1454,6 +1481,9 @@ async def run_agent_loop(
     budget_role: str = "admin",  # ADR-0036: "admin"/"restricted"/"subagent"
     request_budget=None,  # ADR-0036: RequestBudget override (else built from role)
     loop_detector=None,  # ADR-0036: ToolLoopDetector override (else built from role)
+    should_auto_resume=None,  # ADR-0040: (paused_reason:str)->bool — entry.py の
+    # 自動継続ポリシー。checkpoint 時に True を返すと「続けて」導線の代わりに
+    # 自動継続ノートを出す（実際の再実行は entry.py 側が行う）。
 ) -> AgentLoopResult:
     """Run the streaming + tool-use loop. See module docstring for invariants.
 
@@ -1556,8 +1586,18 @@ async def run_agent_loop(
     async def _emit_checkpoint(paused_reason: str) -> AgentLoopResult:
         """ADR-0036: graceful checkpoint を組み立てて返す。streaming 時は本文が
         既にライブ配信済みなので、末尾の resume ノートだけを追加でライブ送信して
-        ユーザーに「続けて」導線を見せる（fallback_alert と同じ流儀）。"""
+        ユーザーに導線を見せる（fallback_alert と同じ流儀）。ADR-0040: entry.py
+        が自動継続する場合は「続けて」の代わりに自動継続ノートを出す。"""
         _log_total_usage(channel_id, usage_totals)
+        will_resume = False
+        if should_auto_resume is not None:
+            try:
+                will_resume = bool(should_auto_resume(paused_reason))
+            except Exception as exc:  # noqa: BLE001 — ポリシー故障で checkpoint を殺さない
+                log.warning(
+                    "[ch=%d] should_auto_resume(%s) failed: %s",
+                    channel_id, paused_reason, exc,
+                )
         result = _build_checkpoint_result(
             text_across_turns=text_across_turns,
             last_text=last_text,
@@ -1568,10 +1608,12 @@ async def run_agent_loop(
             prior_len=prior_len,
             usage_totals=usage_totals,
             paused_reason=paused_reason,
+            auto_resume_planned=will_resume,
         )
         if incremental_text_callback is not None:
             _accumulated = "\n\n".join(t for t in text_across_turns if t)
-            _note = _CHECKPOINT_NOTE if _accumulated else result.text
+            _live_note = _AUTO_RESUME_NOTE if will_resume else _CHECKPOINT_NOTE
+            _note = _live_note if _accumulated else result.text
             try:
                 await incremental_text_callback(_note)
             except Exception as exc:  # noqa: BLE001 — 表示失敗で loop を殺さない

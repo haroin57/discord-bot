@@ -167,6 +167,40 @@ ALWAYS_ADVERTISED_MCP_KEYS = {
 _SNAPSHOT_MAX_AGE_S = int(os.environ.get("SNAPSHOT_MAX_AGE_S", "900"))
 
 
+# ADR-0040: checkpoint auto-resume policy — reason ごとの自動継続上限。
+# tool_loop はループ検知で止まったのに自動継続したらループが再開するだけ
+# なので恒久 0。予算系（wallclock/output_tokens）はコスト暴走ガードの延長に
+# あたるため別上限。module-level なのは unit test のため（closure だと不可視）。
+def auto_resume_cap(reason: str, *, default_max: int, budget_max: int) -> int:
+    caps = {
+        "turn_ceiling": default_max,
+        "stream_stall": default_max,
+        "wallclock": budget_max,
+        "output_tokens": budget_max,
+    }
+    return min(caps.get(reason or "", 0), default_max)
+
+
+def strip_checkpoint_note(text: str) -> str:
+    """checkpoint 応答から resume ノート（手動/自動どちらも）を剥がす。
+
+    自動継続で複数セグメントを結合するとき、中間セグメントに残った
+    「続けて」/「自動で実行します」ノートは最終応答のノイズになるため。
+    本文なし checkpoint（ノートのみの応答）は空文字列に落ちて、結合時に
+    セグメントごと除去される。
+    """
+    from services.claude_api.tool_loop import _AUTO_RESUME_NOTE, _CHECKPOINT_NOTE
+    out = text or ""
+    for note in (
+        _CHECKPOINT_NOTE,
+        _AUTO_RESUME_NOTE,
+        "⏸️ 作業をここまで保存しました。「続けて」で同じ文脈から再開できます。",
+        "⏳ 作業をここまで保存しました。続きを自動で実行します…",
+    ):
+        out = out.replace("\n\n" + note, "").replace(note, "")
+    return out.strip()
+
+
 def _quota_exhausted_signal() -> bool:
     """subscriber 枠が構造的に尽きているか（OAuth failover の即時発動条件）。
 
@@ -768,6 +802,27 @@ async def call_with_tools(
             # (audit #19): True when this request triggered one.
             proactive_fired = False
 
+            # ADR-0040: checkpoint auto-resume policy. run_agent_loop に渡す
+            # closure — checkpoint 発生時に True を返すと loop 側が「続けて」
+            # 導線の代わりに自動継続ノートを出し、下の resume ループが実際に
+            # 継続ターンを注入する。counter は resume ループと共有。
+            from config import (
+                CHECKPOINT_AUTO_RESUME_BUDGET_MAX,
+                CHECKPOINT_AUTO_RESUME_ENABLED,
+                CHECKPOINT_AUTO_RESUME_MAX,
+            )
+            _auto_resume_state = {"used": 0}
+
+            def _should_auto_resume(reason: str) -> bool:
+                if restricted or not CHECKPOINT_AUTO_RESUME_ENABLED:
+                    return False
+                cap = auto_resume_cap(
+                    reason,
+                    default_max=CHECKPOINT_AUTO_RESUME_MAX,
+                    budget_max=CHECKPOINT_AUTO_RESUME_BUDGET_MAX,
+                )
+                return _auto_resume_state["used"] < cap
+
             async def _proactive_compact() -> "list[dict] | None":
                 """In-loop compaction callback for run_agent_loop (audit #3).
 
@@ -962,6 +1017,8 @@ async def call_with_tools(
                                 {"effort": forced_effort_override}
                                 if forced_effort_override else None
                             ),
+                            # ADR-0040: checkpoint 時の自動継続ポリシー。
+                            should_auto_resume=_should_auto_resume,
                         )
                         response_text = result.text
                         if getattr(result, "fallback_model", None):
@@ -1223,9 +1280,152 @@ async def call_with_tools(
                             status_callback=status_callback, label="接続再試行中",
                         )
 
+            # --- ADR-0040: checkpoint auto-resume ------------------------------
+            # graceful checkpoint (turn 上限 / 実行予算 / stream 停止) で止まった
+            # リクエストを、ユーザーの「続けて」を待たずに自動継続する。revision
+            # パイプラインと同じ「同一 history_for_loop に user ターンを注入して
+            # もう1周」パターンなので、resume 分の turns も step 10 のスライス
+            # （prior_len 起点）でそのまま JSONL に永続化される。tool_loop 起因は
+            # ポリシー側（auto_resume_cap）で恒久除外。失敗時は checkpoint が
+            # そのまま残るので、従来の手動「続けて」導線に自然に落ちる。
+            if (
+                result is not None
+                and response_text is not None
+                and getattr(result, "paused_reason", None)
+                and result.synthetic_session_id is not None
+                and not is_non_persistable_reply(response_text)
+                and _should_auto_resume(result.paused_reason)
+            ):
+                from services.claude_api.tool_loop import AUTO_RESUME_DIRECTIVE
+                _resume_segments: list[str] = []
+                _resume_kw = dict(
+                    history=history_for_loop,
+                    system_prompt=system_prompt,
+                    tools_for_api=advertised_tools,
+                    can_use_tool=can_use_tool,
+                    execute_tool=_execute_tool,
+                    status_callback=status_callback,
+                    incremental_text_callback=incremental_text_callback,
+                    text_stream_callback=text_stream_callback,
+                    tool_invocation_callback=tool_invocation_callback,
+                    scratch_stream_callback=scratch_stream_callback,
+                    scratch_finalize_callback=scratch_finalize_callback,
+                    thinking_stream_callback=thinking_stream_callback,
+                    thinking_finalize_callback=thinking_finalize_callback,
+                    progress=progress,
+                    max_turns=max_turns,
+                    budget_role="admin",
+                    api_client=api_client,
+                    model=result.fallback_model or effective_model,
+                    extra_betas=MODEL_BETAS,
+                    active_mcp_keys=result.active_mcp_keys,
+                    prior_turns=result.prior_len or 0,
+                    tool_search_enabled=(
+                        TOOL_SEARCH_ENABLED and is_tool_search_active()
+                    ),
+                    evidence=evidence,
+                    proactive_compact=(
+                        _proactive_compact if not restricted else None
+                    ),
+                    refusal_fallback_model=(
+                        FABLE_REFUSAL_FALLBACK_MODEL
+                        if (FABLE_REFUSAL_FALLBACK_ENABLED
+                            and "fable" in (
+                                (result.fallback_model or effective_model) or ""
+                            ).lower())
+                        else None
+                    ),
+                    output_config_override=(
+                        {"effort": forced_effort_override}
+                        if forced_effort_override else None
+                    ),
+                    should_auto_resume=_should_auto_resume,
+                )
+                while (
+                    getattr(result, "paused_reason", None)
+                    and result.synthetic_session_id is not None
+                    and not is_non_persistable_reply(response_text or "")
+                    and _should_auto_resume(result.paused_reason)
+                ):
+                    _auto_resume_state["used"] += 1
+                    _n = _auto_resume_state["used"]
+                    log.info(
+                        "[ch=%d] checkpoint auto-resume %d: reason=%s",
+                        channel_id, _n, result.paused_reason,
+                    )
+                    await _safe_status(
+                        status_callback, f"⏳ 続きを自動実行中 ({_n})",
+                    )
+                    _resume_segments.append(strip_checkpoint_note(response_text))
+                    try:
+                        async with StallWatchdog(
+                            channel_id, None, idle_timeout_s=600,
+                        ) as _rwd:
+                            r2 = await run_agent_loop(
+                                AUTO_RESUME_DIRECTIVE, channel_id,
+                                stall_watchdog=_rwd, **_resume_kw,
+                            )
+                    except Exception as exc:  # noqa: BLE001 — resume は best-effort
+                        log.warning(
+                            "[ch=%d] auto-resume failed (checkpoint stands): %s",
+                            channel_id, exc,
+                        )
+                        _resume_segments.pop()
+                        if incremental_text_callback is not None:
+                            try:
+                                await incremental_text_callback(
+                                    "-# ⚠️ 自動継続に失敗しました。「続けて」で再開できます。"
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
+                        break
+                    if (
+                        not r2.synthetic_session_id
+                        or not (r2.text or "").strip()
+                        or is_non_persistable_reply(r2.text or "")
+                    ):
+                        # 再開ターンが sentinel / 空で返った — 直前の checkpoint を
+                        # そのまま最終応答として残す（保存済みなので手動再開可能）。
+                        log.warning(
+                            "[ch=%d] auto-resume produced no usable reply "
+                            "(session=%s) — keeping checkpoint",
+                            channel_id, bool(r2.synthetic_session_id),
+                        )
+                        _resume_segments.pop()
+                        if incremental_text_callback is not None:
+                            try:
+                                await incremental_text_callback(
+                                    "-# ⚠️ 自動継続に失敗しました。「続けて」で再開できます。"
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
+                        break
+                    # mid-resume の in-loop compaction が prior window を畳んだ
+                    # 場合、prior_len は新しい boundary を指す — 次の resume と
+                    # step 10 の永続化スライスをそこへ追従させる。
+                    _resume_kw["prior_turns"] = r2.prior_len or 0
+                    _resume_kw["active_mcp_keys"] = r2.active_mcp_keys
+                    if r2.fallback_model:
+                        _resume_kw["model"] = r2.fallback_model
+                        if not restricted:
+                            _record_sticky_model(
+                                channel_id, r2.fallback_model, user_id,
+                            )
+                    result = r2
+                    response_text = r2.text
+                _kept_segments = [s for s in _resume_segments if s]
+                if _kept_segments and (response_text or "").strip():
+                    response_text = "\n\n".join(
+                        _kept_segments + [response_text],
+                    )
+
             # --- 熟考 P2/P5: deliberate tier の 検証・修正パイプライン --------
             # AsyncExitStack 内（revise の _execute_tool が pool を掴むため）。
             # クリーン終了（synthetic_session_id あり・非 sentinel 応答）のみ対象。
+            # ADR-0040: checkpoint（paused_reason あり＝意図的に未完）で終わった
+            # 応答は検証・修正の対象外 — 未完成な回答を「未完成だ」と指摘して
+            # revision を回すのは無意味な追いコストで、caveat が checkpoint 文言を
+            # 引用する珍妙な subtext（2026-07-08 の指摘）の原因だった。
             if (
                 result is not None
                 and response_text is not None
@@ -1233,6 +1433,7 @@ async def call_with_tools(
                 and tier == "deliberate"
                 and result.synthetic_session_id is not None
                 and not is_non_persistable_reply(response_text)
+                and getattr(result, "paused_reason", None) is None
             ):
                 _revise_kw = dict(
                     history=history_for_loop,
@@ -1376,6 +1577,9 @@ async def call_with_tools(
                 and response_text is not None
                 and DELIB_JUDGE_LITE_ENABLED
                 and not is_non_persistable_reply(response_text)
+                # ADR-0040: checkpoint された未完応答は judge の対象外（上の
+                # deliberate パイプラインと同じ理由）。
+                and getattr(result, "paused_reason", None) is None
             ):
                 from services.claude_api.verifier import (
                     build_caveat as _jl_caveat,
