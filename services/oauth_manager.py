@@ -20,6 +20,7 @@ import logging
 import os
 import stat
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -182,9 +183,30 @@ def _record_refresh_success(account: _AccountState) -> None:
 
 
 def is_oauth_healthy() -> bool:
-    """Public helper for health endpoint — True if last refresh succeeded
-    or no failures recorded yet (active account 基準)."""
-    return _acct().refresh_failure_count < _REFRESH_FAILURE_ALERT_THRESHOLD
+    """Public helper for the /health endpoint (active account 基準).
+
+    ``ensure_valid_token()`` の実供給条件と一致させる: access token が存在し
+    未期限切れなら refresh_failure_count を一切見ずに即返す（下記 line ~400）。
+    つまり有効なトークンを保持している間は OAuth は健全 — 過去の rotation 衝突で
+    ``refresh_failure_count`` が張り付いていても実際の API 供給には無関係。
+    実際に refresh が走る（= トークンが期限切れ/期限間近な）ときだけ、閾値超えの
+    連続失敗が本当の degraded を意味する。
+    """
+    acct = _acct()
+    if acct.access_token and not _is_expired(acct):
+        return True
+    return acct.refresh_failure_count < _REFRESH_FAILURE_ALERT_THRESHOLD
+
+
+def oauth_status_detail() -> dict:
+    """Read-only OAuth status snapshot for the /health payload（副作用なし）。"""
+    acct = _acct()
+    return {
+        "active": _active,
+        "token_expired": _is_expired(acct),
+        "refresh_failures": acct.refresh_failure_count,
+        "refresh_permanent": acct.refresh_permanent,
+    }
 
 # Subprocess mode: when this is true, ensure_valid_token() never invokes
 # refresh_token(). Instead it re-reads credentials from disk so the
@@ -440,6 +462,7 @@ _patched = False
 # services/claude_api/restricted.py) can bypass OAuth injection cleanly.
 _orig_anthropic_init = None
 _orig_async_anthropic_init = None
+_patch_lock = threading.Lock()
 
 
 def _patch_anthropic_sdk() -> None:
@@ -457,6 +480,14 @@ def _patch_anthropic_sdk() -> None:
     if _patched:
         return
 
+    with _patch_lock:
+        if _patched:
+            return
+        _patch_anthropic_sdk_locked()
+
+
+def _patch_anthropic_sdk_locked() -> None:
+    global _patched, _orig_anthropic_init, _orig_async_anthropic_init
     try:
         import anthropic
 
@@ -681,13 +712,37 @@ def make_async_oauth_client(**kwargs):
 # ---------------------------------------------------------------------------
 
 def _load_account_from_disk(account: _AccountState) -> bool:
-    """credentials ファイルからアカウント状態をロードする。"""
+    """credentials ファイルからアカウント状態をロードする。
+
+    共有 credential 対策 (SRE): 別プロセス（対話型 Claude CLI や兄弟インタプリタ）
+    がトークンを refresh + rotate してディスクへ書き戻すと、こちらが旧 refresh
+    token に対して記録した invalid_grant 判定（``refresh_permanent`` /
+    ``refresh_failure_count``）は既に陳腐化している。ディスクに「より新しい」
+    credential を検知したら失敗状態をクリアし、次回は新トークンで refresh を
+    試させる（張り付いた permanent failure での偽 degraded / 期限切れ時の即死を防ぐ）。
+    """
     creds = _read_credentials(account.credentials_path)
     if not creds or not creds.get("accessToken"):
         return False
-    account.access_token = creds.get("accessToken")
-    account.refresh_token = creds.get("refreshToken")
-    account.expires_at = creds.get("expiresAt", 0)
+    new_access = creds.get("accessToken")
+    new_refresh = creds.get("refreshToken")
+    new_expires = creds.get("expiresAt", 0)
+    rotated = (
+        (bool(account.refresh_token) and bool(new_refresh)
+         and new_refresh != account.refresh_token)
+        or new_expires > account.expires_at
+    )
+    account.access_token = new_access
+    account.refresh_token = new_refresh
+    account.expires_at = new_expires
+    if rotated and (account.refresh_permanent or account.refresh_failure_count):
+        log.info(
+            "OAuth: newer credential detected on disk (account=%s) — clearing "
+            "stale refresh-failure state (count=%d, permanent=%s)",
+            account.name, account.refresh_failure_count, account.refresh_permanent,
+        )
+        account.refresh_failure_count = 0
+        account.refresh_permanent = False
     return True
 
 
