@@ -763,6 +763,10 @@ class TestRefreshFailureCounter:
     def test_is_oauth_healthy_reflects_threshold(self, monkeypatch):
         import services.oauth_manager as om
 
+        # No valid token → the threshold branch governs health.
+        om._accounts["primary"].access_token = "tok"
+        om._accounts["primary"].expires_at = 0  # expired
+
         om._accounts["primary"].refresh_failure_count = 0
         assert om.is_oauth_healthy() is True
 
@@ -771,6 +775,77 @@ class TestRefreshFailureCounter:
 
         om._accounts["primary"].refresh_failure_count = 3
         assert om.is_oauth_healthy() is False
+
+    def test_is_oauth_healthy_valid_token_overrides_stale_failures(self, monkeypatch):
+        """A present, non-expired access token means the API-serving path never
+        consults refresh_failure_count, so health stays True even if a past
+        rotation collision left the counter pinned at the alert threshold."""
+        import services.oauth_manager as om
+
+        om._accounts["primary"].access_token = "valid-tok"
+        # 有効期限を十分先に（buffer 5min を超える）
+        om._accounts["primary"].expires_at = int(time.time() * 1000) + 3600_000
+        om._accounts["primary"].refresh_failure_count = 5
+        om._accounts["primary"].refresh_permanent = True
+
+        assert om.is_oauth_healthy() is True
+
+    def test_load_account_from_disk_clears_stale_failure_on_newer_creds(
+        self, tmp_path, monkeypatch
+    ):
+        """共有 credential を別プロセスが rotate → ディスクに新トークンが出たら、
+        張り付いた invalid_grant 判定（permanent / failure_count）を自己解除する。"""
+        import services.oauth_manager as om
+
+        creds_path = tmp_path / ".credentials.json"
+        creds_path.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "fresh-access",
+                "refreshToken": "fresh-refresh",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            }
+        }))
+
+        acct = om._accounts["primary"]
+        acct.credentials_path = str(creds_path)
+        # 旧状態: invalid_grant で死んだ判定が張り付いている
+        acct.access_token = "old-access"
+        acct.refresh_token = "old-refresh"
+        acct.expires_at = int(time.time() * 1000) + 60_000
+        acct.refresh_failure_count = 3
+        acct.refresh_permanent = True
+
+        assert om._load_account_from_disk(acct) is True
+        assert acct.refresh_token == "fresh-refresh"
+        assert acct.refresh_failure_count == 0
+        assert acct.refresh_permanent is False
+
+    def test_load_account_from_disk_keeps_failures_when_creds_unchanged(
+        self, tmp_path, monkeypatch
+    ):
+        """同一 credential の再ロードでは失敗状態を消さない（誤クリア防止）。"""
+        import services.oauth_manager as om
+
+        exp = int(time.time() * 1000) + 3600_000
+        creds_path = tmp_path / ".credentials.json"
+        creds_path.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "same-access",
+                "refreshToken": "same-refresh",
+                "expiresAt": exp,
+            }
+        }))
+
+        acct = om._accounts["primary"]
+        acct.credentials_path = str(creds_path)
+        acct.access_token = "same-access"
+        acct.refresh_token = "same-refresh"
+        acct.expires_at = exp
+        acct.refresh_failure_count = 2
+        acct.refresh_permanent = False
+
+        assert om._load_account_from_disk(acct) is True
+        assert acct.refresh_failure_count == 2
 
     @pytest.mark.asyncio
     async def test_ensure_valid_token_raises_when_expired_and_failing(self, monkeypatch):
