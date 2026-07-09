@@ -18,7 +18,11 @@ import asyncio
 import logging
 import time
 
-from config import STREAM_IDLE_TIMEOUT_S, STREAM_STALL_THRESHOLD_S
+from config import (
+    STREAM_IDLE_TIMEOUT_S,
+    STREAM_STALL_STATUS_ENABLED,
+    STREAM_STALL_THRESHOLD_S,
+)
 
 from services.claude_api.status import _safe_status
 
@@ -99,10 +103,18 @@ class StallWatchdog:
                 return
 
             if idle > self.stall_threshold_s and not self._warned:
-                # The bot.py spinner already shows liveness (shimmer + elapsed),
-                # so no user-facing "delayed" message — just log for ops.
                 log.warning(
                     "[ch=%d] stream stall: no message for %.0fs",
                     self.channel_id, idle,
                 )
+                # Surface a user-facing "waiting on API" status so a genuine
+                # no-event stall reads differently from "💭 thinking". Safe:
+                # the watchdog heartbeats on every stream event (thinking_delta
+                # included), so legitimate extended thinking never reaches here.
+                # _warned gates it to once per idle period (reset on heartbeat).
+                if STREAM_STALL_STATUS_ENABLED:
+                    await _safe_status(
+                        self.status_callback,
+                        f"⏳ 応答待ち（API応答なし {int(idle)}秒）",
+                    )
                 self._warned = True

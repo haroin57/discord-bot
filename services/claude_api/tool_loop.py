@@ -42,6 +42,8 @@ from config import (
     PROACTIVE_COMPACT_TRIGGER_TOKENS,
     SERVER_SIDE_FALLBACK_ENABLED,
     SLOW_FIRST_BYTE_MS,
+    STREAM_NONSTREAM_FALLBACK_ENABLED,
+    STREAM_NONSTREAM_TIMEOUT_S,
     STREAM_STALL_MAX_RETRIES,
     STREAM_STALL_RETRY_S,
     TEXT_INVOKE_RESCUE_ENABLED,
@@ -1978,20 +1980,84 @@ async def run_agent_loop(
                     channel_id, turn + 1, STREAM_STALL_RETRY_S,
                     stall_retries, STREAM_STALL_MAX_RETRIES, _backoff,
                 )
-                await _safe_status(status_callback, "⏳ 応答待ち・再試行中")
+                await _safe_status(
+                    status_callback,
+                    f"⏳ 応答待ち・再試行中 ({stall_retries}/{STREAM_STALL_MAX_RETRIES})",
+                )
                 await asyncio.sleep(_backoff)
                 continue
-            if _produced:
-                # Fold the partial prose already shown to the user into the
-                # transcript so the checkpoint isn't missing this turn's head.
-                text_across_turns.append(live_turn_text)
-            log.warning(
-                "[ch=%d] turn=%d stream stall (idle ≥%ds, produced=%s, "
-                "retries=%d) → graceful checkpoint",
-                channel_id, turn + 1, STREAM_STALL_RETRY_S, _produced,
-                stall_retries,
-            )
-            return await _emit_checkpoint("stream_stall")
+            # CLI-parity (2026-07-09): streaming retry budget exhausted on a
+            # clean pre-first-byte stall. The Claude Code CLI falls back to a
+            # single NON-streaming request here ("falling back to non-streaming
+            # mode") rather than dying — a blocking messages.create sidesteps the
+            # per-chunk SSE idle watchdog, keeps the prompt+cache intact, and
+            # needs no second API call. On success we set final_msg and fall
+            # through to the shared post-processing below (which appends the
+            # assistant turn and delivers the prose via incremental_text_callback,
+            # exactly like the streaming path — no double-send). On failure, or
+            # once prose has already streamed, we preserve work with a checkpoint.
+            if not _produced and STREAM_NONSTREAM_FALLBACK_ENABLED:
+                log.warning(
+                    "[ch=%d] turn=%d stream stall exhausted (retries=%d) → "
+                    "non-streaming fallback",
+                    channel_id, turn + 1, stall_retries,
+                )
+                await _safe_status(status_callback, "🐢 非ストリーミングで取得中…")
+                _ns_final = None
+                try:
+                    _ns_final = await asyncio.wait_for(
+                        # SDK-level timeout is deliberately generous (matches the
+                        # CLI's 30-min hard cap) so the SDK's "large max_tokens
+                        # without streaming" guard never trips; the REAL deadline
+                        # is the outer asyncio.wait_for (STREAM_NONSTREAM_TIMEOUT_S).
+                        api_client.beta.messages.create(
+                            **stream_kwargs, timeout=1800,
+                        ),
+                        STREAM_NONSTREAM_TIMEOUT_S,
+                    )
+                except Exception as _ns_exc:  # noqa: BLE001 - best-effort fallback
+                    log.warning(
+                        "[ch=%d] non-streaming fallback failed: %s → checkpoint",
+                        channel_id, _ns_exc,
+                    )
+                if _ns_final is not None:
+                    final_msg = _ns_final
+                    if ttft_ms is None:
+                        ttft_ms = int((time.monotonic() - request_start) * 1000)
+                    _log_turn_usage(
+                        channel_id, turn, final_msg, usage_totals,
+                        model=current_model, request_id="",
+                        duration_ms=int((time.monotonic() - request_start) * 1000),
+                        ttft_ms=ttft_ms, message_count=len(messages),
+                    )
+                    _this_turn_output = _usage_number(
+                        getattr(final_msg, "usage", None), "output_tokens",
+                    )
+                    _tok_base += _this_turn_output
+                    budget.add_output_tokens(_this_turn_output)
+                    if progress is not None:
+                        progress["tokens"] = _tok_base
+                    log.info(
+                        "[ch=%d] turn=%d non-streaming fallback succeeded "
+                        "(stop_reason=%s, output_tokens=%d)",
+                        channel_id, turn + 1,
+                        getattr(final_msg, "stop_reason", None), _this_turn_output,
+                    )
+                    # fall through to shared post-processing below.
+                else:
+                    return await _emit_checkpoint("stream_stall")
+            else:
+                if _produced:
+                    # Fold the partial prose already shown to the user into the
+                    # transcript so the checkpoint isn't missing this turn's head.
+                    text_across_turns.append(live_turn_text)
+                log.warning(
+                    "[ch=%d] turn=%d stream stall (idle ≥%ds, produced=%s, "
+                    "retries=%d) → graceful checkpoint",
+                    channel_id, turn + 1, STREAM_STALL_RETRY_S, _produced,
+                    stall_retries,
+                )
+                return await _emit_checkpoint("stream_stall")
         except anthropic.AnthropicError as exc:
             category = classify_anthropic_error(exc)
             log.error("agent loop API error turn=%d category=%s: %s",
