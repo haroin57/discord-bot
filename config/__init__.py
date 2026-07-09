@@ -632,6 +632,31 @@ STREAM_STALL_RETRY_S = int(os.environ.get("STREAM_STALL_RETRY_S", "120"))
 # resilience for a genuinely slow-but-alive upstream. Only clean pre-first-byte
 # stalls retry, so this can never duplicate visible output.
 STREAM_STALL_MAX_RETRIES = int(os.environ.get("STREAM_STALL_MAX_RETRIES", "2"))
+# CLI-parity (2026-07-09): when the streaming retry budget is exhausted on a
+# clean pre-first-byte stall, the Claude Code CLI falls back to a NON-streaming
+# request ("Error streaming, falling back to non-streaming mode" /
+# tengu_streaming_fallback_to_non_streaming) rather than compacting. A single
+# blocking messages.create sidesteps the per-chunk SSE idle watchdog entirely,
+# keeps the prompt (and its cache prefix) intact, and needs no second API call.
+# On success the turn completes normally; on failure we fall through to the
+# existing graceful checkpoint. Set to 0/false to keep the legacy behaviour
+# (straight to checkpoint).
+STREAM_NONSTREAM_FALLBACK_ENABLED = os.environ.get(
+    "STREAM_NONSTREAM_FALLBACK_ENABLED", "1"
+) not in ("0", "false", "False", "")
+# Explicit client timeout for the non-streaming fallback create(). Required:
+# the anthropic SDK refuses a non-streaming request whose max_tokens could
+# exceed the default 10-min timeout unless an explicit timeout is passed. Mirrors
+# the CLI's 180000ms streaming-idle constant.
+STREAM_NONSTREAM_TIMEOUT_S = int(os.environ.get("STREAM_NONSTREAM_TIMEOUT_S", "180"))
+# When True, StallWatchdog surfaces a user-facing "waiting on API" status at the
+# stall threshold (30s of NO stream event). Because the watchdog heartbeats on
+# every event (thinking_delta included), legitimate extended thinking never
+# trips this — only a genuine no-event stall does, so it cleanly distinguishes
+# "💭 thinking" from "⏳ upstream stalled". Set to 0/false to keep log-only.
+STREAM_STALL_STATUS_ENABLED = os.environ.get(
+    "STREAM_STALL_STATUS_ENABLED", "1"
+) not in ("0", "false", "False", "")
 
 # Status-spinner rendering mode (see services/claude_api/progress.py +
 # spinner_gif.py). "text" = 1 char/sec bold shimmer as message text + animated

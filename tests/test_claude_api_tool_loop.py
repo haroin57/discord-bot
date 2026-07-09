@@ -163,6 +163,9 @@ async def test_stream_stall_exhausted_checkpoints(_inert_watchdog, monkeypatch):
 
     monkeypatch.setattr(tl, "STREAM_STALL_RETRY_S", 0.1)
     monkeypatch.setattr(tl, "STREAM_STALL_MAX_RETRIES", 0)
+    # This test covers the pure exhaustion→checkpoint path; the non-streaming
+    # fallback has its own dedicated tests below.
+    monkeypatch.setattr(tl, "STREAM_NONSTREAM_FALLBACK_ENABLED", False)
     client = _make_client_streams(_StallStream())
     history: list[dict] = []
     result = await run_agent_loop(
@@ -174,6 +177,102 @@ async def test_stream_stall_exhausted_checkpoints(_inert_watchdog, monkeypatch):
     assert result.paused_reason == "stream_stall"
     assert result.synthetic_session_id is not None  # persists → "続けて" resumes
 
+
+def _make_stall_then_create_client(create_mock):
+    """stream() always stalls; create() is the non-streaming fallback mock."""
+    client = MagicMock()
+    client.beta.messages.stream = lambda **_k: _StallStream()
+    client.beta.messages.create = create_mock
+    return client
+
+
+@pytest.mark.asyncio
+async def test_stream_stall_fallback_to_nonstreaming_succeeds(
+    _inert_watchdog, monkeypatch,
+):
+    # CLI-parity: streaming retry budget spent on a clean pre-first-byte stall →
+    # fall back to a single non-streaming create(), which recovers the turn
+    # (no checkpoint, no double-send).
+    import services.claude_api.tool_loop as tl
+
+    monkeypatch.setattr(tl, "STREAM_STALL_RETRY_S", 0.1)
+    monkeypatch.setattr(tl, "STREAM_STALL_MAX_RETRIES", 0)
+    monkeypatch.setattr(tl, "STREAM_NONSTREAM_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(tl, "STREAM_NONSTREAM_TIMEOUT_S", 5)
+    create = AsyncMock(
+        return_value=_final_msg(
+            [_block("text", text="nonstream-recovered!")], "end_turn",
+        )
+    )
+    client = _make_stall_then_create_client(create)
+    delivered: list[str] = []
+
+    async def _incr(text):
+        delivered.append(text)
+
+    history: list[dict] = []
+    result = await run_agent_loop(
+        "hi", channel_id=1, history=history, system_prompt="sys",
+        tools_for_api=[], can_use_tool=_allow_all, execute_tool=AsyncMock(),
+        status_callback=_noop_status, incremental_text_callback=_incr,
+        max_turns=5, stall_watchdog=_inert_watchdog,
+        api_client=client, model="claude-opus-4-6", extra_betas=[],
+    )
+    assert result.text == "nonstream-recovered!"
+    assert result.paused_reason is None  # completed, not a checkpoint
+    create.assert_awaited_once()
+    # explicit timeout passed so the SDK's large-max_tokens guard never trips
+    assert create.await_args.kwargs.get("timeout") == 1800
+    # delivered exactly once (via the shared post-processing path — no double send)
+    assert delivered == ["nonstream-recovered!"]
+    assert [h["role"] for h in history] == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_stream_stall_fallback_disabled_checkpoints(
+    _inert_watchdog, monkeypatch,
+):
+    # Feature flag off → legacy behaviour: straight to graceful checkpoint,
+    # create() is never called.
+    import services.claude_api.tool_loop as tl
+
+    monkeypatch.setattr(tl, "STREAM_STALL_RETRY_S", 0.1)
+    monkeypatch.setattr(tl, "STREAM_STALL_MAX_RETRIES", 0)
+    monkeypatch.setattr(tl, "STREAM_NONSTREAM_FALLBACK_ENABLED", False)
+    create = AsyncMock()
+    client = _make_stall_then_create_client(create)
+    result = await run_agent_loop(
+        "hi", channel_id=1, history=[], system_prompt="sys",
+        tools_for_api=[], can_use_tool=_allow_all, execute_tool=AsyncMock(),
+        status_callback=_noop_status, max_turns=5, stall_watchdog=_inert_watchdog,
+        api_client=client, model="claude-opus-4-6", extra_betas=[],
+    )
+    assert result.paused_reason == "stream_stall"
+    create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stream_stall_fallback_create_fails_checkpoints(
+    _inert_watchdog, monkeypatch,
+):
+    # Non-streaming fallback also fails → graceful checkpoint (work preserved).
+    import services.claude_api.tool_loop as tl
+
+    monkeypatch.setattr(tl, "STREAM_STALL_RETRY_S", 0.1)
+    monkeypatch.setattr(tl, "STREAM_STALL_MAX_RETRIES", 0)
+    monkeypatch.setattr(tl, "STREAM_NONSTREAM_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(tl, "STREAM_NONSTREAM_TIMEOUT_S", 5)
+    create = AsyncMock(side_effect=RuntimeError("upstream still dead"))
+    client = _make_stall_then_create_client(create)
+    result = await run_agent_loop(
+        "hi", channel_id=1, history=[], system_prompt="sys",
+        tools_for_api=[], can_use_tool=_allow_all, execute_tool=AsyncMock(),
+        status_callback=_noop_status, max_turns=5, stall_watchdog=_inert_watchdog,
+        api_client=client, model="claude-opus-4-6", extra_betas=[],
+    )
+    assert result.paused_reason == "stream_stall"
+    assert result.synthetic_session_id is not None
+    create.assert_awaited_once()
 
 
 def _allow_all(name, inp):

@@ -26,7 +26,10 @@ async def test_no_stall_no_callback():
 
 
 @pytest.mark.asyncio
-async def test_stall_threshold_sets_warned_flag():
+async def test_stall_threshold_emits_status_once(monkeypatch):
+    monkeypatch.setattr(
+        "services.claude_api.stall.STREAM_STALL_STATUS_ENABLED", True,
+    )
     calls: list[str] = []
 
     async def cb(msg):
@@ -37,15 +40,18 @@ async def test_stall_threshold_sets_warned_flag():
         stall_threshold_s=0.1, idle_timeout_s=10.0, poll_interval_s=0.05,
     ) as wd:
         await asyncio.sleep(0.5)
-        # Stall warning is log-only now (the bot.py spinner already shows
-        # liveness): the flag flips, but no user-facing callback fires.
         assert wd._warned is True
-    assert all("⏳" not in c for c in calls)
+    # Stall now surfaces ONE user-facing "waiting on API" status (deduped via
+    # _warned), distinguishing a genuine no-event stall from "💭 thinking".
+    assert sum("⏳" in c for c in calls) == 1
     assert all("⏰" not in c for c in calls)
 
 
 @pytest.mark.asyncio
-async def test_stall_warns_once_per_idle_period():
+async def test_stall_status_deduped_per_idle_period(monkeypatch):
+    monkeypatch.setattr(
+        "services.claude_api.stall.STREAM_STALL_STATUS_ENABLED", True,
+    )
     calls: list[str] = []
 
     async def cb(msg):
@@ -56,9 +62,50 @@ async def test_stall_warns_once_per_idle_period():
         stall_threshold_s=0.05, idle_timeout_s=10.0, poll_interval_s=0.02,
     ) as wd:
         await asyncio.sleep(0.3)
-        # Warning is deduped via _warned (log-only); no callback spam.
         assert wd._warned is True
+    # Deduped via _warned — no per-poll spam.
+    assert sum("⏳" in c for c in calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_stall_status_disabled_no_callback(monkeypatch):
+    monkeypatch.setattr(
+        "services.claude_api.stall.STREAM_STALL_STATUS_ENABLED", False,
+    )
+    calls: list[str] = []
+
+    async def cb(msg):
+        calls.append(msg)
+
+    async with StallWatchdog(
+        channel_id=1, status_callback=cb,
+        stall_threshold_s=0.1, idle_timeout_s=10.0, poll_interval_s=0.05,
+    ) as wd:
+        await asyncio.sleep(0.4)
+        assert wd._warned is True  # flag still flips (log-only path)
     assert all("⏳" not in c for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_stall_status_reemits_after_heartbeat(monkeypatch):
+    monkeypatch.setattr(
+        "services.claude_api.stall.STREAM_STALL_STATUS_ENABLED", True,
+    )
+    calls: list[str] = []
+
+    async def cb(msg):
+        calls.append(msg)
+
+    async with StallWatchdog(
+        channel_id=1, status_callback=cb,
+        stall_threshold_s=0.05, idle_timeout_s=10.0, poll_interval_s=0.02,
+    ) as wd:
+        await asyncio.sleep(0.2)
+        assert sum("⏳" in c for c in calls) == 1
+        wd.heartbeat()  # a stream event arrived — resets the dedup
+        await asyncio.sleep(0.2)
+    # After the heartbeat reset, a fresh stall surfaces the status again.
+    assert sum("⏳" in c for c in calls) == 2
 
 
 @pytest.mark.asyncio
