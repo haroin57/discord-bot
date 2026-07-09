@@ -74,8 +74,20 @@ git fetch origin "${BRANCH}" --quiet
 CURRENT_SHA="$(git rev-parse HEAD)"
 REMOTE_SHA="$(git rev-parse "origin/${BRANCH}")"
 
-if [[ "${CURRENT_SHA}" == "${REMOTE_SHA}" ]]; then
-    log "HEAD already at origin/${BRANCH} (${CURRENT_SHA:0:8}); nothing to do"
+# origin/<branch> が既に HEAD に含まれている（HEAD の ancestor である）なら、
+# 取り込むべき新規コミットは無いので何もしない。HEAD == REMOTE の通常ケースに
+# 加えて、HEAD が REMOTE より「先行」しているケース（例: prod 稼働ディレクトリで
+# 誤って local commit / branch 切替をした場合）も no-op にする。これをしないと
+# ff-only merge が "Already up to date" のまま成功扱いになり、step6 の無条件
+# restart が 5 分ごとに走る再起動ストームになる（2026-07-09 に実発生）。
+# origin が HEAD より先行する正常デプロイのみゲートを通過し、乖離時は step4 の
+# ff-only merge が弾いて restart しない。
+if git merge-base --is-ancestor "origin/${BRANCH}" HEAD; then
+    if [[ "${CURRENT_SHA}" == "${REMOTE_SHA}" ]]; then
+        log "HEAD already at origin/${BRANCH} (${CURRENT_SHA:0:8}); nothing to do"
+    else
+        log "HEAD (${CURRENT_SHA:0:8}) already contains origin/${BRANCH} (${REMOTE_SHA:0:8}); HEAD is ahead — nothing to deploy, not restarting"
+    fi
     exit 0
 fi
 
