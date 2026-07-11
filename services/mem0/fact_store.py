@@ -54,6 +54,13 @@ CREATE INDEX IF NOT EXISTS idx_facts_user_valid
 
 _db_lock = threading.Lock()
 _db_path: str | None = None
+# Path for which journal_mode=WAL + schema have been applied. journal_mode is
+# a persistent DB-level property whose lock is NOT governed by busy_timeout,
+# so running `PRAGMA journal_mode=WAL` on every (concurrent) connection made
+# ~30% of concurrent writes fail with "database is locked" — silently
+# dropping derived-index rows (ADR-0007; same fix as history_index). We now
+# apply it exactly once per DB file, serialized under _db_lock.
+_wal_ready_path: str | None = None
 
 
 def _resolve_db_path() -> str:
@@ -70,22 +77,28 @@ def _resolve_db_path() -> str:
 
 def _reset_for_tests(path: str | None = None) -> None:
     """テスト用: DB パスを差し替える（本番コードから呼ばない）。"""
-    global _db_path
+    global _db_path, _wal_ready_path
     _db_path = path
+    _wal_ready_path = None  # new DB file → re-init WAL + schema on next _conn()
 
 
 @contextmanager
 def _conn():
     """Open a connection with WAL, ensure schema, hand it out."""
+    global _wal_ready_path
     path = _resolve_db_path()
     # check_same_thread=False — bot.py + scripts call from various threads
     # via asyncio.to_thread. _db_lock serializes writes; reads are safe.
-    c = sqlite3.connect(path, check_same_thread=False)
+    c = sqlite3.connect(path, check_same_thread=False, timeout=5.0)
     c.row_factory = sqlite3.Row
     try:
-        c.execute("PRAGMA journal_mode=WAL")
-        with _db_lock:
-            c.executescript(_SCHEMA)
+        c.execute("PRAGMA busy_timeout=5000")
+        if _wal_ready_path != path:
+            with _db_lock:
+                if _wal_ready_path != path:
+                    c.execute("PRAGMA journal_mode=WAL")
+                    c.executescript(_SCHEMA)
+                    _wal_ready_path = path
         yield c
     finally:
         c.close()
