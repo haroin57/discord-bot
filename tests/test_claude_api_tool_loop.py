@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import anthropic
+import httpx
 import pytest
 
 from services.claude_api.stall import StallWatchdog
@@ -155,6 +156,98 @@ async def test_stream_stall_ttfb_retries_then_succeeds(_inert_watchdog, monkeypa
     assert [h["role"] for h in history] == ["user", "assistant"]
 
 
+class _ByteStallStream:
+    """Stream whose iteration dies with httpx.ReadTimeout — simulates the byte
+    layer (per-request read timeout, 2026-07-11): ≥STREAM_BYTE_IDLE_TIMEOUT_S
+    with zero bytes on the wire, i.e. a genuinely dead connection. Raw httpx
+    errors bubble unwrapped through the SDK during stream iteration, so the
+    stall handler must catch them itself (they are NOT builtins.TimeoutError)."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    def __aiter__(self):
+        return self._aiter()
+
+    async def _aiter(self):
+        raise httpx.ReadTimeout("Read timed out")
+        yield  # pragma: no cover — unreachable
+
+    async def get_final_message(self):  # pragma: no cover — never reached
+        raise AssertionError("final message requested on a dead stream")
+
+
+class _RequestTimeoutStream:
+    """stream() whose request leg (POST → headers) times out: the SDK wraps
+    that into anthropic.APITimeoutError at __aenter__. Pre-first-event by
+    definition — must ride the same stall recovery, not the generic
+    AnthropicError re-raise."""
+
+    async def __aenter__(self):
+        raise anthropic.APITimeoutError(
+            request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        )
+
+    async def __aexit__(self, *_):  # pragma: no cover — enter never succeeds
+        return False
+
+
+@pytest.mark.asyncio
+async def test_stream_stall_byte_layer_retries_then_succeeds(
+    _inert_watchdog, monkeypatch,
+):
+    # Byte-layer trip (httpx.ReadTimeout mid-stream, zero events yet) must be
+    # treated exactly like an event-layer stall: same-request retry, recover.
+    import services.claude_api.tool_loop as tl
+
+    monkeypatch.setattr(tl, "STREAM_STALL_RETRY_S", 5)
+    monkeypatch.setattr(tl, "STREAM_STALL_MAX_RETRIES", 1)
+    client = _make_client_streams(
+        _ByteStallStream(),  # turn 0: dead connection at the byte layer
+        _FakeStream([], _final_msg([_block("text", text="recovered!")], "end_turn")),
+    )
+    history: list[dict] = []
+    result = await run_agent_loop(
+        "hi", channel_id=1, history=history, system_prompt="sys",
+        tools_for_api=[], can_use_tool=_allow_all, execute_tool=AsyncMock(),
+        status_callback=_noop_status, max_turns=5, stall_watchdog=_inert_watchdog,
+        api_client=client, model="claude-opus-4-6", extra_betas=[],
+    )
+    assert result.text == "recovered!"
+    assert result.paused_reason is None
+    assert [h["role"] for h in history] == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_stream_stall_request_timeout_retries_then_succeeds(
+    _inert_watchdog, monkeypatch,
+):
+    # Request-leg timeout (SDK-wrapped APITimeoutError before headers) must be
+    # caught by the stall handler — except-clause ordering puts it BEFORE the
+    # anthropic.AnthropicError re-raise that would hand it to entry.py.
+    import services.claude_api.tool_loop as tl
+
+    monkeypatch.setattr(tl, "STREAM_STALL_RETRY_S", 5)
+    monkeypatch.setattr(tl, "STREAM_STALL_MAX_RETRIES", 1)
+    client = _make_client_streams(
+        _RequestTimeoutStream(),  # turn 0: POST → headers timeout
+        _FakeStream([], _final_msg([_block("text", text="recovered!")], "end_turn")),
+    )
+    history: list[dict] = []
+    result = await run_agent_loop(
+        "hi", channel_id=1, history=history, system_prompt="sys",
+        tools_for_api=[], can_use_tool=_allow_all, execute_tool=AsyncMock(),
+        status_callback=_noop_status, max_turns=5, stall_watchdog=_inert_watchdog,
+        api_client=client, model="claude-opus-4-6", extra_betas=[],
+    )
+    assert result.text == "recovered!"
+    assert result.paused_reason is None
+    assert [h["role"] for h in history] == ["user", "assistant"]
+
+
 @pytest.mark.asyncio
 async def test_stream_stall_exhausted_checkpoints(_inert_watchdog, monkeypatch):
     # With the retry budget spent (0), a stall must fall through to a graceful
@@ -273,6 +366,116 @@ async def test_stream_stall_fallback_create_fails_checkpoints(
     assert result.paused_reason == "stream_stall"
     assert result.synthetic_session_id is not None
     create.assert_awaited_once()
+
+
+# --- ADR-0045: tool_begin/tool_end bracketing through run_agent_loop -------
+
+
+class _SpyWatchdog:
+    """Records the ordered sequence of watchdog calls so a test can assert the
+    tool phase is bracketed by tool_begin → tool_end (ADR-0045). Duck-types
+    StallWatchdog's call surface used by the loop; never cancels."""
+
+    def __init__(self):
+        self.events: list[str] = []
+        self.inflight_at_tool_run = None
+
+    def heartbeat(self):
+        self.events.append("heartbeat")
+
+    def tool_begin(self):
+        self.events.append("tool_begin")
+
+    def tool_end(self):
+        self.events.append("tool_end")
+
+
+@pytest.mark.asyncio
+async def test_tool_phase_bracketed_by_begin_end():
+    # The main tool-execution phase must be wrapped tool_begin → tool_end so
+    # the whole-task backstop defers while a (possibly long) tool runs.
+    spy = _SpyWatchdog()
+
+    async def _exec(name, inp):
+        # At tool-run time the watchdog must already be in a tool phase.
+        assert spy.events.count("tool_begin") == spy.events.count("tool_end") + 1
+        spy.inflight_at_tool_run = True
+        return "content"
+
+    client = _make_client(
+        ([], _final_msg(
+            [_block("tool_use", id="t1", name="Read", input={"f": "x"})], "tool_use")),
+        ([], _final_msg([_block("text", text="done")], "end_turn")),
+    )
+    result = await run_agent_loop(
+        "read x", channel_id=1, history=[], system_prompt="sys",
+        tools_for_api=[{"name": "Read", "description": "", "input_schema": {}}],
+        can_use_tool=_allow_all, execute_tool=_exec,
+        status_callback=_noop_status, max_turns=5, stall_watchdog=spy,
+        api_client=client, model="claude-opus-4-6", extra_betas=[],
+    )
+    assert result.text == "done"
+    assert spy.inflight_at_tool_run is True
+    # Every tool_begin is matched by a tool_end (balanced — no leak on the
+    # success path).
+    assert spy.events.count("tool_begin") == 1
+    assert spy.events.count("tool_begin") == spy.events.count("tool_end")
+    # Ordering: begin precedes its end.
+    assert spy.events.index("tool_begin") < spy.events.index("tool_end")
+
+
+@pytest.mark.asyncio
+async def test_tool_end_called_even_when_tool_raises():
+    # tool_end must fire via finally even if the tool errors — otherwise the
+    # backstop would defer forever (F3 permanent-defer guard).
+    spy = _SpyWatchdog()
+
+    async def _exec(name, inp):
+        raise RuntimeError("boom")
+
+    client = _make_client(
+        ([], _final_msg(
+            [_block("tool_use", id="t1", name="Read", input={"f": "x"})], "tool_use")),
+        ([], _final_msg([_block("text", text="handled")], "end_turn")),
+    )
+    result = await run_agent_loop(
+        "read x", channel_id=1, history=[], system_prompt="sys",
+        tools_for_api=[{"name": "Read", "description": "", "input_schema": {}}],
+        can_use_tool=_allow_all, execute_tool=_exec,
+        status_callback=_noop_status, max_turns=5, stall_watchdog=spy,
+        api_client=client, model="claude-opus-4-6", extra_betas=[],
+    )
+    assert result.text == "handled"
+    # Balanced despite the tool raising (error surfaces as an is_error
+    # tool_result inside _run_one_tool, but the phase still ends).
+    assert spy.events.count("tool_begin") == spy.events.count("tool_end") == 1
+
+
+@pytest.mark.asyncio
+async def test_long_tool_phase_not_cancelled_by_backstop():
+    # End-to-end: a tool that runs past idle_timeout_s must NOT be killed by
+    # the real StallWatchdog — deferral keeps the task alive.
+    async def _slow(name, inp):
+        await asyncio.sleep(0.4)  # 4x the idle_timeout below
+        return "slow result"
+
+    client = _make_client(
+        ([], _final_msg(
+            [_block("tool_use", id="t1", name="Read", input={"f": "x"})], "tool_use")),
+        ([], _final_msg([_block("text", text="survived")], "end_turn")),
+    )
+    async with StallWatchdog(
+        channel_id=1, status_callback=None,
+        stall_threshold_s=999, idle_timeout_s=0.1, poll_interval_s=0.02,
+    ) as wd:
+        result = await run_agent_loop(
+            "read x", channel_id=1, history=[], system_prompt="sys",
+            tools_for_api=[{"name": "Read", "description": "", "input_schema": {}}],
+            can_use_tool=_allow_all, execute_tool=_slow,
+            status_callback=_noop_status, max_turns=5, stall_watchdog=wd,
+            api_client=client, model="claude-opus-4-6", extra_betas=[],
+        )
+    assert result.text == "survived"
 
 
 def _allow_all(name, inp):

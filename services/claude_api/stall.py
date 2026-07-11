@@ -51,10 +51,25 @@ class StallWatchdog:
         self._task: asyncio.Task | None = None
         self._parent: asyncio.Task | None = None
         self._stream_idle = False
+        self._inflight = 0
 
     def heartbeat(self) -> None:
         self._last = time.monotonic()
         self._warned = False
+
+    def tool_begin(self) -> None:
+        """Mark a tool-execution phase as in flight (CLI parity, ADR-0045).
+
+        The CLI's async-agent stall watchdog (H$$, 2.1.170) defers firing
+        while tool_use ids await their tool_result — a long-running tool is
+        progress, not a stall. Tools have their own deadline
+        (TOOL_CALL_TIMEOUT_S), so deferral cannot hide a genuinely hung tool.
+        Counter-based so concurrent phases compose."""
+        self._inflight += 1
+
+    def tool_end(self) -> None:
+        self._inflight = max(0, self._inflight - 1)
+        self.heartbeat()
 
     @property
     def stream_idle(self) -> bool:
@@ -89,6 +104,18 @@ class StallWatchdog:
                 return
 
             if idle > self.idle_timeout_s:
+                if self._inflight > 0:
+                    # CLI parity (2.1.170 H$$): "stall watchdog deferred —
+                    # N tool(s) in flight". Re-arm with a full budget; the
+                    # tool leg owns its own deadline (TOOL_CALL_TIMEOUT_S)
+                    # and tool_end() heartbeats on completion.
+                    log.info(
+                        "[ch=%d] stall watchdog deferred — %d tool phase(s) "
+                        "in flight",
+                        self.channel_id, self._inflight,
+                    )
+                    self._last = time.monotonic()
+                    continue
                 log.warning(
                     "[ch=%d] stream idle for %.0fs, cancelling",
                     self.channel_id, idle,

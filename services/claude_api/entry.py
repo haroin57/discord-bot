@@ -1034,12 +1034,14 @@ async def call_with_tools(
                                 )
                         break
                     except asyncio.CancelledError as _cancel:
-                        # ADR-0038: the outer StallWatchdog cancels with
-                        # "stream idle" — a wedge the in-loop stream guard
-                        # didn't catch (e.g. a hung tool call). Surface that as
-                        # a timeout. A bare cancel is a real /abort or shutdown:
-                        # re-raise so bot.py shows "⏹️ 中断" instead of
-                        # mislabeling the user's own abort as a timeout.
+                        # ADR-0038/0045: the outer StallWatchdog cancels with
+                        # "stream idle" — a 600s no-progress wedge that escaped
+                        # every inner layer (byte 180 / event 300 / fallback
+                        # 300). NOT a hung tool: those are deferred by
+                        # tool_begin/tool_end and bounded by TOOL_CALL_TIMEOUT_S.
+                        # Surface that as a timeout. A bare cancel is a real
+                        # /abort or shutdown: re-raise so bot.py shows "⏹️ 中断"
+                        # instead of mislabeling the user's own abort as a timeout.
                         if _cancel.args and _cancel.args[0] == "stream idle":
                             log.warning(
                                 "[ch=%d] stream idle backstop → timeout",
