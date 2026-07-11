@@ -28,24 +28,39 @@ else
 fi
 
 WORKFLOW="test.yml"
-NOTIFY_TOKEN_FILE="/tmp/kanae-notify-token.txt"
-NOTIFY_URL="https://kanae-notify.haroin57.workers.dev/notify"
+# Deploy notifications reuse the durable journal-forward Discord webhook
+# (${BOT_DIR}/.env.journal-forward:JOURNAL_WEBHOOK_URL) instead of the old
+# /tmp/kanae-notify-token.txt worker token, which lived on tmpfs and was
+# silently lost on every reboot — leaving deploys unannounced. The webhook
+# file survives reboots and is already in active use by
+# discord-bot-journal-forward.service, so notifications are durable now.
+NOTIFY_ENV_FILE="${BOT_DIR}/.env.journal-forward"
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
 log() { echo "[auto_deploy/${ENV}] $*"; }
 
 notify() {
     local msg="$1"
-    if [[ ! -f "${NOTIFY_TOKEN_FILE}" ]]; then
-        log "WARN: notify token not found at ${NOTIFY_TOKEN_FILE}; skipping Discord notification"
+    if [[ ! -f "${NOTIFY_ENV_FILE}" ]]; then
+        log "WARN: ${NOTIFY_ENV_FILE} not found; skipping Discord notification"
         return 0
     fi
-    local token
-    token="$(cat "${NOTIFY_TOKEN_FILE}")"
-    curl -fsS -X POST "${NOTIFY_URL}" \
+    local webhook
+    webhook="$(grep -E '^JOURNAL_WEBHOOK_URL=' "${NOTIFY_ENV_FILE}" | head -1 | cut -d= -f2-)"
+    if [[ -z "${webhook}" ]]; then
+        log "WARN: JOURNAL_WEBHOOK_URL empty in ${NOTIFY_ENV_FILE}; skipping notification"
+        return 0
+    fi
+    # Build valid JSON via python3 (already a hard dep of this script) rather
+    # than shell quoting, so a message with quotes/newlines can't produce a
+    # malformed payload. Call sites already tag the message with
+    # "auto_deploy/<env>:", so no extra prefix is added here.
+    local payload
+    payload="$(python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' \
+        "${msg}")" || return 0
+    curl -fsS -X POST "${webhook}" \
         -H "Content-Type: application/json" \
-        -H "X-Notify-Auth: ${token}" \
-        -d "{\"target\":\"health\",\"content\":${msg@Q}}" \
+        -d "${payload}" \
         >/dev/null 2>&1 || log "WARN: Discord notification failed (non-fatal)"
 }
 
