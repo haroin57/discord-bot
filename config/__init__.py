@@ -604,27 +604,56 @@ CLAUDE_TRANSIENT_MAX_ATTEMPTS = int(os.environ.get("CLAUDE_TRANSIENT_MAX_ATTEMPT
 CLAUDE_MAX_BACKOFF_S = int(os.environ.get("CLAUDE_MAX_BACKOFF_S", "60"))
 
 # Stream quality (free-code: queryModelWithStreaming)
-# IDLE_TIMEOUT bumped from 90 → 300 (2026-05-14): adaptive extended thinking
-# with mixed-format prior_history (loaded since the resume fix) can keep the
-# SSE stream silent past 90s while the model is still thinking. 300s gives
-# headroom without unbounded waits.
+# Stall detection is layered CLI-parity style (Claude Code 2.1.170 binary
+# extraction, 2026-07-11/12 — ADR-0044/0045). One detector per leg:
+#   byte layer 180s < event layer 300s = fallback 300s < backstop 600s
+# STREAM_IDLE_TIMEOUT_S is the StallWatchdog's whole-task no-progress
+# ceiling. 420 → 600 (2026-07-12, ADR-0045): the CLI's own unattended mode
+# (async agents, function H$$) keeps exactly this — a 600s stall watchdog
+# (CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS default 600000) that ABORTS the task
+# with "Agent stalled: no progress for Ns (stream watchdog did not recover)".
+# It is a hard ceiling: the CLI does NOT feed it during recovery legs
+# (retry backoff / non-streaming fallback), so a recovery chain that cannot
+# finish inside 600s of zero progress is killed by design — that is the
+# "did not recover" case, not a race. Two CLI refinements carried over:
+# the watchdog defers while tools are in flight (StallWatchdog.tool_begin/
+# tool_end), and progress feeds on every stream event (heartbeat per SSE
+# event; the CLI additionally counts pings via its byte-fed synthetic-ping
+# generator Mef — our Python SDK eats pings, but the byte layer below owns
+# that pathology at 180s, long before 600s matters).
 STREAM_STALL_THRESHOLD_S = int(os.environ.get("STREAM_STALL_THRESHOLD_S", "30"))
-STREAM_IDLE_TIMEOUT_S = int(os.environ.get("STREAM_IDLE_TIMEOUT_S", "300"))
+STREAM_IDLE_TIMEOUT_S = int(os.environ.get("STREAM_IDLE_TIMEOUT_S", "600"))
+# Byte-layer stall deadline (CLI-parity, 2026-07-11): the CLI's PRIMARY stall
+# detector is a byte watchdog wrapping the raw response body — 180s of zero
+# bytes on a firstParty stream (constant oh_=180000 in 2.1.170) errors the
+# stream. Crucially, SSE `ping` events are bytes, so a server that is alive
+# but slow (long prefill) keeps resetting it; only a genuinely dead
+# connection trips it. Our equivalent is httpx's read timeout, applied
+# per-request to the streaming call ONLY (the shared client keeps its 600s
+# scalar — non-streaming calls receive zero bytes until generation completes
+# and would false-positive on a 180s read cap). The anthropic Python SDK
+# swallows ping events before the app layer (_streaming.py), so httpx's read
+# timer is the only layer of ours that can see them — exactly why detection
+# must live here and not in the SSE-event loop.
+STREAM_BYTE_IDLE_TIMEOUT_S = int(os.environ.get("STREAM_BYTE_IDLE_TIMEOUT_S", "180"))
 # ADR-0038: per-turn stream stall → in-place recovery (retry / checkpoint)
 # instead of letting StallWatchdog cancel the whole task. STREAM_STALL_RETRY_S
 # is the idle window (no SSE event at all) that trips a single-turn abort.
-# Kept deliberately generous: adaptive extended thinking can leave the stream
-# silent well past 90s while the model is still working (see the IDLE_TIMEOUT
-# note above), so a shorter window would false-positive on legitimate slow
-# turns. Anything past ~120s of *total* silence is a genuinely wedged upstream
-# (the 2026-07-05 incident sat dead for 183s on an HTTP-200 stream). On trip we
-# re-issue the SAME request up to STREAM_STALL_MAX_RETRIES times — but only for
-# a clean pre-first-byte stall (no prose streamed yet, nothing appended to
-# history), so the retry can never duplicate visible output. Past that budget,
-# or on a mid-stream stall, we emit a graceful checkpoint ("続けて" resumes)
-# rather than dying. STREAM_IDLE_TIMEOUT_S stays as the outer hard backstop for
-# wedges the stream guard can't see (e.g. a hung tool call).
-STREAM_STALL_RETRY_S = int(os.environ.get("STREAM_STALL_RETRY_S", "120"))
+# 120 → 300 (2026-07-11): with the byte layer above owning "dead connection"
+# at 180s, this event-layer guard is demoted to backstop duty — the pathology
+# where bytes (pings) still flow but no real SSE event arrives. The CLI keeps
+# its equivalent event watchdog OFF by default and floors it at 300s when on
+# (ZG6()=max(env,300000), gate tengu_event_watchdog_default_on=false); pings
+# deliberately do NOT reset it there either. 120s was killing
+# requests whose prefill was slow-but-alive (26–28.6万 token sessions measure
+# 135–270s to first event; the abort even threw away finished prefill cache —
+# fallback successes logged cache_read=260K/creation=0 from the aborted
+# attempt). On trip we re-issue the SAME request up to
+# STREAM_STALL_MAX_RETRIES times — but only for a clean pre-first-byte stall
+# (no prose streamed yet, nothing appended to history), so the retry can
+# never duplicate visible output. Past that budget, or on a mid-stream stall,
+# we emit a graceful checkpoint ("続けて" resumes) rather than dying.
+STREAM_STALL_RETRY_S = int(os.environ.get("STREAM_STALL_RETRY_S", "300"))
 # Bumped 1 → 2 (2026-07-06): on the largest channels a slow first-byte (cache
 # creation on a big prompt) can trip the idle guard before ANY event; one retry
 # gave only 2 attempts before a checkpoint. The real fix is not sending a 500K+
@@ -644,11 +673,17 @@ STREAM_STALL_MAX_RETRIES = int(os.environ.get("STREAM_STALL_MAX_RETRIES", "2"))
 STREAM_NONSTREAM_FALLBACK_ENABLED = os.environ.get(
     "STREAM_NONSTREAM_FALLBACK_ENABLED", "1"
 ) not in ("0", "false", "False", "")
-# Explicit client timeout for the non-streaming fallback create(). Required:
-# the anthropic SDK refuses a non-streaming request whose max_tokens could
-# exceed the default 10-min timeout unless an explicit timeout is passed. Mirrors
-# the CLI's 180000ms streaming-idle constant.
-STREAM_NONSTREAM_TIMEOUT_S = int(os.environ.get("STREAM_NONSTREAM_TIMEOUT_S", "180"))
+# Outer deadline for the non-streaming fallback create(). 180 → 300
+# (2026-07-12, ADR-0045): the CLI's fallback (fL9) passes an explicit
+# per-request timeout of _ef() = API_TIMEOUT_MS || 300000ms local /
+# 120000ms remote (2.1.170 binary) — NOT the 600000ms client default, and
+# not 180s either (that figure is oh_, the BYTE-watchdog deadline, unrelated
+# to the fallback; both were previously miscited here). 300s also covers the
+# measured 135–270s a cold 26万-token prefill + full generation needs, which
+# the old 180s cap lost races on. The SDK-level timeout stays a deliberately
+# generous 1800 so the SDK's "large max_tokens without streaming" guard
+# never trips; the REAL deadline is this outer value.
+STREAM_NONSTREAM_TIMEOUT_S = int(os.environ.get("STREAM_NONSTREAM_TIMEOUT_S", "300"))
 # When True, StallWatchdog surfaces a user-facing "waiting on API" status at the
 # stall threshold (30s of NO stream event). Because the watchdog heartbeats on
 # every event (thinking_delta included), legitimate extended thinking never
@@ -1189,10 +1224,13 @@ MCP_SERVERS_WEB: dict = {
         "args": ["/home/ubuntu/free-code/x-scraper/mcp_server.py"],
     },
     # Onion-search TEMPORARILY DISABLED (2026-06-19): its MCP tool call parks
-    # in an UNCANCELLABLE await — the bot's StallWatchdog (300s) and per-tool
-    # asyncio.wait_for (240s) both fail to interrupt it, wedging the channel
+    # in an UNCANCELLABLE await — the bot's StallWatchdog (then 300s, now
+    # STREAM_IDLE_TIMEOUT_S=600s) and per-tool asyncio.wait_for (then 240s, now
+    # TOOL_CALL_TIMEOUT_S=360s) both fail to interrupt it, wedging the channel
     # for 70+ min (confirmed via py-spy: event loop idle, zombie task holding
-    # the channel semaphore). Re-enable only after server.py guarantees the
+    # the channel semaphore). NOTE (ADR-0045): the tool-in-flight deferral does
+    # not worsen this — an uncancellable await already defeated both timers
+    # regardless of deferral. Re-enable only after server.py guarantees the
     # get_sources handler always returns within a hard wall-clock budget so
     # the client await can't park. See ADR / the onion-search hardening task.
     # "onion-search": {
@@ -1333,6 +1371,17 @@ MCP_SERVERS_IOT: dict = {
 }
 
 
+# INSHI tier — 院試誤答DB (inshi-vault) MCP。常駐 streamable-HTTP daemon
+# (mcp-inshi-vault-shared :8017) へ接続。誤答の検索・出題・登録・正答参照。
+# データの正は /home/ubuntu/inshi-vault（git bare 経由で Mac クローンと同期）。
+MCP_SERVERS_INSHI: dict = {
+    "inshi-vault": {
+        "type": "http",
+        "url": "http://127.0.0.1:8017/mcp",
+    },
+}
+
+
 # Union (used as a default + by code paths that just need to know "all configured")
 MCP_SERVERS: dict = {
     **MCP_SERVERS_BASE,
@@ -1343,6 +1392,7 @@ MCP_SERVERS: dict = {
     **MCP_SERVERS_DOCS,
     **MCP_SERVERS_REALESTATE,
     **MCP_SERVERS_IOT,
+    **MCP_SERVERS_INSHI,
 }
 
 # 評価ハーネス専用（EVAL_MCP_ENABLED=true の worker プロセスのみ）。

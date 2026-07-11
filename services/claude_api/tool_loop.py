@@ -27,6 +27,7 @@ import uuid
 from dataclasses import dataclass
 
 import anthropic
+import httpx
 
 from config import (
     CLAUDE_MAX_TOKENS,
@@ -42,6 +43,7 @@ from config import (
     PROACTIVE_COMPACT_TRIGGER_TOKENS,
     SERVER_SIDE_FALLBACK_ENABLED,
     SLOW_FIRST_BYTE_MS,
+    STREAM_BYTE_IDLE_TIMEOUT_S,
     STREAM_NONSTREAM_FALLBACK_ENABLED,
     STREAM_NONSTREAM_TIMEOUT_S,
     STREAM_STALL_MAX_RETRIES,
@@ -1705,11 +1707,32 @@ async def run_agent_loop(
         # inherit a stale tool identity.
         cur_tool: dict | None = None
         try:
-            async with api_client.beta.messages.stream(**stream_kwargs) as stream:
+            # Byte-layer stall detection (CLI-parity 2026-07-11): httpx's read
+            # timeout is the max gap between BYTES, and SSE pings are bytes —
+            # so a slow-but-alive upstream (long prefill keeps pinging) never
+            # trips it, only a genuinely dead connection does. This mirrors
+            # the CLI 2.1.170 byte watchdog (180s firstParty, oh_=180000),
+            # its PRIMARY detector. Per-request override only: the shared
+            # client keeps its 600s scalar because non-streaming calls
+            # receive zero bytes until generation completes and a 180s read
+            # cap would kill them. NOT added to stream_kwargs — those are
+            # reused by the fallback create(**stream_kwargs, timeout=1800)
+            # and a second timeout kwarg would TypeError.
+            _stream_timeout = httpx.Timeout(
+                connect=15.0,
+                read=float(STREAM_BYTE_IDLE_TIMEOUT_S),
+                write=60.0,
+                pool=60.0,
+            )
+            async with api_client.beta.messages.stream(
+                **stream_kwargs, timeout=_stream_timeout,
+            ) as stream:
                 # ADR-0038: idle-guard each event so a wedged upstream raises a
                 # catchable TimeoutError here instead of tripping the outer
                 # StallWatchdog's task-cancel. The heartbeat still feeds the
-                # watchdog backstop for stalls this guard can't see.
+                # watchdog backstop for stalls this guard can't see. Since the
+                # byte layer above owns "dead connection" at 180s, this event
+                # guard (300s) only fires when bytes flow but no event arrives.
                 async for event in _idle_guarded(stream, STREAM_STALL_RETRY_S):
                     stall_watchdog.heartbeat()
                     if ttft_ms is None:
@@ -1960,24 +1983,51 @@ async def run_agent_loop(
                                 log.warning(
                                     "server fallback alert callback failed: %s", exc
                                 )
-        except TimeoutError:
-            # ADR-0038: no SSE event for STREAM_STALL_RETRY_S — the upstream
-            # stream is wedged (server took the POST but streamed nothing).
-            # Recover here instead of letting the StallWatchdog cancel the whole
-            # task. A clean pre-first-byte stall (no prose streamed this turn,
+        except (
+            TimeoutError, httpx.ReadTimeout, anthropic.APITimeoutError,
+        ) as _stall_exc:
+            # ADR-0038 + byte layer (2026-07-11): the upstream stream is
+            # wedged. Recover here instead of letting the StallWatchdog cancel
+            # the whole task. Three detection layers land here, distinguished
+            # for the passive prod measurement (byte-vs-event trip ratio tells
+            # us whether pings actually flow during a long prefill):
+            #   - httpx.ReadTimeout  → BYTE layer: ≥STREAM_BYTE_IDLE_TIMEOUT_S
+            #     with zero bytes (pings included) — a genuinely dead
+            #     connection; immediate re-POST is correct.
+            #   - TimeoutError       → EVENT layer: bytes flowed (httpx quiet)
+            #     but no SSE event for STREAM_STALL_RETRY_S.
+            #   - APITimeoutError    → REQUEST leg: the SDK wrapped a timeout
+            #     before headers arrived (connect/TTFB) — pre-first-event by
+            #     definition, same recovery family (CLI treats its stale-
+            #     connection case identically: retry streaming, then fall
+            #     back). Caught here BEFORE the anthropic.AnthropicError
+            #     handler below by except-clause ordering.
+            # A clean pre-first-byte stall (no prose streamed this turn,
             # so nothing was appended to `history` — the user turn was appended
             # once before the loop) is re-issued as the SAME request via
             # `continue`; it cannot duplicate visible output. Once prose has
             # streamed, or the retry budget is spent, preserve the work with a
             # graceful checkpoint ("続けて" resumes) rather than dying.
+            if isinstance(_stall_exc, httpx.ReadTimeout):
+                _stall_layer = "byte"
+            elif isinstance(_stall_exc, anthropic.APITimeoutError):
+                _stall_layer = "request"
+            else:
+                _stall_layer = "event"
+            # Deliberately NO watchdog heartbeat here (ADR-0045): the CLI's
+            # async-agent backstop is a hard 600s no-progress ceiling that is
+            # NOT fed during recovery legs — a recovery chain that can't
+            # finish inside the ceiling is killed as "stream watchdog did not
+            # recover", by design. Ordering: byte 180 < event 300 = fallback
+            # 300 < backstop 600.
             _produced = bool(live_turn_text.strip())
             if not _produced and stall_retries < STREAM_STALL_MAX_RETRIES:
                 stall_retries += 1
                 _backoff = min(2 ** stall_retries, 8)
                 log.warning(
-                    "[ch=%d] turn=%d stream stall (idle ≥%ds) → retry %d/%d "
+                    "[ch=%d] turn=%d stream stall (layer=%s, %r) → retry %d/%d "
                     "after %ds",
-                    channel_id, turn + 1, STREAM_STALL_RETRY_S,
+                    channel_id, turn + 1, _stall_layer, _stall_exc,
                     stall_retries, STREAM_STALL_MAX_RETRIES, _backoff,
                 )
                 await _safe_status(
@@ -2006,21 +2056,35 @@ async def run_agent_loop(
                 _ns_final = None
                 try:
                     _ns_final = await asyncio.wait_for(
-                        # SDK-level timeout is deliberately generous (matches the
-                        # CLI's 30-min hard cap) so the SDK's "large max_tokens
-                        # without streaming" guard never trips; the REAL deadline
-                        # is the outer asyncio.wait_for (STREAM_NONSTREAM_TIMEOUT_S).
+                        # SDK-level timeout stays deliberately generous (1800s)
+                        # so the SDK's "large max_tokens without streaming"
+                        # guard never trips; the REAL deadline is the outer
+                        # STREAM_NONSTREAM_TIMEOUT_S (300s — CLI parity: fL9
+                        # passes _ef() = API_TIMEOUT_MS || 300000ms local as
+                        # its per-request timeout, 2.1.170). This leg runs
+                        # under the 600s backstop unfed, exactly like the
+                        # CLI's fallback under its async-agent watchdog.
                         api_client.beta.messages.create(
                             **stream_kwargs, timeout=1800,
                         ),
                         STREAM_NONSTREAM_TIMEOUT_S,
                     )
                 except Exception as _ns_exc:  # noqa: BLE001 - best-effort fallback
+                    # %r, not %s: str(TimeoutError()) == "" — the bare %s
+                    # produced "non-streaming fallback failed:  → checkpoint"
+                    # with the cause invisible (observed 2026-07-11).
                     log.warning(
-                        "[ch=%d] non-streaming fallback failed: %s → checkpoint",
+                        "[ch=%d] non-streaming fallback failed: %r → checkpoint",
                         channel_id, _ns_exc,
                     )
                 if _ns_final is not None:
+                    # The recovery WAIT ran unfed (hard ceiling), but a
+                    # SUCCEEDED fallback is genuine progress — the CLI feeds
+                    # its backstop on the resulting yielded message (ADR-0045).
+                    # Heartbeat here so the unfed retry→fallback idle can't
+                    # cancel a fully-received, fully-paid response during the
+                    # post-processing / Discord delivery that follows.
+                    stall_watchdog.heartbeat()
                     final_msg = _ns_final
                     if ttft_ms is None:
                         ttft_ms = int((time.monotonic() - request_start) * 1000)
@@ -2052,9 +2116,9 @@ async def run_agent_loop(
                     # transcript so the checkpoint isn't missing this turn's head.
                     text_across_turns.append(live_turn_text)
                 log.warning(
-                    "[ch=%d] turn=%d stream stall (idle ≥%ds, produced=%s, "
+                    "[ch=%d] turn=%d stream stall (layer=%s, %r, produced=%s, "
                     "retries=%d) → graceful checkpoint",
-                    channel_id, turn + 1, STREAM_STALL_RETRY_S, _produced,
+                    channel_id, turn + 1, _stall_layer, _stall_exc, _produced,
                     stall_retries,
                 )
                 return await _emit_checkpoint("stream_stall")
@@ -2114,19 +2178,25 @@ async def run_agent_loop(
                 TEXT_INVOKE_RESCUE_ENABLED
                 and text_invoke_rescues < MAX_TEXT_INVOKE_RESCUES
             ):
-                rescued_results = await _attempt_text_invoke_rescue(
-                    turn_text,
-                    history=history,
-                    tools_for_api=tools_for_api,
-                    tool_schemas=tool_schemas,
-                    can_use_tool=can_use_tool,
-                    execute_tool=execute_tool,
-                    status_callback=status_callback,
-                    tool_invocation_callback=tool_invocation_callback,
-                    channel_id=channel_id,
-                    turn=turn,
-                    evidence=evidence,
-                )
+                # Rescue executes real tools too — same backstop deferral as
+                # the main tool phase (ADR-0045).
+                stall_watchdog.tool_begin()
+                try:
+                    rescued_results = await _attempt_text_invoke_rescue(
+                        turn_text,
+                        history=history,
+                        tools_for_api=tools_for_api,
+                        tool_schemas=tool_schemas,
+                        can_use_tool=can_use_tool,
+                        execute_tool=execute_tool,
+                        status_callback=status_callback,
+                        tool_invocation_callback=tool_invocation_callback,
+                        channel_id=channel_id,
+                        turn=turn,
+                        evidence=evidence,
+                    )
+                finally:
+                    stall_watchdog.tool_end()
             if rescued_results is not None:
                 text_invoke_rescues += 1
                 consecutive_empty = 0
@@ -2331,17 +2401,25 @@ async def run_agent_loop(
         # Read-only batches run concurrently (CLI isConcurrencySafe, audit
         # #12); tool_result order still follows tool_use order because
         # asyncio.gather preserves input order.
-        if len(tool_blocks) > 1 and all(
-            getattr(b, "name", "") in CONCURRENCY_SAFE_TOOLS
-            for b in tool_blocks
-        ):
-            tool_results = list(await asyncio.gather(
-                *(_run_one_tool(b, **_tool_kw) for b in tool_blocks)
-            ))
-        else:
-            tool_results = [
-                await _run_one_tool(b, **_tool_kw) for b in tool_blocks
-            ]
+        # tool_begin/tool_end (ADR-0045): the whole-task backstop defers
+        # while tools are in flight (CLI async-agent parity) — tool legs own
+        # their deadline via TOOL_CALL_TIMEOUT_S, and a sequential multi-tool
+        # phase can legitimately exceed the backstop's 600s.
+        stall_watchdog.tool_begin()
+        try:
+            if len(tool_blocks) > 1 and all(
+                getattr(b, "name", "") in CONCURRENCY_SAFE_TOOLS
+                for b in tool_blocks
+            ):
+                tool_results = list(await asyncio.gather(
+                    *(_run_one_tool(b, **_tool_kw) for b in tool_blocks)
+                ))
+            else:
+                tool_results = [
+                    await _run_one_tool(b, **_tool_kw) for b in tool_blocks
+                ]
+        finally:
+            stall_watchdog.tool_end()
 
         if not tool_results:
             # Tool Search 検索ターン: client 側 tool_use はゼロだが、result 未対の
