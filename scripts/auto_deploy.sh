@@ -41,6 +41,13 @@ log() { echo "[auto_deploy/${ENV}] $*"; }
 
 notify() {
     local msg="$1"
+    # Mark that a specific outcome has been announced, so the EXIT catch-all
+    # (on_exit) does not also fire a generic "CRASHED" message on a non-zero
+    # exit that a handled branch already reported. Set even if the POST below
+    # is skipped/fails: the intent is "we already spoke to Discord about this
+    # run"; a generic crash line on top would just add noise (and would hit the
+    # same missing-webhook condition anyway).
+    NOTIFIED=1
     if [[ ! -f "${NOTIFY_ENV_FILE}" ]]; then
         log "WARN: ${NOTIFY_ENV_FILE} not found; skipping Discord notification"
         return 0
@@ -63,6 +70,24 @@ notify() {
         -d "${payload}" \
         >/dev/null 2>&1 || log "WARN: Discord notification failed (non-fatal)"
 }
+
+# ─── crash catch-all ──────────────────────────────────────────────────────────
+# set -e can kill this script on an UNGUARDED failure (git fetch / pip install /
+# sudo systemctl restart), which would otherwise be SILENT: systemd_forward.py
+# intentionally excludes the -autodeploy units (to avoid duplicating the notify()
+# calls below), so an unhandled crash reaches nobody. The EXIT trap fires a
+# generic alert for any non-zero exit that a handled branch hasn't already
+# announced. notify() marks NOTIFIED=1, so a specific failure message is never
+# doubled by this catch-all.
+NOTIFIED=0
+# shellcheck disable=SC2317  # invoked indirectly via `trap`, not dead code
+on_exit() {
+    local rc=$?
+    if [[ "${rc}" -ne 0 && "${NOTIFIED}" -eq 0 ]]; then
+        notify "auto_deploy/${ENV}: CRASHED exit=${rc} — unhandled failure (journalctl -u ${SERVICE}-autodeploy)"
+    fi
+}
+trap on_exit EXIT
 
 # ─── dev: graceful skip if service doesn't exist yet ─────────────────────────
 # unit ファイルの存在で判定する。list-units + grep は先頭マーカー(●)や
