@@ -36,7 +36,8 @@ def renderer(tmp_path):
 
     render_mock = AsyncMock(side_effect=_write_png)
     with patch.object(mod, "render_with_browser_daemon", render_mock), \
-         patch.object(mod, "_KATEX_AVAILABLE", True):
+         patch.object(mod, "_KATEX_AVAILABLE", True), \
+         patch.object(mod, "KATEX_CDN", "file:///local/katex"):
         yield mod, render_mock, tmp_path
 
     sys.modules.pop("utils.math_renderer", None)
