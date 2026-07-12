@@ -240,7 +240,7 @@ HISTORY_COMPACT_TRIGGER_CHARS = int(
 # How much of the newest history to keep verbatim ("Recent messages are
 # preserved verbatim" leg of the official CLI compact).
 HISTORY_COMPACT_KEEP_CHARS = int(
-    os.environ.get("HISTORY_COMPACT_KEEP_CHARS", "50000")
+    os.environ.get("HISTORY_COMPACT_KEEP_CHARS", "0")
 )
 # The official CLI summarizes with the main-loop model; we deliberately use
 # the refusal-fallback model instead, because Fable 5 refuses exactly the
@@ -268,7 +268,7 @@ HISTORY_COMPACT_EFFORT = os.environ.get("HISTORY_COMPACT_EFFORT", "medium")
 # default effort is "medium", so real usage sits well under this — 48000 is
 # retained as generous headroom, under CLAUDE_MAX_TOKENS_OPUS (64000).
 HISTORY_COMPACT_MAX_TOKENS = int(
-    os.environ.get("HISTORY_COMPACT_MAX_TOKENS", "48000")
+    os.environ.get("HISTORY_COMPACT_MAX_TOKENS", "20000")
 )
 # ADR-0040: graceful checkpoint (ADR-0036) の自動継続。従来は turn 上限・実行
 # 予算・stream 停止で checkpoint すると、ユーザーが手で「続けて」と打つまで
@@ -328,13 +328,18 @@ PROACTIVE_COMPACT_HARD_PCT = int(os.environ.get("PROACTIVE_COMPACT_HARD_PCT", "9
 MICROCOMPACT_ENABLED = os.environ.get(
     "MICROCOMPACT_ENABLED", "1"
 ) not in ("0", "false", "False", "")
-MICROCOMPACT_GAP_MIN = float(os.environ.get("MICROCOMPACT_GAP_MIN", "30"))
-MICROCOMPACT_KEEP_RECENT = int(os.environ.get("MICROCOMPACT_KEEP_RECENT", "3"))
+MICROCOMPACT_GAP_MIN = float(os.environ.get("MICROCOMPACT_GAP_MIN", "60"))
+MICROCOMPACT_KEEP_RECENT = int(os.environ.get("MICROCOMPACT_KEEP_RECENT", "5"))
 # Whether the context-1m beta is active (mirrors the gate in client.py). Drives
 # the model context window used by the model-window-based compaction threshold.
 CONTEXT_1M_ENABLED = os.environ.get(
     "CONTEXT_1M_ENABLED", "1"
 ) not in ("0", "false", "False", "")
+# free-code parity (autoCompact.ts:29,61): auto-compact 閾値の予約分。
+# threshold = window − min(model_max_output, RESERVED_SUMMARY_TOKENS) − AUTOCOMPACT_BUFFER_TOKENS
+# 本家は要約出力に 20K を予約し、さらに 13K のバッファを引く（1M窓で実効≈967K）。
+RESERVED_SUMMARY_TOKENS = int(os.environ.get("RESERVED_SUMMARY_TOKENS", "20000"))
+AUTOCOMPACT_BUFFER_TOKENS = int(os.environ.get("AUTOCOMPACT_BUFFER_TOKENS", "13000"))
 # Auto-compaction trigger as a PERCENT of the effective window (mirrors the
 # CLI's CLAUDE_AUTOCOMPACT_PCT_OVERRIDE). 0 = use the reserve-based formula
 # (window − output − headroom, ≈ CLI et6). Set e.g. 50 to fire at half-window

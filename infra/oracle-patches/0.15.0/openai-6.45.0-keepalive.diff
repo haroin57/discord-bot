@@ -1,0 +1,38 @@
+--- a/node_modules/openai/lib/responses/ResponseAccumulator.js
++++ b/node_modules/openai/lib/responses/ResponseAccumulator.js
+@@ -397,6 +397,14 @@
+     return part;
+ }
+ function assertNever(value) {
+-    throw new error_1.OpenAIError(`Unhandled response stream event: ${JSON.stringify(value)}`);
++    // LOCAL PATCH (2026-07-10, docs/oracle_mcp.md 追補5): OpenAI Responses API が
++    // 送る keepalive 等の未知 stream イベントで throw すると consult セッションが
++    // 丸ごと落ちる (Session failed: Unhandled response stream event {"type":"keepalive"})。
++    // accumulateResponse は switch の後で snapshot を返すため、未知イベントは
++    // 無視しても状態を壊さない。警告だけ stderr に残して握りつぶす。
++    try {
++        process.stderr.write(`[openai-local-patch] ignoring unhandled response stream event type=${JSON.stringify(value?.type ?? value)}\n`);
++    }
++    catch { }
+ }
+ //# sourceMappingURL=ResponseAccumulator.js.map
+\ No newline at end of file
+--- a/node_modules/openai/lib/responses/ResponseAccumulator.mjs
++++ b/node_modules/openai/lib/responses/ResponseAccumulator.mjs
+@@ -394,6 +394,14 @@
+     return part;
+ }
+ function assertNever(value) {
+-    throw new OpenAIError(`Unhandled response stream event: ${JSON.stringify(value)}`);
++    // LOCAL PATCH (2026-07-10, docs/oracle_mcp.md 追補5): OpenAI Responses API が
++    // 送る keepalive 等の未知 stream イベントで throw すると consult セッションが
++    // 丸ごと落ちる (Session failed: Unhandled response stream event {"type":"keepalive"})。
++    // accumulateResponse は switch の後で snapshot を返すため、未知イベントは
++    // 無視しても状態を壊さない。警告だけ stderr に残して握りつぶす。
++    try {
++        process.stderr.write(`[openai-local-patch] ignoring unhandled response stream event type=${JSON.stringify(value?.type ?? value)}\n`);
++    }
++    catch { }
+ }
+ //# sourceMappingURL=ResponseAccumulator.mjs.map
+\ No newline at end of file

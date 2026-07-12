@@ -45,7 +45,9 @@ export async function stdioToStatelessStreamableHttp(args) {
     logger.info(`  - Health endpoints: ${healthEndpoints.length ? healthEndpoints.join(', ') : '(none)'}`);
     onSignals({ logger });
     const app = express();
-    app.use(express.json());
+    // LOCAL PATCH (2026-07-10, docs/oracle_mcp.md 追補5): express.json() の
+    // デフォルト 100kb 制限だと長い consult prompt が 413 で弾かれるため拡大。
+    app.use(express.json({ limit: '8mb' }));
     if (corsOrigin) {
         app.use(cors({ origin: corsOrigin }));
     }
@@ -200,6 +202,14 @@ export async function stdioToStatelessStreamableHttp(args) {
                 logger.error(`StreamableHttp error:`, err);
                 killTree('onerror');
             };
+            // LOCAL PATCH (2026-07-10, docs/oracle_mcp.md 追補5): stateless では
+            // transport.onclose が正常完了時に発火せず、killTree が一度も呼ばれない
+            // (実測: spawn 20 / reap 0、子チェーン ~20本・1.18GB が永久リーク)。
+            // res 'close' は「応答送信完了 or クライアント切断」の両方で必ず発火する
+            // ため、ここをライフサイクル終端として子プロセスグループを回収する。
+            // OpenAI 側の background ジョブはサーバー側で継続し、oracle session
+            // <slug> で回収可能（従来挙動と同じ）。
+            res.on('close', () => killTree('res-close'));
             await transport.handleRequest(req, res, req.body);
         }
         catch (error) {
