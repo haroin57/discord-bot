@@ -48,6 +48,32 @@ To restore:
 4. Start the service: `sudo systemctl start discord-bot`
 5. Confirm health: `curl 127.0.0.1:3002/health | jq`
 
+## Cloudflare R2会話・状態アーカイブ
+
+`services/r2_archive.py`はローカル保存後に`.state/r2_archive/pending/`へ永続スプールし、
+バックグラウンドで非公開R2バケットへ送信する。R2停止中もbotの会話処理は継続し、
+失敗項目は指数バックオフで再送する。全体復元用の`snapshots/*.tar.gz`は従来の
+`scripts/snapshot_state.sh`が担当し、本機能は検索・個別取得しやすい次の構造を担当する。
+
+```text
+discord-bot/v1/history/events/<channel>/YYYY/MM/DD/<event>.json
+discord-bot/v1/history/transcripts/<channel>.jsonl
+discord-bot/v1/images/<channel>/YYYY/MM/DD/<message>/<direction>/<image>
+discord-bot/v1/state/latest/<relative-path>
+discord-bot/v1/state/manifests/YYYY/MM/DD/<timestamp>.json
+```
+
+- 状態確認: `python scripts/r2_archive.py status`。
+- `.state`差分登録: `python scripts/r2_archive.py sync-state`。
+- 送信待ち処理: `python scripts/r2_archive.py flush --limit 100`。
+- 個別取得: `python scripts/r2_archive.py fetch 'r2://kanae-state-backup/<key>' --output /tmp/object`。
+- Discord内の画像確認・取得: 管理者用`/r2recent`と`/r2fetch`。
+- 即時状態同期: 管理者用`/r2sync`。
+- 無効化: `.env`で`R2_ARCHIVE_ENABLED=false`。
+
+R2バケットは公開しない。画像の共有URLが必要な場合は、S3 API資格情報を別途発行して
+短時間のpresigned GET URLを生成する。資格情報やpresigned URLはJSONLへ保存しない。
+
 ## Common Failures
 
 | Symptom | First step |

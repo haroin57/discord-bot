@@ -14,6 +14,9 @@ import pytest
 os.environ.setdefault(
     "BOT_LOG_PATH", os.path.join(tempfile.gettempdir(), "discord-bot-test.log")
 )
+# Production defaults R2 archiving on.  Unit tests opt out before config import
+# so transcript tests never stage data under the live .state directory.
+os.environ.setdefault("R2_ARCHIVE_ENABLED", "false")
 
 
 @pytest.fixture

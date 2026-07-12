@@ -1434,6 +1434,29 @@ def _bool_env(name: str, default: bool) -> bool:
     if v is None:
         return default
     return v.lower() in ("1", "true", "yes", "on")
+
+# Cloudflare R2 searchable archive.  Conversation writes are always committed
+# locally first; R2 delivery uses a durable .state/r2_archive spool and is
+# therefore non-fatal.  The existing scripts/snapshot_state.sh archive remains
+# the whole-tree disaster-recovery layer, while this layer stores individually
+# addressable history events, state files, manifests, and conversation images.
+R2_ARCHIVE_ENABLED = _bool_env("R2_ARCHIVE_ENABLED", True)
+R2_ARCHIVE_BUCKET = os.environ.get("R2_ARCHIVE_BUCKET", "kanae-state-backup")
+R2_ARCHIVE_PREFIX = os.environ.get("R2_ARCHIVE_PREFIX", "discord-bot/v1")
+R2_ARCHIVE_WRANGLER_BIN = os.environ.get(
+    "R2_ARCHIVE_WRANGLER_BIN", os.path.expanduser("~/.volta/bin/wrangler")
+)
+R2_ARCHIVE_FLUSH_INTERVAL_S = float(
+    os.environ.get("R2_ARCHIVE_FLUSH_INTERVAL_S", "5")
+)
+R2_ARCHIVE_FLUSH_BATCH = int(os.environ.get("R2_ARCHIVE_FLUSH_BATCH", "20"))
+R2_ARCHIVE_STATE_INTERVAL_S = float(
+    os.environ.get("R2_ARCHIVE_STATE_INTERVAL_S", "3600")
+)
+R2_ARCHIVE_COMMAND_TIMEOUT_S = float(
+    os.environ.get("R2_ARCHIVE_COMMAND_TIMEOUT_S", "300")
+)
+
 MEM0_LEGACY_CONTEXT = _bool_env("MEM0_LEGACY_CONTEXT", False)             # P1: True で旧 channel-history 流入挙動に戻す
 MEM0_GATE_ENABLED = _bool_env("MEM0_GATE_ENABLED", True)                   # P2: False で Mem0 標準抽出にフォールバック
 MEM0_GATE_MIN_IMPORTANCE = int(os.environ.get("MEM0_GATE_MIN_IMPORTANCE", "2"))
