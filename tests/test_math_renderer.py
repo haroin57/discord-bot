@@ -1,9 +1,4 @@
-"""Tests for utils/math_renderer.py (Cloudflare Browser Rendering backend).
-
-No browser is launched: the Browser Rendering client (render_screenshot) is
-mocked to return fake PNG bytes, and KaTeX availability is driven by
-_KATEX_AVAILABLE (True when the CF client is configured).
-"""
+"""Tests for the local KaTeX/Puppeteer math renderer."""
 
 from __future__ import annotations
 
@@ -28,20 +23,19 @@ def _import_renderer():
 
 @pytest.fixture()
 def renderer(tmp_path):
-    """math_renderer with the CF client mocked to succeed (returns PNG bytes).
-
-    The fixture yields (module, render_mock, tmp_path). render_mock is an async
-    mock installed as ``mod.render_screenshot``; by default it returns b"PNG".
-    _KATEX_AVAILABLE is forced True regardless of environment config.
-    """
+    """math_renderer with the local browser daemon mocked to write a PNG."""
     from unittest.mock import AsyncMock, patch
 
     saved = sys.modules.get("utils.math_renderer")
     sys.modules.pop("utils.math_renderer", None)
     import utils.math_renderer as mod
 
-    render_mock = AsyncMock(return_value=b"\x89PNG\r\n")
-    with patch.object(mod, "render_screenshot", render_mock), \
+    async def _write_png(**kwargs):
+        with open(kwargs["output_path"], "wb") as file:
+            file.write(b"\x89PNG\r\n")
+
+    render_mock = AsyncMock(side_effect=_write_png)
+    with patch.object(mod, "render_with_browser_daemon", render_mock), \
          patch.object(mod, "_KATEX_AVAILABLE", True):
         yield mod, render_mock, tmp_path
 
@@ -155,7 +149,7 @@ class TestHashNaming:
 
         latex = r"\alpha + \beta"
         display = True
-        _TEMPLATE_VERSION = "3"
+        _TEMPLATE_VERSION = "4"
         cache_key = f"v{_TEMPLATE_VERSION}:{latex}:{'display' if display else 'inline'}"
         expected_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
         expected_path = os.path.join(output_dir, f"math_{expected_hash}.png")
@@ -163,12 +157,10 @@ class TestHashNaming:
         result = await mod.render_math_image(latex, display_mode=display, output_dir=output_dir)
 
         assert result == expected_path
-        # The remote browser is told to clip to the math element, HiDPI, and
-        # wait for the CDN KaTeX bundle.
-        _, kwargs = render_mock.call_args
+        kwargs = render_mock.call_args.kwargs
         assert kwargs["selector"] == ".math-container"
-        assert kwargs["device_scale_factor"] == 2
-        assert kwargs["wait_for_network_idle"] is True
+        assert kwargs["viewport"]["deviceScaleFactor"] == 2
+        assert kwargs["html_path"].endswith(".html")
 
     @pytest.mark.asyncio
     async def test_display_and_inline_produce_different_hashes(self, renderer):
@@ -192,7 +184,7 @@ class TestCacheHit:
         mod, render_mock, tmp_path = renderer
         output_dir = str(tmp_path)
         latex = "x^2"
-        _TEMPLATE_VERSION = "3"
+        _TEMPLATE_VERSION = "4"
         cache_key = f"v{_TEMPLATE_VERSION}:{latex}:display"
         h = hashlib.md5(cache_key.encode()).hexdigest()[:12]
         cached_path = os.path.join(output_dir, f"math_{h}.png")
@@ -205,7 +197,7 @@ class TestCacheHit:
 
 
 # ---------------------------------------------------------------------------
-# render_math_image — KaTeX / Browser Rendering unavailable
+# render_math_image — KaTeX unavailable
 # ---------------------------------------------------------------------------
 
 class TestKatexUnavailable:
@@ -219,29 +211,30 @@ class TestKatexUnavailable:
 
 
 # ---------------------------------------------------------------------------
-# render_math_image — error handling (client returns None → None result)
+# render_math_image — error handling
 # ---------------------------------------------------------------------------
 
 class TestErrorHandling:
     @pytest.mark.asyncio
     async def test_render_failure_returns_none(self, renderer):
         mod, render_mock, tmp_path = renderer
-        render_mock.return_value = None  # client failed (timeout/5xx/etc.)
+        render_mock.side_effect = RuntimeError("browser failed")
 
         result = await mod.render_math_image("x", output_dir=str(tmp_path))
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_empty_bytes_returns_none(self, renderer):
+    async def test_missing_output_returns_none(self, renderer):
         mod, render_mock, tmp_path = renderer
-        render_mock.return_value = b""  # no image content
+        render_mock.side_effect = None
+        render_mock.return_value = None
 
         result = await mod.render_math_image("x^2", output_dir=str(tmp_path))
         assert result is None
 
 
 # ---------------------------------------------------------------------------
-# render_math_image — HTML template sanity (HTML passed to render_screenshot)
+# render_math_image — HTML template sanity
 # ---------------------------------------------------------------------------
 
 class TestHtmlTemplate:
@@ -249,46 +242,47 @@ class TestHtmlTemplate:
     async def test_html_contains_display_true(self, renderer):
         mod, render_mock, tmp_path = renderer
         await mod.render_math_image(r"\alpha", display_mode=True, output_dir=str(tmp_path))
-        html = render_mock.call_args.args[0]
+        html = open(render_mock.call_args.kwargs["html_path"]).read()
         assert "displayMode: true" in html
 
     @pytest.mark.asyncio
     async def test_html_contains_display_false_for_inline(self, renderer):
         mod, render_mock, tmp_path = renderer
         await mod.render_math_image(r"\alpha", display_mode=False, output_dir=str(tmp_path))
-        html = render_mock.call_args.args[0]
+        html = open(render_mock.call_args.kwargs["html_path"]).read()
         assert "displayMode: false" in html
 
     @pytest.mark.asyncio
     async def test_html_latex_is_json_escaped(self, renderer):
         mod, render_mock, tmp_path = renderer
         await mod.render_math_image(r'\frac{"x"}{y}', display_mode=True, output_dir=str(tmp_path))
-        html = render_mock.call_args.args[0]
+        html = open(render_mock.call_args.kwargs["html_path"]).read()
         assert '\\"' in html or "\\u0022" in html
 
     @pytest.mark.asyncio
-    async def test_html_references_katex_cdn(self, renderer):
+    async def test_html_references_local_katex(self, renderer):
         mod, render_mock, tmp_path = renderer
         await mod.render_math_image(r"\alpha", display_mode=True, output_dir=str(tmp_path))
-        html = render_mock.call_args.args[0]
-        # KaTeX is loaded from the pinned CDN base (not a local file:// path).
+        html = open(render_mock.call_args.kwargs["html_path"]).read()
         assert mod.KATEX_CDN in html
         assert "katex.min.css" in html
-        assert "file://" not in html
+        assert "file://" in html
 
 
 # ---------------------------------------------------------------------------
-# KaTeX availability tracks Browser Rendering config
+# KaTeX availability tracks local assets
 # ---------------------------------------------------------------------------
 
 class TestKatexAvailability:
-    def test_available_mirrors_is_configured(self):
+    def test_resolver_finds_first_local_install(self):
         from unittest.mock import patch
-        # Configured → available
-        with patch("utils.cf_browser.is_configured", return_value=True):
-            mod = _import_renderer()
-            assert mod._KATEX_AVAILABLE is True
-        # Not configured → unavailable
-        with patch("utils.cf_browser.is_configured", return_value=False):
-            mod = _import_renderer()
-            assert mod._KATEX_AVAILABLE is False
+        mod = _import_renderer()
+        target = mod._KATEX_CANDIDATES[1]
+        with patch.object(mod.os.path, "isfile", side_effect=lambda p: p == f"{target}/katex.min.js"):
+            assert mod._resolve_katex_root() == f"file://{target}"
+
+    def test_resolver_returns_none_without_local_install(self):
+        from unittest.mock import patch
+        mod = _import_renderer()
+        with patch.object(mod.os.path, "isfile", return_value=False):
+            assert mod._resolve_katex_root() is None

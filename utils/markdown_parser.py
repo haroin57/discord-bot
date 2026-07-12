@@ -59,25 +59,40 @@ DISPLAY_MATH_RE = re.compile(
     re.MULTILINE,
 )
 
-# Inline math: single $ ... $ (not preceded/followed by $). Requires a LaTeX
-# marker in the body so currency ($50) isn't matched — see _ALL_MATH_RE.
+# Inline math candidate: single $ ... $ on one line. Semantic filtering below
+# separates math from currency without allowing one pair to consume another.
 INLINE_MATH_RE = re.compile(
-    r"(?<!\$)\$(?!\$)(.*?[\\^_{}=].*?)(?<!\$)\$(?!\$)",
+    r"(?<!\$)\$(?!\$)([^\n$]+?)(?<!\$)\$(?!\$)",
 )
 
-# Combined: find all math (display first, then inline).
-# Inline $...$ REQUIRES a LaTeX marker (= \ ^ _ { }) in its body so that plain
-# currency like "$50、送料$10" / "$5から$10" / "$100-$200" is NOT mistaken for
-# math (the bug: two $ separated by non-space JP/punct/hyphen matched as math
-# and got rendered as a broken KaTeX image). Real math ($E=mc^2$, $\frac{a}{b}$,
-# $x^2$) always carries one of those markers. Trade-off: a marker-less single
-# variable like $x$ is no longer treated as inline math — acceptable, since the
-# currency false-positive is far more common and damaging than that miss.
-_ALL_MATH_RE = re.compile(
+# Combined candidate regex. Inline bodies explicitly exclude `$`, so adjacent
+# expressions such as `$n$ ... $A^n$` can never be merged into one expression.
+_MATH_CANDIDATE_RE = re.compile(
     r"(\$\$[\s\S]*?\$\$"           # display math $$...$$
-    r"|(?<!\$)\$(?!\$)(?!\s)(.*?[\\^_{}=].*?)(?<!\s)(?<!\$)\$(?!\$))",  # inline $...$ (LaTeX-marker required)
+    r"|(?<!\$)\$(?!\$)(?!\s)([^\n$]+?)(?<!\s)(?<!\$)\$(?!\$))",
     re.MULTILINE,
 )
+
+_INLINE_TEX_MARKER_RE = re.compile(r"[\\^_{}=]")
+_INLINE_SIMPLE_MATH_RE = re.compile(
+    r"^(?=.*[A-Za-z\u0370-\u03ff])[A-Za-z0-9\u0370-\u03ff+*/(),.\-\s]+$"
+)
+
+
+def _looks_like_inline_math(body: str) -> bool:
+    """Accept TeX syntax and simple symbolic expressions, but not prices."""
+    if not body or body != body.strip():
+        return False
+    if _INLINE_TEX_MARKER_RE.search(body):
+        return True
+    return bool(_INLINE_SIMPLE_MATH_RE.fullmatch(body))
+
+
+def _iter_math_matches(text: str):
+    for match in _MATH_CANDIDATE_RE.finditer(text):
+        raw = match.group(0)
+        if raw.startswith("$$") or _looks_like_inline_math(raw[1:-1]):
+            yield match
 
 
 def mask_code_blocks(text: str) -> str:
@@ -113,7 +128,7 @@ def has_math(text: str, *, _masked: str | None = None) -> bool:
     See has_tables() for the optional `_masked` arg.
     """
     masked = _masked if _masked is not None else mask_code_blocks(text)
-    return bool(_ALL_MATH_RE.search(masked))
+    return next(_iter_math_matches(masked), None) is not None
 
 
 def _split_math_in_text(text: str) -> list[Segment]:
@@ -122,7 +137,7 @@ def _split_math_in_text(text: str) -> list[Segment]:
     segments: list[Segment] = []
     last_end = 0
 
-    for m in _ALL_MATH_RE.finditer(masked):
+    for m in _iter_math_matches(masked):
         start, end = m.start(), m.end()
         before = text[last_end:start]
         if before.strip():
@@ -272,14 +287,18 @@ def split_settled(text: str) -> tuple[str, str, bool]:
     # Unclosed inline math: odd number of single $ after neutralizing $$ pairs.
     # Two guards so we don't hold on a literal $ (currency):
     #   - newline after the open $ → literal $ (e.g. a price on its own line)
-    #   - the tail after the open $ has no LaTeX marker (= \ ^ _ { }) → it's
-    #     currency like "$50", not math being typed (mirrors _ALL_MATH_RE).
+    #   - the tail after the open $ has neither TeX syntax nor a symbolic
+    #     identifier prefix → it is currency like "$50", not math being typed.
     masked_no_dd = re.sub(r"\$\$", "  ", masked)
     singles = [m.start() for m in re.finditer(r"\$", masked_no_dd)]
     if len(singles) % 2 == 1:
         pos = singles[-1]
         tail = text[pos:scan_limit]
-        if "\n" not in tail and re.search(r"[\\^_{}=]", tail):
+        open_body = tail[1:]
+        looks_symbolic = bool(re.match(r"[A-Za-z\u0370-\u03ff\\]", open_body))
+        if "\n" not in tail and (
+            _INLINE_TEX_MARKER_RE.search(open_body) or looks_symbolic
+        ):
             open_start = pos if open_start is None else min(open_start, pos)
 
     # A table touching the tail: still growing / awaiting a terminating line.
@@ -297,7 +316,7 @@ def split_settled(text: str) -> tuple[str, str, bool]:
     last_end = 0
     for m in TABLE_RE.finditer(masked):
         last_end = max(last_end, m.end())
-    for m in _ALL_MATH_RE.finditer(masked):
+    for m in _iter_math_matches(masked):
         last_end = max(last_end, m.end())
     # text[last_end:] is plain prose (plus any open code fence region after
     # scan_limit, which is also live text) — stream it as an editable draft.
@@ -321,7 +340,7 @@ def first_block_span(text: str) -> tuple[int, int, "Segment"] | None:
     tm = TABLE_RE.search(masked)
     if tm is not None:
         best = (tm.start(), tm.end(), "table")
-    mm = _ALL_MATH_RE.search(masked)
+    mm = next(_iter_math_matches(masked), None)
     if mm is not None and (best is None or mm.start() < best[0]):
         best = (mm.start(), mm.end(), "math")
 

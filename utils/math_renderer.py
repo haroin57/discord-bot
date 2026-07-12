@@ -1,20 +1,10 @@
-"""Render LaTeX math expressions as PNG images using KaTeX via Cloudflare
-Browser Rendering.
-
-Phase 2-1: the local Puppeteer daemon was replaced by the Cloudflare Browser
-Rendering REST screenshot API (utils/cf_browser.py). KaTeX is loaded from a
-pinned jsDelivr CDN inside the remote browser (the old local file:// bundle is
-invisible to Cloudflare's browser), and the screenshot is clipped tight to the
-math element. A ``networkidle0`` wait ensures the KaTeX JS + web fonts finish
-loading before capture.
-"""
+"""Render LaTeX math expressions locally with KaTeX and Puppeteer."""
 
 import hashlib
 import logging
 import os
 
-from config import KATEX_CDN_BASE
-from utils.cf_browser import is_configured, render_screenshot
+from utils.browser_pool import render_with_browser_daemon
 
 __all__ = ["render_math_image"]
 
@@ -117,22 +107,31 @@ def _get_math_css(display_mode: bool, latex: str = "") -> str:
     )
     return base + KATEX_THEME_CSS
 
-# KaTeX is served from a pinned jsDelivr CDN (config.KATEX_CDN_BASE) and loaded
-# by the *remote* Cloudflare browser — the previous local file:// bundle is
-# unreachable from Cloudflare's browser. Math rendering is therefore available
-# whenever the Browser Rendering client is configured (token + account id).
-# The network dependency that the old local bundle avoided is now inherent to
-# every render (the whole call is a Cloudflare HTTP request); the CDN version is
-# pinned to keep the supply-chain surface small.
-_KATEX_AVAILABLE: bool = is_configured()
+# Local-only assets avoid Cloudflare's Quick Actions rate limit and remove a
+# network dependency from the response path.
+_KATEX_CANDIDATES = [
+    "/usr/lib/node_modules/katex/dist",
+    "/usr/local/lib/node_modules/katex/dist",
+    "/usr/local/lib/node_modules/@mermaid-js/mermaid-cli/node_modules/katex/dist",
+]
+
+
+def _resolve_katex_root() -> str | None:
+    for path in _KATEX_CANDIDATES:
+        if os.path.isfile(os.path.join(path, "katex.min.js")):
+            return f"file://{path}"
+    return None
+
+
+_katex_root = _resolve_katex_root()
+_KATEX_AVAILABLE: bool = _katex_root is not None
 if not _KATEX_AVAILABLE:
     log.warning(
-        "Cloudflare Browser Rendering not configured; math rendering disabled. "
-        "Set CF_BROWSER_RENDERING_TOKEN/CF_ACCOUNT_ID to enable."
+        "Local KaTeX not found (checked %s); math rendering disabled",
+        ", ".join(_KATEX_CANDIDATES),
     )
 
-# Field name stays `KATEX_CDN` for HTML_TEMPLATE.format(katex_cdn=...) substitution.
-KATEX_CDN: str = KATEX_CDN_BASE
+KATEX_CDN: str = _katex_root or ""
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html><head>
@@ -178,7 +177,7 @@ async def render_math_image(
     rendering fails. Requires a local KaTeX install (`npm install katex`).
     """
     if not _KATEX_AVAILABLE:
-        log.warning("render_math_image called but KaTeX is not installed locally; returning None")
+        log.warning("render_math_image called without a local KaTeX installation")
         return None
     os.makedirs(output_dir, exist_ok=True)
 
@@ -186,7 +185,7 @@ async def render_math_image(
     # HTML_TEMPLATE / KaTeX options (e.g. trust:true -> trust:false) busts
     # previously-cached PNGs that may have been rendered with insecure
     # settings. Bump _TEMPLATE_VERSION on every template/option change.
-    _TEMPLATE_VERSION = "3"  # bumped: Puppeteer daemon -> Cloudflare Browser Rendering (CDN KaTeX)
+    _TEMPLATE_VERSION = "4"  # local Puppeteer backend
     cache_key = f"v{_TEMPLATE_VERSION}:{latex}:{'display' if display_mode else 'inline'}"
     math_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
     out_path = os.path.join(output_dir, f"math_{math_hash}.png")
@@ -195,7 +194,7 @@ async def render_math_image(
     if os.path.isfile(out_path):
         return out_path
 
-    # Build HTML — _get_math_css scales font/padding by expression complexity.
+    scale_params = _get_scale_params(latex, display_mode)
     full_html = HTML_TEMPLATE.format(
         katex_cdn=KATEX_CDN,
         css=_get_math_css(display_mode, latex),
@@ -203,27 +202,22 @@ async def render_math_image(
         display_mode="true" if display_mode else "false",
     )
 
-    # Keep the .html on disk for debugging/parity; the remote browser renders
-    # from the inlined string (it cannot see local files).
     html_path = os.path.join(output_dir, f"math_{math_hash}.html")
     with open(html_path, "w") as f:
         f.write(full_html)
 
-    # deviceScaleFactor=2 for crisp glyphs (matches the old viewport). Wait for
-    # networkidle0 so the CDN KaTeX bundle + web fonts render before capture.
-    png_bytes = await render_screenshot(
-        full_html,
-        selector=".math-container",
-        device_scale_factor=2,
-        wait_for_network_idle=True,
-    )
-    if not png_bytes:
-        log.warning("Math render failed (Browser Rendering returned no image)")
-        return None
     try:
-        with open(out_path, "wb") as f:
-            f.write(png_bytes)
-    except OSError as e:
-        log.error("Failed to write math PNG: %s", e)
+        await render_with_browser_daemon(
+            html_path=html_path,
+            output_path=out_path,
+            selector=".math-container",
+            pad=scale_params["screenshot_pad"],
+            viewport={"width": 800, "height": 600, "deviceScaleFactor": 2},
+        )
+    except TimeoutError:
+        log.error("Local math render timed out")
+        return None
+    except Exception as exc:
+        log.error("Local math render failed: %s", exc)
         return None
     return out_path if os.path.isfile(out_path) else None

@@ -97,9 +97,10 @@ class TestHasMath:
         assert has_math(text) is True
 
     def test_inline_math_detected(self):
-        # inline math now requires a LaTeX marker (= \ ^ _ { }) so currency
-        # like "$50" isn't matched; use "=" here.
         assert has_math("The value is $x = 1$ here.") is True
+
+    def test_single_variable_detected(self):
+        assert has_math("Let $n$ be natural and $A$ a matrix.") is True
 
     def test_inline_currency_not_detected(self):
         # Regression: plain currency must NOT be treated as inline math.
@@ -250,6 +251,19 @@ class TestParseSegmentsMath:
         segs = parse_segments(text)
         math_segs = [s for s in segs if isinstance(s, MathSegment)]
         assert len(math_segs) == 2
+
+    def test_adjacent_simple_and_complex_math_are_not_merged(self):
+        text = r"すべての自然数 $n$ について $A^n=\begin{pmatrix}1&0\\0&1\end{pmatrix}$ を示す。"
+        math_segs = [s for s in parse_segments(text) if isinstance(s, MathSegment)]
+        assert [s.latex for s in math_segs] == [
+            "n",
+            r"A^n=\begin{pmatrix}1&0\\0&1\end{pmatrix}",
+        ]
+
+    def test_multiple_markerless_variables_are_separate(self):
+        text = "Let $x$ and $y$ be variables."
+        math_segs = [s for s in parse_segments(text) if isinstance(s, MathSegment)]
+        assert [s.latex for s in math_segs] == ["x", "y"]
 
 
 # ---------------------------------------------------------------------------
