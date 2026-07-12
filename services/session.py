@@ -316,6 +316,16 @@ def append_jsonl(channel_id: int, entry: dict) -> None:
     except Exception as exc:
         log.warning("history embed update failed (non-fatal): %s", exc)
 
+    # Durable Cloudflare R2 mirror.  archive_history_entry only writes to the
+    # local spool here; the background worker performs network I/O later.  Keep
+    # this independent from both indexes so an R2/configuration failure cannot
+    # affect the canonical local JSONL.
+    try:
+        from services.r2_archive import archive_history_entry
+        archive_history_entry(channel_id, entry)
+    except Exception as exc:
+        log.warning("R2 history staging failed (non-fatal): %s", exc)
+
 
 _CONTEXT_BLOCK_RE = re.compile(
     r"<(?P<tag>retrieved_memories|kanae_self_memory)(?:\s[^>]*)?>.*?</(?P=tag)>",

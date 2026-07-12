@@ -67,6 +67,7 @@ from services.claude_api import _is_session_fresh, call_with_tools, kill_orphan_
 from services.oauth_manager import OAuthRefreshFailed
 from services import claude_tag
 from services import deep_research
+from services import r2_archive
 from services.mem0 import (
     add_memories,
     delete_memory,
@@ -554,6 +555,7 @@ async def on_ready():
         gc.collect()
         gc.freeze()
         _track_task(_periodic_memory_trim(), name="memory_trim")
+        _track_task(r2_archive.archive_worker(), name="r2_archive")
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +618,19 @@ async def _send_segmented(
     # Send any extracted file attachments at the end
     if attach_files:
         await message.channel.send(files=attach_files)
+
+    if rendered_images:
+        refs = await asyncio.to_thread(
+            r2_archive.archive_images,
+            rendered_images,
+            channel_id=message.channel.id,
+            message_id=message.id,
+            direction="outbound-render",
+            author_id=getattr(bot.user, "id", None),
+            source="table-math-renderer",
+        )
+        if refs:
+            log.info("R2 staged %d non-streamed rendered image(s)", len(refs))
 
     # Cleanup rendered images (tables + math)
     for p in rendered_images:
@@ -931,6 +946,18 @@ async def on_message(message: discord.Message):
             )
         http_session = await get_http_session()
         image_paths = await download_attachments(http_session, all_attachments)
+        if image_paths:
+            refs = await asyncio.to_thread(
+                r2_archive.archive_images,
+                image_paths,
+                channel_id=message.channel.id,
+                message_id=message.id,
+                direction="inbound",
+                author_id=message.author.id,
+                source="discord-attachment",
+            )
+            if refs:
+                log.info("R2 staged %d inbound image(s) for message %s", len(refs), message.id)
         text_attachments = await download_text_attachments(http_session, all_attachments)
         # Admin-only: keep non-image, non-text attachments (.als, .zip,
         # .pdf, etc.) so kanae can analyze them via Bash/Read.
@@ -1635,6 +1662,7 @@ async def on_message(message: discord.Message):
         # come from prompt injection — refuse to attach.
         attach_files: list[discord.File] = []
         attached_paths: list[str] = []
+        outbound_image_paths: list[str] = []
         if caller_is_admin:
             # Normalize bare filenames to full paths before extraction
             response_text = normalize_image_filenames(response_text)
@@ -1645,6 +1673,7 @@ async def on_message(message: discord.Message):
                 try:
                     attach_files.append(discord.File(img_path))
                     attached_paths.append(img_path)
+                    outbound_image_paths.append(img_path)
                     log.info("Attaching image: %s", img_path)
                 except OSError as e:
                     log.warning(
@@ -1669,6 +1698,19 @@ async def on_message(message: discord.Message):
                 except Exception as e:
                     log.warning("Failed to attach file %s: %s", file_path, e)
             # Keep file paths in the response text (don't strip them)
+
+        if outbound_image_paths:
+            refs = await asyncio.to_thread(
+                r2_archive.archive_images,
+                outbound_image_paths,
+                channel_id=message.channel.id,
+                message_id=message.id,
+                direction="outbound-generated",
+                author_id=getattr(bot.user, "id", None),
+                source="agent-output",
+            )
+            if refs:
+                log.info("R2 staged %d generated image(s) for message %s", len(refs), message.id)
 
         try:
             if _renderer.live_sent_any:
@@ -1725,6 +1767,17 @@ async def on_message(message: discord.Message):
             # Clean up temp images rendered in-stream by _emit_block (the
             # non-streamed _send_segmented path cleans up its own).
             if _renderer.rendered_images:
+                refs = await asyncio.to_thread(
+                    r2_archive.archive_images,
+                    list(_renderer.rendered_images),
+                    channel_id=message.channel.id,
+                    message_id=message.id,
+                    direction="outbound-render",
+                    author_id=getattr(bot.user, "id", None),
+                    source="stream-renderer",
+                )
+                if refs:
+                    log.info("R2 staged %d streamed rendered image(s)", len(refs))
                 import os as _os
                 for _p in _renderer.rendered_images:
                     try:
