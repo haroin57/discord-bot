@@ -93,6 +93,7 @@ from utils.attachments import (
     MAX_ARBITRARY_ATTACHMENT_BYTES,
     MAX_TEXT_ATTACHMENT_BYTES,
     TEXT_CONTENT_TYPES,
+    attachment_metadata_by_path,
     cleanup_attachments,
     cleanup_stale_attachments,
     download_arbitrary_attachments,
@@ -565,7 +566,7 @@ async def _send_segmented(
     message: discord.Message,
     response_text: str,
     attach_files: list[discord.File],
-) -> None:
+) -> int | None:
     """Send response with Markdown tables rendered as PNG images.
 
     Text segments are sent as regular messages, table segments are rendered
@@ -578,6 +579,7 @@ async def _send_segmented(
     segments = parse_segments(response_text)
     sender = ReplyChainSender(message)
     rendered_images: list[str] = []
+    attachment_response_id: int | None = None
 
     for seg in segments:
         if isinstance(seg, TextSegment):
@@ -592,7 +594,19 @@ async def _send_segmented(
                 rendered_images.append(img_path)
                 f = discord.File(img_path)
                 try:
-                    await sender.send(file=f)
+                    sent = await sender.send(file=f)
+                    refs = await asyncio.to_thread(
+                        r2_archive.archive_images,
+                        [img_path],
+                        channel_id=message.channel.id,
+                        request_message_id=message.id,
+                        response_message_id=sent.id,
+                        direction="outbound-render",
+                        author_id=getattr(bot.user, "id", None),
+                        source="table-renderer",
+                    )
+                    if refs:
+                        log.info("R2 staged rendered table for response %s", sent.id)
                 finally:
                     f.close()
             else:
@@ -606,7 +620,19 @@ async def _send_segmented(
                 rendered_images.append(img_path)
                 f = discord.File(img_path)
                 try:
-                    await sender.send(file=f)
+                    sent = await sender.send(file=f)
+                    refs = await asyncio.to_thread(
+                        r2_archive.archive_images,
+                        [img_path],
+                        channel_id=message.channel.id,
+                        request_message_id=message.id,
+                        response_message_id=sent.id,
+                        direction="outbound-render",
+                        author_id=getattr(bot.user, "id", None),
+                        source="math-renderer",
+                    )
+                    if refs:
+                        log.info("R2 staged rendered math for response %s", sent.id)
                 finally:
                     f.close()
             else:
@@ -617,20 +643,8 @@ async def _send_segmented(
 
     # Send any extracted file attachments at the end
     if attach_files:
-        await message.channel.send(files=attach_files)
-
-    if rendered_images:
-        refs = await asyncio.to_thread(
-            r2_archive.archive_images,
-            rendered_images,
-            channel_id=message.channel.id,
-            message_id=message.id,
-            direction="outbound-render",
-            author_id=getattr(bot.user, "id", None),
-            source="table-math-renderer",
-        )
-        if refs:
-            log.info("R2 staged %d non-streamed rendered image(s)", len(refs))
+        sent = await message.channel.send(files=attach_files)
+        attachment_response_id = sent.id
 
     # Cleanup rendered images (tables + math)
     for p in rendered_images:
@@ -638,6 +652,7 @@ async def _send_segmented(
             _os.remove(p)
         except OSError:
             pass
+    return attachment_response_id
 
 
 # ---------------------------------------------------------------------------
@@ -947,14 +962,16 @@ async def on_message(message: discord.Message):
         http_session = await get_http_session()
         image_paths = await download_attachments(http_session, all_attachments)
         if image_paths:
+            inbound_metadata = attachment_metadata_by_path(all_attachments, image_paths)
             refs = await asyncio.to_thread(
                 r2_archive.archive_images,
                 image_paths,
                 channel_id=message.channel.id,
-                message_id=message.id,
+                request_message_id=message.id,
                 direction="inbound",
                 author_id=message.author.id,
                 source="discord-attachment",
+                per_path_metadata=inbound_metadata,
             )
             if refs:
                 log.info("R2 staged %d inbound image(s) for message %s", len(refs), message.id)
@@ -1699,18 +1716,22 @@ async def on_message(message: discord.Message):
                     log.warning("Failed to attach file %s: %s", file_path, e)
             # Keep file paths in the response text (don't strip them)
 
+        outbound_image_refs = []
         if outbound_image_paths:
-            refs = await asyncio.to_thread(
+            outbound_image_refs = await asyncio.to_thread(
                 r2_archive.archive_images,
                 outbound_image_paths,
                 channel_id=message.channel.id,
-                message_id=message.id,
+                request_message_id=message.id,
                 direction="outbound-generated",
                 author_id=getattr(bot.user, "id", None),
                 source="agent-output",
             )
-            if refs:
-                log.info("R2 staged %d generated image(s) for message %s", len(refs), message.id)
+            if outbound_image_refs:
+                log.info(
+                    "R2 staged %d generated image(s) for request %s",
+                    len(outbound_image_refs), message.id,
+                )
 
         try:
             if _renderer.live_sent_any:
@@ -1735,7 +1756,11 @@ async def on_message(message: discord.Message):
                             len(_reply_files),
                         )
                         _reply_files = _reply_files[:10]
-                    await message.channel.send(files=_reply_files)
+                    sent = await message.channel.send(files=_reply_files)
+                    await asyncio.to_thread(
+                        r2_archive.bind_response_message,
+                        outbound_image_refs[:len(_reply_files)], sent.id,
+                    )
             else:
                 # Mask code blocks once and reuse the result for both detectors.
                 # Previously has_tables + has_math + parse_segments each ran
@@ -1747,9 +1772,21 @@ async def on_message(message: discord.Message):
                     if len(all_files) > 10:
                         log.warning("Capping attachments %d -> 10 for Discord limit", len(all_files))
                         all_files = all_files[:10]
-                    await message.reply("📄 長文のため response.md として添付します。", files=all_files)
+                    sent = await message.reply(
+                        "📄 長文のため response.md として添付します。", files=all_files
+                    )
+                    await asyncio.to_thread(
+                        r2_archive.bind_response_message,
+                        outbound_image_refs[:max(0, len(all_files) - 1)], sent.id,
+                    )
                 elif _has_rich:
-                    await _send_segmented(message, response_text, attach_files)
+                    response_message_id = await _send_segmented(
+                        message, response_text, attach_files
+                    )
+                    await asyncio.to_thread(
+                        r2_archive.bind_response_message,
+                        outbound_image_refs, response_message_id,
+                    )
                 else:
                     _sender = ReplyChainSender(message)
                     _reply_files = attach_files
@@ -1758,7 +1795,11 @@ async def on_message(message: discord.Message):
                         _reply_files = _reply_files[:10]
                     for i, chunk in enumerate(split_message(response_text)):
                         if i == 0 and _reply_files:
-                            await _sender.send(chunk, files=_reply_files)
+                            sent = await _sender.send(chunk, files=_reply_files)
+                            await asyncio.to_thread(
+                                r2_archive.bind_response_message,
+                                outbound_image_refs[:len(_reply_files)], sent.id,
+                            )
                         else:
                             await _sender.send(chunk)
         finally:
@@ -1767,14 +1808,19 @@ async def on_message(message: discord.Message):
             # Clean up temp images rendered in-stream by _emit_block (the
             # non-streamed _send_segmented path cleans up its own).
             if _renderer.rendered_images:
+                rendered_metadata = {
+                    path: {"response_message_id": response_id}
+                    for path, response_id in _renderer.rendered_image_message_ids.items()
+                }
                 refs = await asyncio.to_thread(
                     r2_archive.archive_images,
                     list(_renderer.rendered_images),
                     channel_id=message.channel.id,
-                    message_id=message.id,
+                    request_message_id=message.id,
                     direction="outbound-render",
                     author_id=getattr(bot.user, "id", None),
                     source="stream-renderer",
+                    per_path_metadata=rendered_metadata,
                 )
                 if refs:
                     log.info("R2 staged %d streamed rendered image(s)", len(refs))
@@ -1785,6 +1831,7 @@ async def on_message(message: discord.Message):
                     except OSError:
                         pass
                 _renderer.rendered_images.clear()
+                _renderer.rendered_image_message_ids.clear()
 
         # Surface rejected attachments (P2): one short line per file with its
         # reason, instead of silently dropping. non-admin rejections are

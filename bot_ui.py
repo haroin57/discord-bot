@@ -375,6 +375,7 @@ class LiveRenderer:
         self._draft_msgs: list["discord.Message"] = []     # editable live-tail prose msgs
         self._placeholder: dict = {"msg": None}            # held open-block placeholder
         self._rendered_images: list[str] = []              # temp image paths to clean up
+        self._rendered_image_message_ids: dict[str, int] = {}
         self._first_reply = {"done": False}                # first content msg replies to user
         self._render_lock = asyncio.Lock()
 
@@ -410,6 +411,10 @@ class LiveRenderer:
     @property
     def rendered_images(self) -> list[str]:
         return self._rendered_images
+
+    @property
+    def rendered_image_message_ids(self) -> dict[str, int]:
+        return self._rendered_image_message_ids
 
     @property
     def tool_notice_task(self):
@@ -525,7 +530,9 @@ class LiveRenderer:
             self._rendered_images.append(img_path)
             f = discord.File(img_path)
             try:
-                await self._send_content(file=f)
+                sent = await self._send_content(file=f)
+                if sent is not None:
+                    self._rendered_image_message_ids[img_path] = sent.id
             finally:
                 f.close()
             return

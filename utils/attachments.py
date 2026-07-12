@@ -510,6 +510,37 @@ async def download_attachments(http_session: aiohttp.ClientSession, attachments:
     return [p for p in results if p]
 
 
+def attachment_metadata_by_path(attachments: list, paths: list[str]) -> dict[str, dict]:
+    """Recover Discord attachment metadata for downloaded local image paths.
+
+    ``_download_one`` deliberately names each file ``<attachment_id>.<ext>``.
+    This helper keeps the long-standing ``download_attachments -> list[str]``
+    contract while making the Discord snowflake and original filename explicit
+    for durable archives.
+    """
+    by_id: dict[str, object] = {}
+    for att in attachments:
+        attachment_id = getattr(att, "id", None)
+        if attachment_id is None:
+            continue
+        safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(attachment_id))[:64]
+        if safe_id:
+            by_id[safe_id] = att
+    result: dict[str, dict] = {}
+    for path in paths:
+        local_id = os.path.splitext(os.path.basename(path))[0]
+        att = by_id.get(local_id)
+        if att is None:
+            continue
+        result[path] = {
+            "attachment_id": str(getattr(att, "id")),
+            "original_name": getattr(att, "filename", None) or os.path.basename(path),
+            "content_type": getattr(att, "content_type", None),
+            "attachment_size": getattr(att, "size", None),
+        }
+    return result
+
+
 def _cleanup_attachments_sync(paths: list[str]) -> None:
     """Synchronous helper for cleanup_attachments; runs in a worker thread."""
     for p in paths:

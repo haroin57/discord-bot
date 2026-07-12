@@ -16,6 +16,7 @@ from utils.attachments import (
     cleanup_stale_attachments,
     download_attachments,
     download_text_attachments,
+    attachment_metadata_by_path,
     extract_file_paths,
     extract_image_paths,
     is_attach_ignored,
@@ -301,6 +302,30 @@ class TestDownloadAttachments:
             att = self._make_attachment(content_type=ct)
             # Just verify it's recognized as an image
             assert ct in IMAGE_CONTENT_TYPES
+
+    def test_attachment_metadata_is_explicitly_mapped_to_local_path(self, tmp_path):
+        att = self._make_attachment(
+            content_type="image/png",
+            size=1234,
+            filename="original chart.png",
+            att_id=987654321012345678,
+        )
+        path = str(tmp_path / "987654321012345678.png")
+
+        metadata = attachment_metadata_by_path([att], [path])
+
+        assert metadata[path] == {
+            "attachment_id": "987654321012345678",
+            "original_name": "original chart.png",
+            "content_type": "image/png",
+            "attachment_size": 1234,
+        }
+
+    def test_attachment_metadata_ignores_unmatched_paths(self, tmp_path):
+        att = self._make_attachment(att_id=123)
+        unmatched = str(tmp_path / "456.png")
+
+        assert attachment_metadata_by_path([att], [unmatched]) == {}
 
 
 class TestHostIsAllowed:
