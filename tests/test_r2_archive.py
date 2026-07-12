@@ -25,6 +25,14 @@ def _manifests(state: Path):
     return sorted((state / "r2_archive" / "pending").glob("*.json"))
 
 
+def _catalog_rows(state: Path, where: str = "1=1") -> list[dict]:
+    with sqlite3.connect(state / "r2_catalog.sqlite") as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in conn.execute(
+            f"SELECT * FROM objects WHERE {where} ORDER BY created_at, object_key"
+        )]
+
+
 def test_history_event_is_individually_queued(monkeypatch, tmp_path):
     state = _enable(monkeypatch, tmp_path)
     ref = r2.archive_history_entry(123456789012345, {
@@ -38,6 +46,7 @@ def test_history_event_is_individually_queued(monkeypatch, tmp_path):
     assert saved["content"] == "hello"
     assert saved["channel_id"] == 123456789012345
     assert saved["archive_event_id"]
+    assert (state / "r2_catalog.sqlite").stat().st_mode & 0o777 == 0o600
 
 
 def test_image_is_copied_before_source_cleanup_and_is_discoverable(monkeypatch, tmp_path):
@@ -58,6 +67,80 @@ def test_image_is_copied_before_source_cleanup_and_is_discoverable(monkeypatch, 
     recent = r2.recent_images(123456789012345)
     assert recent[0]["uri"] == ref.uri
     assert recent[0]["message_id"] == 987654321098765
+    assert recent[0]["request_message_id"] == 987654321098765
+    assert recent[0]["response_message_id"] is None
+    assert recent[0]["status"] == "pending"
+    assert recent[0]["retry_count"] == 0
+    assert recent[0]["sha256"] == ref.sha256
+
+
+def test_image_catalog_stores_attachment_and_separate_message_ids(monkeypatch, tmp_path):
+    state = _enable(monkeypatch, tmp_path)
+    image = tmp_path / "987654321012345678.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
+
+    ref = r2.archive_image(
+        image,
+        channel_id=123456789012345,
+        request_message_id=111111111111111,
+        response_message_id=222222222222222,
+        attachment_id=987654321012345678,
+        original_name="original chart.png",
+        direction="outbound-generated",
+    )
+
+    assert ref is not None
+    rows = _catalog_rows(state, "kind='image'")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["channel_id"] == 123456789012345
+    assert row["message_id"] == 222222222222222
+    assert row["request_message_id"] == 111111111111111
+    assert row["response_message_id"] == 222222222222222
+    assert row["attachment_id"] == "987654321012345678"
+    assert row["object_key"] == ref.key
+    assert row["sha256"] == ref.sha256
+    assert row["status"] == "pending"
+    assert row["retry_count"] == 0
+
+
+def test_bind_response_message_updates_catalog_and_pending_manifest(monkeypatch, tmp_path):
+    state = _enable(monkeypatch, tmp_path)
+    image = tmp_path / "generated.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
+    ref = r2.archive_image(
+        image,
+        channel_id=123456789012345,
+        request_message_id=111111111111111,
+        direction="outbound-generated",
+    )
+    assert ref is not None
+
+    assert r2.bind_response_message([ref], 222222222222222) == 1
+    row = _catalog_rows(state, "kind='image'")[0]
+    assert row["request_message_id"] == 111111111111111
+    assert row["response_message_id"] == 222222222222222
+    assert row["message_id"] == 222222222222222
+    manifest = next(
+        json.loads(path.read_text())
+        for path in _manifests(state)
+        if json.loads(path.read_text())["key"] == ref.key
+    )
+    assert manifest["metadata"]["request_message_id"] == 111111111111111
+    assert manifest["metadata"]["response_message_id"] == 222222222222222
+    metadata_manifest = next(
+        json.loads(path.read_text())
+        for path in _manifests(state)
+        if json.loads(path.read_text())["key"] == f"{ref.key}.metadata.json"
+    )
+    metadata_payload = json.loads(
+        (state / "r2_archive" / "pending" / metadata_manifest["payload"]).read_text()
+    )
+    assert metadata_payload["request_message_id"] == 111111111111111
+    assert metadata_payload["response_message_id"] == 222222222222222
+    companion = _catalog_rows(state, "kind='image_metadata'")[0]
+    assert companion["response_message_id"] == 222222222222222
+    assert companion["sha256"] == metadata_manifest["sha256"]
 
 
 def test_state_sync_uses_sqlite_backup_and_clean_layout(monkeypatch, tmp_path):
@@ -102,8 +185,10 @@ def test_flush_removes_successful_spool_items(monkeypatch, tmp_path):
     assert result["pending"] == 0
     assert calls[0][:3] == ["r2", "object", "put"]
     assert not list((state / "r2_archive" / "pending").glob("*"))
-    catalog = (state / "r2_archive" / "catalog.jsonl").read_text()
-    assert '"kind":"delivery"' in catalog
+    row = _catalog_rows(state, "kind='history_event'")[0]
+    assert row["status"] == "uploaded"
+    assert row["retry_count"] == 0
+    assert row["uploaded_at"] is not None
 
 
 def test_recent_image_reports_uploaded_after_delivery(monkeypatch, tmp_path):
@@ -124,6 +209,107 @@ def test_recent_image_reports_uploaded_after_delivery(monkeypatch, tmp_path):
     )
     r2.flush_pending_once(limit=10)
     assert r2.recent_images(123456789012345)[0]["upload_status"] == "uploaded"
+
+
+def test_failed_upload_records_retry_status(monkeypatch, tmp_path):
+    state = _enable(monkeypatch, tmp_path)
+    ref = r2.archive_history_entry(
+        123456789012345, {"role": "user", "content": "x"}
+    )
+    assert ref is not None
+    monkeypatch.setattr(
+        r2,
+        "_run_wrangler",
+        lambda args, timeout=None: subprocess.CompletedProcess(
+            args, 1, stdout="", stderr="network unavailable"
+        ),
+    )
+
+    result = r2.flush_pending_once(limit=10)
+
+    assert result["failed"] == 1
+    row = _catalog_rows(state, f"object_key='{ref.key}'")[0]
+    assert row["status"] == "retry_wait"
+    assert row["retry_count"] == 1
+    assert row["last_error"] == "network unavailable"
+
+    manifest_path = _manifests(state)[0]
+    manifest = json.loads(manifest_path.read_text())
+    manifest["next_attempt_at"] = 0
+    manifest_path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(
+        r2,
+        "_run_wrangler",
+        lambda args, timeout=None: subprocess.CompletedProcess(
+            args, 0, stdout="ok", stderr=""
+        ),
+    )
+    success = r2.flush_pending_once(limit=10)
+    assert success["uploaded"] == 1
+    delivered = _catalog_rows(state, f"object_key='{ref.key}'")[0]
+    assert delivered["status"] == "uploaded"
+    assert delivered["retry_count"] == 1
+    assert delivered["last_error"] is None
+
+
+def test_legacy_jsonl_catalog_is_migrated_once(monkeypatch, tmp_path):
+    state = _enable(monkeypatch, tmp_path)
+    legacy_dir = state / "r2_archive"
+    legacy_dir.mkdir()
+    key = "bot/v1/images/123/2026/07/12/456/inbound/hash-789.png"
+    legacy_rows = [
+        {
+            "bucket": "test-bucket",
+            "key": key,
+            "kind": "image",
+            "sha256": "abc123",
+            "size": 42,
+            "content_type": "image/png",
+            "created_at": "2026-07-12T00:00:00.000Z",
+            "channel_id": 123,
+            "message_id": 456,
+            "direction": "inbound",
+            "metadata": {
+                "channel_id": 123,
+                "message_id": 456,
+                "original_name": "789.png",
+            },
+        },
+        {"kind": "delivery", "key": key},
+    ]
+    (legacy_dir / "catalog.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in legacy_rows)
+    )
+
+    first = r2.recent_images(123)
+    second = r2.recent_images(123)
+
+    assert len(first) == len(second) == 1
+    assert first[0]["attachment_id"] == "789"
+    assert first[0]["request_message_id"] == 456
+    assert first[0]["response_message_id"] is None
+    assert first[0]["status"] == "uploaded"
+    with sqlite3.connect(state / "r2_catalog.sqlite") as conn:
+        assert conn.execute("SELECT count(*) FROM objects").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT count(*) FROM catalog_meta WHERE key='legacy_jsonl_migrated'"
+        ).fetchone()[0] == 1
+
+
+def test_sqlite_fingerprint_includes_wal_changes(monkeypatch, tmp_path):
+    _enable(monkeypatch, tmp_path)
+    db_path = tmp_path / "catalog.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE items(value TEXT)")
+        first = r2._fingerprint(db_path)
+        conn.execute("INSERT INTO items VALUES ('changed')")
+        conn.commit()
+        second = r2._fingerprint(db_path)
+
+    assert "wal:" in second
+    assert second != first
 
 
 def test_fetch_accepts_own_uri_and_rejects_other_prefix(monkeypatch, tmp_path):

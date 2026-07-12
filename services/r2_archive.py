@@ -36,7 +36,6 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import deque
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -71,6 +70,9 @@ class R2ObjectRef:
     created_at: str
     channel_id: int | None = None
     message_id: int | None = None
+    request_message_id: int | None = None
+    response_message_id: int | None = None
+    attachment_id: str | None = None
     direction: str | None = None
 
     @property
@@ -108,8 +110,219 @@ def _catalog_path() -> Path:
     return _spool_dir() / "catalog.jsonl"
 
 
+def _catalog_db_path() -> Path:
+    return Path(config.STATE_DIR) / "r2_catalog.sqlite"
+
+
 def _state_index_path() -> Path:
     return _spool_dir() / "state_index.json"
+
+
+_CATALOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS objects (
+    object_key TEXT PRIMARY KEY,
+    bucket TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    channel_id INTEGER,
+    message_id INTEGER,
+    request_message_id INTEGER,
+    response_message_id INTEGER,
+    attachment_id TEXT,
+    sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    content_type TEXT NOT NULL,
+    original_name TEXT,
+    direction TEXT,
+    source TEXT,
+    status TEXT NOT NULL,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    uploaded_at TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_r2_objects_channel_created
+    ON objects(channel_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_r2_objects_message
+    ON objects(channel_id, message_id);
+CREATE INDEX IF NOT EXISTS idx_r2_objects_attachment
+    ON objects(attachment_id);
+CREATE INDEX IF NOT EXISTS idx_r2_objects_status
+    ON objects(status, updated_at);
+CREATE TABLE IF NOT EXISTS catalog_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+
+def _infer_attachment_id(name: str | None) -> str | None:
+    stem = Path(name or "").stem
+    return stem if stem.isdigit() else None
+
+
+def _connect_catalog() -> sqlite3.Connection:
+    path = _catalog_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    conn = sqlite3.connect(path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.executescript(_CATALOG_SCHEMA)
+    _migrate_legacy_catalog(conn)
+    for catalog_file in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        try:
+            os.chmod(catalog_file, 0o600)
+        except FileNotFoundError:
+            pass
+    return conn
+
+
+def _migrate_legacy_catalog(conn: sqlite3.Connection) -> None:
+    marker = conn.execute(
+        "SELECT value FROM catalog_meta WHERE key='legacy_jsonl_migrated'"
+    ).fetchone()
+    if marker:
+        return
+    legacy = _catalog_path()
+    rows: list[dict[str, Any]] = []
+    if legacy.is_file():
+        try:
+            with legacy.open(encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(row, dict):
+                        rows.append(row)
+        except OSError as exc:
+            log.warning("R2 legacy catalog read failed: %s", exc)
+    delivered = {
+        str(row.get("key"))
+        for row in rows
+        if row.get("kind") == "delivery" and row.get("key")
+    }
+    for row in rows:
+        key = row.get("key")
+        if not key or row.get("kind") == "delivery":
+            continue
+        meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        old_message_id = row.get("message_id") or meta.get("message_id")
+        original_name = meta.get("original_name")
+        attachment_id = meta.get("attachment_id") or _infer_attachment_id(original_name)
+        created_at = str(row.get("created_at") or _iso_now())
+        status = "uploaded" if str(key) in delivered else "pending"
+        conn.execute(
+            """
+            INSERT INTO objects (
+                object_key, bucket, kind, channel_id, message_id,
+                request_message_id, response_message_id, attachment_id,
+                sha256, size, content_type, original_name, direction, source,
+                status, retry_count, created_at, updated_at, uploaded_at,
+                metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+            ON CONFLICT(object_key) DO NOTHING
+            """,
+            (
+                str(key), str(row.get("bucket") or _bucket()),
+                str(row.get("kind") or "unknown"), row.get("channel_id"),
+                old_message_id, old_message_id, str(attachment_id) if attachment_id else None,
+                str(row.get("sha256") or ""), int(row.get("size") or 0),
+                str(row.get("content_type") or "application/octet-stream"),
+                original_name, row.get("direction"), meta.get("source"), status,
+                created_at, created_at, created_at if status == "uploaded" else None,
+                json.dumps(meta, ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+    conn.execute(
+        "INSERT OR REPLACE INTO catalog_meta(key, value) VALUES('legacy_jsonl_migrated', ?)",
+        (_iso_now(),),
+    )
+    conn.commit()
+
+
+def _catalog_upsert_ref(
+    ref: R2ObjectRef,
+    metadata: dict[str, Any],
+    *,
+    status: str = "pending",
+) -> None:
+    now = _iso_now()
+    with _connect_catalog() as conn:
+        conn.execute(
+            """
+            INSERT INTO objects (
+                object_key, bucket, kind, channel_id, message_id,
+                request_message_id, response_message_id, attachment_id,
+                sha256, size, content_type, original_name, direction, source,
+                status, retry_count, last_error, created_at, updated_at,
+                uploaded_at, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, NULL, ?)
+            ON CONFLICT(object_key) DO UPDATE SET
+                bucket=excluded.bucket,
+                kind=excluded.kind,
+                channel_id=excluded.channel_id,
+                message_id=COALESCE(
+                    excluded.response_message_id,
+                    objects.response_message_id,
+                    excluded.message_id,
+                    objects.message_id
+                ),
+                request_message_id=excluded.request_message_id,
+                response_message_id=COALESCE(excluded.response_message_id, objects.response_message_id),
+                attachment_id=COALESCE(excluded.attachment_id, objects.attachment_id),
+                sha256=excluded.sha256,
+                size=excluded.size,
+                content_type=excluded.content_type,
+                original_name=COALESCE(excluded.original_name, objects.original_name),
+                direction=COALESCE(excluded.direction, objects.direction),
+                source=COALESCE(excluded.source, objects.source),
+                status=excluded.status,
+                retry_count=objects.retry_count,
+                last_error=objects.last_error,
+                updated_at=excluded.updated_at,
+                uploaded_at=objects.uploaded_at,
+                metadata_json=excluded.metadata_json
+            """,
+            (
+                ref.key, ref.bucket, ref.kind, ref.channel_id, ref.message_id,
+                ref.request_message_id, ref.response_message_id, ref.attachment_id,
+                ref.sha256, ref.size, ref.content_type,
+                metadata.get("original_name"), ref.direction, metadata.get("source"),
+                status, ref.created_at, now,
+                json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+
+
+def _catalog_mark_delivery(manifest: dict[str, Any]) -> None:
+    now = _iso_now()
+    with _connect_catalog() as conn:
+        conn.execute(
+            """
+            UPDATE objects
+               SET status='uploaded', uploaded_at=?, updated_at=?, last_error=NULL
+             WHERE object_key=?
+            """,
+            (now, now, manifest.get("key")),
+        )
+
+
+def _catalog_mark_failure(
+    manifest: dict[str, Any], *, status: str, attempts: int, error: str,
+) -> None:
+    with _connect_catalog() as conn:
+        conn.execute(
+            """
+            UPDATE objects
+               SET status=?, retry_count=?, last_error=?, updated_at=?
+             WHERE object_key=?
+            """,
+            (status, attempts, error[-1000:], _iso_now(), manifest.get("key")),
+        )
 
 
 @contextmanager
@@ -211,18 +424,6 @@ def _sqlite_backup_atomic(source: Path, target: Path) -> None:
         raise
 
 
-def _append_catalog(record: dict[str, Any]) -> None:
-    path = _catalog_path()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
-    fd = os.open(path, flags, 0o600)
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-
-
 def _queue_payload(
     *,
     key: str,
@@ -275,6 +476,10 @@ def _queue_payload(
         digest = _sha256_file(payload_path)
         size = payload_path.stat().st_size
         meta = dict(metadata or {})
+        request_message_id = meta.get("request_message_id")
+        response_message_id = meta.get("response_message_id")
+        message_id = meta.get("message_id") or response_message_id or request_message_id
+        attachment_id = meta.get("attachment_id")
         ref = R2ObjectRef(
             bucket=_bucket(),
             key=key,
@@ -284,7 +489,10 @@ def _queue_payload(
             content_type=content_type,
             created_at=created_at,
             channel_id=meta.get("channel_id"),
-            message_id=meta.get("message_id"),
+            message_id=message_id,
+            request_message_id=request_message_id,
+            response_message_id=response_message_id,
+            attachment_id=str(attachment_id) if attachment_id is not None else None,
             direction=meta.get("direction"),
         )
         manifest = {
@@ -303,7 +511,13 @@ def _queue_payload(
             "metadata": meta,
         }
         atomic_write_json(manifest_path, manifest, indent=None)
-        _append_catalog({**asdict(ref), "uri": ref.uri, "metadata": meta})
+        try:
+            _catalog_upsert_ref(ref, meta)
+        except sqlite3.Error as exc:
+            # The spool manifest remains authoritative for delivery.  A later
+            # flush retries the catalog upsert before upload, so an index lock
+            # cannot make a downloaded Discord attachment disappear.
+            log.warning("R2 catalog staging failed; manifest retained: %s", exc)
         return ref
 
 
@@ -351,7 +565,11 @@ def archive_image(
     path: str | os.PathLike[str],
     *,
     channel_id: int,
-    message_id: int,
+    message_id: int | None = None,
+    request_message_id: int | None = None,
+    response_message_id: int | None = None,
+    attachment_id: int | str | None = None,
+    original_name: str | None = None,
     direction: str,
     author_id: int | None = None,
     source: str = "discord",
@@ -366,20 +584,29 @@ def archive_image(
     if not content_type.startswith("image/"):
         raise ValueError(f"not an image: {image_path}")
     direction = _safe_component(direction, fallback="unknown", limit=24)
+    request_message_id = request_message_id or message_id
+    canonical_message_id = response_message_id or request_message_id
+    if canonical_message_id is None:
+        raise ValueError("request_message_id or response_message_id is required")
     now = _utc_now()
     digest = _sha256_file(image_path)
-    filename = _safe_component(image_path.name, fallback=f"image{image_path.suffix}")
+    filename = _safe_component(
+        original_name or image_path.name, fallback=f"image{image_path.suffix}"
+    )
     key = (
-        f"{_prefix()}/images/{channel_id}/{now:%Y/%m/%d}/{message_id}/"
+        f"{_prefix()}/images/{channel_id}/{now:%Y/%m/%d}/{canonical_message_id}/"
         f"{direction}/{digest[:20]}-{filename}"
     )
     metadata = {
         "channel_id": channel_id,
-        "message_id": message_id,
+        "message_id": canonical_message_id,
+        "request_message_id": request_message_id,
+        "response_message_id": response_message_id,
+        "attachment_id": str(attachment_id) if attachment_id is not None else None,
         "direction": direction,
         "author_id": author_id,
         "source": source,
-        "original_name": image_path.name,
+        "original_name": original_name or image_path.name,
     }
     ref = _queue_payload(
         key=key,
@@ -401,20 +628,28 @@ def archive_images(
     paths: Iterable[str | os.PathLike[str]],
     *,
     channel_id: int,
-    message_id: int,
+    message_id: int | None = None,
+    request_message_id: int | None = None,
+    response_message_id: int | None = None,
     direction: str,
     author_id: int | None = None,
     source: str = "discord",
+    per_path_metadata: dict[str, dict[str, Any]] | None = None,
 ) -> list[R2ObjectRef]:
     refs: list[R2ObjectRef] = []
     if not is_enabled():
         return refs
     for path in dict.fromkeys(str(p) for p in paths):
         try:
+            extra = (per_path_metadata or {}).get(path, {})
             ref = archive_image(
                 path,
                 channel_id=channel_id,
                 message_id=message_id,
+                request_message_id=extra.get("request_message_id", request_message_id),
+                response_message_id=extra.get("response_message_id", response_message_id),
+                attachment_id=extra.get("attachment_id"),
+                original_name=extra.get("original_name"),
                 direction=direction,
                 author_id=author_id,
                 source=source,
@@ -424,6 +659,95 @@ def archive_images(
         except (OSError, ValueError) as exc:
             log.warning("R2 image staging failed for %s: %s", path, exc)
     return refs
+
+
+def bind_response_message(
+    refs: Iterable[R2ObjectRef], response_message_id: int | None,
+) -> int:
+    """Attach the actual Discord bot reply ID after a successful send."""
+    if response_message_id is None:
+        return 0
+    image_keys = [ref.key for ref in refs]
+    if not image_keys:
+        return 0
+    keys = image_keys + [f"{key}.metadata.json" for key in image_keys]
+    payload_updates = _bind_pending_manifest_response(keys, response_message_id)
+    with _connect_catalog() as conn:
+        updated = 0
+        for key in keys:
+            row = conn.execute(
+                "SELECT metadata_json FROM objects WHERE object_key=?", (key,)
+            ).fetchone()
+            try:
+                metadata = json.loads(row[0] or "{}") if row else {}
+            except json.JSONDecodeError:
+                metadata = {}
+            metadata["response_message_id"] = response_message_id
+            metadata["message_id"] = response_message_id
+            digest, size = payload_updates.get(key, (None, None))
+            cursor = conn.execute(
+                """
+                UPDATE objects
+                   SET response_message_id=?, message_id=?, updated_at=?, metadata_json=?,
+                       sha256=COALESCE(?, sha256), size=COALESCE(?, size)
+                 WHERE object_key=?
+                """,
+                (
+                    response_message_id, response_message_id, _iso_now(),
+                    json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+                    digest, size, key,
+                ),
+            )
+            if key in image_keys:
+                updated += cursor.rowcount
+    return updated
+
+
+def _bind_pending_manifest_response(
+    keys: list[str], response_message_id: int,
+) -> dict[str, tuple[str, int]]:
+    wanted = set(keys)
+    pending = _pending_dir()
+    if not pending.exists():
+        return {}
+    payload_updates: dict[str, tuple[str, int]] = {}
+    for manifest_path in pending.glob("*.json"):
+        manifest = _load_queue_manifest(manifest_path)
+        if not manifest or manifest.get("key") not in wanted:
+            continue
+        metadata = manifest.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            manifest["metadata"] = metadata
+        metadata["response_message_id"] = response_message_id
+        metadata["message_id"] = response_message_id
+        if manifest.get("kind") == "image_metadata":
+            payload_name = Path(str(manifest.get("payload", ""))).name
+            payload_path = pending / payload_name
+            try:
+                payload = json.loads(payload_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    payload["response_message_id"] = response_message_id
+                    payload["message_id"] = response_message_id
+                    nested = payload.get("metadata")
+                    if not isinstance(nested, dict):
+                        nested = {}
+                        payload["metadata"] = nested
+                    nested["response_message_id"] = response_message_id
+                    nested["message_id"] = response_message_id
+                    atomic_write_json(payload_path, payload, indent=None)
+                    digest = _sha256_file(payload_path)
+                    size = payload_path.stat().st_size
+                    manifest["sha256"] = digest
+                    manifest["size"] = size
+                    payload_updates[str(manifest["key"])] = (digest, size)
+            except (OSError, json.JSONDecodeError) as exc:
+                log.warning(
+                    "R2 image metadata response binding failed for %s: %s",
+                    manifest.get("key"), exc,
+                )
+        atomic_write_json(manifest_path, manifest, indent=None)
+    return payload_updates
 
 
 def _state_path_excluded(relative: Path) -> bool:
@@ -441,7 +765,16 @@ def _state_path_excluded(relative: Path) -> bool:
 
 def _fingerprint(path: Path) -> str:
     stat = path.stat()
-    return f"{stat.st_size}:{stat.st_mtime_ns}"
+    parts = [f"{stat.st_size}:{stat.st_mtime_ns}"]
+    if path.suffix.lower() in _SQLITE_SUFFIXES:
+        wal_path = Path(f"{path}-wal")
+        try:
+            wal_stat = wal_path.stat()
+        except OSError:
+            pass
+        else:
+            parts.append(f"wal:{wal_stat.st_size}:{wal_stat.st_mtime_ns}")
+    return ":".join(parts)
 
 
 def _load_state_index() -> dict[str, str]:
@@ -605,6 +938,30 @@ def _load_queue_manifest(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _catalog_restore_from_manifest(manifest: dict[str, Any]) -> None:
+    meta = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {}
+    request_message_id = meta.get("request_message_id")
+    response_message_id = meta.get("response_message_id")
+    message_id = meta.get("message_id") or response_message_id or request_message_id
+    attachment_id = meta.get("attachment_id")
+    ref = R2ObjectRef(
+        bucket=str(manifest.get("bucket") or _bucket()),
+        key=str(manifest["key"]),
+        kind=str(manifest.get("kind") or "unknown"),
+        sha256=str(manifest.get("sha256") or ""),
+        size=int(manifest.get("size") or 0),
+        content_type=str(manifest.get("content_type") or "application/octet-stream"),
+        created_at=str(manifest.get("created_at") or _iso_now()),
+        channel_id=meta.get("channel_id"),
+        message_id=message_id,
+        request_message_id=request_message_id,
+        response_message_id=response_message_id,
+        attachment_id=str(attachment_id) if attachment_id is not None else None,
+        direction=meta.get("direction"),
+    )
+    _catalog_upsert_ref(ref, meta, status="pending")
+
+
 def flush_pending_once(*, limit: int | None = None) -> dict[str, Any]:
     """Upload one bounded batch from the durable spool."""
     if not is_enabled():
@@ -649,12 +1006,26 @@ def _flush_pending_once_locked(*, limit: int | None = None) -> dict[str, Any]:
             continue
         if float(manifest.get("next_attempt_at", 0.0) or 0.0) > now:
             continue
+        try:
+            _catalog_restore_from_manifest(manifest)
+        except sqlite3.Error as exc:
+            log.warning("R2 catalog recovery from manifest failed: %s", exc)
         payload_name = Path(str(manifest.get("payload", ""))).name
         payload_path = pending_dir / payload_name
         if not payload_path.is_file():
             manifest["last_error"] = "spool payload missing"
-            manifest["attempts"] = int(manifest.get("attempts", 0)) + 1
+            attempts = int(manifest.get("attempts", 0)) + 1
+            manifest["attempts"] = attempts
             atomic_write_json(manifest_path, manifest, indent=None)
+            try:
+                _catalog_mark_failure(
+                    manifest,
+                    status="missing_payload",
+                    attempts=attempts,
+                    error="spool payload missing",
+                )
+            except sqlite3.Error as exc:
+                log.warning("R2 catalog missing-payload update failed: %s", exc)
             failed += 1
             continue
         args = [
@@ -673,13 +1044,8 @@ def _flush_pending_once_locked(*, limit: int | None = None) -> dict[str, Any]:
             error = (result.stderr or result.stdout or "wrangler upload failed").strip()
         if result is not None and result.returncode == 0:
             try:
-                _append_catalog({
-                    "kind": "delivery",
-                    "key": manifest.get("key"),
-                    "source_kind": manifest.get("kind"),
-                    "uploaded_at": _iso_now(),
-                })
-            except OSError as exc:
+                _catalog_mark_delivery(manifest)
+            except sqlite3.Error as exc:
                 log.warning("R2 delivery catalog update failed: %s", exc)
             try:
                 manifest_path.unlink()
@@ -693,6 +1059,15 @@ def _flush_pending_once_locked(*, limit: int | None = None) -> dict[str, Any]:
         manifest["last_error"] = error[-1000:]
         manifest["next_attempt_at"] = time.time() + min(3600.0, 5.0 * (2 ** min(attempts, 9)))
         atomic_write_json(manifest_path, manifest, indent=None)
+        try:
+            _catalog_mark_failure(
+                manifest,
+                status="retry_wait",
+                attempts=attempts,
+                error=error,
+            )
+        except sqlite3.Error as exc:
+            log.warning("R2 catalog retry update failed: %s", exc)
         failed += 1
         log.warning("R2 upload deferred key=%s attempt=%d: %s", manifest.get("key"), attempts, error[-300:])
 
@@ -712,12 +1087,20 @@ def pending_status() -> dict[str, Any]:
             payload_bytes += path.stat().st_size
         except OSError:
             pass
+    catalog_rows = 0
+    try:
+        with _connect_catalog() as conn:
+            catalog_rows = int(conn.execute("SELECT count(*) FROM objects").fetchone()[0])
+    except sqlite3.Error:
+        pass
     return {
         "enabled": is_enabled(),
         "bucket": _bucket() if is_enabled() else None,
         "prefix": _prefix() if is_enabled() else None,
         "pending": len(manifests),
         "pending_bytes": payload_bytes,
+        "catalog_path": str(_catalog_db_path()),
+        "catalog_rows": catalog_rows,
     }
 
 
@@ -796,39 +1179,33 @@ def fetch_object(value: str, destination: str | os.PathLike[str]) -> Path:
 
 
 def recent_images(channel_id: int, *, limit: int = 10) -> list[dict[str, Any]]:
-    """Return newest locally catalogued image references for a channel."""
+    """Return newest SQLite-indexed image references for a channel."""
     limit = max(1, min(int(limit), 50))
     try:
-        with _catalog_path().open(encoding="utf-8") as f:
-            tail = deque(f, maxlen=5000)
-    except OSError:
+        with _connect_catalog() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM objects
+                 WHERE kind='image' AND channel_id=?
+                 ORDER BY created_at DESC, rowid DESC
+                 LIMIT ?
+                """,
+                (channel_id, limit),
+            ).fetchall()
+    except sqlite3.Error:
         return []
     results: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    delivered = {
-        row.get("key")
-        for line in tail
-        for row in [_parse_catalog_line(line)]
-        if row.get("kind") == "delivery" and row.get("key")
-    }
-    for line in reversed(tail):
-        row = _parse_catalog_line(line)
-        key = row.get("key")
-        if row.get("kind") != "image" or row.get("channel_id") != channel_id or not key:
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        row["upload_status"] = "uploaded" if key in delivered else "pending"
+    for sql_row in rows:
+        row = dict(sql_row)
+        try:
+            metadata = json.loads(row.pop("metadata_json") or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        row["key"] = row.pop("object_key")
+        row["metadata"] = metadata
+        row["uri"] = f"r2://{row['bucket']}/{row['key']}"
+        row["upload_status"] = (
+            "uploaded" if row.get("status") == "uploaded" else "pending"
+        )
         results.append(row)
-        if len(results) >= limit:
-            break
     return results
-
-
-def _parse_catalog_line(line: str) -> dict[str, Any]:
-    try:
-        row = json.loads(line)
-        return row if isinstance(row, dict) else {}
-    except json.JSONDecodeError:
-        return {}

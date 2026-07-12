@@ -70,6 +70,10 @@ discord-bot/v1/state/manifests/YYYY/MM/DD/<timestamp>.json
 - Discord内の画像確認・取得: 管理者用`/r2recent`と`/r2fetch`。
 - 即時状態同期: 管理者用`/r2sync`。
 - 無効化: `.env`で`R2_ARCHIVE_ENABLED=false`。
+- ローカル索引: `.state/r2_catalog.sqlite`。`objects`表で`channel_id`、`message_id`、
+  `request_message_id`、`response_message_id`、`attachment_id`、`object_key`、`sha256`、
+  `status`、`retry_count`を保持する。旧`.state/r2_archive/catalog.jsonl`は初回接続時に
+  一度だけ移行し、以後はSQLiteを正本とする。
 
 R2バケットは公開しない。画像の共有URLが必要な場合は、S3 API資格情報を別途発行して
 短時間のpresigned GET URLを生成する。資格情報やpresigned URLはJSONLへ保存しない。
