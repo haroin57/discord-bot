@@ -1947,7 +1947,7 @@ class TestParallelToolExecution:
         assert ids == ["t0", "t1", "t2"]
 
     @pytest.mark.asyncio
-    async def test_unsafe_batch_stays_sequential(self, watchdog):
+    async def test_mixed_batch_runs_safe_batch_before_unsafe_tool(self, watchdog):
         blocks = self._read_blocks(2) + [
             _block("tool_use", id="t9", name="Bash",
                    input={"command": "ls"}),
@@ -1965,7 +1965,9 @@ class TestParallelToolExecution:
             stall_watchdog=watchdog, api_client=client,
             model="claude-opus-4-6", extra_betas=[],
         )
-        assert state["peak"] == 1
+        # Consecutive safe tools are batched even when a later unsafe tool
+        # forces a sequential boundary.
+        assert state["peak"] >= 2
 
 
 class TestUsageObservability:

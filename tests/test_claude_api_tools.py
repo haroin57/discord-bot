@@ -87,7 +87,7 @@ class TestRead:
         with open(p, "w") as fh:
             fh.write("\n".join(f"line{i}" for i in range(READ_MAX_LINES + 50)))
         out = await execute_builtin_tool("Read", {"file_path": "long.txt"}, tmpdir_ctx)
-        assert "[truncated" in out
+        assert "[showing lines 1-2000 of 2050; continue with offset=2000]" in out
 
     @pytest.mark.asyncio
     async def test_read_rejects_escape_via_symlink(self, tmpdir_ctx_restricted):
@@ -137,6 +137,7 @@ class TestEdit:
         p = os.path.join(tmpdir_ctx.cwd, "f.txt")
         with open(p, "w") as fh:
             fh.write("foo bar baz")
+        await execute_builtin_tool("Read", {"file_path": "f.txt"}, tmpdir_ctx)
         await execute_builtin_tool(
             "Edit",
             {"file_path": "f.txt", "old_string": "bar", "new_string": "BAR"},
@@ -150,6 +151,7 @@ class TestEdit:
         p = os.path.join(tmpdir_ctx.cwd, "f.txt")
         with open(p, "w") as fh:
             fh.write("xx xx xx")
+        await execute_builtin_tool("Read", {"file_path": "f.txt"}, tmpdir_ctx)
         with pytest.raises(ValueError, match="occurs"):
             await execute_builtin_tool(
                 "Edit",
@@ -162,6 +164,7 @@ class TestEdit:
         p = os.path.join(tmpdir_ctx.cwd, "f.txt")
         with open(p, "w") as fh:
             fh.write("a a a")
+        await execute_builtin_tool("Read", {"file_path": "f.txt"}, tmpdir_ctx)
         await execute_builtin_tool(
             "Edit",
             {"file_path": "f.txt", "old_string": "a", "new_string": "b", "replace_all": True},
@@ -175,6 +178,7 @@ class TestEdit:
         p = os.path.join(tmpdir_ctx.cwd, "f.txt")
         with open(p, "w") as fh:
             fh.write("hello")
+        await execute_builtin_tool("Read", {"file_path": "f.txt"}, tmpdir_ctx)
         with pytest.raises(ValueError, match="not found"):
             await execute_builtin_tool(
                 "Edit",
@@ -266,7 +270,7 @@ class TestGrep:
         with open(p, "w") as fh:
             fh.write("def needle():\n    pass\n")
         out = await execute_builtin_tool(
-            "Grep", {"pattern": "needle"}, tmpdir_ctx,
+            "Grep", {"pattern": "needle", "output_mode": "content"}, tmpdir_ctx,
         )
         assert "needle" in out and ":1:" in out
 

@@ -176,10 +176,10 @@ class TestCompactChannelHistory:
         assert row["keep_tail_rows"] >= 1
         # success resets breaker state
         assert comp._compact_failures == {}
-        # the configured effort dial must reach the wire (default "medium"
-        # since the 2026-07-08 runtime optimization; env-tunable either way).
+        # The summary turn disables thinking to avoid spending reasoning
+        # tokens on a throwaway compaction response.
         _, kwargs = client.beta.messages.create.call_args
-        assert kwargs["output_config"] == {"effort": comp.HISTORY_COMPACT_EFFORT}
+        assert kwargs["thinking"] == {"type": "disabled"}
         assert kwargs["model"] == comp.HISTORY_COMPACT_MODEL
         assert "effort-2025-11-24" in kwargs["betas"]
 
