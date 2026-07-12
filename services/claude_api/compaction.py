@@ -136,8 +136,14 @@ def compact_threshold_tokens() -> int:
     pct = getattr(config, "HISTORY_COMPACT_PCT_OVERRIDE", 0) or 0
     if pct > 0:
         return max(_COMPACT_FLOOR_TOKENS, int(win * pct / 100.0))
-    reserve = int(getattr(config, "CLAUDE_MAX_TOKENS", 64000)) + _COMPACT_HEADROOM_TOKENS
-    return max(_COMPACT_FLOOR_TOKENS, min(win - reserve, win - 1000))
+    # free-code parity (autoCompact.ts getAutoCompactThreshold):
+    # window − min(model_max_output, 20K) − 13K buffer.
+    reserved_summary = min(
+        int(getattr(config, "CLAUDE_MAX_TOKENS", 64000)),
+        int(getattr(config, "RESERVED_SUMMARY_TOKENS", 20000)),
+    )
+    buffer = int(getattr(config, "AUTOCOMPACT_BUFFER_TOKENS", 13000))
+    return max(_COMPACT_FLOOR_TOKENS, min(win - reserved_summary - buffer, win - 1000))
 
 
 def proactive_hard_threshold_tokens() -> int:
@@ -150,11 +156,12 @@ def proactive_hard_threshold_tokens() -> int:
     before it can reach a boundary — the overflow/crash case the external
     review said must NOT be removed. Percent via PROACTIVE_COMPACT_HARD_PCT.
     """
-    import config
-    win = effective_context_window()
-    pct = getattr(config, "PROACTIVE_COMPACT_HARD_PCT", 97) or 97
-    # The in-loop fold is the HIGHER gate — never below the boundary trigger.
-    return max(int(win * pct / 100.0), compact_threshold_tokens())
+    # free-code parity: the CLI uses ONE threshold for both the boundary check
+    # and the per-turn in-loop check (autoCompactIfNeeded). Delegate so the
+    # in-loop fold fires at the same point as boundary compaction. The
+    # "once per request" cap (tool_loop proactive_compacted) and the
+    # rapid-refill breaker keep this from thrashing on a giant single turn.
+    return compact_threshold_tokens()
 
 
 def record_proactive_compaction(channel_id: int) -> None:
@@ -361,11 +368,13 @@ def wrap_summary(
     summary_text: str,
     transcript_path: str | None,
     kept_verbatim: bool,
+    auto_continue: bool = False,
 ) -> str:
     """Continuation wrapper around an extracted summary (binary fn X0$).
 
-    No "Continue the conversation…" leg: in this bot a fresh user turn always
-    follows the summary, so the model never has to self-resume.
+    ``auto_continue`` adds the free-code self-resume leg (prompt.ts:361-364,
+    suppressFollowUpQuestions=true) for AUTO compaction (boundary/in-loop),
+    where the fold happens mid-request. Manual /compact passes False.
     """
     out = f"{CONTINUATION_PREAMBLE}\n{extract_summary(summary_text)}"
     if transcript_path:
@@ -376,6 +385,14 @@ def wrap_summary(
         )
     if kept_verbatim:
         out += "\nRecent messages are preserved verbatim."
+    if auto_continue:
+        out += (
+            "\nContinue the conversation from where it left off without asking "
+            "the user any further questions. Resume directly — do not "
+            "acknowledge the summary, do not recap what was happening, do not "
+            "preface with \"I'll continue\" or similar. Pick up the last task "
+            "as if the break never happened."
+        )
     return out
 
 
@@ -585,6 +602,8 @@ async def compact_channel_history(
     status_callback=None,
     *,
     force: bool = False,
+    custom_instructions: str | None = None,
+    auto_continue: bool = True,
 ) -> "CompactionResult | None":
     """Serialized (per channel) entry point — see _compact_channel_history.
 
@@ -597,6 +616,7 @@ async def compact_channel_history(
     async with _channel_lock(channel_id):
         return await _compact_channel_history(
             channel_id, api_client, status_callback, force=force,
+            custom_instructions=custom_instructions, auto_continue=auto_continue,
         )
 
 
@@ -606,6 +626,8 @@ async def _compact_channel_history(
     status_callback=None,
     *,
     force: bool = False,
+    custom_instructions: str | None = None,
+    auto_continue: bool = True,
 ) -> "CompactionResult | None":
     """Summarize the older replay window into a compact-summary JSONL row.
 
@@ -701,12 +723,23 @@ async def _compact_channel_history(
         # regardless of actual quota (observed 2026-06-13: every compaction
         # 429'd while same-minute main-loop calls returned 200 — compaction
         # had never succeeded in production).
+        def _build_summary_content(_flat: str) -> str:
+            _c = (
+                "Here is the conversation transcript to summarize:\n\n"
+                f"{_flat}\n\n{COMPACT_INSTRUCTIONS}"
+            )
+            # free-code /compact parity: focus instructions after the base
+            # prompt (prompt.ts:296-298 "Additional Instructions").
+            if custom_instructions and custom_instructions.strip():
+                _c += (
+                    "\n\nAdditional focus instructions for this compaction:\n"
+                    f"{custom_instructions.strip()}"
+                )
+            return _c
+
         compact_messages = [{
             "role": "user",
-            "content": (
-                "Here is the conversation transcript to summarize:\n\n"
-                f"{flat}\n\n{COMPACT_INSTRUCTIONS}"
-            ),
+            "content": _build_summary_content(flat),
         }]
         compact_system = [
             {"type": "text",
@@ -717,16 +750,43 @@ async def _compact_channel_history(
                                "scope": "global"}},
             {"type": "text", "text": COMPACT_SYSTEM_PROMPT},
         ]
-        resp = await api_client.beta.messages.create(
-            model=HISTORY_COMPACT_MODEL,
-            max_tokens=MAX_SUMMARY_OUTPUT_TOKENS,
-            system=compact_system,
-            messages=compact_messages,
-            betas=MODEL_BETAS,
-            metadata=get_metadata(),
-            thinking=THINKING_CONFIG,
-            output_config={"effort": HISTORY_COMPACT_EFFORT},
-        )
+        # free-code parity: thinking disabled for the summary turn
+        # (compact.ts:1329 streaming path) — the summary needs no reasoning
+        # channel, and adaptive thinking was the bulk of the 4-8min runtimes.
+        # PTL retry (truncateHeadForPTLRetry, compact.ts:262,479-509): if the
+        # summary request itself is prompt-too-long, drop the oldest half and
+        # retry up to 3 times.
+        _ptl_attempts = 0
+        while True:
+            try:
+                resp = await api_client.beta.messages.create(
+                    model=HISTORY_COMPACT_MODEL,
+                    max_tokens=MAX_SUMMARY_OUTPUT_TOKENS,
+                    system=compact_system,
+                    messages=compact_messages,
+                    betas=MODEL_BETAS,
+                    metadata=get_metadata(),
+                    thinking={"type": "disabled"},
+                )
+                break
+            except Exception as _exc:  # noqa: BLE001
+                _low = str(_exc).lower()
+                _is_ptl = (
+                    "prompt is too long" in _low
+                    or "prompt too long" in _low
+                    or getattr(_exc, "status_code", None) == 413
+                )
+                if _is_ptl and _ptl_attempts < 3 and len(flat) > 40000:
+                    _ptl_attempts += 1
+                    flat = flat[len(flat) // 2:]  # drop the oldest half
+                    compact_messages[0]["content"] = _build_summary_content(flat)
+                    log.warning(
+                        "[ch=%d] compaction PTL retry %d/3: halved summary "
+                        "input to %d chars",
+                        channel_id, _ptl_attempts, len(flat),
+                    )
+                    continue
+                raise
         text = "".join(
             getattr(block, "text", "")
             for block in (resp.content or [])
@@ -824,6 +884,7 @@ async def _compact_channel_history(
         text,
         transcript_path=history_file_path(channel_id),
         kept_verbatim=bool(tail_rows),
+        auto_continue=auto_continue,
     )
     row = {
         "role": "user",

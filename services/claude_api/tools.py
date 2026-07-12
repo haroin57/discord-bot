@@ -123,6 +123,9 @@ class ToolContext:
     # ファイルにしない理由: チャンネル永続だと stale 内容が次依頼を汚染し、
     # マルチ admin で衝突し、JSONL/Mem0 と真実が三重化するため。
     scratchpad: dict[str, str] = field(default_factory=dict)
+    # free-code parity: Read が読んだファイルの mtime を記録し、Write/Edit の
+    # read-before-edit 検査（未Read書込・外部変更後の盲目書込の拒否）に使う。
+    read_state: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -166,7 +169,7 @@ def _resolve_under(cwd: str, path: str, *, restricted: bool = True) -> str:
 # ---------------------------------------------------------------------------
 # Read
 # ---------------------------------------------------------------------------
-def _read_file_sync(path: str) -> str:
+def _read_file_sync(path: str, offset: int = 0, limit: int | None = None) -> str:
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         st = os.fstat(fd)
@@ -185,10 +188,65 @@ def _read_file_sync(path: str) -> str:
                 pass
     text = data.decode("utf-8", errors="replace")
     lines = text.splitlines(keepends=True)
-    if len(lines) > READ_MAX_LINES:
-        head = "".join(lines[:READ_MAX_LINES])
-        return head + f"\n[truncated at {READ_MAX_LINES} lines]"
-    return text
+    total = len(lines)
+    start = max(0, int(offset or 0))
+    if total and start >= total:
+        raise ValueError(f"offset {start} is beyond end of file ({total} lines)")
+    win = min(int(limit), READ_MAX_LINES) if limit else READ_MAX_LINES
+    window = lines[start:start + win]
+    out = "".join(window)
+    end = start + len(window)
+    if end < total:
+        out += (
+            f"\n[showing lines {start + 1}-{end} of {total}; "
+            f"continue with offset={end}]"
+        )
+    return out
+
+
+def _read_full_for_edit(path: str) -> str:
+    """Edit 用の非切り詰め読み込み（free-code差分監査で発見した潜在バグの修正:
+    従来は _read_file_sync の 2000 行切りの内容がそのまま書き戻され、大きい
+    ファイルの Edit がデータ損失になり得た）。cap 超過は編集自体を拒否する。"""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if st.st_size > READ_MAX_BYTES:
+            raise ValueError(
+                f"file too large to edit safely: {st.st_size} bytes > "
+                f"{READ_MAX_BYTES} cap",
+            )
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            data = fh.read()
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return data.decode("utf-8", errors="replace")
+
+
+def _check_read_before_write(path: str, ctx: "ToolContext") -> None:
+    """free-code parity: 既存ファイルは Read 済みでないと Write/Edit 不可。
+    Read 後に外部変更（mtime 前進）があれば再 Read を要求（文言は本家原文）。"""
+    if not os.path.exists(path):
+        return  # 新規作成は Read 不要（本家同様）
+    recorded = ctx.read_state.get(path)
+    if recorded is None:
+        raise ValueError(
+            "File has not been read yet. Read it first before writing to it.",
+        )
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return
+    if mtime > recorded:
+        raise ValueError(
+            "File has been modified since read, either by the user or by a "
+            "linter. Read it again before attempting to write it.",
+        )
 
 
 def _read_image_sync(path: str) -> list[dict]:
@@ -366,7 +424,16 @@ async def _tool_read(args: dict, ctx: ToolContext) -> "str | list[dict]":
     ext = os.path.splitext(path)[1].lower()
     if ext in _IMAGE_EXTENSIONS:
         return await asyncio.to_thread(_read_image_sync, path)
-    return await asyncio.to_thread(_read_file_sync, path)
+    result = await asyncio.to_thread(
+        _read_file_sync, path,
+        int(args.get("offset") or 0),
+        int(args.get("limit") or 0) or None,
+    )
+    try:
+        ctx.read_state[path] = os.path.getmtime(path)
+    except OSError:
+        pass
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +474,12 @@ async def _tool_write(args: dict, ctx: ToolContext) -> str:
     if content is None:
         raise ValueError("content is required")
     path = _resolve_under(ctx.cwd, raw_path, restricted=ctx.restricted)
+    _check_read_before_write(path, ctx)
     n = await asyncio.to_thread(_write_file_sync, path, content)
+    try:
+        ctx.read_state[path] = os.path.getmtime(path)
+    except OSError:
+        pass
     return f"wrote {n} bytes to {path}"
 
 
@@ -424,7 +496,8 @@ async def _tool_edit(args: dict, ctx: ToolContext) -> str:
     if old == new:
         raise ValueError("old_string and new_string are identical")
     path = _resolve_under(ctx.cwd, raw_path, restricted=ctx.restricted)
-    content = await asyncio.to_thread(_read_file_sync, path)
+    _check_read_before_write(path, ctx)
+    content = await asyncio.to_thread(_read_full_for_edit, path)
     occurrences = content.count(old)
     if occurrences == 0:
         raise ValueError(f"old_string not found in {path}")
@@ -435,6 +508,10 @@ async def _tool_edit(args: dict, ctx: ToolContext) -> str:
         )
     updated = content.replace(old, new) if replace_all else content.replace(old, new, 1)
     n = await asyncio.to_thread(_write_file_sync, path, updated)
+    try:
+        ctx.read_state[path] = os.path.getmtime(path)
+    except OSError:
+        pass
     return f"edited {path} ({occurrences} replacement{'s' if occurrences != 1 else ''}, {n} bytes)"
 
 
@@ -520,6 +597,23 @@ async def _tool_second_opinion(args: dict, ctx: ToolContext) -> str:
     return await get_second_opinions(
         question, context=str(args.get("context") or ""),
     )
+
+
+# Skill 呼び出し — free-code SkillTool の移植（services/claude_api/skills.py 参照）。
+# SKILL.md 本文を tool_result として返し、以後のループの指示書にする。
+from services.claude_api.skills import (  # noqa: E402
+    build_invocation as _skill_build_invocation,
+    format_listing as _skill_format_listing,
+)
+
+
+async def _tool_skill(args: dict, ctx: ToolContext) -> str:
+    if ctx.restricted:
+        raise ValueError("Skill tool is not available in restricted mode")
+    name = str(args.get("skill") or "").strip()
+    if not name:
+        raise ValueError("skill is required")
+    return _skill_build_invocation(name, str(args.get("args") or ""))
 
 
 async def _tool_todo_write(args: dict, ctx: ToolContext) -> str:
@@ -609,6 +703,11 @@ async def _tool_bash(args: dict, ctx: ToolContext) -> str:
     # The model-supplied timeout is honored up to BASH_MAX_TIMEOUT_S (CLI
     # parity: default and max are independent). Values are SECONDS.
     timeout_s = float(args.get("timeout", BASH_DEFAULT_TIMEOUT_S))
+    # free-code (本家CLI) は timeout を **ミリ秒** で受ける。モデルがその癖で
+    # 30000（30秒のつもり）を渡すと秒解釈では 600s クランプ＝意図の20倍待つ。
+    # 正当な秒指定の上限(600)を大きく超える 3600 超は ms とみなして変換する。
+    if timeout_s > 3600:
+        timeout_s = timeout_s / 1000.0
     timeout_s = max(1.0, min(timeout_s, BASH_MAX_TIMEOUT_S))
 
     proc = await asyncio.create_subprocess_exec(
@@ -708,11 +807,24 @@ async def _tool_glob(args: dict, ctx: ToolContext) -> str:
 # ---------------------------------------------------------------------------
 # Grep
 # ---------------------------------------------------------------------------
-async def _grep_via_rg(cwd: str, pattern: str, glob: str | None) -> str:
-    cmd = ["rg", "-n", "--no-heading", "--color=never", pattern]
+async def _grep_via_rg(
+    cwd: str, pattern: str, glob: str | None,
+    mode: str = "content", context: int = 0, case_insensitive: bool = False,
+) -> str:
+    cmd = ["rg", "--no-heading", "--color=never"]
+    if mode == "files_with_matches":
+        cmd.append("-l")
+    elif mode == "count":
+        cmd.append("-c")
+    else:
+        cmd.append("-n")
+        if context:
+            cmd.extend(["-C", str(int(context))])
+    if case_insensitive:
+        cmd.append("-i")
     if glob:
         cmd.extend(["-g", glob])
-    cmd.append(".")
+    cmd.extend(["--", pattern, "."])
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -727,8 +839,11 @@ async def _grep_via_rg(cwd: str, pattern: str, glob: str | None) -> str:
     return "\n".join(lines) if lines else "(no matches)"
 
 
-def _grep_python(cwd: str, pattern: str, glob: str | None) -> str:
-    rx = re.compile(pattern)
+def _grep_python(
+    cwd: str, pattern: str, glob: str | None,
+    mode: str = "content", case_insensitive: bool = False,
+) -> str:
+    rx = re.compile(pattern, re.IGNORECASE if case_insensitive else 0)
     results: list[str] = []
     base = Path(cwd)
     iterator = base.rglob(glob) if glob else base.rglob("*")
@@ -751,10 +866,41 @@ async def _tool_grep(args: dict, ctx: ToolContext) -> str:
     pattern = args.get("pattern")
     if not pattern:
         raise ValueError("pattern is required")
+    mode = str(args.get("output_mode") or "files_with_matches")
+    if mode not in ("content", "files_with_matches", "count"):
+        raise ValueError(
+            "output_mode must be one of content/files_with_matches/count",
+        )
+    raw_head = args.get("head_limit")
+    head_limit = 250 if raw_head is None else max(0, int(raw_head))
+    context = int(args.get("context") or 0)
+    ci = bool(args.get("case_insensitive"))
     glob = args.get("glob")
-    if shutil.which("rg"):
-        return await _grep_via_rg(ctx.cwd, pattern, glob)
-    return await asyncio.to_thread(_grep_python, ctx.cwd, pattern, glob)
+    try:
+        out = await _grep_via_rg(ctx.cwd, pattern, glob, mode, context, ci)
+    except FileNotFoundError:
+        out = await asyncio.to_thread(_grep_python, ctx.cwd, pattern, glob, mode, ci)
+        if mode == "files_with_matches":
+            files = []
+            for ln in out.splitlines():
+                f = ln.split(":", 1)[0]
+                if f and not f.startswith("(") and f not in files:
+                    files.append(f)
+            out = "\n".join(files) if files else "(no matches)"
+        elif mode == "count":
+            counts: dict[str, int] = {}
+            for ln in out.splitlines():
+                f = ln.split(":", 1)[0]
+                if f and not f.startswith("("):
+                    counts[f] = counts.get(f, 0) + 1
+            out = "\n".join(f"{k}:{v}" for k, v in counts.items()) or "(no matches)"
+    lines = out.splitlines()
+    if head_limit and len(lines) > head_limit:
+        lines = lines[:head_limit] + [
+            f"[limited to first {head_limit} lines; pass head_limit=0 for "
+            "all, or refine the pattern / use output_mode=count]"
+        ]
+    return "\n".join(lines) if lines else "(no matches)"
 
 
 # ---------------------------------------------------------------------------
@@ -987,6 +1133,51 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
         },
         handler=_tool_scratchpad,
     ),
+    # free-code (Claude Code CLI) SkillTool 移植。description の前半は本家
+    # tools/SkillTool/prompt.ts の getPrompt 原文、一覧は本家が system-reminder
+    # に注入するのを bot 構造に合わせて description 埋め込みへ変更（import 時に
+    # 確定 = skills 追加は bot 再起動で反映。本文は呼び出し毎に再読込）。
+    "Skill": ToolDef(
+        name="Skill",
+        description=(
+            "Execute a skill within the main conversation\n\n"
+            "When users ask you to perform tasks, check if any of the "
+            "available skills match. Skills provide specialized capabilities "
+            "and domain knowledge.\n\n"
+            "When users reference a \"slash command\" or \"/<something>\", "
+            "they are referring to a skill. Use this tool to invoke it.\n\n"
+            "How to invoke:\n"
+            "- Use this tool with the skill name and optional arguments\n"
+            "- Examples: skill: \"inshi-coach\" / "
+            "skill: \"inshi-coach\", args: \"今日のログ\"\n\n"
+            "Important:\n"
+            "- Available skills are listed below\n"
+            "- When a skill matches the user's request, this is a BLOCKING "
+            "REQUIREMENT: invoke the relevant Skill tool BEFORE generating "
+            "any other response about the task\n"
+            "- NEVER mention a skill without actually calling this tool\n"
+            "- Do not invoke a skill that is already running\n"
+            "- The result contains the skill's instructions — follow them "
+            "directly for the rest of the turn\n\n"
+            "Available skills:\n" + _skill_format_listing()
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "skill": {
+                    "type": "string",
+                    "description": "The skill name. E.g., \"inshi-coach\"",
+                },
+                "args": {
+                    "type": "string",
+                    "description": "Optional arguments for the skill",
+                },
+            },
+            "required": ["skill"],
+            "additionalProperties": False,
+        },
+        handler=_tool_skill,
+    ),
 }
 
 
@@ -998,6 +1189,9 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
 # the model wastes a turn rediscovering the right name. We resolve them
 # silently and log so we can spot patterns.
 BUILTIN_TOOL_ALIASES = {
+    "skill": "Skill",
+    "invoke_skill": "Skill",
+    "use_skill": "Skill",
     "read":       "Read",
     "read_file":  "Read",
     "file_read":  "Read",
@@ -1058,3 +1252,53 @@ async def execute_builtin_tool(name: str, args: dict, ctx: ToolContext) -> str:
     if td is None:
         raise KeyError(f"unknown builtin tool: {name}")
     return await td.handler(args, ctx)
+
+
+# ---------------------------------------------------------------------------
+# free-code parity: schema 追補（2026-07-12 ask/Top5 移植）。ToolDef 定義本体を
+# 差し替えず末尾で更新する（アンカー安定・byte 決定的で prompt cache も安定）。
+# ---------------------------------------------------------------------------
+BUILTIN_TOOLS["Read"].input_schema["properties"]["offset"] = {
+    "type": "integer",
+    "description": "開始行（0始まり）。大きいファイルの続き読み用",
+}
+BUILTIN_TOOLS["Read"].input_schema["properties"]["limit"] = {
+    "type": "integer",
+    "description": "読む行数（既定・上限2000）",
+}
+BUILTIN_TOOLS["Read"].description += (
+    " Supports offset/limit to read large files in windows; truncated reads "
+    "tell you the offset to continue from."
+)
+BUILTIN_TOOLS["Grep"].input_schema["properties"].update({
+    "output_mode": {
+        "type": "string",
+        "enum": ["content", "files_with_matches", "count"],
+        "description": "既定 files_with_matches（本家CLIと同じ）",
+    },
+    "head_limit": {
+        "type": "integer",
+        "description": "出力を先頭N行に制限（既定250、0=無制限）",
+    },
+    "context": {
+        "type": "integer",
+        "description": "マッチ前後の行数（-C相当。output_mode=contentのみ）",
+    },
+    "case_insensitive": {"type": "boolean", "description": "-i相当"},
+})
+BUILTIN_TOOLS["Grep"].description += (
+    " Defaults to output_mode=files_with_matches, head_limit=250. Use "
+    "output_mode=content with context=N to see matching lines."
+)
+BUILTIN_TOOLS["Bash"].description += (
+    " NOTE: timeout is in SECONDS (default 120, max 600); values above 3600 "
+    "are treated as milliseconds for CLI-habit compatibility."
+)
+BUILTIN_TOOLS["Write"].description += (
+    " Existing files must be Read first in this conversation (and re-Read "
+    "if externally modified) or the write is rejected."
+)
+BUILTIN_TOOLS["Edit"].description += (
+    " Requires a prior Read of the file in this conversation; re-Read if it "
+    "was externally modified."
+)

@@ -20,6 +20,7 @@ Notes:
 """
 
 import asyncio
+import inspect
 import logging
 import re
 import time
@@ -1284,7 +1285,12 @@ async def _run_one_tool_inner(
             "is_error": True,
         }
 
-    allowed, reason = can_use_tool(tool_name, tool_input)
+    _gate_res = can_use_tool(tool_name, tool_input)
+    if inspect.isawaitable(_gate_res):
+        # permission ask（free-code移植）: ask ルールは Discord リアクション承認を
+        # await する。同期 gate（従来の restricted 等）はそのまま通る。
+        _gate_res = await _gate_res
+    allowed, reason = _gate_res
     if not allowed:
         await _safe_status(status_callback, "❌ ツール拒否")
         return {
@@ -2407,17 +2413,38 @@ async def run_agent_loop(
         # phase can legitimately exceed the backstop's 600s.
         stall_watchdog.tool_begin()
         try:
-            if len(tool_blocks) > 1 and all(
-                getattr(b, "name", "") in CONCURRENCY_SAFE_TOOLS
-                for b in tool_blocks
-            ):
-                tool_results = list(await asyncio.gather(
-                    *(_run_one_tool(b, **_tool_kw) for b in tool_blocks)
-                ))
-            else:
-                tool_results = [
-                    await _run_one_tool(b, **_tool_kw) for b in tool_blocks
-                ]
+            # free-code parity (toolOrchestration.partitionToolCalls): 連続する
+            # concurrency-safe ブロックをバッチ並列（上限10）、非 safe は単体直列。
+            # 従来の「全ブロックが safe のときだけ全並列」は混在ターンで全直列だった。
+            tool_results = []
+            _safe_batch: list = []
+
+            async def _flush_batch() -> None:
+                if not _safe_batch:
+                    return
+                if len(_safe_batch) > 1:
+                    _sem = asyncio.Semaphore(10)
+
+                    async def _capped(blk):
+                        async with _sem:
+                            return await _run_one_tool(blk, **_tool_kw)
+
+                    tool_results.extend(await asyncio.gather(
+                        *(_capped(b) for b in list(_safe_batch))
+                    ))
+                else:
+                    tool_results.append(
+                        await _run_one_tool(_safe_batch[0], **_tool_kw)
+                    )
+                _safe_batch.clear()
+
+            for _blk in tool_blocks:
+                if getattr(_blk, "name", "") in CONCURRENCY_SAFE_TOOLS:
+                    _safe_batch.append(_blk)
+                else:
+                    await _flush_batch()
+                    tool_results.append(await _run_one_tool(_blk, **_tool_kw))
+            await _flush_batch()
         finally:
             stall_watchdog.tool_end()
 

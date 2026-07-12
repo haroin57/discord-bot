@@ -12,6 +12,32 @@ from __future__ import annotations
 
 PLACEHOLDER = "[Old tool result content cleared]"
 
+# free-code parity (microCompact.ts:41-50 COMPACTABLE_TOOLS): time-based MC only
+# clears results from these builtin tools. mcp__ / bespoke tool results are
+# kept unless `emergency=True` (bot extension for the boundary-compaction
+#救済 path, where the whole window must shrink NOW).
+COMPACTABLE_TOOLS = frozenset({
+    "Read", "Bash", "Grep", "Glob", "Write", "Edit",
+    "WebFetch", "WebSearch", "NotebookEdit", "MultiEdit",
+})
+
+
+def _bare_tool_name(name: str) -> str:
+    return name.split("__", 2)[-1] if "__" in name else name
+
+
+def _tool_use_id_names(messages: list[dict]) -> dict:
+    """Map tool_use id -> tool name from assistant turns."""
+    out: dict = {}
+    for m in messages:
+        content = m.get("content")
+        if m.get("role") != "assistant" or not isinstance(content, list):
+            continue
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id"):
+                out[b["id"]] = b.get("name") or ""
+    return out
+
 
 def _tool_use_ids_in_order(messages: list[dict]) -> list[str]:
     """Collect tool_use ids from assistant turns, in conversation order."""
@@ -41,21 +67,35 @@ def microcompact_tool_results(
     messages: list[dict],
     *,
     gap_minutes: float,
-    gap_threshold_min: float = 30.0,
-    keep_recent: int = 3,
+    gap_threshold_min: float = 60.0,
+    keep_recent: int = 5,
+    emergency: bool = False,
 ) -> tuple[list[dict], int]:
     """Clear old tool_result bodies when the idle gap exceeds the threshold.
 
     Returns ``(messages, tokens_saved)``. When the gap is below threshold, or
-    there are no more than ``keep_recent`` tool calls, the input list is
-    returned unchanged with ``tokens_saved == 0``.
+    there are no more than ``keep_recent`` compactable tool calls, the input
+    list is returned unchanged with ``tokens_saved == 0``.
+
+    free-code parity: only COMPACTABLE_TOOLS results are cleared (mcp/bespoke
+    are kept). ``emergency=True`` clears ALL tool results regardless — the
+    boundary-compaction救済 path where the window must shrink immediately.
     """
     if gap_minutes < gap_threshold_min:
         return messages, 0
-    ids = _tool_use_ids_in_order(messages)
-    if len(ids) <= keep_recent:
+    all_ids = _tool_use_ids_in_order(messages)
+    if emergency:
+        target_ids = all_ids
+    else:
+        names = _tool_use_id_names(messages)
+        target_ids = [
+            i for i in all_ids
+            if _bare_tool_name(names.get(i, "")) in COMPACTABLE_TOOLS
+        ]
+    if len(target_ids) <= keep_recent:
         return messages, 0
-    keep = set(ids[-keep_recent:]) if keep_recent > 0 else set()
+    keep = set(target_ids[-keep_recent:]) if keep_recent > 0 else set()
+    clearable = set(target_ids) - keep
 
     saved = 0
     out: list[dict] = []
@@ -70,7 +110,7 @@ def microcompact_tool_results(
             if (
                 isinstance(b, dict)
                 and b.get("type") == "tool_result"
-                and b.get("tool_use_id") not in keep
+                and b.get("tool_use_id") in clearable
                 and b.get("content") != PLACEHOLDER
             ):
                 saved += _estimate_tokens(b.get("content"))

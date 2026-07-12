@@ -1395,6 +1395,89 @@ async def on_message(message: discord.Message):
         # Start the CLI-style spinner: it owns status_msg until the call returns.
         # SPINNER_MODE picks the renderer: "gif" = animated word-GIF (B), else
         # the 1/sec text shimmer + animated emoji (A+C).
+        # permission ask（free-code移植）: ask ルールに踏んだツールは管理者の
+        # 承認を待つ。承認手段はリアクション（✅/❌）または承認メッセージへの
+        # リプライの両対応で、リプライの意図判定は LLM（Haiku・
+        # ask_bridge.judge_approval）。**時間制限なし**（2026-07-12 指示）—
+        # 応答があるまでこのツール呼び出しで待機し続ける。ContextVar なので
+        # このタスク（=このリクエスト）のループにだけ効く。
+        if admin:
+            from services.claude_api.ask_bridge import (
+                judge_approval,
+                set_ask_handler,
+            )
+
+            async def _permission_ask(
+                _tool_name: str, _detail: str, _rule: str,
+            ) -> bool:
+                _m = await message.channel.send(
+                    f"🔐 **ツール承認待ち** `{_tool_name}`（rule: `{_rule}`）\n"
+                    f"```\n{_detail[:800]}\n```\n"
+                    "✅/❌ のリアクション、またはこのメッセージへの返信で"
+                    "指示してください（時間制限なし）"
+                )
+                await _m.add_reaction("✅")
+                await _m.add_reaction("❌")
+
+                def _rchk(r, u):
+                    return (
+                        r.message.id == _m.id
+                        and u.id in ADMIN_USER_IDS
+                        and str(r.emoji) in ("✅", "❌")
+                    )
+
+                def _mchk(msg2):
+                    return (
+                        msg2.channel.id == message.channel.id
+                        and msg2.author.id in ADMIN_USER_IDS
+                        and msg2.reference is not None
+                        and msg2.reference.message_id == _m.id
+                    )
+
+                while True:
+                    _t_r = asyncio.ensure_future(
+                        bot.wait_for("reaction_add", check=_rchk),
+                    )
+                    _t_m = asyncio.ensure_future(
+                        bot.wait_for("message", check=_mchk),
+                    )
+                    try:
+                        _done, _ = await asyncio.wait(
+                            {_t_r, _t_m},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        for _p in (_t_r, _t_m):
+                            if not _p.done():
+                                _p.cancel()
+                    _res = next(iter(_done)).result()
+                    if isinstance(_res, tuple):  # (reaction, user)
+                        _ok = str(_res[0].emoji) == "✅"
+                    else:  # リプライ → LLM に意図判定させる
+                        _v = await judge_approval(
+                            _res.content or "",
+                            tool_name=_tool_name,
+                            rule=_rule,
+                            detail=_detail,
+                        )
+                        if _v is None:
+                            # 判定不能（曖昧・無関係・LLM失敗）→ ❓ を付けて待機継続
+                            try:
+                                await _res.add_reaction("❓")
+                            except Exception:
+                                pass
+                            continue
+                        _ok = _v
+                    try:
+                        await _m.reply(
+                            "🆗 許可しました" if _ok else "🚫 拒否しました",
+                        )
+                    except Exception:
+                        pass
+                    return _ok
+
+            set_ask_handler(_permission_ask)
+
         status.spin_start(mode=SPINNER_MODE)
         try:
             response_text, session_info, actually_resumed = await call_with_tools(

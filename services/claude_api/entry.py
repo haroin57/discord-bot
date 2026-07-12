@@ -538,7 +538,13 @@ async def call_with_tools(
             cwd = CWD
             max_turns = ADMIN_MAX_TURNS
 
-        can_use_tool = make_can_use_tool(restricted=restricted)
+        from services.claude_api.permissions import wrap_permission_gate
+
+        # free-code permission port: ルール評価（deny/ask/allow）＋Discord
+        # リアクション承認（ask_bridge 経由）を既存 gate に重ねる。
+        can_use_tool = wrap_permission_gate(
+            make_can_use_tool(restricted=restricted), restricted=restricted,
+        )
         tool_ctx = ToolContext(cwd=cwd, restricted=restricted, channel_id=channel_id)
 
         # 熟考 P1: tool 呼び出し台帳（観測層）。restricted には作らない。
@@ -770,6 +776,7 @@ async def call_with_tools(
                             gap_minutes=MICROCOMPACT_GAP_MIN + 1.0,
                             gap_threshold_min=MICROCOMPACT_GAP_MIN,
                             keep_recent=MICROCOMPACT_KEEP_RECENT,
+                            emergency=True,
                         )
                         if _emg_saved > 0:
                             log.info(

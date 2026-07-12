@@ -1,6 +1,54 @@
---- /tmp/supergateway-orig/stdioToStatelessStreamableHttp.js	2026-07-04 10:16:29.189258245 +0900
-+++ /home/ubuntu/.volta/tools/image/node/24.14.1/lib/node_modules/supergateway/dist/gateways/stdioToStatelessStreamableHttp.js	2026-07-04 10:16:36.131197996 +0900
-@@ -117,7 +117,16 @@
+--- a/dist/gateways/stdioToStatelessStreamableHttp.js
++++ b/dist/gateways/stdioToStatelessStreamableHttp.js
+@@ -45,7 +45,9 @@
+     logger.info(`  - Health endpoints: ${healthEndpoints.length ? healthEndpoints.join(', ') : '(none)'}`);
+     onSignals({ logger });
+     const app = express();
+-    app.use(express.json());
++    // LOCAL PATCH (2026-07-10, docs/oracle_mcp.md 追補5): express.json() の
++    // デフォルト 100kb 制限だと長い consult prompt が 413 で弾かれるため拡大。
++    app.use(express.json({ limit: '8mb' }));
+     if (corsOrigin) {
+         app.use(cors({ origin: corsOrigin }));
+     }
+@@ -68,7 +70,35 @@
+                 sessionIdGenerator: undefined,
+             });
+             await server.connect(transport);
+-            const child = spawn(stdioCmd, { shell: true });
++            const child = spawn(stdioCmd, { shell: true, detached: true });
++            // LOCAL PATCH (2026-07-05, ADR-0037): stateless gateway child-leak fix.
++            // shell:true spawns the real MCP as a GRANDCHILD; child.kill() only
++            // hits the wrapper shell, so a long-running grandchild (oracle-mcp's
++            // 10-60min background consult) orphans to PPid=1 and piles up
++            // (measured 37 procs / 2GB RSS / 1.8G swap). detached:true makes the
++            // child a process-group leader so we can signal the WHOLE group.
++            let _killed = false;
++            const killTree = (reason) => {
++                if (_killed)
++                    return;
++                _killed = true;
++                logger.info(`Reaping child group pgid=${child.pid} reason=${reason}`);
++                try {
++                    process.kill(-child.pid, 'SIGTERM');
++                }
++                catch {
++                    try {
++                        child.kill('SIGTERM');
++                    }
++                    catch { }
++                }
++                setTimeout(() => {
++                    try {
++                        process.kill(-child.pid, 'SIGKILL');
++                    }
++                    catch { }
++                }, 15000).unref();
++            };
+             child.on('exit', (code, signal) => {
+                 logger.error(`Child exited: code=${code}, signal=${signal}`);
+                 transport.close();
+@@ -117,7 +147,16 @@
                              }
                          }
                          try {
@@ -18,8 +66,31 @@
                          }
                          catch (e) {
                              logger.error(`Failed to send to StreamableHttp`, e);
---- /tmp/supergateway-orig/stdioToSse.js	2026-07-04 10:16:29.189342583 +0900
-+++ /home/ubuntu/.volta/tools/image/node/24.14.1/lib/node_modules/supergateway/dist/gateways/stdioToSse.js	2026-07-04 10:16:39.800192924 +0900
+@@ -157,12 +196,20 @@
+             };
+             transport.onclose = () => {
+                 logger.info('StreamableHttp connection closed');
+-                child.kill();
++                killTree('onclose');
+             };
+             transport.onerror = (err) => {
+                 logger.error(`StreamableHttp error:`, err);
+-                child.kill();
++                killTree('onerror');
+             };
++            // LOCAL PATCH (2026-07-10, docs/oracle_mcp.md 追補5): stateless では
++            // transport.onclose が正常完了時に発火せず、killTree が一度も呼ばれない
++            // (実測: spawn 20 / reap 0、子チェーン ~20本・1.18GB が永久リーク)。
++            // res 'close' は「応答送信完了 or クライアント切断」の両方で必ず発火する
++            // ため、ここをライフサイクル終端として子プロセスグループを回収する。
++            // OpenAI 側の background ジョブはサーバー側で継続し、oracle session
++            // <slug> で回収可能（従来挙動と同じ）。
++            res.on('close', () => killTree('res-close'));
+             await transport.handleRequest(req, res, req.body);
+         }
+         catch (error) {
+--- a/dist/gateways/stdioToSse.js
++++ b/dist/gateways/stdioToSse.js
 @@ -114,7 +114,17 @@
                  logger.info('Child → SSE:', jsonMsg);
                  for (const [sid, session] of Object.entries(sessions)) {
@@ -39,3 +110,90 @@
                      }
                      catch (err) {
                          logger.error(`Failed to send to session ${sid}:`, err);
+--- a/dist/gateways/stdioToStatefulStreamableHttp.js
++++ b/dist/gateways/stdioToStatefulStreamableHttp.js
+@@ -23,7 +23,9 @@
+     logger.info(`  - Session timeout: ${sessionTimeout ? `${sessionTimeout}ms` : 'disabled'}`);
+     onSignals({ logger });
+     const app = express();
+-    app.use(express.json());
++    // LOCAL PATCH (2026-07-10, docs/oracle_mcp.md 追補5): express.json() の
++    // デフォルト 100kb 制限だと長い consult prompt が 413 で弾かれるため拡大。
++    app.use(express.json({ limit: '8mb' }));
+     if (corsOrigin) {
+         app.use(cors({
+             origin: corsOrigin,
+@@ -76,7 +78,34 @@
+                 },
+             });
+             await server.connect(transport);
+-            const child = spawn(stdioCmd, { shell: true });
++            // LOCAL PATCH (2026-07-10, docs/oracle_mcp.md 追補5): ADR-0037 と同型の
++            // 孫孤児化対策。shell:true は実 MCP を孫プロセスとして spawn するため、
++            // 素の child.kill() はラッパー shell しか殺せず node 孫が PPid=1 に
++            // 孤児化して積み上がる。detached:true でプロセスグループリーダー化し、
++            // グループごと SIGTERM → 15s 後 SIGKILL で回収する。
++            const child = spawn(stdioCmd, { shell: true, detached: true });
++            let _killed = false;
++            const killTree = (reason) => {
++                if (_killed)
++                    return;
++                _killed = true;
++                logger.info(`Reaping child group pgid=${child.pid} reason=${reason}`);
++                try {
++                    process.kill(-child.pid, 'SIGTERM');
++                }
++                catch {
++                    try {
++                        child.kill('SIGTERM');
++                    }
++                    catch { }
++                }
++                setTimeout(() => {
++                    try {
++                        process.kill(-child.pid, 'SIGKILL');
++                    }
++                    catch { }
++                }, 15000).unref();
++            };
+             child.on('exit', (code, signal) => {
+                 logger.error(`Child exited: code=${code}, signal=${signal}`);
+                 transport.close();
+@@ -93,7 +122,16 @@
+                         const jsonMsg = JSON.parse(line);
+                         logger.info('Child → StreamableHttp:', line);
+                         try {
+-                            transport.send(jsonMsg);
++                            // LOCAL PATCH (2026-07-10, docs/oracle_mcp.md 追補5):
++                            // transport.send は async。クライアント切断後の応答で
++                            // unhandled rejection になり node ごと死ぬため
++                            // (stateless/SSE 側と同じパターン) rejection を捕捉する。
++                            const sendResult = transport.send(jsonMsg);
++                            if (sendResult && typeof sendResult.catch === 'function') {
++                                sendResult.catch((e) => {
++                                    logger.error(`Failed to send to StreamableHttp (async)`, e);
++                                });
++                            }
+                         }
+                         catch (e) {
+                             logger.error(`Failed to send to StreamableHttp`, e);
+@@ -117,7 +155,8 @@
+                     sessionCounter?.clear(transport.sessionId, false, 'transport being closed');
+                     delete transports[transport.sessionId];
+                 }
+-                child.kill();
++                // LOCAL PATCH (2026-07-10): child.kill() では孫が残る → killTree で回収。
++                killTree('onclose');
+             };
+             transport.onerror = (err) => {
+                 logger.error(`StreamableHttp error (session ${sessionId}):`, err);
+@@ -125,7 +164,8 @@
+                     sessionCounter?.clear(transport.sessionId, false, 'transport emitting error');
+                     delete transports[transport.sessionId];
+                 }
+-                child.kill();
++                // LOCAL PATCH (2026-07-10): child.kill() では孫が残る → killTree で回収。
++                killTree('onerror');
+             };
+         }
+         else {

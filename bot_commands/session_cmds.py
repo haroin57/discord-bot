@@ -17,7 +17,8 @@ log = logging.getLogger(__name__)
 
 def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
     @tree.command(name="compact", description="このチャンネルの会話履歴を手動で圧縮する (admin only)")
-    async def compact_cmd(interaction: discord.Interaction):
+    @app_commands.describe(focus="要約で特に残したい観点（任意・free-codeの /compact <指示> と同じ）")
+    async def compact_cmd(interaction: discord.Interaction, focus: str | None = None):
         if not deps.is_admin(interaction.user):
             await interaction.response.send_message("admin only", ephemeral=True)
             return
@@ -42,7 +43,11 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
                     + int(_usage.get("cache_read_input_tokens", 0) or 0)
                     + int(_usage.get("cache_creation_input_tokens", 0) or 0)
                 )
-            result = await compact_channel_history(channel_id, api_client, force=True)
+            result = await compact_channel_history(
+                channel_id, api_client, force=True,
+                custom_instructions=focus,      # free-code: focus instructions
+                auto_continue=False,            # 手動は自己継続文言を付けない
+            )
         except Exception as exc:
             await interaction.followup.send(f"圧縮に失敗しました: {exc}", ephemeral=True)
             return
