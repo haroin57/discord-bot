@@ -69,8 +69,12 @@ def _host_is_allowed(url: str) -> bool:
     host = (parsed.hostname or "").lower()
     return host in ALLOWED_ATTACHMENT_HOSTS
 
+# Leading delimiter also accepts ':' and full-width '：' so that Japanese
+# "ラベル：/abs/path.png" (colon immediately before the path, no space) is
+# caught — the trailing set already allows CJK punctuation, so the anchors
+# were asymmetric and silently dropped colon-prefixed paths.
 IMAGE_PATH_RE = re.compile(
-    r"(?:^|\s|`|\()(\/[\w./_-]{1,512}\.(?:png|jpg|jpeg|gif|webp|svg))(?:\s|$|`|[)}\]]|[。、,.])",
+    r"(?:^|[\s`(:：])(\/[\w./_-]{1,512}\.(?:png|jpg|jpeg|gif|webp|svg))(?:\s|$|`|[)}\]]|[。、,.])",
     re.MULTILINE,
 )
 
@@ -103,7 +107,7 @@ _IMAGE_PATH_QUOTED_RE = re.compile(
 # Matches any absolute file path in response text (for admin file attachment).
 # Looks for paths like /home/ubuntu/foo.txt or /tmp/bar.csv
 FILE_PATH_RE = re.compile(
-    r"(?:^|\s|`|\()(\/[\w./_-]{1,512}\.[\w]{1,16})(?:\s|$|`|[)}\]]|[。、,.])",
+    r"(?:^|[\s`(:：])(\/[\w./_-]{1,512}\.[\w]{1,16})(?:\s|$|`|[)}\]]|[。、,.])",
     re.MULTILINE,
 )
 

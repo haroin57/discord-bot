@@ -165,6 +165,24 @@ class TestExtractImagePaths:
         paths = extract_image_paths(text)
         assert str(img) in paths
 
+    def test_leading_fullwidth_colon(self, allowed_tmp):
+        """Path written directly after a full-width colon (ラベル：/path) must
+        be extracted. Regression: the leading anchor used to require a space,
+        so `プレビュー：/abs/path.png` silently dropped the attachment."""
+        img = allowed_tmp / "preview.png"
+        img.write_bytes(_MAGIC["png"])
+        text = f"プレビュー：{img}"
+        paths = extract_image_paths(text)
+        assert str(img) in paths
+
+    def test_leading_halfwidth_colon(self, allowed_tmp):
+        """Path directly after a half-width colon (label:/path) must extract."""
+        img = allowed_tmp / "shot.png"
+        img.write_bytes(_MAGIC["png"])
+        text = f"STL:{img}"
+        paths = extract_image_paths(text)
+        assert str(img) in paths
+
     def test_unenclosed_space_path_not_extracted(self, allowed_tmp):
         """A path with spaces NOT enclosed by delimiters must NOT be extracted
         to avoid false positives from prose text."""
@@ -611,6 +629,19 @@ class TestExtractFilePathsExtra:
         text = f"check {f} done"
         result = extract_file_paths(text)
         assert str(f) not in result
+
+    def test_file_leading_fullwidth_colon(self, tmp_path, monkeypatch):
+        """File path directly after a full-width colon (STL：/path) must extract.
+
+        Regression for the 2026-07-09 case where `STL：/home/.../model.stl`
+        silently dropped the attachment because the leading anchor required a
+        space/backtick/paren and rejected the colon."""
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        f = tmp_path / "model.stl"
+        f.write_text("solid x\nendsolid x\n")
+        text = f"STL：{f}"
+        result = extract_file_paths(text)
+        assert str(f) in result
 
 
 class TestCleanupAttachmentsAsync:
