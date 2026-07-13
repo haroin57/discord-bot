@@ -708,6 +708,7 @@ _command_deps = bot_commands.CommandDeps(
     model_overrides=_MODEL_OVERRIDES,
     effort_overrides=_EFFORT_OVERRIDES,
     tier_overrides=_TIER_OVERRIDES,
+    get_channel_sema=_get_channel_sema,
 )
 bot_commands.register_all(bot.tree, _command_deps)
 

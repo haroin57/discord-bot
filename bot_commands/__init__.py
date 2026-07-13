@@ -8,7 +8,16 @@ their bot.py originals; tree.sync timing stays owned by bot.py's on_ready.
 
 from __future__ import annotations
 
-from bot_commands import archive, btw, memory, misc, model_cmds, prefix, session_cmds
+from bot_commands import (
+    archive,
+    btw,
+    free_code_slash,
+    memory,
+    misc,
+    model_cmds,
+    prefix,
+    session_cmds,
+)
 from bot_commands._deps import CommandDeps
 
 __all__ = ["CommandDeps", "prefix", "register_all"]
@@ -21,3 +30,4 @@ def register_all(tree, deps: CommandDeps) -> None:
     archive.register(tree, deps)
     model_cmds.register(tree, deps)
     btw.register(tree, deps)
+    free_code_slash.register(tree, deps)
