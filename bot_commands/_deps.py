@@ -29,3 +29,8 @@ class CommandDeps:
     # /tier (2026-07-08): "deliberate"（熟考固定）| "chat"（会話固定）。
     # 未設定はルーター判定（既定は明示マーカーのみ）。
     tier_overrides: dict
+    # (channel_id) -> per-channel asyncio.Semaphore(1). The same FIFO gate
+    # on_message uses to serialise turns; free-code slash commands (/commit etc.)
+    # acquire it so their tool-enabled turn can't race a concurrent channel reply
+    # (ADR-0048). Optional/last-field so existing constructors stay valid.
+    get_channel_sema: Callable[[int], Any] | None = None
