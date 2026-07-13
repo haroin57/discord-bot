@@ -1,24 +1,42 @@
 """Side question ("/btw") — answer a quick aside in-context, WITHOUT persisting.
 
-Mirrors claude-cli 2.1.170's ``/btw`` ("Ask a quick side question without
-interrupting the main conversation"): it forks the current channel context,
-runs a bounded agent turn, and writes **nothing** back to the JSONL transcript
-/ replay window / search indexes. Non-persistence is *structural* — this module
-never imports ``append_jsonl`` or ``set_session``, so there is no persistence
-tail that a future edit could accidentally re-enable.
+Faithful port of claude-cli's ``/btw`` ("Ask a quick side question without
+interrupting the main conversation"). Upstream (``src/utils/sideQuestion.ts``)
+forks the current conversation context and runs a **single-turn, tool-less**
+forked agent: it wraps the question in a ``<system-reminder>`` that tells the
+model it is a separate lightweight instance with NO tools and exactly one shot
+to answer from what it already knows, denies every tool call, and caps the run
+at ``maxTurns: 1``. Nothing is written back to the transcript.
 
-Reuses the same primitives as the main path (``services/claude_api/entry.py``):
-``load_api_replay_channel`` for the read-only context, ``run_agent_loop`` for the
-bounded loop (which itself performs no disk writes — see its module docstring),
-``McpPool`` + ``select_mcp_servers`` for MCP, ``build_advertised_tools`` for the
-tool schema, and ``make_can_use_tool`` for gating.
+This module mirrors that contract on the Discord side:
 
-Safety: a side question leaves no audit trail, so destructive tools are denied
-by default. It runs with a READ-ONLY tool allowlist (no Write / Edit / Bash /
-Agent, no MCP mutation) enforced through ``make_can_use_tool(restricted=False,
-allowed_tools=...)`` — the exact hook ``restricted.py`` scaffolded for "the
-side-question feature". Pass ``allow_mutating_tools=True`` to lift the guard
-(records-nothing destructive ops — use with care).
+* **No tools.** ``tools_for_api=[]`` — the request carries no ``tools`` field,
+  so the model cannot emit a ``tool_use`` block. A deny-all ``can_use_tool``
+  gate backs this up (defense in depth), exactly like upstream's
+  ``canUseTool: async () => deny`` with the message "Side questions cannot use
+  tools".
+* **One turn.** ``max_turns=1`` — a single API call, no tool round-trips. Upstream
+  is ``maxTurns: 1``.
+* **Upstream system-reminder.** The question is wrapped in the same
+  ``<system-reminder>`` framing so the model answers directly, in one response,
+  without promising to "look it up" or "check".
+* **Non-persistence is structural.** This module never imports ``append_jsonl``
+  or ``set_session``, so there is no persistence tail a future edit could
+  accidentally re-enable. ``load_api_replay_channel`` gives a read-only fork of
+  the channel context (the compact-summary-applied equivalent of upstream's
+  ``getMessagesAfterCompactBoundary``); ``run_agent_loop`` mutates only the
+  in-memory ``history`` copy and writes nothing to disk (see its module
+  docstring — persistence is the caller's job, and we simply don't).
+
+Divergence from upstream, documented (ADR-0046): upstream keeps the main turn's
+exact system/tool bytes (``cacheSafeParams`` + ``skipCacheWrite``) so the forked
+request re-hits the prompt cache. That byte-capture machinery does not exist on
+this side; advertising tools purely for cache-prefix parity would risk a
+``turn_ceiling`` truncation under ``max_turns=1`` if the model tried to call one.
+We therefore send no tools and rely on the already-cached system blocks
+(``_build_cached_system``, 1h TTL). The observable behaviour — tool-less,
+single-turn, answer-from-context — matches upstream; only the cache-hit
+optimization is omitted.
 """
 
 from __future__ import annotations
@@ -26,42 +44,49 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from contextlib import AsyncExitStack
 from dataclasses import dataclass
 
-from config import CLAUDE_EFFORT, CLAUDE_MODEL, CWD, MCP_SERVERS, SYSTEM_PROMPT
-from services.mcp_selector import select_mcp_servers
+from config import CLAUDE_EFFORT, CLAUDE_MODEL, CWD, SYSTEM_PROMPT
 from services.session import load_api_replay_channel
 
 from services.claude_api.client import MODEL_BETAS
-from services.claude_api.mcp_client import McpPool
-from services.claude_api.restricted import make_can_use_tool
 from services.claude_api.stall import StallWatchdog
-from services.claude_api.tool_catalog import (
-    build_advertised_tools,
-    deferred_catalog_keys,
-)
 from services.claude_api.tool_loop import run_agent_loop
-from services.claude_api.tools import ToolContext, execute_builtin_tool
 
 log = logging.getLogger(__name__)
 
-# Read-only builtins a side question may still use (no filesystem/shell writes,
-# no subagent). Write / Edit / Bash / Agent are intentionally excluded.
-_READONLY_BUILTINS = frozenset(
-    {"Read", "Glob", "Grep", "TodoWrite", "Scratchpad", "SecondOpinion"}
-)
-# An MCP tool whose bare name contains any of these markers is treated as a
-# mutation and dropped from the read-only allowlist (mem0 add/delete,
-# cron create/delete, oracle image gen, etc.).
-_MCP_MUTATION_MARKERS = (
-    "add",
-    "delete",
-    "create",
-    "update",
-    "remove",
-    "write",
-    "image",
+# The exact framing upstream (src/utils/sideQuestion.ts) wraps the question in.
+# Kept verbatim (English) because it is a model-behaviour constraint layer, not
+# persona copy — the answer still comes back in the bot's configured voice via
+# SYSTEM_PROMPT. It steers the model to answer directly, tool-lessly, in one
+# response, without promising follow-up actions.
+_SIDE_QUESTION_REMINDER = (
+    "<system-reminder>This is a side question from the user. You must answer "
+    "this question directly in a single response.\n"
+    "\n"
+    "IMPORTANT CONTEXT:\n"
+    "- You are a separate, lightweight agent spawned to answer this one "
+    "question\n"
+    "- The main agent is NOT interrupted - it continues working independently "
+    "in the background\n"
+    "- You share the conversation context but are a completely separate "
+    "instance\n"
+    "- Do NOT reference being interrupted or what you were \"previously doing\" "
+    "- that framing is incorrect\n"
+    "\n"
+    "CRITICAL CONSTRAINTS:\n"
+    "- You have NO tools available - you cannot read files, run commands, "
+    "search, or take any actions\n"
+    "- This is a one-off response - there will be no follow-up turns\n"
+    "- You can ONLY provide information based on what you already know from the "
+    "conversation context\n"
+    "- NEVER say things like \"Let me try...\", \"I'll now...\", \"Let me "
+    "check...\", or promise to take any action\n"
+    "- If you don't know the answer, say so - do not offer to look it up or "
+    "investigate\n"
+    "\n"
+    "Simply answer the question with the information you have."
+    "</system-reminder>"
 )
 
 
@@ -75,12 +100,17 @@ class SideQuestionResult:
     paused_reason: str | None = None
 
 
-def _is_readonly_tool(name: str) -> bool:
-    """True if ``name`` is a safe read-only tool for a non-persisted aside."""
-    if name.startswith("mcp__"):
-        bare = name.split("__", 2)[-1].lower()
-        return not any(m in bare for m in _MCP_MUTATION_MARKERS)
-    return name in _READONLY_BUILTINS
+def _deny_all_tools(_name: str, _tool_input: dict) -> tuple[bool, str]:
+    """can_use_tool gate that refuses everything (upstream parity)."""
+    return False, "Side questions cannot use tools"
+
+
+async def _reject_tool(name: str, _args: dict) -> str:
+    """execute_tool stub. Never reached (tools=[]), but required by the loop."""
+    return (
+        "<tool_use_error>side questions cannot use tools; "
+        f"{name} is not permitted</tool_use_error>"
+    )
 
 
 async def answer_side_question(
@@ -92,104 +122,54 @@ async def answer_side_question(
     model: str | None = None,
     effort: str | None = None,
     author: str = "",
-    max_turns: int = 2,
-    allow_mutating_tools: bool = False,
+    max_turns: int = 1,
 ) -> SideQuestionResult:
     """Answer ``question`` in the context of ``channel_id`` without persisting.
 
-    Returns the assistant's text plus lightweight metrics. Never touches the
-    JSONL transcript, the session store, or the search indexes.
+    Runs a single tool-less turn (upstream ``/btw`` semantics) and returns the
+    assistant's text plus lightweight metrics. Never touches the JSONL
+    transcript, the session store, or the search indexes.
     """
     t0 = time.monotonic()
 
     # 1. Read-only fork of the current channel context (compact-summary applied,
-    #    tool blocks paired — same builder the main loop uses at entry.py:436).
+    #    tool blocks paired — the equivalent of upstream's
+    #    getMessagesAfterCompactBoundary). run_agent_loop mutates ``history`` in
+    #    place and appends the prompt itself, so hand it a copy and keep
+    #    ``prior`` for the metric.
     prior, _snapshot, _ts = await asyncio.to_thread(
         load_api_replay_channel, channel_id
     )
-    # run_agent_loop mutates ``history`` in place and appends the prompt itself,
-    # so hand it a copy and keep ``prior`` for the metric.
     history = list(prior)
 
-    lead = "[Side question — 手短に。これはメイン会話に保存されない一時的な横質問です]"
+    # 2. Wrap the question in the upstream side-question system-reminder. Like
+    #    upstream, the reminder is injected into the user message (not the system
+    #    prompt, which stays identical to the main path). The [発言者] label is a
+    #    Discord-specific addition for multi-admin channels.
     body = f"[発言者: {author}]\n{question}" if author else question
-    prompt = f"{lead}\n{body}"
+    prompt = f"{_SIDE_QUESTION_REMINDER}\n\n{body}"
 
-    async with AsyncExitStack() as stack:
-        # 2. MCP pool: pick servers by the question text (same as the main path);
-        #    everything spawnable is lazy, keyword hits are spawned eagerly so
-        #    their tools show up in the advertised schema.
-        try:
-            chosen_cfg = await select_mcp_servers(question, user_id=user_id)
-        except Exception as exc:  # MCP selection is best-effort; degrade to none
-            log.warning("btw: select_mcp_servers failed: %s", exc)
-            chosen_cfg = {}
-        chosen_keys = set(chosen_cfg)
-        spawnable = deferred_catalog_keys(user_id) | chosen_keys
-        pool_available = {k: v for k, v in MCP_SERVERS.items() if k in spawnable}
-        pool = McpPool(stack=stack, available_configs=pool_available)
-        if chosen_cfg:
-            await pool.spawn_eager(list(chosen_cfg))
-
-        # 3. Advertise the full tool set, then filter to read-only unless the
-        #    caller explicitly opted into mutations.
-        advertised = build_advertised_tools(
-            restricted=False,
-            live_handles=pool.handles,
-            always_keys=set(),
-            hot_keys=chosen_keys,
-            user_id=user_id,
-            tool_search_enabled=False,
-            agent_tool_schema=None,  # no subagent inside a side question
+    # 3. Bounded, tool-less, non-persisting agent turn. No tools are advertised
+    #    (the request carries no ``tools`` field, so the model cannot emit a
+    #    tool_use block); the deny-all gate is belt-and-suspenders.
+    async with StallWatchdog(channel_id) as watchdog:
+        result = await run_agent_loop(
+            prompt,
+            channel_id,
+            history=history,
+            system_prompt=SYSTEM_PROMPT,
+            tools_for_api=[],
+            can_use_tool=_deny_all_tools,
+            execute_tool=_reject_tool,
+            max_turns=max_turns,
+            stall_watchdog=watchdog,
+            api_client=api_client,
+            model=model or CLAUDE_MODEL,
+            extra_betas=MODEL_BETAS,
+            budget_role="admin",
+            output_config_override={"effort": effort or CLAUDE_EFFORT},
+            active_mcp_keys=[],
         )
-        if allow_mutating_tools:
-            tools = advertised
-            can_use_tool = make_can_use_tool(restricted=False)
-        else:
-            tools = [
-                t for t in advertised if _is_readonly_tool(t.get("name", ""))
-            ]
-            can_use_tool = make_can_use_tool(
-                restricted=False,
-                allowed_tools=[t["name"] for t in tools],
-            )
-
-        tool_ctx = ToolContext(cwd=CWD, restricted=False, channel_id=channel_id)
-
-        async def _execute_tool(name: str, args: dict) -> str:
-            # Defense in depth: refuse mutations even if one slipped past the
-            # advertised-list filter (hallucinated tool name, etc.).
-            if not allow_mutating_tools and not _is_readonly_tool(name):
-                return (
-                    "<tool_use_error>side question is read-only; "
-                    f"{name} is not permitted</tool_use_error>"
-                )
-            if name.startswith("mcp__"):
-                return await pool.call_tool(name, args)
-            return await execute_builtin_tool(name, args, tool_ctx)
-
-        # 4. Bounded, non-persisting agent loop. run_agent_loop mutates history
-        #    in place and returns text/usage; it calls neither append_jsonl nor
-        #    set_session (its module docstring guarantees the caller owns
-        #    persistence, and we simply don't persist).
-        async with StallWatchdog(channel_id) as watchdog:
-            result = await run_agent_loop(
-                prompt,
-                channel_id,
-                history=history,
-                system_prompt=SYSTEM_PROMPT,
-                tools_for_api=tools,
-                can_use_tool=can_use_tool,
-                execute_tool=_execute_tool,
-                max_turns=max_turns,
-                stall_watchdog=watchdog,
-                api_client=api_client,
-                model=model or CLAUDE_MODEL,
-                extra_betas=MODEL_BETAS,
-                budget_role="admin",
-                output_config_override={"effort": effort or CLAUDE_EFFORT},
-                active_mcp_keys=sorted(chosen_keys),
-            )
 
     usage = result.usage_total or {}
     input_tokens = (
