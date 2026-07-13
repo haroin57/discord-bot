@@ -1,10 +1,12 @@
 """Tests for the /btw side-question feature.
 
 Two layers:
-- ``services/claude_api/side_question.py`` (``answer_side_question``): the
-  non-persisting, read-only-by-default bounded agent turn. The load-bearing
-  invariant is that it NEVER persists (no append_jsonl / set_session) and, by
-  default, advertises/permits only read-only tools.
+- ``services/claude_api/side_question.py`` (``answer_side_question``): a faithful
+  port of claude-cli's ``/btw`` — a non-persisting, **tool-less, single-turn**
+  bounded agent turn. The load-bearing invariants are that it NEVER persists
+  (no append_jsonl / set_session), advertises **no** tools (``tools_for_api=[]``,
+  deny-all gate), runs exactly one turn (``max_turns=1``), and wraps the question
+  in the upstream ``<system-reminder>`` framing.
 - ``bot_commands/btw.py`` (``/btw`` command): admin gate, ephemeral replies,
   "+N earlier /btw" counter.
 """
@@ -17,7 +19,6 @@ import pytest
 import services.claude_api.side_question as sq
 import services.session as session_mod
 import bot_commands.btw as btw
-from discord import app_commands
 
 CHANNEL = 10**15
 
@@ -25,18 +26,6 @@ CHANNEL = 10**15
 # --------------------------------------------------------------------------- #
 # Fakes shared by the service-layer tests
 # --------------------------------------------------------------------------- #
-class _FakePool:
-    def __init__(self, *, stack, available_configs):
-        self.handles: dict = {}
-        self.available_configs = available_configs
-
-    async def spawn_eager(self, keys):
-        return None
-
-    async def call_tool(self, name, args):
-        return "ok"
-
-
 class _FakeWatchdog:
     def __init__(self, channel_id, *a, **k):
         self.channel_id = channel_id
@@ -48,15 +37,6 @@ class _FakeWatchdog:
         return False
 
 
-_ADVERTISED = [
-    {"name": "Read"},
-    {"name": "Write"},
-    {"name": "Bash"},
-    {"name": "mcp__brave-search__brave_web_search"},
-    {"name": "mcp__mem0__add_memories"},
-]
-
-
 @pytest.fixture
 def wired(monkeypatch):
     """Patch side_question's collaborators; return a dict capturing loop kwargs."""
@@ -66,23 +46,7 @@ def wired(monkeypatch):
         sq, "load_api_replay_channel",
         lambda cid: (captured.get("prior", []), "", ""),
     )
-    monkeypatch.setattr(sq, "select_mcp_servers", AsyncMock(return_value={}))
-    monkeypatch.setattr(sq, "deferred_catalog_keys", lambda uid: set())
-    monkeypatch.setattr(sq, "MCP_SERVERS", {})
-    monkeypatch.setattr(sq, "McpPool", _FakePool)
     monkeypatch.setattr(sq, "StallWatchdog", _FakeWatchdog)
-    monkeypatch.setattr(
-        sq, "build_advertised_tools", lambda **kw: [dict(t) for t in _ADVERTISED],
-    )
-
-    gate_rec: dict = {}
-
-    def _fake_mcut(restricted=False, allowed_tools=None):
-        gate_rec["restricted"] = restricted
-        gate_rec["allowed"] = allowed_tools
-        return lambda name, inp: (True, "")
-
-    monkeypatch.setattr(sq, "make_can_use_tool", _fake_mcut)
 
     async def _fake_loop(prompt, channel_id, **kw):
         captured["prompt"] = prompt
@@ -90,6 +54,8 @@ def wired(monkeypatch):
         captured["tools"] = kw["tools_for_api"]
         captured["max_turns"] = kw["max_turns"]
         captured["model"] = kw["model"]
+        captured["can_use_tool"] = kw["can_use_tool"]
+        captured["active_mcp_keys"] = kw["active_mcp_keys"]
         return SimpleNamespace(
             text=captured.get("answer", "an answer"),
             usage_total={
@@ -102,7 +68,6 @@ def wired(monkeypatch):
         )
 
     monkeypatch.setattr(sq, "run_agent_loop", AsyncMock(side_effect=_fake_loop))
-    captured["gate"] = gate_rec
     return captured
 
 
@@ -138,25 +103,38 @@ class TestAnswerSideQuestion:
         assert wired["history"] == prior
         assert "ついでの質問" in wired["prompt"]
 
-    async def test_readonly_toolset_default(self, wired):
+    async def test_no_tools_advertised(self, wired):
+        """Upstream parity: /btw runs tool-less (empty tools_for_api)."""
         await sq.answer_side_question(CHANNEL, "q", object())
-        names = {t["name"] for t in wired["tools"]}
-        assert names == {"Read", "mcp__brave-search__brave_web_search"}
-        # Write / Bash / mem0 add dropped.
-        assert "Write" not in names and "Bash" not in names
-        assert "mcp__mem0__add_memories" not in names
-        # gate built with an explicit allowlist of exactly those read-only names.
-        assert wired["gate"]["restricted"] is False
-        assert set(wired["gate"]["allowed"]) == names
+        assert wired["tools"] == []
+        assert wired["active_mcp_keys"] == []
 
-    async def test_allow_mutating_tools_opt_in(self, wired):
-        await sq.answer_side_question(
-            CHANNEL, "q", object(), allow_mutating_tools=True,
-        )
-        names = {t["name"] for t in wired["tools"]}
-        assert "Write" in names and "Bash" in names
-        # full allow — no allowlist passed to the gate.
-        assert wired["gate"]["allowed"] is None
+    async def test_gate_denies_every_tool(self, wired):
+        """The can_use_tool gate refuses all tools (defense in depth)."""
+        await sq.answer_side_question(CHANNEL, "q", object())
+        gate = wired["can_use_tool"]
+        for name in ("Read", "Write", "Bash", "mcp__mem0__add_memories"):
+            allowed, reason = gate(name, {})
+            assert allowed is False
+            assert "cannot use tools" in reason
+
+    async def test_system_reminder_wraps_question(self, wired):
+        """The upstream side-question system-reminder frames the prompt."""
+        await sq.answer_side_question(CHANNEL, "元号は", object())
+        prompt = wired["prompt"]
+        assert prompt.startswith("<system-reminder>")
+        assert "NO tools available" in prompt
+        assert "single response" in prompt
+        assert "元号は" in prompt
+
+    async def test_author_label_included(self, wired):
+        await sq.answer_side_question(CHANNEL, "q", object(), author="先輩")
+        assert "[発言者: 先輩]" in wired["prompt"]
+
+    async def test_max_turns_one(self, wired):
+        """Upstream parity: exactly one turn, no tool round-trips."""
+        await sq.answer_side_question(CHANNEL, "q", object())
+        assert wired["max_turns"] == 1
 
     async def test_no_history(self, wired):
         wired["prior"] = []
@@ -167,10 +145,6 @@ class TestAnswerSideQuestion:
         wired["answer"] = ""
         res = await sq.answer_side_question(CHANNEL, "q", object())
         assert res.answer == ""
-
-    async def test_max_turns_bound(self, wired):
-        await sq.answer_side_question(CHANNEL, "q", object())
-        assert wired["max_turns"] == 2
 
 
 # --------------------------------------------------------------------------- #
