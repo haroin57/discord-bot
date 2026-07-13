@@ -119,6 +119,35 @@ if [[ "${CURRENT_SHA}" == "${REMOTE_SHA}" ]]; then
     exit 0
 fi
 
+# merge-based guard (replaces relying on the SHA-inequality check alone).
+# The bare `CURRENT_SHA != REMOTE_SHA` test above is not sufficient to decide
+# "there is something to deploy": if HEAD is at or AHEAD of origin/${BRANCH}
+# (e.g. the prod checkout was left on a local/feature branch, or a commit was
+# made directly in the prod dir), the SHAs differ yet the ff-only merge in
+# step 4 is a guaranteed no-op. The old code fell through, then step 6
+# unconditionally `systemctl restart`ed the service — every 5 min, for zero
+# code delta: a restart storm that also spammed pre-deploy-* tags. Decide by
+# ancestry instead of raw inequality.
+#
+#   git merge-base --is-ancestor A B  →  exit 0 iff A is an ancestor of B.
+#
+# (a) origin is already an ancestor of HEAD → HEAD contains origin, ff is a
+#     no-op → nothing to deploy.
+if git merge-base --is-ancestor "origin/${BRANCH}" HEAD; then
+    log "HEAD (${CURRENT_SHA:0:8}) already contains origin/${BRANCH} (${REMOTE_SHA:0:8}); local is at/ahead of origin, ff-only would be a no-op — nothing to deploy"
+    exit 0
+fi
+
+# (b) HEAD is not an ancestor of origin either → the two have diverged and are
+#     not fast-forwardable. Auto-restarting on this is wrong; the ff-only merge
+#     in step 4 would abort anyway. Surface it once and skip instead of looping.
+if ! git merge-base --is-ancestor HEAD "origin/${BRANCH}"; then
+    log "HEAD (${CURRENT_SHA:0:8}) has diverged from origin/${BRANCH} (${REMOTE_SHA:0:8}); not fast-forwardable — skipping (prod checkout needs manual attention)"
+    notify "auto_deploy/${ENV}: HEAD diverged from origin/${BRANCH} (${CURRENT_SHA:0:8} vs ${REMOTE_SHA:0:8}) — deploy skipped, checkout needs attention"
+    exit 0
+fi
+
+# Only here is origin/${BRANCH} genuinely a fast-forward ahead of HEAD.
 log "New commits available: ${CURRENT_SHA:0:8} -> ${REMOTE_SHA:0:8}"
 
 # ─── step 2: CI green gate ────────────────────────────────────────────────────
@@ -186,6 +215,14 @@ git merge --ff-only "origin/${BRANCH}" || {
 }
 NEW_SHA="$(git rev-parse HEAD)"
 log "Merged: ${ROLLBACK_SHA:0:8} -> ${NEW_SHA:0:8}"
+
+# Belt-and-suspenders: after the merge-base guard in step 1 this can't happen,
+# but never restart the service for a deploy that didn't move HEAD. A zero-delta
+# restart is exactly the storm we're preventing; guard the restart on it too.
+if [[ "${NEW_SHA}" == "${ROLLBACK_SHA}" ]]; then
+    log "HEAD unchanged after merge (${NEW_SHA:0:8}); skipping restart — no-op deploy"
+    exit 0
+fi
 
 # ─── step 5: reinstall deps if lock changed ───────────────────────────────────
 if git diff --name-only "${ROLLBACK_SHA}" "${NEW_SHA}" | grep -q "requirements\.lock$"; then
