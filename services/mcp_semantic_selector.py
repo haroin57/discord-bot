@@ -32,6 +32,7 @@ from config import (
 )
 from utils.atomic_write import atomic_write_json
 from utils.cache import TTLLRUCache
+from services.mcp_control import filter_enabled_mcp_configs
 
 log = logging.getLogger(__name__)
 
@@ -207,7 +208,7 @@ async def pick_mcp_servers_semantic(
             "mcp_selector semantic: %s",
             ", ".join(f"{k}={s:.3f}" for k, s in chosen),
         )
-    return {k: MCP_SERVERS[k] for k, _ in chosen}
+    return filter_enabled_mcp_configs({k: MCP_SERVERS[k] for k, _ in chosen})
 
 
 def _reset_for_test() -> None:

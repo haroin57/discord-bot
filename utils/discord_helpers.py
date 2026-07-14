@@ -12,6 +12,7 @@ from utils.cache import TTLLRUCache
 from config import (
     ADMIN_USER_IDS,
     ALLOWED_ATTACHMENT_HOSTS,
+    BOT_IGNORED_ROLE_IDS,
     BOT_ROLE_IDS,
     CROSS_THREAD_CONTEXT_MESSAGES,
     MAX_CROSS_THREAD_CHARS,
@@ -55,7 +56,7 @@ def build_mention_regex(user_id: int) -> None:
     """Pre-compile the bot's mention/role-mention regex. Called once after on_ready."""
     global _mention_re_cache
     parts = [rf"<@!?{user_id}>"]
-    for role_id in BOT_ROLE_IDS:
+    for role_id in BOT_ROLE_IDS | BOT_IGNORED_ROLE_IDS:
         parts.append(rf"<@&{role_id}>")
     _mention_re_cache = re.compile(r"(?:" + "|".join(parts) + r")\s*")
 

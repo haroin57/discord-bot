@@ -8,10 +8,12 @@ Discord messages.
 import re
 from dataclasses import dataclass
 
+from utils.math_presentation import PresentationKind, classify_math
+
 __all__ = [
     "TextSegment", "TableSegment", "MathSegment", "Segment",
     "parse_segments", "has_tables", "has_math", "mask_code_blocks",
-    "split_settled", "first_block_span",
+    "format_math_for_discord", "split_settled", "first_block_span",
 ]
 
 
@@ -50,25 +52,30 @@ TABLE_RE = re.compile(
 _CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```", re.MULTILINE)
 
 # ---------------------------------------------------------------------------
-# Math detection: $$ ... $$ (display) and $ ... $ (inline)
+# Math detection: $$ ... $$ / \[ ... \] (display) and
+# $ ... $ / \( ... \) (inline)
 # ---------------------------------------------------------------------------
 # Display math: $$ on its own line (or surrounded by whitespace)
 DISPLAY_MATH_RE = re.compile(
     r"(\$\$\n[\s\S]*?\n\$\$"       # $$ on own lines
-    r"|\$\$[^\$]+?\$\$)",           # $$ inline $$
+    r"|\$\$[^\$]+?\$\$"            # $$ inline $$
+    r"|\\\[[\s\S]*?\\\])",        # \[ ... \]
     re.MULTILINE,
 )
 
 # Inline math candidate: single $ ... $ on one line. Semantic filtering below
 # separates math from currency without allowing one pair to consume another.
 INLINE_MATH_RE = re.compile(
-    r"(?<!\$)\$(?!\$)([^\n$]+?)(?<!\$)\$(?!\$)",
+    r"(?<!\$)\$(?!\$)([^\n$]+?)(?<!\$)\$(?!\$)"
+    r"|\\\(([\s\S]*?)\\\)",
 )
 
 # Combined candidate regex. Inline bodies explicitly exclude `$`, so adjacent
 # expressions such as `$n$ ... $A^n$` can never be merged into one expression.
 _MATH_CANDIDATE_RE = re.compile(
     r"(\$\$[\s\S]*?\$\$"           # display math $$...$$
+    r"|\\\[[\s\S]*?\\\]"         # display math \[...\]
+    r"|\\\([\s\S]*?\\\)"         # inline math \(...\)
     r"|(?<!\$)\$(?!\$)(?!\s)([^\n$]+?)(?<!\s)(?<!\$)\$(?!\$))",
     re.MULTILINE,
 )
@@ -91,7 +98,28 @@ def _looks_like_inline_math(body: str) -> bool:
 def _iter_math_matches(text: str):
     for match in _MATH_CANDIDATE_RE.finditer(text):
         raw = match.group(0)
-        if raw.startswith("$$") or _looks_like_inline_math(raw[1:-1]):
+        if raw.startswith(("$$", r"\[", r"\(")) or _looks_like_inline_math(
+            raw[1:-1]
+        ):
+            yield match
+
+
+def _math_segment(raw: str) -> MathSegment:
+    """Convert one closed raw delimiter block into a MathSegment."""
+    if raw.startswith("$$") or raw.startswith(r"\["):
+        return MathSegment(latex=raw[2:-2].strip(), display_mode=True)
+    if raw.startswith(r"\("):
+        return MathSegment(latex=raw[2:-2].strip(), display_mode=False)
+    return MathSegment(latex=raw[1:-1].strip(), display_mode=False)
+
+
+def _iter_renderable_math_matches(text: str, *, adaptive_math: bool):
+    for match in _iter_math_matches(text):
+        if not adaptive_math:
+            yield match
+            continue
+        segment = _math_segment(match.group(0))
+        if classify_math(segment).kind is PresentationKind.IMAGE:
             yield match
 
 
@@ -110,6 +138,29 @@ def mask_code_blocks(text: str) -> str:
 
 # Backwards-compat alias (some internal callers still use the underscore name).
 _mask_code_blocks = mask_code_blocks
+
+
+def format_math_for_discord(text: str) -> str:
+    """Replace safely representable closed TeX with inline Discord text.
+
+    Complex expressions stay byte-for-byte unchanged so the image block
+    pipeline can still identify them from raw offsets. Fenced code is masked
+    during detection and therefore never rewritten.
+    """
+    masked = mask_code_blocks(text)
+    parts: list[str] = []
+    last_end = 0
+    for match in _iter_math_matches(masked):
+        presentation = classify_math(_math_segment(text[match.start():match.end()]))
+        if presentation.kind is not PresentationKind.TEXT:
+            continue
+        parts.append(text[last_end:match.start()])
+        parts.append(presentation.text)
+        last_end = match.end()
+    if not parts:
+        return text
+    parts.append(text[last_end:])
+    return "".join(parts)
 
 
 def has_tables(text: str, *, _masked: str | None = None) -> bool:
@@ -144,14 +195,7 @@ def _split_math_in_text(text: str) -> list[Segment]:
             segments.append(TextSegment(content=before))
 
         raw_match = text[start:end]
-        if raw_match.startswith("$$"):
-            # Display math — strip $$ delimiters
-            latex = raw_match[2:-2].strip()
-            segments.append(MathSegment(latex=latex, display_mode=True))
-        else:
-            # Inline math — strip $ delimiters
-            latex = raw_match[1:-1].strip()
-            segments.append(MathSegment(latex=latex, display_mode=False))
+        segments.append(_math_segment(raw_match))
         last_end = end
 
     remaining = text[last_end:]
@@ -162,11 +206,11 @@ def _split_math_in_text(text: str) -> list[Segment]:
 
 
 def parse_segments(text: str) -> list[Segment]:
-    """Split response text into Text, Table, and Math segments.
+    r"""Split response text into Text, Table, and Math segments.
 
     Tables inside fenced code blocks are ignored. If a heading (### ...)
     immediately precedes a table, it is absorbed as the table caption.
-    Math expressions ($..$ and $$..$$) are also extracted.
+    Math expressions ($..$, $$..$$, \(..\), and \[..\]) are also extracted.
     """
     masked = _mask_code_blocks(text)
     segments: list[Segment] = []
@@ -248,15 +292,43 @@ def _trailing_table_start(masked: str) -> int | None:
     return start
 
 
-def split_settled(text: str) -> tuple[str, str, bool]:
-    """Split a streaming-in-progress response into (settled, pending, open).
+def _last_unclosed_pair_start(
+    text: str,
+    opener: str,
+    closer: str,
+) -> int | None:
+    """Return the last unmatched explicit TeX opener, if one exists."""
+    opened_at: int | None = None
+    cursor = 0
+    while cursor < len(text):
+        next_open = text.find(opener, cursor)
+        next_close = text.find(closer, cursor)
+        if next_open < 0 and next_close < 0:
+            break
+        if next_open >= 0 and (next_close < 0 or next_open < next_close):
+            opened_at = next_open
+            cursor = next_open + len(opener)
+            continue
+        if opened_at is not None:
+            opened_at = None
+        cursor = next_close + len(closer)
+    return opened_at
+
+
+def split_settled(
+    text: str,
+    *,
+    adaptive_math: bool = False,
+) -> tuple[str, str, bool]:
+    r"""Split a streaming-in-progress response into (settled, pending, open).
 
     ``settled``  — leading prefix in which every renderable block ($$..$$,
-                   $..$, Markdown table) is fully closed. Safe to finalize:
+                   $..$, \[...\], \(...\), Markdown table) is fully closed.
+                   Safe to finalize:
                    parse_segments() + render block images, immutable thereafter.
     ``pending``  — trailing region that may still grow.
     ``open``     — True when ``pending`` begins with an *unclosed renderable
-                   block* (open $$, open inline $, or a table still
+                   block* (open math delimiter or a table still
                    accumulating). The caller then shows a "rendering…"
                    placeholder and holds — never the raw block. False when
                    ``pending`` is plain prose / an open code fence, which the
@@ -283,6 +355,32 @@ def split_settled(text: str) -> tuple[str, str, bool]:
     dd = [m.start() for m in re.finditer(r"\$\$", masked)]
     if len(dd) % 2 == 1:
         open_start = dd[-1]
+
+    # Codex commonly emits standard TeX delimiters instead of dollar signs.
+    # Hold an incomplete explicit block exactly like an incomplete $ block so
+    # raw TeX never flashes in Discord before the image is ready.
+    for opener, closer in ((r"\[", r"\]"), (r"\(", r"\)")):
+        pos = _last_unclosed_pair_start(masked, opener, closer)
+        if pos is not None:
+            open_start = pos if open_start is None else min(open_start, pos)
+
+    # A streaming tick can stop after the first character of ``$$``, ``\[``,
+    # or ``\(``. Hold that ambiguous suffix for one tick so it cannot flash as
+    # prose before the next token reveals the complete opener. A trailing ``$``
+    # that already closes a complete expression is not ambiguous.
+    if scan_limit:
+        suffix = masked[scan_limit - 1:scan_limit]
+        if suffix in {"$", "\\"}:
+            closes_math = any(
+                match.end() == scan_limit for match in _iter_math_matches(masked)
+            )
+            trailing_backslashes = len(masked) - len(masked.rstrip("\\"))
+            if (
+                (suffix == "\\" and trailing_backslashes % 2 == 1)
+                or (suffix == "$" and not closes_math)
+            ):
+                pos = scan_limit - 1
+                open_start = pos if open_start is None else min(open_start, pos)
 
     # Unclosed inline math: odd number of single $ after neutralizing $$ pairs.
     # Two guards so we don't hold on a literal $ (currency):
@@ -316,14 +414,20 @@ def split_settled(text: str) -> tuple[str, str, bool]:
     last_end = 0
     for m in TABLE_RE.finditer(masked):
         last_end = max(last_end, m.end())
-    for m in _iter_math_matches(masked):
+    for m in _iter_renderable_math_matches(
+        masked, adaptive_math=adaptive_math,
+    ):
         last_end = max(last_end, m.end())
     # text[last_end:] is plain prose (plus any open code fence region after
     # scan_limit, which is also live text) — stream it as an editable draft.
     return text[:last_end], text[last_end:], False
 
 
-def first_block_span(text: str) -> tuple[int, int, "Segment"] | None:
+def first_block_span(
+    text: str,
+    *,
+    adaptive_math: bool = False,
+) -> tuple[int, int, "Segment"] | None:
     """Leftmost CLOSED renderable block (table or math) in ``text``.
 
     Returns ``(start, end, segment)`` with raw character offsets into ``text``
@@ -340,7 +444,12 @@ def first_block_span(text: str) -> tuple[int, int, "Segment"] | None:
     tm = TABLE_RE.search(masked)
     if tm is not None:
         best = (tm.start(), tm.end(), "table")
-    mm = next(_iter_math_matches(masked), None)
+    mm = next(
+        _iter_renderable_math_matches(
+            masked, adaptive_math=adaptive_math,
+        ),
+        None,
+    )
     if mm is not None and (best is None or mm.start() < best[0]):
         best = (mm.start(), mm.end(), "math")
 
@@ -359,7 +468,4 @@ def first_block_span(text: str) -> tuple[int, int, "Segment"] | None:
             start = heading_match.start()  # fold the heading into the block span
         return start, end, TableSegment(markdown=raw, caption=caption)
 
-    # math
-    if raw.startswith("$$"):
-        return start, end, MathSegment(latex=raw[2:-2].strip(), display_mode=True)
-    return start, end, MathSegment(latex=raw[1:-1].strip(), display_mode=False)
+    return start, end, _math_segment(raw)

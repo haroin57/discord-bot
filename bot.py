@@ -32,6 +32,7 @@ from config import (
     DEEP_RESEARCH_ENABLED,
     DELIB_ROUTER_ENABLED,
     SPINNER_MODE,
+    BOT_IGNORED_ROLE_IDS,
     BOT_KEYWORDS,
     BOT_ROLE_IDS,
     COOLDOWN_SECONDS,
@@ -40,6 +41,7 @@ from config import (
     MAX_COOLDOWN_ENTRIES,
     MAX_PROMPT_CHARS,
     MAX_USER_MESSAGE_CHARS,
+    MATH_PRESENTATION_MODE,
     MEM0_AUTO_RECORD_ENABLED,
     MEM0_AUTO_RECORD_INTERVAL_S,
     MEM0_AUTO_RECORD_MIN_CHARS,
@@ -63,7 +65,22 @@ from config import (
     STATE_DIR,
     speaker_label,
 )
-from services.claude_api import _is_session_fresh, call_with_tools, kill_orphan_claude_cli
+from services.claude_api import _is_session_fresh, kill_orphan_claude_cli
+from services.codex_app_server import (
+    CodexAuthError,
+    CodexProtocolError,
+    CodexTurnError,
+    CodexUnavailableError,
+)
+from services.provider_router import (
+    PROVIDER_CLAUDE,
+    PROVIDER_CODEX,
+    call_with_provider,
+    provider_label,
+    resolve_provider,
+)
+from services.skills import SkillError, render_active_skill_prompt
+
 from services.oauth_manager import OAuthRefreshFailed
 from services import claude_tag
 from services import deep_research
@@ -116,9 +133,22 @@ from utils.discord_helpers import (
     strip_mention,
 )
 from utils.markdown_parser import TextSegment, TableSegment, MathSegment, has_tables, has_math, mask_code_blocks, parse_segments, split_settled, first_block_span
+from utils.math_presentation import (
+    PresentationBlockKind,
+    PresentationKind,
+    classify_math,
+    latex_to_discord_text,
+    plan_segments,
+)
 from utils.math_renderer import render_math_image
 from utils.response_sanitizer import strip_numeric_inline_code
 from utils.table_renderer import render_table_image
+
+# Compatibility seam for the existing characterization suite and out-of-tree
+# integrations that patch ``bot.call_with_tools``. The implementation is now
+# provider-neutral, but retaining this module attribute avoids a flag-day
+# migration for callers that replace the model boundary in tests.
+call_with_tools = call_with_provider
 
 log = logging.getLogger(__name__)
 
@@ -263,6 +293,8 @@ sessions = shared_sessions()
 # are cheap to re-issue.
 _MODEL_OVERRIDES: dict[tuple[int, int], str] = {}
 _EFFORT_OVERRIDES: dict[tuple[int, int], str] = {}
+_PROVIDER_OVERRIDES: dict[tuple[int, int], str] = {}
+_SKILL_OVERRIDES: dict[tuple[int, int], object] = {}
 # /tier live override（2026-07-08）: "deliberate"（熟考固定）| "chat"（会話固定）。
 # 未設定ならルーター判定（既定は明示マーカーのみ — DELIB_ROUTER_AUTO_ENABLED
 # が false の間、スコアによる自動昇格はしない）。
@@ -562,6 +594,33 @@ async def on_ready():
 # ---------------------------------------------------------------------------
 # Segmented response sender (table images + text)
 # ---------------------------------------------------------------------------
+def _log_math_presentation(segments) -> None:
+    math_segments = [
+        segment for segment in segments if isinstance(segment, MathSegment)
+    ]
+    if not math_segments:
+        return
+    if MATH_PRESENTATION_MODE != "adaptive":
+        log.info(
+            "Math presentation mode=%s text=0 image=%d reasons=%s",
+            MATH_PRESENTATION_MODE,
+            len(math_segments),
+            {"legacy": len(math_segments)},
+        )
+        return
+    decisions = [classify_math(segment) for segment in math_segments]
+    reasons: dict[str, int] = {}
+    for decision in decisions:
+        reasons[decision.reason] = reasons.get(decision.reason, 0) + 1
+    log.info(
+        "Math presentation mode=%s text=%d image=%d reasons=%s",
+        MATH_PRESENTATION_MODE,
+        sum(d.kind is PresentationKind.TEXT for d in decisions),
+        sum(d.kind is PresentationKind.IMAGE for d in decisions),
+        reasons,
+    )
+
+
 async def _send_segmented(
     message: discord.Message,
     response_text: str,
@@ -576,7 +635,19 @@ async def _send_segmented(
     """
     import os as _os
 
-    segments = parse_segments(response_text)
+    parsed_segments = parse_segments(response_text)
+    segments = parsed_segments
+    if MATH_PRESENTATION_MODE == "adaptive":
+        planned = plan_segments(parsed_segments)
+        segments = [
+            TextSegment(block.text)
+            if block.kind is PresentationBlockKind.TEXT
+            else block.source
+            for block in planned
+            if block.kind is PresentationBlockKind.TEXT or block.source is not None
+        ]
+
+    _log_math_presentation(parsed_segments)
     sender = ReplyChainSender(message)
     rendered_images: list[str] = []
     attachment_response_id: int | None = None
@@ -618,7 +689,11 @@ async def _send_segmented(
             img_path = await render_math_image(seg.latex, display_mode=seg.display_mode)
             if img_path:
                 rendered_images.append(img_path)
-                f = discord.File(img_path)
+                description = latex_to_discord_text(seg.latex) or seg.latex
+                f = discord.File(
+                    img_path,
+                    description=description.strip()[:1024] or None,
+                )
                 try:
                     sent = await sender.send(file=f)
                     refs = await asyncio.to_thread(
@@ -709,6 +784,8 @@ _command_deps = bot_commands.CommandDeps(
     effort_overrides=_EFFORT_OVERRIDES,
     tier_overrides=_TIER_OVERRIDES,
     get_channel_sema=_get_channel_sema,
+    provider_overrides=_PROVIDER_OVERRIDES,
+    skill_overrides=_SKILL_OVERRIDES,
 )
 bot_commands.register_all(bot.tree, _command_deps)
 
@@ -737,6 +814,97 @@ async def _index_channel_message(message: discord.Message) -> None:
         log.debug("channel-message index failed (non-fatal): %s", exc)
 
 
+_ROLE_MENTION_TOKEN_RE = re.compile(r"<@&(\d+)>")
+
+
+def _reply_ping_addresses_bot(
+    message: discord.Message,
+    *,
+    bot_user_id: int,
+) -> bool:
+    """Return whether Discord's reply ping targets this bot identity.
+
+    A reply with ``mention_author=True`` adds the referenced author to the
+    gateway payload's ``mentions`` array, but does not add a literal
+    ``<@user_id>`` token to ``content``.  Checking ``mentions`` alone is not
+    safe because role mentions can expand into the same array.  Requiring the
+    referenced message author to be this exact bot distinguishes a reply ping
+    from a role expansion and keeps co-located bot identities isolated.
+    """
+    reference = getattr(message, "reference", None)
+    if reference is None or not getattr(reference, "message_id", None):
+        return False
+    if getattr(reference, "type", None) == discord.MessageReferenceType.forward:
+        return False
+
+    referenced = getattr(reference, "resolved", None)
+    referenced_author_id = getattr(
+        getattr(referenced, "author", None), "id", None,
+    )
+    if referenced_author_id != bot_user_id:
+        referenced = getattr(reference, "cached_message", None)
+        referenced_author_id = getattr(
+            getattr(referenced, "author", None), "id", None,
+        )
+    if referenced_author_id != bot_user_id:
+        return False
+
+    mentioned_user_ids = {
+        user_id
+        for user in (getattr(message, "mentions", ()) or ())
+        if isinstance((user_id := getattr(user, "id", None)), int)
+    }
+    return bot_user_id in mentioned_user_ids
+
+
+def _guild_message_addresses_bot(message: discord.Message) -> bool:
+    """Return whether a guild message explicitly addresses this bot process.
+
+    Discord may include users reached through a role mention in
+    ``message.mentions``. Treating membership in that expanded list as a
+    direct mention makes two bot identities answer one role callout. Direct
+    user mentions are therefore determined from the literal ``<@id>`` token,
+    except for a reply ping whose referenced author is this exact bot.
+    """
+    content = message.content or ""
+    bot_user = bot.user
+    if bot_user is None:
+        return False
+
+    direct_mention = re.search(
+        rf"<@!?{re.escape(str(bot_user.id))}>", content,
+    ) is not None
+
+    mentioned_role_ids = {
+        int(match.group(1)) for match in _ROLE_MENTION_TOKEN_RE.finditer(content)
+    }
+    for role in getattr(message, "role_mentions", ()) or ():
+        role_id = getattr(role, "id", None)
+        if isinstance(role_id, int):
+            mentioned_role_ids.add(role_id)
+
+    reply_mention = _reply_ping_addresses_bot(
+        message,
+        bot_user_id=bot_user.id,
+    )
+
+    if direct_mention or reply_mention:
+        return True
+
+    # An explicitly ignored role belongs to another co-located bot. It blocks
+    # both role and keyword activation so that a role callout remains
+    # single-recipient even if that role is accidentally assigned to this bot.
+    ignored_role_mentions = mentioned_role_ids & BOT_IGNORED_ROLE_IDS
+    own_role_mentions = mentioned_role_ids & BOT_ROLE_IDS
+    if own_role_mentions - ignored_role_mentions:
+        return True
+    if ignored_role_mentions:
+        return False
+
+    content_lower = content.lower()
+    return any(keyword in content_lower for keyword in BOT_KEYWORDS)
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author == bot.user or message.author.bot:
@@ -757,11 +925,7 @@ async def on_message(message: discord.Message):
     if is_dm and not is_admin(message.author):
         return
     if not is_dm:
-        content_lower = message.content.lower()
-        mentioned = (bot.user in message.mentions or
-                     any(role.id in BOT_ROLE_IDS for role in message.role_mentions) or
-                     any(kw in content_lower for kw in BOT_KEYWORDS))
-        if not mentioned:
+        if not _guild_message_addresses_bot(message):
             # Not addressed to the bot — don't reply, but index it for later
             # literal keyword recall (history_search) so a proper noun said in
             # passing is still findable. Persisted as role="channel".
@@ -825,6 +989,15 @@ async def on_message(message: discord.Message):
     if not prompt:
         await message.reply("何か用ですか？" if is_dm else "Please include a message after mentioning me!")
         return
+
+    _request_key = (message.channel.id, message.author.id)
+    _forced_model = _MODEL_OVERRIDES.get(_request_key)
+    _forced_effort = _EFFORT_OVERRIDES.get(_request_key)
+    _provider = resolve_provider(
+        explicit=_PROVIDER_OVERRIDES.get(_request_key),
+        model=_forced_model,
+        restricted=not caller_is_admin,
+    )
 
     sema = _get_channel_sema(message.channel.id)
     was_queued = sema.locked()
@@ -890,6 +1063,13 @@ async def on_message(message: discord.Message):
     image_paths: list[str] = []
     is_thread = isinstance(message.channel, discord.Thread)
     try:
+        _provider_will_resume = None
+        if _provider == PROVIDER_CODEX:
+            from services.codex_app_server.manager import get_manager
+
+            _provider_will_resume = get_manager().has_thread(
+                message.channel.id, message.author.id,
+            )
         # --- Parallel pre-processing (P2-a: launch lives in bot_preprocess) ---
         # Collaborator functions are passed at call time so test patches on
         # bot-module attributes (patch("bot.fetch_thread_context") etc.)
@@ -921,6 +1101,7 @@ async def on_message(message: discord.Message):
             mem0_history_search_limit=MEM0_HISTORY_SEARCH_LIMIT,
             mem0_history_embed_enabled=MEM0_HISTORY_EMBED_ENABLED,
             mem0_history_embed_limit=MEM0_HISTORY_EMBED_LIMIT,
+            will_resume_override=_provider_will_resume,
         )
         will_resume = _ctx.will_resume
         reply_task = _ctx.reply
@@ -1300,6 +1481,39 @@ async def on_message(message: discord.Message):
             except Exception as e:
                 log.warning("History search failed (non-fatal): %s", e)
 
+        # /skills is an admin-only, per-(channel,user) trusted instruction
+        # override.  Render from the shared registry on every turn so both bot
+        # processes pick up SKILL.md edits by mtime.  The block is passed to
+        # each provider's trusted instruction channel below and is never mixed
+        # into raw_user_text, the Discord trust wrapper, or JSONL history.
+        _active_skill_prompt = ""
+        _skill_selection = _SKILL_OVERRIDES.get(_request_key)
+        if _skill_selection is not None:
+            if not caller_is_admin:
+                # Defensive fail-closed path if state is ever populated outside
+                # the admin-gated slash command.
+                _SKILL_OVERRIDES.pop(_request_key, None)
+                log.warning(
+                    "Discarded active skill for restricted user=%s channel=%s",
+                    message.author.id,
+                    message.channel.id,
+                )
+            else:
+                try:
+                    _active_skill_prompt = render_active_skill_prompt(
+                        _skill_selection,
+                    )
+                    prompt_breakdown["active_skill_instructions"] = len(
+                        _active_skill_prompt
+                    )
+                except SkillError as exc:
+                    _SKILL_OVERRIDES.pop(_request_key, None)
+                    log.warning(
+                        "Active skill became unavailable; cleared key=%s: %s",
+                        _request_key,
+                        exc,
+                    )
+
         # ── Pre-cap prompt injection breakdown ──────────────────
         # Single structured log line listing every component that
         # entered the final prompt, sorted by char count desc.
@@ -1339,9 +1553,12 @@ async def on_message(message: discord.Message):
         # semaphore) so the queued phase shares the same message. Transition
         # into the model phase here.
         job.phase = JobPhase.CALLING_CLAUDE
-        await status.update("📨 Claudeへ送信中")
+        await status.update(f"📨 {provider_label(_provider)}へ送信中")
 
-        log.info("Routing to SDK/CLI (restricted=%s, is_thread=%s)", not admin, is_thread)
+        log.info(
+            "Routing provider=%s (restricted=%s, is_thread=%s, model=%s)",
+            _provider, not admin, is_thread, _forced_model or "<provider-default>",
+        )
 
         # Live-stream the model's narration each turn: when the agent
         # loop writes prose in a tool_use turn (image review → tool call
@@ -1370,6 +1587,7 @@ async def on_message(message: discord.Message):
             track_task=_track_task,
             job=job,
             split_message=split_message,
+            math_presentation_mode=MATH_PRESENTATION_MODE,
         )
         _incremental_send = _renderer.incremental_send
         _stream_preview = _renderer.stream_preview
@@ -1527,6 +1745,7 @@ async def on_message(message: discord.Message):
         try:
             response_text, session_info, actually_resumed = await call_with_tools(
                 prompt, message.channel.id, sessions,
+                provider=_provider,
                 status_callback=status.update,
                 incremental_text_callback=None if _delib else _incremental_send,
                 text_stream_callback=None if _delib else _stream_preview,
@@ -1546,13 +1765,10 @@ async def on_message(message: discord.Message):
                 has_image_attachment=bool(image_paths),
                 author=sender_speaker_label,
                 user_id=message.author.id,
-            # 機能6: per-(channel,user) overrides set by /model and /effort.
-            forced_model_override=_MODEL_OVERRIDES.get(
-                (message.channel.id, message.author.id)
-            ),
-            forced_effort_override=_EFFORT_OVERRIDES.get(
-                (message.channel.id, message.author.id)
-            ),
+                # Per-(channel,user) model and effort overrides.
+                forced_model_override=_forced_model,
+                forced_effort_override=_forced_effort,
+                active_skill_prompt=_active_skill_prompt,
             )
         finally:
             # Spinner hands status_msg back to the normal (throttled) flow.
@@ -1561,7 +1777,7 @@ async def on_message(message: discord.Message):
         job.phase = JobPhase.FINALIZING
         await status.update("🪄 整形中")
 
-        if will_resume and not actually_resumed:
+        if _provider == PROVIDER_CLAUDE and will_resume and not actually_resumed:
             # actually_resumed is the 3rd return value from call_with_tools.
             # It can be False for several reasons: a genuine MCP-set mismatch,
             # a context_overflow that intentionally drops the session, OR a
@@ -1736,6 +1952,7 @@ async def on_message(message: discord.Message):
 
         try:
             if _renderer.live_sent_any:
+                _log_math_presentation(parse_segments(response_text))
                 # Streaming already rendered prose + table/$$/$ block images in
                 # order via the incremental renderer (_render_incremental) — no
                 # raw markdown was ever shown then deleted. Run the authoritative
@@ -1900,6 +2117,41 @@ async def on_message(message: discord.Message):
                 await status.edit_final(oauth_text)
             else:
                 await message.reply(oauth_text)
+        except Exception:
+            pass
+    except CodexAuthError:
+        job.phase = JobPhase.FAILED
+        log.warning(
+            "Codex ChatGPT OAuth unavailable (user ...%s in #%s)",
+            str(message.author.id)[-4:], message.channel,
+        )
+        auth_text = (
+            "CodexのChatGPT認証が利用できません。サーバー上で "
+            "`/home/ubuntu/.volta/bin/codex login` を実行してください。"
+        )
+        try:
+            if status.status_msg is not None:
+                await status.edit_final(auth_text)
+            else:
+                await message.reply(auth_text)
+        except Exception:
+            pass
+    except (CodexUnavailableError, CodexProtocolError, CodexTurnError) as exc:
+        job.phase = JobPhase.FAILED
+        log.warning(
+            "Codex provider failed for user ...%s in #%s: %s",
+            str(message.author.id)[-4:], message.channel, exc,
+            exc_info=True,
+        )
+        err_text = "Codexの実行に失敗しました。サーバーログを確認してください。"
+        rid = get_request_id()
+        if caller_is_admin and rid:
+            err_text += f"\n-# req: {rid}"
+        try:
+            if status.status_msg is not None:
+                await status.edit_final(err_text)
+            else:
+                await message.reply(err_text)
         except Exception:
             pass
     except Exception:

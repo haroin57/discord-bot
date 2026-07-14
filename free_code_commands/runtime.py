@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 
@@ -203,6 +203,32 @@ class CommandRuntime:
 
     def get_vim_mode(self) -> bool:
         return False
+
+    # ---- /mcp -----------------------------------------------------------
+    def mcp_selected_keys(self) -> list[str]:
+        return []
+
+    def mcp_list(self) -> list[dict[str, Any]]:
+        from services.mcp_control import get_mcp_control
+
+        return get_mcp_control().list_servers(
+            selected_keys=self.mcp_selected_keys()
+        )
+
+    async def mcp_probe(self, key: str) -> dict[str, Any]:
+        from services.mcp_control import get_mcp_control
+
+        return asdict(await get_mcp_control().probe(key))
+
+    def mcp_set_enabled(self, target: str, enabled: bool) -> dict[str, Any]:
+        from services.mcp_control import get_mcp_control
+
+        return asdict(get_mcp_control().set_enabled(target, enabled))
+
+    def mcp_tool_names(self, key: str) -> list[str]:
+        from services.mcp_control import get_mcp_control
+
+        return list(get_mcp_control().tool_names(key))
 
     # ---- capabilities ----------------------------------------------------
     def has_command(self, name: str) -> bool:
@@ -458,6 +484,8 @@ class RecordingRuntime(CommandRuntime):
         extra_usage: Optional[dict[str, Any]] = None,
         remote_mode: bool = False,
         fast_mode: bool = False,
+        mcp_servers: Optional[list[dict[str, Any]]] = None,
+        mcp_probe_results: Optional[dict[str, dict[str, Any]]] = None,
     ) -> None:
         self._env = dict(env or {})
         self._user_type = user_type
@@ -497,6 +525,8 @@ class RecordingRuntime(CommandRuntime):
         self._extra_usage = extra_usage
         self._remote_mode = remote_mode
         self._fast_mode = fast_mode
+        self._mcp_servers = [dict(row) for row in (mcp_servers or [])]
+        self._mcp_probe_results = dict(mcp_probe_results or {})
         # Recorded side effects, inspectable by tests.
         self.opened_dialogs: list[tuple[str, dict[str, Any]]] = []
         self.shell_calls: list[str] = []
@@ -642,3 +672,47 @@ class RecordingRuntime(CommandRuntime):
 
     def fast_mode_enabled(self) -> bool:
         return self._fast_mode
+
+    # /mcp — in-memory implementation for command tests.
+    def mcp_list(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._mcp_servers]
+
+    async def mcp_probe(self, key: str) -> dict[str, Any]:
+        if key not in {row.get("key") for row in self._mcp_servers}:
+            raise KeyError(key)
+        result = dict(self._mcp_probe_results.get(key, {
+            "key": key,
+            "status": "reachable",
+            "tool_names": (),
+            "checked_at": "test",
+            "error": None,
+        }))
+        for row in self._mcp_servers:
+            if row.get("key") == key:
+                row["probe_status"] = result.get("status", "failed")
+                row["error"] = result.get("error")
+                row["tool_count"] = len(result.get("tool_names", ()))
+        return result
+
+    def mcp_set_enabled(self, target: str, enabled: bool) -> dict[str, Any]:
+        keys = {str(row.get("key")) for row in self._mcp_servers}
+        if target != "all" and target not in keys:
+            raise KeyError(target)
+        changed: list[str] = []
+        for row in self._mcp_servers:
+            if target != "all" and row.get("key") != target:
+                continue
+            if bool(row.get("enabled", True)) != enabled:
+                row["enabled"] = enabled
+                changed.append(str(row.get("key")))
+        return {
+            "target": target,
+            "enabled": enabled,
+            "changed_keys": tuple(sorted(changed)),
+        }
+
+    def mcp_tool_names(self, key: str) -> list[str]:
+        if key not in {row.get("key") for row in self._mcp_servers}:
+            raise KeyError(key)
+        result = self._mcp_probe_results.get(key, {})
+        return list(result.get("tool_names", ()))

@@ -69,6 +69,10 @@ from services.mcp_selector import (
     get_mcp_servers_by_keys,
     select_mcp_servers,
 )
+from services.mcp_control import (
+    filter_enabled_mcp_configs,
+    filter_enabled_mcp_keys,
+)
 from services.session import (
     SessionInfo,
     append_jsonl,
@@ -365,6 +369,21 @@ async def _transient_backoff(
     await asyncio.sleep(backoff)
 
 
+def _compose_system_prompt(
+    *,
+    restricted: bool,
+    active_skill_prompt: str = "",
+) -> str:
+    """Build the per-call trusted instruction block without touching history."""
+    if restricted:
+        if active_skill_prompt:
+            raise ValueError("active skills are unavailable in restricted mode")
+        return RESTRICTED_SYSTEM_PROMPT
+    if not active_skill_prompt:
+        return SYSTEM_PROMPT
+    return f"{SYSTEM_PROMPT.rstrip()}\n\n{active_skill_prompt.strip()}"
+
+
 async def call_with_tools(
     prompt: str,
     channel_id: int,
@@ -390,6 +409,7 @@ async def call_with_tools(
     forced_effort_override: "str | None" = None,
     tier: "str | None" = None,        # 熟考P2: "chat" | "deliberate" | None(=従来)
     route_judgment: bool = False,      # 熟考P5: 判断系の問い（MAGI-lite トリガー）
+    active_skill_prompt: str = "",
 ) -> tuple[str, SessionInfo | None, bool]:
     """Direct-API replacement for services/claude_sdk.py:call_with_tools.
 
@@ -410,6 +430,8 @@ async def call_with_tools(
     """
     sema = restricted_claude_semaphore if restricted else claude_semaphore
     if restricted:
+        if active_skill_prompt:
+            raise ValueError("active skills are unavailable in restricted mode")
         tier = None  # 二重ゲート: restricted に熟考パイプラインは適用しない
         route_judgment = False
     async with sema:
@@ -433,6 +455,10 @@ async def call_with_tools(
                 # （静的 schema が無いので live handle 経由でしか tools に載らない）。
                 chosen_mcp_cfg = dict(chosen_mcp_cfg)
                 chosen_mcp_cfg["evalsearch"] = MCP_SERVERS["evalsearch"]
+            chosen_mcp_cfg = filter_enabled_mcp_configs(chosen_mcp_cfg)
+            always_advertised_mcp_keys = filter_enabled_mcp_keys(
+                always_advertised_mcp_keys
+            )
         chosen_mcp_keys = set(chosen_mcp_cfg.keys())
 
         # 3. Session resume (admin only — restricted is stateless).
@@ -530,11 +556,17 @@ async def call_with_tools(
 
         # 5. Per-call settings
         if restricted:
-            system_prompt = RESTRICTED_SYSTEM_PROMPT
+            system_prompt = _compose_system_prompt(
+                restricted=True,
+                active_skill_prompt=active_skill_prompt,
+            )
             cwd = ATTACHMENT_DIR
             max_turns = RESTRICTED_MAX_TURNS
         else:
-            system_prompt = SYSTEM_PROMPT
+            system_prompt = _compose_system_prompt(
+                restricted=False,
+                active_skill_prompt=active_skill_prompt,
+            )
             cwd = CWD
             max_turns = ADMIN_MAX_TURNS
 

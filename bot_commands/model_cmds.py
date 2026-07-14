@@ -1,4 +1,4 @@
-"""/model /effort /tier — チャンネル×ユーザー単位のモデル/推論強度/tier override."""
+"""/provider /model /effort /tier — channel/user scoped runtime overrides."""
 
 from __future__ import annotations
 
@@ -9,6 +9,62 @@ from bot_commands._deps import CommandDeps
 
 
 def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
+    # Older tests and external command registrars construct a lightweight
+    # dependency object that predates provider routing. Keep that boundary
+    # source-compatible while the real bot injects its shared live mapping.
+    provider_overrides = getattr(deps, "provider_overrides", None)
+    if provider_overrides is None:
+        provider_overrides = {}
+
+    @tree.command(
+        name="provider",
+        description="このチャンネル×自分用のAI providerを切り替える (admin only)",
+    )
+    @app_commands.describe(provider="Claude / Codex / 既定に戻す")
+    @app_commands.choices(provider=[
+        app_commands.Choice(name="Codex (ChatGPT OAuth)", value="codex"),
+        app_commands.Choice(name="Claude", value="claude"),
+        app_commands.Choice(name="clear（env既定に戻す）", value="clear"),
+    ])
+    async def provider_cmd(
+        interaction: discord.Interaction,
+        provider: app_commands.Choice[str],
+    ):
+        if not deps.is_admin(interaction.user):
+            await interaction.response.send_message("admin only", ephemeral=True)
+            return
+        cid = interaction.channel_id
+        uid = interaction.user.id
+        if cid is None:
+            await interaction.response.send_message(
+                "チャンネル外では使えません", ephemeral=True,
+            )
+            return
+        key = (cid, uid)
+        if provider.value == "clear":
+            provider_overrides.pop(key, None)
+            await interaction.response.send_message(
+                "provider override を解除しました。model override がある場合は"
+                "そのモデルに対応するproviderを使用します。",
+                ephemeral=True,
+            )
+            return
+        current_model = str(deps.model_overrides.get(key) or "").lower()
+        if (
+            provider.value == "codex"
+            and current_model.startswith("claude-")
+        ) or (
+            provider.value == "claude"
+            and current_model.startswith(("gpt-", "o1", "o3", "o4"))
+        ):
+            deps.model_overrides.pop(key, None)
+        provider_overrides[key] = provider.value
+        await interaction.response.send_message(
+            f"次のターンから provider=`{provider.value}` を使用します"
+            "（このチャンネル × あなただけ）",
+            ephemeral=True,
+        )
+
     @tree.command(name="model", description="このチャンネル×自分用にモデルを切り替える (admin only)")
     @app_commands.describe(
         model="切替先モデル（clear で解除）",
@@ -17,6 +73,9 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
     # 主要モデルは選択肢から1タップで切替（2026-07-08 要望）。ID の手打ちは
     # 選択肢に無い実験用モデルのための custom に残す。
     @app_commands.choices(model=[
+        app_commands.Choice(name="GPT-5.6 Sol (Codex)", value="gpt-5.6-sol"),
+        app_commands.Choice(name="GPT-5.6 Terra (Codex)", value="gpt-5.6-terra"),
+        app_commands.Choice(name="GPT-5.6 Luna (Codex)", value="gpt-5.6-luna"),
         app_commands.Choice(name="Fable 5", value="claude-fable-5"),
         app_commands.Choice(name="Opus 4.8", value="claude-opus-4-8"),
         app_commands.Choice(name="Opus 4.7", value="claude-opus-4-7"),
@@ -50,9 +109,16 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
             )
             return
         deps.model_overrides[key] = value
+        # A model selection is an explicit provider signal. This prevents a
+        # GPT slug from being handed to Anthropic (or a Claude slug to Codex)
+        # while still allowing /provider to be used independently.
+        if value.lower().startswith(("gpt-", "o1", "o3", "o4")):
+            provider_overrides[key] = "codex"
+        elif value.lower().startswith("claude-"):
+            provider_overrides[key] = "claude"
         label = model.name if (model and not custom) else value
         await interaction.response.send_message(
-            f"✅ 次のターンから `{label}` を使います（このチャンネル × あなただけ）",
+            f"次のターンから `{label}` を使います（このチャンネル × あなただけ）",
             ephemeral=True,
         )
 
@@ -64,6 +130,7 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
         app_commands.Choice(name="high", value="high"),
         app_commands.Choice(name="xhigh", value="xhigh"),
         app_commands.Choice(name="max", value="max"),
+        app_commands.Choice(name="ultra (Codex Sol/Terra)", value="ultra"),
         app_commands.Choice(name="clear", value="clear"),
     ])
     async def effort_cmd(interaction: discord.Interaction, level: app_commands.Choice[str]):

@@ -180,6 +180,11 @@ async def main() -> None:
         except Exception as e:
             log.warning("kill_orphan_claude_cli failed: %s", e)
         try:
+            from services.codex_app_server.manager import close_all_codex_sessions
+            await close_all_codex_sessions()
+        except Exception as e:
+            log.warning("close_all_codex_sessions failed: %s", e)
+        try:
             await bot.close()
         except Exception:
             pass

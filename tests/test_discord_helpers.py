@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 import pytest
 
-from config import ADMIN_USER_IDS, BOT_ROLE_IDS
+from config import ADMIN_USER_IDS, BOT_IGNORED_ROLE_IDS, BOT_ROLE_IDS
 from utils.discord_helpers import (
     _cache_get,
     _cache_set,
@@ -135,6 +135,17 @@ class TestStripMention:
         build_mention_regex(123456)
         result = strip_mention("<@&789> hello", 123456)
         assert result == "hello"
+
+    def test_strips_ignored_role_mention(self):
+        BOT_ROLE_IDS.clear()
+        BOT_IGNORED_ROLE_IDS.clear()
+        BOT_IGNORED_ROLE_IDS.add(987)
+        try:
+            build_mention_regex(123456)
+            result = strip_mention("<@&987> hello", 123456)
+            assert result == "hello"
+        finally:
+            BOT_IGNORED_ROLE_IDS.clear()
 
     def test_keyword_callout_preserved(self):
         # ADR-0003: キーワード呼びかけは strip しない。本文に残して Claude に渡す。
