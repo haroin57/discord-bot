@@ -52,6 +52,78 @@ def _jsx(name: str, description: str, **kw) -> LocalJsxCommand:
     return LocalJsxCommand(name=name, description=description, **kw)
 
 
+def _mcp_summary(rows: list[dict]) -> str:
+    enabled = sum(bool(row.get("enabled")) for row in rows)
+    selected = sum(bool(row.get("selected")) for row in rows)
+    reachable = sum(row.get("probe_status") == "reachable" for row in rows)
+    failed = sum(row.get("probe_status") == "failed" for row in rows)
+    return (
+        f"MCP servers: {len(rows)} configured, {enabled} enabled, "
+        f"{selected} selected, {reachable} reachable, {failed} failed."
+    )
+
+
+async def _mcp_call(args: str, rt: CommandRuntime) -> JsxOutcome:
+    """Headless port of free-code's MCP action dispatcher."""
+
+    raw = (args or "").strip()
+    parts = raw.split()
+    action = parts[0].lower() if parts else "status"
+
+    def finish(message: str, **data) -> JsxOutcome:
+        payload = {"args": args, "action": action, **data}
+        rt.open_dialog("mcp", **payload)
+        return JsxOutcome(message=message, dialog="mcp", data=payload)
+
+    if action in {"status", "list"}:
+        if len(parts) > 1:
+            return finish("Usage: /mcp [reconnect|tools|enable|disable] [server|all]")
+        rows = rt.mcp_list()
+        return finish(_mcp_summary(rows), servers=rows)
+
+    if action not in {"reconnect", "tools", "enable", "disable"}:
+        return finish(
+            f"Unknown MCP action: {action}. "
+            "Use status, reconnect, tools, enable, or disable."
+        )
+    if len(parts) != 2:
+        return finish(f"Usage: /mcp {action} <server"
+                      + ("|all>" if action in {"enable", "disable"} else ">"))
+
+    target = parts[1]
+    try:
+        if action == "reconnect":
+            result = await rt.mcp_probe(target)
+            status = result.get("status", "failed")
+            count = len(result.get("tool_names", ()))
+            message = f"{target}: {status}"
+            if status == "reachable":
+                message += f" ({count} tools)"
+            elif result.get("error"):
+                message += f" ({result['error']})"
+            return finish(message, server=target, probe=result)
+
+        if action == "tools":
+            names = rt.mcp_tool_names(target)
+            message = (
+                f"{target}: {len(names)} tools"
+                if names else f"{target}: no known tools; run reconnect to probe."
+            )
+            return finish(message, server=target, tools=names)
+
+        enabled = action == "enable"
+        result = rt.mcp_set_enabled(target, enabled)
+        changed = tuple(result.get("changed_keys", ()))
+        state = "enabled" if enabled else "disabled"
+        if changed:
+            message = f"{target}: {state} ({len(changed)} changed)"
+        else:
+            message = f"{target}: already {state}"
+        return finish(message, server=target, mutation=result)
+    except KeyError:
+        return finish(f"Unknown MCP server: {target}", server=target)
+
+
 COMMANDS: list[LocalJsxCommand] = [
     # add-dir/index.ts
     _jsx("add-dir", "Add a new working directory", argument_hint="<path>"),
@@ -169,6 +241,7 @@ COMMANDS: list[LocalJsxCommand] = [
         "Manage MCP servers",
         immediate=True,
         argument_hint="[enable|disable [server-name]]",
+        call_fn=_mcp_call,
     ),
     # memory/index.ts
     _jsx("memory", "Edit Claude memory files"),

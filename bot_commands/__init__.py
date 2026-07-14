@@ -12,11 +12,13 @@ from bot_commands import (
     archive,
     btw,
     free_code_slash,
+    mcp,
     memory,
     misc,
     model_cmds,
     prefix,
     session_cmds,
+    skills,
 )
 from bot_commands._deps import CommandDeps
 
@@ -31,3 +33,5 @@ def register_all(tree, deps: CommandDeps) -> None:
     model_cmds.register(tree, deps)
     btw.register(tree, deps)
     free_code_slash.register(tree, deps)
+    mcp.register(tree, deps)
+    skills.register(tree, deps)

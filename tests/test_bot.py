@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from collections import OrderedDict, deque
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 import aiohttp
@@ -144,10 +145,13 @@ class TestOnMessage:
         """Clean state before each test."""
         import bot
         bot._channel_semas.clear()
+        bot._SKILL_OVERRIDES.clear()
         monkeypatch.setattr("bot.COOLDOWN_SECONDS", 5)
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345})
+        monkeypatch.setattr("bot.BOT_IGNORED_ROLE_IDS", set())
         monkeypatch.setattr("bot.BOT_KEYWORDS", ["かなえ"])
         monkeypatch.setattr("bot.BOT_ROLE_IDS", set())
+        monkeypatch.setattr("bot.MATH_PRESENTATION_MODE", "legacy")
         monkeypatch.setattr("bot.MAX_COOLDOWN_ENTRIES", 1000)
 
         # Mock bot.user — it's a property on discord.Client, so we patch at class level
@@ -158,6 +162,7 @@ class TestOnMessage:
         )
         self._user_patcher.start()
         yield
+        bot._SKILL_OVERRIDES.clear()
         self._user_patcher.stop()
 
     async def _dispatch(self, message):
@@ -242,6 +247,43 @@ class TestOnMessage:
             msg.reply.assert_called()
 
     @pytest.mark.asyncio
+    async def test_reply_ping_to_bot_triggers_without_literal_mention(self):
+        """Discord reply pings live in mentions/reference, not content."""
+        import bot
+
+        referenced = MagicMock()
+        referenced.author = MagicMock()
+        referenced.author.id = bot.bot.user.id
+        referenced.author.display_name = "かなえ"
+        referenced.content = "prior bot answer"
+        referenced.attachments = []
+        reference = MagicMock()
+        reference.message_id = 112233
+        reference.resolved = referenced
+        reference.cached_message = referenced
+        msg = _make_message(
+            content="続きを説明して",
+            author_id=12345,
+            mentions=[bot.bot.user],
+            reference=reference,
+        )
+
+        with patch("bot.strip_mention", return_value="続きを説明して"), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)) as model_call, \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="続きを説明して"), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+
+        model_call.assert_awaited_once()
+        msg.reply.assert_called()
+
+    @pytest.mark.asyncio
     async def test_role_mention_triggers(self, monkeypatch):
         import bot
         monkeypatch.setattr("bot.BOT_ROLE_IDS", {7777})
@@ -267,6 +309,150 @@ class TestOnMessage:
             msg.reply.assert_called()
 
     @pytest.mark.asyncio
+    async def test_other_bot_role_does_not_trigger_from_expanded_mentions(
+        self, monkeypatch,
+    ):
+        """A role-expanded mentions payload is not a direct bot mention."""
+        import bot
+        old_bot_role_id = 222222222222222222
+        monkeypatch.setattr("bot.BOT_IGNORED_ROLE_IDS", {old_bot_role_id})
+        monkeypatch.setattr("bot.BOT_ROLE_IDS", {7777})
+
+        old_bot_role = MagicMock()
+        old_bot_role.id = old_bot_role_id
+        msg = _make_message(
+            content=f"<@&{old_bot_role_id}> old bot only",
+            author_id=12345,
+            # Reproduce a Discord payload that expands the role into users.
+            mentions=[bot.bot.user],
+            role_mentions=[old_bot_role],
+        )
+
+        await self._dispatch(msg)
+
+        msg.reply.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_other_bot_role_blocks_keyword_trigger(self, monkeypatch):
+        """A legacy role callout stays isolated even when it names kanae."""
+        old_bot_role_id = 222222222222222222
+        monkeypatch.setattr("bot.BOT_IGNORED_ROLE_IDS", {old_bot_role_id})
+
+        old_bot_role = MagicMock()
+        old_bot_role.id = old_bot_role_id
+        msg = _make_message(
+            content=f"<@&{old_bot_role_id}> かなえ old bot only",
+            author_id=12345,
+            role_mentions=[old_bot_role],
+        )
+
+        await self._dispatch(msg)
+
+        msg.reply.assert_not_called()
+
+    def test_direct_mention_takes_precedence_over_ignored_role(self, monkeypatch):
+        import bot
+        old_bot_role_id = 222222222222222222
+        monkeypatch.setattr("bot.BOT_IGNORED_ROLE_IDS", {old_bot_role_id})
+        msg = _make_message(
+            content=f"<@99900> <@&{old_bot_role_id}> explicit override",
+            author_id=12345,
+        )
+
+        assert bot._guild_message_addresses_bot(msg) is True
+
+    def test_ignored_role_wins_if_accidentally_assigned_to_bot(self, monkeypatch):
+        import bot
+        old_bot_role_id = 222222222222222222
+        monkeypatch.setattr("bot.BOT_IGNORED_ROLE_IDS", {old_bot_role_id})
+        monkeypatch.setattr("bot.BOT_ROLE_IDS", {old_bot_role_id})
+        role = MagicMock()
+        role.id = old_bot_role_id
+        msg = _make_message(
+            content=f"<@&{old_bot_role_id}> old bot only",
+            author_id=12345,
+            role_mentions=[role],
+        )
+
+        assert bot._guild_message_addresses_bot(msg) is False
+
+    def test_reply_without_ping_does_not_trigger(self):
+        import bot
+
+        referenced = MagicMock()
+        referenced.author.id = bot.bot.user.id
+        reference = MagicMock()
+        reference.message_id = 1
+        reference.resolved = referenced
+        reference.cached_message = referenced
+        msg = _make_message(
+            content="notification disabled",
+            mentions=[],
+            reference=reference,
+        )
+
+        assert bot._guild_message_addresses_bot(msg) is False
+
+    def test_reply_ping_uses_cached_message_fallback(self):
+        import bot
+
+        cached = MagicMock()
+        cached.author.id = bot.bot.user.id
+        reference = MagicMock()
+        reference.message_id = 1
+        reference.resolved = None
+        reference.cached_message = cached
+        msg = _make_message(
+            content="cached reply",
+            mentions=[bot.bot.user],
+            reference=reference,
+        )
+
+        assert bot._guild_message_addresses_bot(msg) is True
+
+    def test_forward_reference_is_not_treated_as_reply_ping(self):
+        import bot
+
+        forwarded = MagicMock()
+        forwarded.author.id = bot.bot.user.id
+        reference = MagicMock()
+        reference.type = discord.MessageReferenceType.forward
+        reference.message_id = 1
+        reference.resolved = forwarded
+        reference.cached_message = forwarded
+        msg = _make_message(
+            content="forwarded content",
+            mentions=[bot.bot.user],
+            reference=reference,
+        )
+
+        assert bot._guild_message_addresses_bot(msg) is False
+
+    def test_reply_to_other_author_does_not_revive_role_expansion(
+        self, monkeypatch,
+    ):
+        import bot
+
+        old_bot_role_id = 222222222222222222
+        monkeypatch.setattr("bot.BOT_IGNORED_ROLE_IDS", {old_bot_role_id})
+        referenced = MagicMock()
+        referenced.author.id = 4444
+        reference = MagicMock()
+        reference.message_id = 1
+        reference.resolved = referenced
+        reference.cached_message = referenced
+        role = MagicMock()
+        role.id = old_bot_role_id
+        msg = _make_message(
+            content=f"<@&{old_bot_role_id}> old bot",
+            mentions=[bot.bot.user],
+            role_mentions=[role],
+            reference=reference,
+        )
+
+        assert bot._guild_message_addresses_bot(msg) is False
+
+    @pytest.mark.asyncio
     async def test_rate_limiting(self, monkeypatch):
         import bot
         # Cooldown applies to NON-admins only (admins skip it so their rapid
@@ -286,36 +472,40 @@ class TestOnMessage:
         reply_text = msg.reply.call_args[0][0]
         assert "⏳" in reply_text or "wait" in reply_text.lower()
 
-    @pytest.mark.skip(
-        reason=(
-            "channel_busy set was replaced with asyncio.Semaphore (_channel_semas). "
-            "Pre-marking a channel as busy requires acquiring the semaphore in a "
-            "concurrent task, which cannot be done deterministically in a unit test "
-            "without a real event loop running in parallel. "
-            "Integration-level coverage of the queuing behaviour is sufficient."
-        )
-    )
     @pytest.mark.asyncio
-    async def test_channel_busy(self, monkeypatch):
+    async def test_channel_busy_queues_until_semaphore_is_released(self, monkeypatch):
         import bot
 
-        # New busy management: sema.locked() is True while sema is acquired.
-        # Simulate by pre-acquiring the semaphore for channel 888.
         msg = _make_message(content="かなえ hello", author_id=12345, channel_id=888)
+        status_msg = AsyncMock()
+        msg.reply = AsyncMock(return_value=status_msg)
+        sema = bot._get_channel_sema(888)
+        await sema.acquire()
 
-        with patch("bot.strip_mention", return_value="hello"):
-            # Pre-mark channel as busy
-            sema = bot._get_channel_sema(888)
-            await sema.acquire()
+        with patch("bot.strip_mention", return_value="hello"), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            task = asyncio.create_task(self._dispatch(msg))
+            for _ in range(20):
+                if msg.reply.await_count:
+                    break
+                await asyncio.sleep(0)
 
-            await self._dispatch(msg)
-
+            assert task.done() is False
+            assert any("待機中" in str(call) for call in msg.reply.call_args_list)
+            msg.add_reaction.assert_any_await("⏳")
             sema.release()
+            await asyncio.wait_for(task, timeout=5)
 
-            # Should reply with busy message (queued reaction, not a direct reply)
-            calls = msg.reply.call_args_list
-            busy_replied = any("前のリクエスト" in str(c) or "処理中" in str(c) for c in calls)
-            assert busy_replied
+            assert any("ok" in str(call) for call in msg.reply.call_args_list)
+            assert sema.locked() is False
 
     @pytest.mark.asyncio
     async def test_empty_prompt_dm(self, monkeypatch):
@@ -389,6 +579,41 @@ class TestOnMessage:
             calls = msg.reply.call_args_list
             any_response = any("chunk1" in str(c) for c in calls)
             assert any_response
+
+    @pytest.mark.asyncio
+    async def test_codex_tex_response_is_sent_as_rendered_image(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        import bot
+
+        msg = _make_message(content="かなえ 行列を説明して", author_id=12345)
+        image_path = tmp_path / "matrix.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        latex = r"B=\begin{pmatrix}1&0\\0&1\end{pmatrix}"
+        response = rf"\[{latex}\]"
+
+        with patch("bot.strip_mention", return_value="行列を説明して"), \
+             patch("bot.resolve_provider", return_value=bot.PROVIDER_CODEX), \
+             patch("services.codex_app_server.manager.get_manager") as manager, \
+             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=(response, None, False)) as model_call, \
+             patch("bot.render_math_image", new_callable=AsyncMock, return_value=str(image_path)) as render_call, \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="行列を説明して"), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.r2_archive.archive_images", return_value=[]), \
+             patch("bot.r2_archive.bind_response_message"):
+            manager.return_value.has_thread.return_value = False
+            await self._dispatch(msg)
+
+        assert model_call.await_args.kwargs["provider"] == bot.PROVIDER_CODEX
+        render_call.assert_awaited_once_with(latex, display_mode=True)
+        assert any("file" in call.kwargs for call in msg.reply.call_args_list)
 
     @pytest.mark.asyncio
     async def test_multi_chunk_response(self, monkeypatch):
@@ -645,6 +870,37 @@ class TestOnMessage:
             # Admin prompt must use the trusted-context header, not the strict-mode header
             assert "Trusted context" in captured_prompt
             assert "external untrusted user" not in captured_prompt
+
+    @pytest.mark.asyncio
+    async def test_active_skill_is_passed_outside_user_prompt(self, monkeypatch):
+        import bot
+        from services.skills import SkillSelection
+
+        monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345})
+        bot._SKILL_OVERRIDES[(99999, 12345)] = SkillSelection("inshi-coach")
+        msg = _make_message(content="かなえ hello", author_id=12345)
+        captured: dict = {}
+
+        async def capture_call_with_tools(prompt, *args, **kwargs):
+            captured["prompt"] = prompt
+            captured["kwargs"] = kwargs
+            return ("ok", None, False)
+
+        with patch("bot.strip_mention", return_value="hello"), \
+             patch("bot.render_active_skill_prompt", return_value="ACTIVE_INSHI"), \
+             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call_with_tools), \
+             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
+             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
+             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
+             patch("bot.extract_image_paths", return_value=[]), \
+             patch("bot.split_message", return_value=["ok"]), \
+             patch("bot.cleanup_attachments"), \
+             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
+             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            await self._dispatch(msg)
+
+        assert captured["kwargs"]["active_skill_prompt"] == "ACTIVE_INSHI"
+        assert "ACTIVE_INSHI" not in captured["prompt"]
 
     @pytest.mark.asyncio
     async def test_lean_resume_prompt_declares_current_speaker(self, monkeypatch):
@@ -1112,6 +1368,61 @@ class TestOnMessage:
             assert captured_prompt is not None
             # Thread context is sanitized but the payload body should survive
             assert "thread-context-sentinel" in captured_prompt
+
+
+class TestAdaptiveSegmentedMath:
+    @pytest.mark.asyncio
+    async def test_regression_fixture_sends_one_math_image_and_two_text_blocks(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        import bot
+
+        response = (
+            Path(__file__).parent / "fixtures" / "tex_inline_vertical_case.md"
+        ).read_text(encoding="utf-8")
+        image_path = tmp_path / "aligned.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        msg = _make_message(content="かなえ explain")
+        sent = MagicMock()
+        sent.id = 123
+        msg.reply.return_value = sent
+        msg.channel.send.return_value = sent
+        monkeypatch.setattr(bot, "MATH_PRESENTATION_MODE", "adaptive")
+
+        with patch(
+            "bot.render_math_image",
+            new_callable=AsyncMock,
+            return_value=str(image_path),
+        ) as render_call, patch(
+            "bot.r2_archive.archive_images", return_value=[]
+        ):
+            await bot._send_segmented(msg, response, [])
+
+        render_call.assert_awaited_once()
+        rendered_latex = render_call.await_args.args[0]
+        assert r"\begin{aligned}" in rendered_latex
+        assert render_call.await_args.kwargs == {"display_mode": True}
+        assert msg.reply.await_count == 1
+        assert msg.channel.send.await_count == 2
+
+        text_payloads = [
+            call.args[0]
+            for call in [*msg.reply.await_args_list, *msg.channel.send.await_args_list]
+            if call.args
+        ]
+        combined = "\n".join(text_payloads)
+        assert "a₁, …, aₙ" in combined
+        assert "x ≠ 0" in combined
+        assert "m × n" in combined
+        assert r"\(" not in combined
+        assert "$$" not in combined
+
+        image_call = next(
+            call for call in msg.channel.send.await_args_list if "file" in call.kwargs
+        )
+        assert image_call.kwargs["file"].description == rendered_latex[:1024]
 
 
 # ---------------------------------------------------------------------------

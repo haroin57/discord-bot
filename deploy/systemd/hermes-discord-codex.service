@@ -1,0 +1,43 @@
+[Unit]
+Description=Hermes Discord Identity - Codex App Server Bot
+After=network-online.target chromadb-server.service
+Wants=network-online.target chromadb-server.service
+StartLimitBurst=3
+StartLimitIntervalSec=60
+StartLimitAction=none
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/discord-bot
+EnvironmentFile=/home/ubuntu/discord-bot/.env
+EnvironmentFile=/home/ubuntu/discord-bot/.env.hermes-discord
+ExecStartPre=/usr/bin/test -s /home/ubuntu/discord-bot/.env.hermes-discord
+ExecStart=/home/ubuntu/discord-bot/.venv/bin/python /home/ubuntu/discord-bot/main_async.py
+Restart=on-failure
+RestartSec=10s
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-discord-codex
+
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictRealtime=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+MemoryMax=900M
+MemoryHigh=700M
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

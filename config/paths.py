@@ -14,7 +14,9 @@ load_dotenv()  # idempotent; guards direct `import config.paths` in scripts
 
 # Repo root is one level above the config/ package.
 BOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATE_DIR = os.path.join(BOT_DIR, ".state")
+STATE_DIR = os.path.abspath(os.path.expanduser(
+    os.environ.get("BOT_STATE_DIR", os.path.join(BOT_DIR, ".state")),
+))
 HISTORY_DIR = os.path.join(STATE_DIR, "history")
 SESSIONS_PATH = os.path.join(STATE_DIR, "sessions.json")
 # Single source of truth for the session freshness window (機能2, 2026-06-17).
@@ -34,7 +36,12 @@ RUNTIME_STATE_PATH = os.path.join(STATE_DIR, "runtime_state.json")
 INVEST_KB_PATH = os.path.join(STATE_DIR, "invest_kb")
 SETTINGS_PATH = os.path.join(BOT_DIR, ".claude", "settings.json")
 CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
-ATTACHMENT_DIR = os.path.join(tempfile.gettempdir(), "discord_bot_attachments")
+ATTACHMENT_DIR = os.path.abspath(os.path.expanduser(
+    os.environ.get(
+        "BOT_ATTACHMENT_DIR",
+        os.path.join(tempfile.gettempdir(), "discord_bot_attachments"),
+    ),
+))
 
 
 def _ensure_mode_700(path: str) -> None:

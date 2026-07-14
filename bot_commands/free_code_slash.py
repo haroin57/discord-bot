@@ -115,25 +115,43 @@ async def _run(interaction: discord.Interaction, deps: CommandDeps, command, arg
     key = (channel_id, interaction.user.id)
     model = deps.model_overrides.get(key)
     effort = deps.effort_overrides.get(key)
+    active_skill_prompt = ""
+    skill_selection = getattr(deps, "skill_overrides", {}).get(key)
+    if skill_selection is not None:
+        from services.skills import SkillError, render_active_skill_prompt
+
+        try:
+            active_skill_prompt = render_active_skill_prompt(skill_selection)
+        except SkillError as exc:
+            getattr(deps, "skill_overrides", {}).pop(key, None)
+            log.warning("active skill cleared for /%s: %s", command.name, exc)
 
     try:
-        from services.claude_api import call_with_tools
+        from services.provider_router import call_with_provider, resolve_provider
         from services.session import shared_sessions
 
         sessions = shared_sessions()
+        provider_overrides = getattr(deps, "provider_overrides", {})
+        provider = resolve_provider(
+            explicit=provider_overrides.get(key),
+            model=model,
+            restricted=False,
+        )
         sema = deps.get_channel_sema(channel_id) if deps.get_channel_sema else None
 
         async def _invoke():
-            return await call_with_tools(
+            return await call_with_provider(
                 prepared.prompt,
                 channel_id,
                 sessions,
+                provider=provider,
                 restricted=False,  # admin-gated above → full tools (allowedTools ⊆ admin)
                 raw_user_text=f"/{command.name} {args}".strip(),
                 author=author,
                 user_id=interaction.user.id,
                 forced_model_override=model,
                 forced_effort_override=effort,
+                active_skill_prompt=active_skill_prompt,
             )
 
         if sema is not None:

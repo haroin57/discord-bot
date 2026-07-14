@@ -11,7 +11,7 @@ go through this container.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
@@ -34,3 +34,10 @@ class CommandDeps:
     # acquire it so their tool-enabled turn can't race a concurrent channel reply
     # (ADR-0048). Optional/last-field so existing constructors stay valid.
     get_channel_sema: Callable[[int], Any] | None = None
+    # (channel_id, user_id) -> "claude" | "codex". Optional so older command
+    # tests and out-of-tree constructors remain source-compatible.
+    provider_overrides: dict = field(default_factory=dict)
+    # (channel_id, user_id) -> services.skills.SkillSelection.  Like model and
+    # provider overrides this is process-local and intentionally cheap to
+    # re-issue after a restart.
+    skill_overrides: dict = field(default_factory=dict)

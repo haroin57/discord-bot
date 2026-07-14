@@ -7,6 +7,7 @@ from utils.markdown_parser import (
     TableSegment,
     TextSegment,
     first_block_span,
+    format_math_for_discord,
     has_math,
     has_tables,
     mask_code_blocks,
@@ -99,6 +100,12 @@ class TestHasMath:
     def test_inline_math_detected(self):
         assert has_math("The value is $x = 1$ here.") is True
 
+    def test_tex_display_delimiter_detected(self):
+        assert has_math(r"The matrix is \[A=I\].") is True
+
+    def test_tex_inline_delimiter_detected(self):
+        assert has_math(r"The value is \(x=1\) here.") is True
+
     def test_single_variable_detected(self):
         assert has_math("Let $n$ be natural and $A$ a matrix.") is True
 
@@ -117,6 +124,10 @@ class TestHasMath:
 
     def test_math_inside_code_block_ignored(self):
         text = "```\n$$x^2$$\n```"
+        assert has_math(text) is False
+
+    def test_tex_delimiters_inside_code_block_ignored(self):
+        text = "```tex\n\\[x^2\\]\n\\(y\\)\n```"
         assert has_math(text) is False
 
     def test_precomputed_masked_accepted(self):
@@ -227,6 +238,38 @@ class TestParseSegmentsMath:
         segs = parse_segments("Value is $x=1$ here.")
         ms = next(s for s in segs if isinstance(s, MathSegment))
         assert "$" not in ms.latex
+
+    def test_tex_display_math_extracted_and_stripped(self):
+        segs = parse_segments(r"Before \[x^2+y^2=r^2\] after.")
+        ms = next(s for s in segs if isinstance(s, MathSegment))
+        assert ms.display_mode is True
+        assert ms.latex == "x^2+y^2=r^2"
+
+    def test_tex_inline_math_extracted_and_stripped(self):
+        segs = parse_segments(r"Value \(A_{jk}=B_{jk}\) follows.")
+        ms = next(s for s in segs if isinstance(s, MathSegment))
+        assert ms.display_mode is False
+        assert ms.latex == r"A_{jk}=B_{jk}"
+
+    def test_codex_matrix_response_delimiters_are_all_extracted(self):
+        text = r"""
+厳密には、元の行列 \(A\) の第 \(j\) 行による展開ではありません。
+
+\[
+B=
+\begin{pmatrix}
+ & & \\
+a_{i1}&\cdots&a_{in} \quad \leftarrow j\text{行目}\\
+ & &
+\end{pmatrix}
+\]
+
+したがって、\[C_{ij}=|B|=0\] です。
+"""
+        math_segs = [s for s in parse_segments(text) if isinstance(s, MathSegment)]
+        assert len(math_segs) == 4
+        assert [s.display_mode for s in math_segs] == [False, False, True, True]
+        assert r"\begin{pmatrix}" in math_segs[2].latex
 
     def test_text_around_math_preserved(self):
         segs = parse_segments("Before $$E=mc^2$$ after.")
@@ -339,6 +382,42 @@ class TestSplitSettled:
         assert pending == "$$x = "
         assert is_open is True
 
+    @pytest.mark.parametrize("suffix", ["$", "\\"])
+    def test_ambiguous_streaming_opener_prefix_is_held(self, suffix):
+        text = "intro " + suffix
+        settled, pending, is_open = split_settled(text)
+        assert settled == "intro "
+        assert pending == suffix
+        assert is_open is True
+
+    def test_complete_trailing_inline_math_is_not_mistaken_for_opener(self):
+        text = "value $x$"
+        settled, pending, is_open = split_settled(text)
+        assert settled == text
+        assert pending == ""
+        assert is_open is False
+
+    def test_even_trailing_backslashes_are_not_an_opener_prefix(self):
+        text = r"literal line break \\"
+        settled, pending, is_open = split_settled(text)
+        assert settled == ""
+        assert pending == text
+        assert is_open is False
+
+    def test_open_tex_display_math_is_held(self):
+        text = r"intro text \[A=\begin{pmatrix}1&0"
+        settled, pending, is_open = split_settled(text)
+        assert settled == "intro text "
+        assert pending.startswith(r"\[")
+        assert is_open is True
+
+    def test_closed_tex_display_math_is_settled(self):
+        text = r"before \[A=I\] after prose"
+        settled, pending, is_open = split_settled(text)
+        assert r"\[A=I\]" in settled
+        assert pending.strip() == "after prose"
+        assert is_open is False
+
     def test_open_inline_math_is_held(self):
         text = "the value $x = "
         settled, pending, is_open = split_settled(text)
@@ -346,11 +425,32 @@ class TestSplitSettled:
         assert pending == "$x = "
         assert is_open is True
 
+    def test_open_tex_inline_math_is_held(self):
+        text = r"the value \(x = "
+        settled, pending, is_open = split_settled(text)
+        assert settled == "the value "
+        assert pending == r"\(x = "
+        assert is_open is True
+
     def test_closed_inline_math_is_settled(self):
         text = "the value $x=y$ is set, and more"
         settled, pending, is_open = split_settled(text)
         assert "$x=y$" in settled
         assert "and more" in pending
+        assert is_open is False
+
+    def test_adaptive_simple_math_remains_in_live_prose(self):
+        text = "the value \\(x=0\\) is final"
+        settled, pending, is_open = split_settled(text, adaptive_math=True)
+        assert settled == ""
+        assert pending == text
+        assert is_open is False
+
+    def test_adaptive_complex_math_is_still_settled(self):
+        text = r"before \[\frac{a}{b}\] after"
+        settled, pending, is_open = split_settled(text, adaptive_math=True)
+        assert r"\[\frac{a}{b}\]" in settled
+        assert pending.strip() == "after"
         assert is_open is False
 
     def test_lone_dollar_with_newline_not_held(self):
@@ -509,6 +609,22 @@ class TestFirstBlockSpan:
         assert seg.display_mode is False
         assert seg.latex == "a=b"
 
+    def test_finds_tex_display_math(self):
+        text = r"lead in \[E=mc^2\] trailing"
+        start, end, seg = first_block_span(text)
+        assert text[start:end] == r"\[E=mc^2\]"
+        assert isinstance(seg, MathSegment)
+        assert seg.display_mode is True
+        assert seg.latex == "E=mc^2"
+
+    def test_finds_tex_inline_math(self):
+        text = r"value \(a=b\) here"
+        start, end, seg = first_block_span(text)
+        assert text[start:end] == r"\(a=b\)"
+        assert isinstance(seg, MathSegment)
+        assert seg.display_mode is False
+        assert seg.latex == "a=b"
+
     def test_finds_table_with_offsets(self):
         text = "before\n\n" + self.TABLE + "\nafter"
         start, end, seg = first_block_span(text)
@@ -537,6 +653,32 @@ class TestFirstBlockSpan:
         start, end, seg = first_block_span(text)
         # The $$ inside the code fence is masked; the real inline $x=1$ wins.
         assert text[start:end] == "$x=1$"
+
+    def test_adaptive_skips_simple_math_and_finds_complex_math(self):
+        text = r"value \(x=0\), then \[\frac{a}{b}\]"
+        start, end, seg = first_block_span(text, adaptive_math=True)
+        assert text[start:end] == r"\[\frac{a}{b}\]"
+        assert isinstance(seg, MathSegment)
+
+    def test_adaptive_simple_math_is_not_an_image_block(self):
+        assert first_block_span(r"value \(x=0\)", adaptive_math=True) is None
+
+
+class TestFormatMathForDiscord:
+    def test_rewrites_simple_math_in_place(self):
+        text = r"vectors \(a_1,\ldots,a_n\) give \(x\ne0\)."
+        result = format_math_for_discord(text)
+        assert result == "vectors a₁, …, aₙ give x ≠ 0."
+
+    def test_preserves_complex_math_for_image_pipeline(self):
+        text = r"before \[\frac{a}{b}\] after"
+        assert format_math_for_discord(text) == text
+
+    def test_does_not_rewrite_tex_inside_code_fence(self):
+        text = "```tex\n\\(x=0\\)\n```\nreal \\(y=1\\)"
+        result = format_math_for_discord(text)
+        assert "\\(x=0\\)" in result
+        assert result.endswith("real y = 1")
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +731,7 @@ class TestStreamingComposition:
         "Lead.\n\nHere is $a + b$ inline and more prose after it.",
         "See the data:\n\n" + TABLE + "\nThat concludes the table.",
         "Mix: $x$ then\n\n$$y=1$$\n\n" + TABLE + "\n\nfinal words.",
+        r"Codex form: \(x\) then \[A=\begin{pmatrix}1&0\\0&1\end{pmatrix}\] done.",
         "### Caption\n" + TABLE + "\nafter caption table.",
         "Cost is $5 today, around $10 tomorrow — no math here.",
         "```python\nx = '$$ not math $$'\n| not | table |\n```\nreal tail.",

@@ -34,6 +34,7 @@ from services.claude_api.mcp_client import (
     static_mcp_tools_to_anthropic,
 )
 from services.claude_api.tools import builtin_tools_for_api
+from services.mcp_control import filter_enabled_mcp_keys
 
 log = logging.getLogger(__name__)
 
@@ -107,10 +108,10 @@ def deferred_catalog_keys(user_id: int | None) -> set[str]:
     schema が無い）ため返さない — dump 拡充までは従来の keyword ゲートが継続
     する段階的移行。
     """
-    return {
+    return filter_enabled_mcp_keys({
         key for key in STATIC_MCP_TOOL_SCHEMAS
         if _server_allowed(key, user_id)
-    }
+    })
 
 
 def build_advertised_tools(
@@ -145,6 +146,9 @@ def build_advertised_tools(
         if ADVISOR_ENABLED:
             out = out + [advisor_tool()]
         return out
+
+    always_keys = filter_enabled_mcp_keys(always_keys)
+    hot_keys = filter_enabled_mcp_keys(hot_keys)
 
     tools: list[dict] = [tool_search_tool()]
     if ADVISOR_ENABLED:

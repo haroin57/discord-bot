@@ -182,6 +182,46 @@ class TestSystemPromptConstants:
         assert "UNTRUSTED" in config.RESTRICTED_SYSTEM_PROMPT
         assert "NEVER" in config.RESTRICTED_SYSTEM_PROMPT
 
+    def test_math_guidance_is_consistent_across_access_levels(self):
+        import config
+        expected = config.MATH_PRESENTATION_MODE == "adaptive"
+        assert (
+            config.MATH_PRESENTATION_GUIDANCE in config.SYSTEM_PROMPT
+        ) is expected
+        assert (
+            config.MATH_PRESENTATION_GUIDANCE in config.RESTRICTED_SYSTEM_PROMPT
+        ) is expected
+
+
+class TestMathPresentationMode:
+    def test_defaults_to_legacy(self):
+        import config
+        assert config._parse_math_presentation_mode(None) == "legacy"
+
+    @pytest.mark.parametrize("value", ["legacy", "adaptive", " Adaptive "])
+    def test_accepts_supported_modes(self, value):
+        import config
+        assert config._parse_math_presentation_mode(value) == value.strip().lower()
+
+    @pytest.mark.parametrize("value", ["", "auto", "enabled", "legacy,adaptive"])
+    def test_rejects_unsupported_modes(self, value):
+        import config
+        with pytest.raises(RuntimeError, match="MATH_PRESENTATION_MODE"):
+            config._parse_math_presentation_mode(value)
+
+    def test_guidance_is_gated_by_adaptive_mode(self, monkeypatch):
+        import config
+        base = "base prompt"
+
+        monkeypatch.setattr(config, "MATH_PRESENTATION_MODE", "legacy")
+        assert config._with_math_presentation_guidance(base) == base
+
+        monkeypatch.setattr(config, "MATH_PRESENTATION_MODE", "adaptive")
+        result = config._with_math_presentation_guidance(base)
+        assert result.startswith(base)
+        assert config.MATH_PRESENTATION_GUIDANCE in result
+        assert "Do not wrap" in result
+
 
 class TestBoolEnv:
     def test_bool_env_true_values(self, monkeypatch):

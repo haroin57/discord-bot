@@ -71,8 +71,9 @@ def set_session(channel_id: int, user_id: int | None, info: "SessionInfo") -> No
 
 def clear_session(channel_id: int, user_id: int | None) -> None:
     """Remove the session for (channel_id, user_id) if present."""
-    _sessions_store.pop((channel_id, user_id), None)
-    _schedule_save()
+    removed = _sessions_store.pop((channel_id, user_id), None)
+    if removed is not None:
+        _schedule_save()
 
 
 def clear_all_sessions_for_channel(channel_id: int) -> int:

@@ -30,6 +30,7 @@ from config import (
     MCP_SERVERS_WEB,
     NATURE_REMO_ALLOWED_USER_IDS,
 )
+from services.mcp_control import filter_enabled_mcp_configs
 
 __all__ = [
     "get_mcp_servers_by_keys",
@@ -130,7 +131,9 @@ _INSHI_TRIGGERS = tuple(kw.lower() for kw in (
 
 def get_mcp_servers_by_keys(keys: list[str]) -> dict:
     """Reconstruct MCP server config dict from a list of server name keys."""
-    return {k: v for k, v in MCP_SERVERS.items() if k in keys}
+    return filter_enabled_mcp_configs(
+        {k: v for k, v in MCP_SERVERS.items() if k in keys}
+    )
 
 
 def pick_mcp_servers(raw_user_text: str, user_id: int | None = None) -> dict:
@@ -174,7 +177,7 @@ def pick_mcp_servers(raw_user_text: str, user_id: int | None = None) -> dict:
         and any(kw in text for kw in _IOT_TRIGGERS)
     ):
         servers.update(MCP_SERVERS_IOT)
-    return servers
+    return filter_enabled_mcp_configs(servers)
 
 
 async def select_mcp_servers(
@@ -205,7 +208,7 @@ async def select_mcp_servers(
         )
         return keyword
     if MCP_SELECTOR_MODE == "semantic":
-        return semantic
+        return filter_enabled_mcp_configs(semantic)
     merged = dict(keyword)
     merged.update(semantic)
-    return merged
+    return filter_enabled_mcp_configs(merged)

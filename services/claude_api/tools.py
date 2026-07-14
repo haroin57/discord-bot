@@ -1231,15 +1231,25 @@ def builtin_tools_for_api(restricted: bool) -> list[dict]:
         skip.add("Scratchpad")
     if not SECOND_OPINION_ENABLED:
         skip.add("SecondOpinion")
-    return [
-        {
+    result: list[dict] = []
+    for td in BUILTIN_TOOLS.values():
+        if td.name in skip:
+            continue
+        description = td.description
+        if td.name == "Skill":
+            # The module-level ToolDef is stable for Anthropic prompt caching,
+            # but the installed-skill suffix must follow filesystem changes in
+            # both long-running bot processes.  Rebuild only that suffix from
+            # the shared mtime-cached registry on every catalog request.
+            marker = "Available skills:\n"
+            prefix = description.split(marker, 1)[0] + marker
+            description = prefix + _skill_format_listing()
+        result.append({
             "name": td.name,
-            "description": td.description,
+            "description": description,
             "input_schema": td.input_schema,
-        }
-        for td in BUILTIN_TOOLS.values()
-        if td.name not in skip
-    ]
+        })
+    return result
 
 
 async def execute_builtin_tool(name: str, args: dict, ctx: ToolContext) -> str:
