@@ -11,6 +11,7 @@ import pytest
 from services.claude_api import entry as entry_mod
 from services.claude_api import image_processor as image_processor_mod
 from services.claude_api.entry import (
+    _compose_system_prompt,
     _extract_attached_image_blocks,
     _resolve_session,
     _safe_image_path,
@@ -43,6 +44,26 @@ class TestIdentifyImage:
 
     def test_unknown_format_rejected(self):
         assert _identify_image(b"BMP_or_something") is None
+
+
+class TestActiveSkillSystemPrompt:
+    def test_admin_skill_is_appended_to_trusted_system_prompt(self):
+        active = "<active_local_skill>INSHI</active_local_skill>"
+
+        result = _compose_system_prompt(
+            restricted=False,
+            active_skill_prompt=active,
+        )
+
+        assert result.startswith(entry_mod.SYSTEM_PROMPT)
+        assert result.endswith(active)
+
+    def test_restricted_skill_is_rejected(self):
+        with pytest.raises(ValueError, match="restricted"):
+            _compose_system_prompt(
+                restricted=True,
+                active_skill_prompt="INSHI",
+            )
 
 
 # ---------------------------------------------------------------------------

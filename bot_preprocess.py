@@ -70,6 +70,7 @@ def launch_context_tasks(
     mem0_history_search_limit: int,
     mem0_history_embed_enabled: bool,
     mem0_history_embed_limit: int,
+    will_resume_override: bool | None = None,
 ) -> ContextTasks:
     """Fire all pre-processing tasks for ``message`` in parallel."""
     is_thread = isinstance(message.channel, discord.Thread)
@@ -78,17 +79,29 @@ def launch_context_tasks(
     # window. Saves tokens on every resumed turn. 機能1: resume 可否は
     # (channel, user) 単位で判定する。同一チャンネルに複数 admin がいても、
     # 相手のセッションを自分の resume 判定に使わない。
-    will_resume = (
-        caller_is_admin
-        and get_session(message.channel.id, message.author.id) is not None
-        and is_session_fresh(message.channel.id, message.author.id)
-    )
+    if will_resume_override is None:
+        will_resume = (
+            caller_is_admin
+            and get_session(message.channel.id, message.author.id) is not None
+            and is_session_fresh(message.channel.id, message.author.id)
+        )
+    else:
+        # Provider-owned session stores are authoritative for their own route.
+        # In particular, a Codex app-server thread must not inherit Claude's
+        # freshness decision or the channel transcript is replayed on every
+        # native thread resume.
+        will_resume = caller_is_admin and bool(will_resume_override)
 
     async def _fetch_reply():
         if not (message.reference and message.reference.message_id):
             return "", [], False
         try:
-            ref_msg = message.reference.cached_message
+            # Gateway reply payloads normally include referenced_message as
+            # ``reference.resolved``. Use it before cache/REST so the same
+            # metadata that admitted a reply ping also supplies its context.
+            ref_msg = getattr(message.reference, "resolved", None)
+            if not isinstance(ref_msg, discord.Message):
+                ref_msg = message.reference.cached_message
             if ref_msg is None:
                 ref_msg = await message.channel.fetch_message(message.reference.message_id)
             # For non-admins, refuse to inline admin messages — they may

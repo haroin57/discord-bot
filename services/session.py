@@ -71,8 +71,9 @@ def set_session(channel_id: int, user_id: int | None, info: "SessionInfo") -> No
 
 def clear_session(channel_id: int, user_id: int | None) -> None:
     """Remove the session for (channel_id, user_id) if present."""
-    _sessions_store.pop((channel_id, user_id), None)
-    _schedule_save()
+    removed = _sessions_store.pop((channel_id, user_id), None)
+    if removed is not None:
+        _schedule_save()
 
 
 def clear_all_sessions_for_channel(channel_id: int) -> int:
@@ -315,6 +316,16 @@ def append_jsonl(channel_id: int, entry: dict) -> None:
                 )
     except Exception as exc:
         log.warning("history embed update failed (non-fatal): %s", exc)
+
+    # Durable Cloudflare R2 mirror.  archive_history_entry only writes to the
+    # local spool here; the background worker performs network I/O later.  Keep
+    # this independent from both indexes so an R2/configuration failure cannot
+    # affect the canonical local JSONL.
+    try:
+        from services.r2_archive import archive_history_entry
+        archive_history_entry(channel_id, entry)
+    except Exception as exc:
+        log.warning("R2 history staging failed (non-fatal): %s", exc)
 
 
 _CONTEXT_BLOCK_RE = re.compile(

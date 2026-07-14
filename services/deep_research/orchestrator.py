@@ -61,6 +61,10 @@ from services.claude_api.stall import StallWatchdog
 from services.claude_api.status import tool_oneline
 from services.claude_api.tool_loop import run_agent_loop
 from services.job_state import JobPhase, JobState, register_job, unregister_job
+from services.mcp_control import (
+    filter_enabled_mcp_configs,
+    filter_enabled_mcp_keys,
+)
 
 from .magi import run_integrator, run_magi_lens
 from .prompts import (
@@ -262,12 +266,16 @@ async def _recall_user_memories(anchor, user, query: str, state: ResearchState) 
 
 def available_research_keys() -> list[str]:
     """env で実際に有効な Deep Research 用 MCP key（在るものだけ。Web+X+金融+学術を横断）。"""
-    return [k for k in DEEP_RESEARCH_MCP_KEYS if k in MCP_SERVERS]
+    return sorted(filter_enabled_mcp_keys(
+        k for k in DEEP_RESEARCH_MCP_KEYS if k in MCP_SERVERS
+    ))
 
 
 def has_required_web_backend() -> bool:
     """brave-search または tavily が利用可能か（FR-1 前提条件）。"""
-    return any(k in MCP_SERVERS_WEB for k in DEEP_RESEARCH_REQUIRED_WEB_KEYS)
+    return bool(filter_enabled_mcp_keys(
+        k for k in DEEP_RESEARCH_REQUIRED_WEB_KEYS if k in MCP_SERVERS_WEB
+    ))
 
 
 async def run_deep_research(
@@ -314,7 +322,9 @@ async def _run(channel, user, query, deps, *, skip_clarify, depth) -> None:
         await stack.__aenter__()
 
         # --- MCP プール（Web + X + 金融 + 学術 を横断利用。playwright/mem0 等は除外）---
-        research_cfg = {k: MCP_SERVERS[k] for k in available_research_keys()}
+        research_cfg = filter_enabled_mcp_configs(
+            {k: MCP_SERVERS[k] for k in available_research_keys()}
+        )
         if not has_required_web_backend():
             await _safe_edit(anchor, "❌ 一般 Web 検索バックエンド（brave-search / tavily）が未設定です。")
             return

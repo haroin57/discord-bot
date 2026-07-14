@@ -2,7 +2,9 @@
 __pycache__/
 *.pyc
 .env
+.env.hermes-discord
 .state/
+.state-hermes-discord/
 .claude/
 .omc/
 .env.example

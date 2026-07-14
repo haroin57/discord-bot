@@ -62,11 +62,16 @@ from services.claude_api.compaction import (
     pop_pending_recovery,
     record_proactive_compaction,
     reset_rapid_refill,
+    start_background_compaction,
 )
 from services.claude_api.microcompact import microcompact_tool_results
 from services.mcp_selector import (
     get_mcp_servers_by_keys,
     select_mcp_servers,
+)
+from services.mcp_control import (
+    filter_enabled_mcp_configs,
+    filter_enabled_mcp_keys,
 )
 from services.session import (
     SessionInfo,
@@ -164,6 +169,40 @@ ALWAYS_ADVERTISED_MCP_KEYS = {
 }
 
 _SNAPSHOT_MAX_AGE_S = int(os.environ.get("SNAPSHOT_MAX_AGE_S", "900"))
+
+
+# ADR-0040: checkpoint auto-resume policy — reason ごとの自動継続上限。
+# tool_loop はループ検知で止まったのに自動継続したらループが再開するだけ
+# なので恒久 0。予算系（wallclock/output_tokens）はコスト暴走ガードの延長に
+# あたるため別上限。module-level なのは unit test のため（closure だと不可視）。
+def auto_resume_cap(reason: str, *, default_max: int, budget_max: int) -> int:
+    caps = {
+        "turn_ceiling": default_max,
+        "stream_stall": default_max,
+        "wallclock": budget_max,
+        "output_tokens": budget_max,
+    }
+    return min(caps.get(reason or "", 0), default_max)
+
+
+def strip_checkpoint_note(text: str) -> str:
+    """checkpoint 応答から resume ノート（手動/自動どちらも）を剥がす。
+
+    自動継続で複数セグメントを結合するとき、中間セグメントに残った
+    「続けて」/「自動で実行します」ノートは最終応答のノイズになるため。
+    本文なし checkpoint（ノートのみの応答）は空文字列に落ちて、結合時に
+    セグメントごと除去される。
+    """
+    from services.claude_api.tool_loop import _AUTO_RESUME_NOTE, _CHECKPOINT_NOTE
+    out = text or ""
+    for note in (
+        _CHECKPOINT_NOTE,
+        _AUTO_RESUME_NOTE,
+        "⏸️ 作業をここまで保存しました。「続けて」で同じ文脈から再開できます。",
+        "⏳ 作業をここまで保存しました。続きを自動で実行します…",
+    ):
+        out = out.replace("\n\n" + note, "").replace(note, "")
+    return out.strip()
 
 
 def _quota_exhausted_signal() -> bool:
@@ -330,6 +369,21 @@ async def _transient_backoff(
     await asyncio.sleep(backoff)
 
 
+def _compose_system_prompt(
+    *,
+    restricted: bool,
+    active_skill_prompt: str = "",
+) -> str:
+    """Build the per-call trusted instruction block without touching history."""
+    if restricted:
+        if active_skill_prompt:
+            raise ValueError("active skills are unavailable in restricted mode")
+        return RESTRICTED_SYSTEM_PROMPT
+    if not active_skill_prompt:
+        return SYSTEM_PROMPT
+    return f"{SYSTEM_PROMPT.rstrip()}\n\n{active_skill_prompt.strip()}"
+
+
 async def call_with_tools(
     prompt: str,
     channel_id: int,
@@ -355,6 +409,7 @@ async def call_with_tools(
     forced_effort_override: "str | None" = None,
     tier: "str | None" = None,        # 熟考P2: "chat" | "deliberate" | None(=従来)
     route_judgment: bool = False,      # 熟考P5: 判断系の問い（MAGI-lite トリガー）
+    active_skill_prompt: str = "",
 ) -> tuple[str, SessionInfo | None, bool]:
     """Direct-API replacement for services/claude_sdk.py:call_with_tools.
 
@@ -375,6 +430,8 @@ async def call_with_tools(
     """
     sema = restricted_claude_semaphore if restricted else claude_semaphore
     if restricted:
+        if active_skill_prompt:
+            raise ValueError("active skills are unavailable in restricted mode")
         tier = None  # 二重ゲート: restricted に熟考パイプラインは適用しない
         route_judgment = False
     async with sema:
@@ -398,6 +455,10 @@ async def call_with_tools(
                 # （静的 schema が無いので live handle 経由でしか tools に載らない）。
                 chosen_mcp_cfg = dict(chosen_mcp_cfg)
                 chosen_mcp_cfg["evalsearch"] = MCP_SERVERS["evalsearch"]
+            chosen_mcp_cfg = filter_enabled_mcp_configs(chosen_mcp_cfg)
+            always_advertised_mcp_keys = filter_enabled_mcp_keys(
+                always_advertised_mcp_keys
+            )
         chosen_mcp_keys = set(chosen_mcp_cfg.keys())
 
         # 3. Session resume (admin only — restricted is stateless).
@@ -495,15 +556,27 @@ async def call_with_tools(
 
         # 5. Per-call settings
         if restricted:
-            system_prompt = RESTRICTED_SYSTEM_PROMPT
+            system_prompt = _compose_system_prompt(
+                restricted=True,
+                active_skill_prompt=active_skill_prompt,
+            )
             cwd = ATTACHMENT_DIR
             max_turns = RESTRICTED_MAX_TURNS
         else:
-            system_prompt = SYSTEM_PROMPT
+            system_prompt = _compose_system_prompt(
+                restricted=False,
+                active_skill_prompt=active_skill_prompt,
+            )
             cwd = CWD
             max_turns = ADMIN_MAX_TURNS
 
-        can_use_tool = make_can_use_tool(restricted=restricted)
+        from services.claude_api.permissions import wrap_permission_gate
+
+        # free-code permission port: ルール評価（deny/ask/allow）＋Discord
+        # リアクション承認（ask_bridge 経由）を既存 gate に重ねる。
+        can_use_tool = wrap_permission_gate(
+            make_can_use_tool(restricted=restricted), restricted=restricted,
+        )
         tool_ctx = ToolContext(cwd=cwd, restricted=restricted, channel_id=channel_id)
 
         # 熟考 P1: tool 呼び出し台帳（観測層）。restricted には作らない。
@@ -687,57 +760,61 @@ async def call_with_tools(
                     _compact_trigger = compact_threshold_tokens()
                     _last_tokens = get_last_context_tokens(channel_id)
                     over_tokens = _last_tokens > _compact_trigger
-                    _reduced = False
                     if over_tokens:
-                        log.info(
-                            "[ch=%d] boundary compaction trigger: "
-                            "last_context_tokens=%d (trigger=%d) force=True",
-                            channel_id,
-                            _last_tokens,
-                            _compact_trigger,
-                        )
-                    if (
-                        over_tokens
-                        and await compact_channel_history(
-                            channel_id, api_client, status_callback,
-                            force=True,
-                        )
-                    ):
-                        reloaded, _snap, _ts = await asyncio.to_thread(
-                            load_api_replay_channel, channel_id
-                        )
-                        if reloaded:
-                            log.info(
-                                "[ch=%d] boundary compaction reload: "
-                                "replay %d → %d turns, %d → %d chars",
-                                channel_id,
-                                len(prior_history), len(reloaded),
-                                estimate_replay_chars(prior_history),
-                                estimate_replay_chars(reloaded),
+                        # Runtime opt (2026-07-08): the summary call takes
+                        # minutes (measured 4.4-8.2 min at effort=max), so the
+                        # boundary path no longer awaits it. Dispatch to a
+                        # background task; THIS turn rides the raw window
+                        # (immediate relief via the microcompact below) and the
+                        # NEXT turn's normal replay load picks up the summary
+                        # row. Guard against stale-usage thrash: after the
+                        # summary lands, last_context_tokens stays high until a
+                        # turn completes on the collapsed window — if the
+                        # replay we just loaded is already small in chars, the
+                        # token gate fired on stale usage and compacting again
+                        # would summarize the summary.
+                        from config import HISTORY_COMPACT_TRIGGER_CHARS
+                        _replay_chars = estimate_replay_chars(prior_history)
+                        if _replay_chars > HISTORY_COMPACT_TRIGGER_CHARS:
+                            _spawned = start_background_compaction(
+                                channel_id, api_client,
                             )
-                            prior_history = reloaded
-                            _reduced = True
-                    # P1 (2026-07-06): compaction wanted to fire but couldn't
-                    # shrink the window — the LLM summary failed or the circuit
-                    # breaker is open (30-min cooldown). Sending the raw 500K+
-                    # context now stalls on TTFB → graceful checkpoint (the
-                    # "すぐタイムアウト" symptom). Fall back to a STRUCTURE-SAFE,
-                    # no-LLM emergency microcompact: clear OLD tool_result bodies
-                    # (message order/roles/tool_use↔tool_result pairing preserved,
-                    # so replay stays API-valid) so at least the tool-output bulk
-                    # is reclaimed instead of riding into a stall.
-                    if over_tokens and not _reduced and MICROCOMPACT_ENABLED:
+                            log.info(
+                                "[ch=%d] boundary compaction trigger: "
+                                "last_context_tokens=%d (trigger=%d) — "
+                                "dispatched to background (spawned=%s)",
+                                channel_id, _last_tokens, _compact_trigger,
+                                _spawned,
+                            )
+                        else:
+                            log.info(
+                                "[ch=%d] boundary compaction skipped: token "
+                                "gate is stale (tokens=%d > trigger=%d but "
+                                "replay is only %d chars — already collapsed)",
+                                channel_id, _last_tokens, _compact_trigger,
+                                _replay_chars,
+                            )
+                            over_tokens = False
+                    # Structure-safe, no-LLM relief for THIS turn while the
+                    # summary runs in the background (and the only relief when
+                    # the summary failed or the circuit breaker is open — the
+                    # P1 2026-07-06 stall case). Clears OLD tool_result bodies
+                    # (message order/roles/tool_use↔tool_result pairing
+                    # preserved, so replay stays API-valid) so the tool-output
+                    # bulk is reclaimed instead of riding into a TTFB stall.
+                    if over_tokens and MICROCOMPACT_ENABLED:
                         prior_history, _emg_saved = microcompact_tool_results(
                             prior_history,
                             gap_minutes=MICROCOMPACT_GAP_MIN + 1.0,
                             gap_threshold_min=MICROCOMPACT_GAP_MIN,
                             keep_recent=MICROCOMPACT_KEEP_RECENT,
+                            emergency=True,
                         )
                         if _emg_saved > 0:
-                            log.warning(
-                                "[ch=%d] emergency microcompact (boundary "
-                                "compaction unavailable): ~%d tokens reclaimed "
-                                "from old tool_results",
+                            log.info(
+                                "[ch=%d] microcompact while boundary "
+                                "compaction runs in background: ~%d tokens "
+                                "reclaimed from old tool_results",
                                 channel_id, _emg_saved,
                             )
                 except Exception as exc:  # noqa: BLE001
@@ -763,6 +840,27 @@ async def call_with_tools(
             # Rapid-refill accounting for the in-loop proactive compaction
             # (audit #19): True when this request triggered one.
             proactive_fired = False
+
+            # ADR-0040: checkpoint auto-resume policy. run_agent_loop に渡す
+            # closure — checkpoint 発生時に True を返すと loop 側が「続けて」
+            # 導線の代わりに自動継続ノートを出し、下の resume ループが実際に
+            # 継続ターンを注入する。counter は resume ループと共有。
+            from config import (
+                CHECKPOINT_AUTO_RESUME_BUDGET_MAX,
+                CHECKPOINT_AUTO_RESUME_ENABLED,
+                CHECKPOINT_AUTO_RESUME_MAX,
+            )
+            _auto_resume_state = {"used": 0}
+
+            def _should_auto_resume(reason: str) -> bool:
+                if restricted or not CHECKPOINT_AUTO_RESUME_ENABLED:
+                    return False
+                cap = auto_resume_cap(
+                    reason,
+                    default_max=CHECKPOINT_AUTO_RESUME_MAX,
+                    budget_max=CHECKPOINT_AUTO_RESUME_BUDGET_MAX,
+                )
+                return _auto_resume_state["used"] < cap
 
             async def _proactive_compact() -> "list[dict] | None":
                 """In-loop compaction callback for run_agent_loop (audit #3).
@@ -958,6 +1056,8 @@ async def call_with_tools(
                                 {"effort": forced_effort_override}
                                 if forced_effort_override else None
                             ),
+                            # ADR-0040: checkpoint 時の自動継続ポリシー。
+                            should_auto_resume=_should_auto_resume,
                         )
                         response_text = result.text
                         if getattr(result, "fallback_model", None):
@@ -973,12 +1073,14 @@ async def call_with_tools(
                                 )
                         break
                     except asyncio.CancelledError as _cancel:
-                        # ADR-0038: the outer StallWatchdog cancels with
-                        # "stream idle" — a wedge the in-loop stream guard
-                        # didn't catch (e.g. a hung tool call). Surface that as
-                        # a timeout. A bare cancel is a real /abort or shutdown:
-                        # re-raise so bot.py shows "⏹️ 中断" instead of
-                        # mislabeling the user's own abort as a timeout.
+                        # ADR-0038/0045: the outer StallWatchdog cancels with
+                        # "stream idle" — a 600s no-progress wedge that escaped
+                        # every inner layer (byte 180 / event 300 / fallback
+                        # 300). NOT a hung tool: those are deferred by
+                        # tool_begin/tool_end and bounded by TOOL_CALL_TIMEOUT_S.
+                        # Surface that as a timeout. A bare cancel is a real
+                        # /abort or shutdown: re-raise so bot.py shows "⏹️ 中断"
+                        # instead of mislabeling the user's own abort as a timeout.
                         if _cancel.args and _cancel.args[0] == "stream idle":
                             log.warning(
                                 "[ch=%d] stream idle backstop → timeout",
@@ -1219,9 +1321,152 @@ async def call_with_tools(
                             status_callback=status_callback, label="接続再試行中",
                         )
 
+            # --- ADR-0040: checkpoint auto-resume ------------------------------
+            # graceful checkpoint (turn 上限 / 実行予算 / stream 停止) で止まった
+            # リクエストを、ユーザーの「続けて」を待たずに自動継続する。revision
+            # パイプラインと同じ「同一 history_for_loop に user ターンを注入して
+            # もう1周」パターンなので、resume 分の turns も step 10 のスライス
+            # （prior_len 起点）でそのまま JSONL に永続化される。tool_loop 起因は
+            # ポリシー側（auto_resume_cap）で恒久除外。失敗時は checkpoint が
+            # そのまま残るので、従来の手動「続けて」導線に自然に落ちる。
+            if (
+                result is not None
+                and response_text is not None
+                and getattr(result, "paused_reason", None)
+                and result.synthetic_session_id is not None
+                and not is_non_persistable_reply(response_text)
+                and _should_auto_resume(result.paused_reason)
+            ):
+                from services.claude_api.tool_loop import AUTO_RESUME_DIRECTIVE
+                _resume_segments: list[str] = []
+                _resume_kw = dict(
+                    history=history_for_loop,
+                    system_prompt=system_prompt,
+                    tools_for_api=advertised_tools,
+                    can_use_tool=can_use_tool,
+                    execute_tool=_execute_tool,
+                    status_callback=status_callback,
+                    incremental_text_callback=incremental_text_callback,
+                    text_stream_callback=text_stream_callback,
+                    tool_invocation_callback=tool_invocation_callback,
+                    scratch_stream_callback=scratch_stream_callback,
+                    scratch_finalize_callback=scratch_finalize_callback,
+                    thinking_stream_callback=thinking_stream_callback,
+                    thinking_finalize_callback=thinking_finalize_callback,
+                    progress=progress,
+                    max_turns=max_turns,
+                    budget_role="admin",
+                    api_client=api_client,
+                    model=result.fallback_model or effective_model,
+                    extra_betas=MODEL_BETAS,
+                    active_mcp_keys=result.active_mcp_keys,
+                    prior_turns=result.prior_len or 0,
+                    tool_search_enabled=(
+                        TOOL_SEARCH_ENABLED and is_tool_search_active()
+                    ),
+                    evidence=evidence,
+                    proactive_compact=(
+                        _proactive_compact if not restricted else None
+                    ),
+                    refusal_fallback_model=(
+                        FABLE_REFUSAL_FALLBACK_MODEL
+                        if (FABLE_REFUSAL_FALLBACK_ENABLED
+                            and "fable" in (
+                                (result.fallback_model or effective_model) or ""
+                            ).lower())
+                        else None
+                    ),
+                    output_config_override=(
+                        {"effort": forced_effort_override}
+                        if forced_effort_override else None
+                    ),
+                    should_auto_resume=_should_auto_resume,
+                )
+                while (
+                    getattr(result, "paused_reason", None)
+                    and result.synthetic_session_id is not None
+                    and not is_non_persistable_reply(response_text or "")
+                    and _should_auto_resume(result.paused_reason)
+                ):
+                    _auto_resume_state["used"] += 1
+                    _n = _auto_resume_state["used"]
+                    log.info(
+                        "[ch=%d] checkpoint auto-resume %d: reason=%s",
+                        channel_id, _n, result.paused_reason,
+                    )
+                    await _safe_status(
+                        status_callback, f"⏳ 続きを自動実行中 ({_n})",
+                    )
+                    _resume_segments.append(strip_checkpoint_note(response_text))
+                    try:
+                        async with StallWatchdog(
+                            channel_id, None, idle_timeout_s=600,
+                        ) as _rwd:
+                            r2 = await run_agent_loop(
+                                AUTO_RESUME_DIRECTIVE, channel_id,
+                                stall_watchdog=_rwd, **_resume_kw,
+                            )
+                    except Exception as exc:  # noqa: BLE001 — resume は best-effort
+                        log.warning(
+                            "[ch=%d] auto-resume failed (checkpoint stands): %s",
+                            channel_id, exc,
+                        )
+                        _resume_segments.pop()
+                        if incremental_text_callback is not None:
+                            try:
+                                await incremental_text_callback(
+                                    "-# ⚠️ 自動継続に失敗しました。「続けて」で再開できます。"
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
+                        break
+                    if (
+                        not r2.synthetic_session_id
+                        or not (r2.text or "").strip()
+                        or is_non_persistable_reply(r2.text or "")
+                    ):
+                        # 再開ターンが sentinel / 空で返った — 直前の checkpoint を
+                        # そのまま最終応答として残す（保存済みなので手動再開可能）。
+                        log.warning(
+                            "[ch=%d] auto-resume produced no usable reply "
+                            "(session=%s) — keeping checkpoint",
+                            channel_id, bool(r2.synthetic_session_id),
+                        )
+                        _resume_segments.pop()
+                        if incremental_text_callback is not None:
+                            try:
+                                await incremental_text_callback(
+                                    "-# ⚠️ 自動継続に失敗しました。「続けて」で再開できます。"
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
+                        break
+                    # mid-resume の in-loop compaction が prior window を畳んだ
+                    # 場合、prior_len は新しい boundary を指す — 次の resume と
+                    # step 10 の永続化スライスをそこへ追従させる。
+                    _resume_kw["prior_turns"] = r2.prior_len or 0
+                    _resume_kw["active_mcp_keys"] = r2.active_mcp_keys
+                    if r2.fallback_model:
+                        _resume_kw["model"] = r2.fallback_model
+                        if not restricted:
+                            _record_sticky_model(
+                                channel_id, r2.fallback_model, user_id,
+                            )
+                    result = r2
+                    response_text = r2.text
+                _kept_segments = [s for s in _resume_segments if s]
+                if _kept_segments and (response_text or "").strip():
+                    response_text = "\n\n".join(
+                        _kept_segments + [response_text],
+                    )
+
             # --- 熟考 P2/P5: deliberate tier の 検証・修正パイプライン --------
             # AsyncExitStack 内（revise の _execute_tool が pool を掴むため）。
             # クリーン終了（synthetic_session_id あり・非 sentinel 応答）のみ対象。
+            # ADR-0040: checkpoint（paused_reason あり＝意図的に未完）で終わった
+            # 応答は検証・修正の対象外 — 未完成な回答を「未完成だ」と指摘して
+            # revision を回すのは無意味な追いコストで、caveat が checkpoint 文言を
+            # 引用する珍妙な subtext（2026-07-08 の指摘）の原因だった。
             if (
                 result is not None
                 and response_text is not None
@@ -1229,6 +1474,7 @@ async def call_with_tools(
                 and tier == "deliberate"
                 and result.synthetic_session_id is not None
                 and not is_non_persistable_reply(response_text)
+                and getattr(result, "paused_reason", None) is None
             ):
                 _revise_kw = dict(
                     history=history_for_loop,
@@ -1372,6 +1618,9 @@ async def call_with_tools(
                 and response_text is not None
                 and DELIB_JUDGE_LITE_ENABLED
                 and not is_non_persistable_reply(response_text)
+                # ADR-0040: checkpoint された未完応答は judge の対象外（上の
+                # deliberate パイプラインと同じ理由）。
+                and getattr(result, "paused_reason", None) is None
             ):
                 from services.claude_api.verifier import (
                     build_caveat as _jl_caveat,

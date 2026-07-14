@@ -1,0 +1,79 @@
+name: notify-ci-failure
+
+# test / lint / security のいずれかが conclusion=failure で完了したら Discord に通知する。
+# GitHub Actions には CI 失敗を直接 Discord へ流す仕組みが無く、これまでは
+# auto_deploy.sh の poll (5分毎・デプロイ対象ブランチ限定) が間接的に拾うだけだった。
+# workflow_run はデフォルトブランチ(master)にあるこのファイルが評価されるため、
+# feature/PR/dev の失敗もここで即時に拾える。
+#
+# 通知先はブランチ別。既存の notify-push.yml と同じ webhook secret を再利用する:
+#   master 失敗              → DISCORD_WEBHOOK_MASTER(+_2)
+#   それ以外 (dev/feature/PR) → DISCORD_WEBHOOK_DEV(+_2)
+on:
+  workflow_run:
+    workflows: [test, lint, security]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    # 失敗時のみ発火。success / cancelled / skipped は無視する。
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    steps:
+      - name: Notify branch-specific Discord channels on CI failure
+        env:
+          WEBHOOK_MASTER: ${{ secrets.DISCORD_WEBHOOK_MASTER }}
+          WEBHOOK_MASTER_2: ${{ secrets.DISCORD_WEBHOOK_MASTER_2 }}
+          WEBHOOK_DEV: ${{ secrets.DISCORD_WEBHOOK_DEV }}
+          WEBHOOK_DEV_2: ${{ secrets.DISCORD_WEBHOOK_DEV_2 }}
+        run: |
+          set -euo pipefail
+          # untrusted なフィールド (branch 名・commit message) はシェルへ直接展開
+          # せず、必ず $GITHUB_EVENT_PATH から jq 経由で読む (notify-push.yml と同じ
+          # 方針。injection 回避)。
+          BRANCH="$(jq -r '.workflow_run.head_branch // ""' "${GITHUB_EVENT_PATH}")"
+          case "${BRANCH}" in
+            master) WEBHOOKS=("${WEBHOOK_MASTER}" "${WEBHOOK_MASTER_2}") ;;
+            *)      WEBHOOKS=("${WEBHOOK_DEV}" "${WEBHOOK_DEV_2}") ;;
+          esac
+          # 赤い embed を event JSON から直接組む。commit message は先頭行・80字。
+          PAYLOAD="$(jq -c '
+            .workflow_run as $r
+            | {
+                username: "GitHub CI",
+                embeds: [{
+                  title: ("❌ CI failed: " + $r.name
+                          + " on " + ($r.head_branch // "?")),
+                  url: $r.html_url,
+                  color: 15158332,
+                  timestamp: ($r.updated_at // $r.created_at),
+                  fields: [
+                    { name: "workflow", value: $r.name, inline: true },
+                    { name: "branch", value: ($r.head_branch // "?"), inline: true },
+                    { name: "event", value: ($r.event // "?"), inline: true },
+                    { name: "commit",
+                      value: ("[`" + ($r.head_sha[0:7]) + "`]("
+                              + $r.repository.html_url + "/commit/" + $r.head_sha + ") "
+                              + (($r.head_commit.message // "") | split("\n")[0] | .[0:80])),
+                      inline: false },
+                    { name: "actor",
+                      value: (($r.triggering_actor.login // $r.actor.login) // "?"),
+                      inline: true },
+                    { name: "attempt",
+                      value: (($r.run_attempt // 1) | tostring),
+                      inline: true }
+                  ]
+                }]
+              }' "${GITHUB_EVENT_PATH}")"
+          rc=0
+          for WEBHOOK in "${WEBHOOKS[@]}"; do
+            [ -z "${WEBHOOK}" ] && continue   # 未設定 secret はスキップ
+            code="$(curl -s -o /dev/null -w '%{http_code}' \
+              -H 'Content-Type: application/json' -d "${PAYLOAD}" "${WEBHOOK}")"
+            echo "Discord webhook responded ${code}"
+            [ "${code}" = "204" ] || rc=1
+          done
+          exit "${rc}"

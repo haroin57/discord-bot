@@ -269,8 +269,10 @@ def static_mcp_tools_to_anthropic(keys) -> list[dict]:
     server to be spawned — the schemas are baked in. Spawn happens at
     tool_use time via ``McpPool.call_tool()``.
     """
+    from services.mcp_control import filter_enabled_mcp_keys
+
     out: list[dict] = []
-    for key in keys:
+    for key in filter_enabled_mcp_keys(keys):
         out.extend(dict(tool) for tool in STATIC_MCP_TOOL_SCHEMAS.get(key, []))
     return out
 
@@ -346,6 +348,13 @@ class McpPool:
     available_configs: dict[str, dict]
     handles: dict[str, McpServerHandle] = field(default_factory=dict)
     _spawn_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Snapshot the persistent override at pool construction. A command that
+        # changes enablement does not mutate an already-running model turn.
+        from services.mcp_control import filter_enabled_mcp_configs
+
+        self.available_configs = filter_enabled_mcp_configs(self.available_configs)
 
     async def ensure_spawned(self, name: str) -> McpServerHandle:
         """Return an existing handle or lazy-spawn the configured server."""

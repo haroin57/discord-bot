@@ -11,7 +11,7 @@ go through this container.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
@@ -26,3 +26,18 @@ class CommandDeps:
     # dicts until P2.5 moves them into an OverrideState.
     model_overrides: dict
     effort_overrides: dict
+    # /tier (2026-07-08): "deliberate"（熟考固定）| "chat"（会話固定）。
+    # 未設定はルーター判定（既定は明示マーカーのみ）。
+    tier_overrides: dict
+    # (channel_id) -> per-channel asyncio.Semaphore(1). The same FIFO gate
+    # on_message uses to serialise turns; free-code slash commands (/commit etc.)
+    # acquire it so their tool-enabled turn can't race a concurrent channel reply
+    # (ADR-0048). Optional/last-field so existing constructors stay valid.
+    get_channel_sema: Callable[[int], Any] | None = None
+    # (channel_id, user_id) -> "claude" | "codex". Optional so older command
+    # tests and out-of-tree constructors remain source-compatible.
+    provider_overrides: dict = field(default_factory=dict)
+    # (channel_id, user_id) -> services.skills.SkillSelection.  Like model and
+    # provider overrides this is process-local and intentionally cheap to
+    # re-issue after a restart.
+    skill_overrides: dict = field(default_factory=dict)

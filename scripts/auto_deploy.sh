@@ -28,26 +28,66 @@ else
 fi
 
 WORKFLOW="test.yml"
-NOTIFY_TOKEN_FILE="/tmp/kanae-notify-token.txt"
-NOTIFY_URL="https://kanae-notify.haroin57.workers.dev/notify"
+# Deploy notifications reuse the durable journal-forward Discord webhook
+# (${BOT_DIR}/.env.journal-forward:JOURNAL_WEBHOOK_URL) instead of the old
+# /tmp/kanae-notify-token.txt worker token, which lived on tmpfs and was
+# silently lost on every reboot — leaving deploys unannounced. The webhook
+# file survives reboots and is already in active use by
+# discord-bot-journal-forward.service, so notifications are durable now.
+NOTIFY_ENV_FILE="${BOT_DIR}/.env.journal-forward"
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
 log() { echo "[auto_deploy/${ENV}] $*"; }
 
 notify() {
     local msg="$1"
-    if [[ ! -f "${NOTIFY_TOKEN_FILE}" ]]; then
-        log "WARN: notify token not found at ${NOTIFY_TOKEN_FILE}; skipping Discord notification"
+    # Mark that a specific outcome has been announced, so the EXIT catch-all
+    # (on_exit) does not also fire a generic "CRASHED" message on a non-zero
+    # exit that a handled branch already reported. Set even if the POST below
+    # is skipped/fails: the intent is "we already spoke to Discord about this
+    # run"; a generic crash line on top would just add noise (and would hit the
+    # same missing-webhook condition anyway).
+    NOTIFIED=1
+    if [[ ! -f "${NOTIFY_ENV_FILE}" ]]; then
+        log "WARN: ${NOTIFY_ENV_FILE} not found; skipping Discord notification"
         return 0
     fi
-    local token
-    token="$(cat "${NOTIFY_TOKEN_FILE}")"
-    curl -fsS -X POST "${NOTIFY_URL}" \
+    local webhook
+    webhook="$(grep -E '^JOURNAL_WEBHOOK_URL=' "${NOTIFY_ENV_FILE}" | head -1 | cut -d= -f2-)"
+    if [[ -z "${webhook}" ]]; then
+        log "WARN: JOURNAL_WEBHOOK_URL empty in ${NOTIFY_ENV_FILE}; skipping notification"
+        return 0
+    fi
+    # Build valid JSON via python3 (already a hard dep of this script) rather
+    # than shell quoting, so a message with quotes/newlines can't produce a
+    # malformed payload. Call sites already tag the message with
+    # "auto_deploy/<env>:", so no extra prefix is added here.
+    local payload
+    payload="$(python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' \
+        "${msg}")" || return 0
+    curl -fsS -X POST "${webhook}" \
         -H "Content-Type: application/json" \
-        -H "X-Notify-Auth: ${token}" \
-        -d "{\"target\":\"health\",\"content\":${msg@Q}}" \
+        -d "${payload}" \
         >/dev/null 2>&1 || log "WARN: Discord notification failed (non-fatal)"
 }
+
+# ─── crash catch-all ──────────────────────────────────────────────────────────
+# set -e can kill this script on an UNGUARDED failure (git fetch / pip install /
+# sudo systemctl restart), which would otherwise be SILENT: systemd_forward.py
+# intentionally excludes the -autodeploy units (to avoid duplicating the notify()
+# calls below), so an unhandled crash reaches nobody. The EXIT trap fires a
+# generic alert for any non-zero exit that a handled branch hasn't already
+# announced. notify() marks NOTIFIED=1, so a specific failure message is never
+# doubled by this catch-all.
+NOTIFIED=0
+# shellcheck disable=SC2317  # invoked indirectly via `trap`, not dead code
+on_exit() {
+    local rc=$?
+    if [[ "${rc}" -ne 0 && "${NOTIFIED}" -eq 0 ]]; then
+        notify "auto_deploy/${ENV}: CRASHED exit=${rc} — unhandled failure (journalctl -u ${SERVICE}-autodeploy)"
+    fi
+}
+trap on_exit EXIT
 
 # ─── dev: graceful skip if service doesn't exist yet ─────────────────────────
 # unit ファイルの存在で判定する。list-units + grep は先頭マーカー(●)や
@@ -79,6 +119,35 @@ if [[ "${CURRENT_SHA}" == "${REMOTE_SHA}" ]]; then
     exit 0
 fi
 
+# merge-based guard (replaces relying on the SHA-inequality check alone).
+# The bare `CURRENT_SHA != REMOTE_SHA` test above is not sufficient to decide
+# "there is something to deploy": if HEAD is at or AHEAD of origin/${BRANCH}
+# (e.g. the prod checkout was left on a local/feature branch, or a commit was
+# made directly in the prod dir), the SHAs differ yet the ff-only merge in
+# step 4 is a guaranteed no-op. The old code fell through, then step 6
+# unconditionally `systemctl restart`ed the service — every 5 min, for zero
+# code delta: a restart storm that also spammed pre-deploy-* tags. Decide by
+# ancestry instead of raw inequality.
+#
+#   git merge-base --is-ancestor A B  →  exit 0 iff A is an ancestor of B.
+#
+# (a) origin is already an ancestor of HEAD → HEAD contains origin, ff is a
+#     no-op → nothing to deploy.
+if git merge-base --is-ancestor "origin/${BRANCH}" HEAD; then
+    log "HEAD (${CURRENT_SHA:0:8}) already contains origin/${BRANCH} (${REMOTE_SHA:0:8}); local is at/ahead of origin, ff-only would be a no-op — nothing to deploy"
+    exit 0
+fi
+
+# (b) HEAD is not an ancestor of origin either → the two have diverged and are
+#     not fast-forwardable. Auto-restarting on this is wrong; the ff-only merge
+#     in step 4 would abort anyway. Surface it once and skip instead of looping.
+if ! git merge-base --is-ancestor HEAD "origin/${BRANCH}"; then
+    log "HEAD (${CURRENT_SHA:0:8}) has diverged from origin/${BRANCH} (${REMOTE_SHA:0:8}); not fast-forwardable — skipping (prod checkout needs manual attention)"
+    notify "auto_deploy/${ENV}: HEAD diverged from origin/${BRANCH} (${CURRENT_SHA:0:8} vs ${REMOTE_SHA:0:8}) — deploy skipped, checkout needs attention"
+    exit 0
+fi
+
+# Only here is origin/${BRANCH} genuinely a fast-forward ahead of HEAD.
 log "New commits available: ${CURRENT_SHA:0:8} -> ${REMOTE_SHA:0:8}"
 
 # ─── step 2: CI green gate ────────────────────────────────────────────────────
@@ -146,6 +215,14 @@ git merge --ff-only "origin/${BRANCH}" || {
 }
 NEW_SHA="$(git rev-parse HEAD)"
 log "Merged: ${ROLLBACK_SHA:0:8} -> ${NEW_SHA:0:8}"
+
+# Belt-and-suspenders: after the merge-base guard in step 1 this can't happen,
+# but never restart the service for a deploy that didn't move HEAD. A zero-delta
+# restart is exactly the storm we're preventing; guard the restart on it too.
+if [[ "${NEW_SHA}" == "${ROLLBACK_SHA}" ]]; then
+    log "HEAD unchanged after merge (${NEW_SHA:0:8}); skipping restart — no-op deploy"
+    exit 0
+fi
 
 # ─── step 5: reinstall deps if lock changed ───────────────────────────────────
 if git diff --name-only "${ROLLBACK_SHA}" "${NEW_SHA}" | grep -q "requirements\.lock$"; then

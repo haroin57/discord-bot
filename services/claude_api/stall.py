@@ -18,7 +18,11 @@ import asyncio
 import logging
 import time
 
-from config import STREAM_IDLE_TIMEOUT_S, STREAM_STALL_THRESHOLD_S
+from config import (
+    STREAM_IDLE_TIMEOUT_S,
+    STREAM_STALL_STATUS_ENABLED,
+    STREAM_STALL_THRESHOLD_S,
+)
 
 from services.claude_api.status import _safe_status
 
@@ -47,10 +51,25 @@ class StallWatchdog:
         self._task: asyncio.Task | None = None
         self._parent: asyncio.Task | None = None
         self._stream_idle = False
+        self._inflight = 0
 
     def heartbeat(self) -> None:
         self._last = time.monotonic()
         self._warned = False
+
+    def tool_begin(self) -> None:
+        """Mark a tool-execution phase as in flight (CLI parity, ADR-0045).
+
+        The CLI's async-agent stall watchdog (H$$, 2.1.170) defers firing
+        while tool_use ids await their tool_result — a long-running tool is
+        progress, not a stall. Tools have their own deadline
+        (TOOL_CALL_TIMEOUT_S), so deferral cannot hide a genuinely hung tool.
+        Counter-based so concurrent phases compose."""
+        self._inflight += 1
+
+    def tool_end(self) -> None:
+        self._inflight = max(0, self._inflight - 1)
+        self.heartbeat()
 
     @property
     def stream_idle(self) -> bool:
@@ -85,6 +104,18 @@ class StallWatchdog:
                 return
 
             if idle > self.idle_timeout_s:
+                if self._inflight > 0:
+                    # CLI parity (2.1.170 H$$): "stall watchdog deferred —
+                    # N tool(s) in flight". Re-arm with a full budget; the
+                    # tool leg owns its own deadline (TOOL_CALL_TIMEOUT_S)
+                    # and tool_end() heartbeats on completion.
+                    log.info(
+                        "[ch=%d] stall watchdog deferred — %d tool phase(s) "
+                        "in flight",
+                        self.channel_id, self._inflight,
+                    )
+                    self._last = time.monotonic()
+                    continue
                 log.warning(
                     "[ch=%d] stream idle for %.0fs, cancelling",
                     self.channel_id, idle,
@@ -99,10 +130,18 @@ class StallWatchdog:
                 return
 
             if idle > self.stall_threshold_s and not self._warned:
-                # The bot.py spinner already shows liveness (shimmer + elapsed),
-                # so no user-facing "delayed" message — just log for ops.
                 log.warning(
                     "[ch=%d] stream stall: no message for %.0fs",
                     self.channel_id, idle,
                 )
+                # Surface a user-facing "waiting on API" status so a genuine
+                # no-event stall reads differently from "💭 thinking". Safe:
+                # the watchdog heartbeats on every stream event (thinking_delta
+                # included), so legitimate extended thinking never reaches here.
+                # _warned gates it to once per idle period (reset on heartbeat).
+                if STREAM_STALL_STATUS_ENABLED:
+                    await _safe_status(
+                        self.status_callback,
+                        f"⏳ 応答待ち（API応答なし {int(idle)}秒）",
+                    )
                 self._warned = True

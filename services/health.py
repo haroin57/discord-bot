@@ -36,8 +36,13 @@ def _check_discord(bot) -> dict[str, Any]:
 
 def _check_oauth() -> dict[str, Any]:
     try:
-        from services.oauth_manager import is_oauth_healthy
-        return {"ok": bool(is_oauth_healthy())}
+        from services.oauth_manager import is_oauth_healthy, oauth_status_detail
+        st: dict[str, Any] = {"ok": bool(is_oauth_healthy())}
+        try:
+            st.update(oauth_status_detail())
+        except Exception:  # detail は best-effort — ok 判定は壊さない
+            pass
+        return st
     except ImportError:
         return {"ok": True, "reason": "oauth_module_unavailable"}
     except Exception as e:

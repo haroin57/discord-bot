@@ -46,6 +46,48 @@ class TestRouter:
         assert with_att > base
 
 
+class TestRouterAutoDisabled:
+    """2026-07-08 ユーザー決定: スコアによる自動 deliberate 昇格は opt-in。
+    auto_enabled=False では明示マーカーだけが tier を動かす。"""
+
+    def test_task_keywords_do_not_escalate(self):
+        # auto 有効なら deliberate になる依頼型キーワードが、無効では chat。
+        d = rt.route_request(
+            "この2つのライブラリを比較して検討して", auto_enabled=False,
+        )
+        assert d.tier == "chat"
+        assert d.reason == "auto_routing_disabled"
+
+    def test_long_text_does_not_escalate(self):
+        d = rt.route_request("あ" * 350, auto_enabled=False)
+        assert d.tier == "chat"
+
+    def test_force_marker_still_escalates(self):
+        # 文中の明示マーカーはユーザーによる明示呼び出しなので生きる。
+        d = rt.route_request("熟考して: この設計どう思う？", auto_enabled=False)
+        assert d.tier == "deliberate"
+
+    def test_force_chat_marker_still_works(self):
+        d = rt.route_request("さくっと教えて", auto_enabled=False)
+        assert d.tier == "chat"
+        assert d.reason.startswith("force_chat")
+
+    def test_judgment_flag_still_computed(self):
+        # MAGI-lite のトリガー材料は tier と独立に返り続ける。
+        d = rt.route_request("AとBどっちがいいと思う？", auto_enabled=False)
+        assert d.judgment is True
+
+    def test_config_default_is_off(self, monkeypatch):
+        import importlib
+        monkeypatch.delenv("DELIB_ROUTER_AUTO_ENABLED", raising=False)
+        import config
+        importlib.reload(config)
+        try:
+            assert config.DELIB_ROUTER_AUTO_ENABLED is False
+        finally:
+            importlib.reload(config)
+
+
 # ---------------------------------------------------------------------------
 # P2: verifier — verdict parse / fail-open / prompts / judge gate
 # ---------------------------------------------------------------------------

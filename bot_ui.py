@@ -23,9 +23,11 @@ from services.job_state import JobPhase
 from utils.markdown_parser import (
     TableSegment,
     MathSegment,
+    format_math_for_discord,
     split_settled,
     first_block_span,
 )
+from utils.math_presentation import latex_to_discord_text
 from utils.math_renderer import render_math_image
 from utils.response_sanitizer import strip_numeric_inline_code
 from utils.table_renderer import render_table_image
@@ -361,12 +363,14 @@ class LiveRenderer:
         track_task,
         job,
         split_message,
+        math_presentation_mode: str = "legacy",
     ) -> None:
         self.message = message
         self._status = status
         self._track_task = track_task
         self._job = job
         self._split_message = split_message
+        self._adaptive_math = math_presentation_mode == "adaptive"
 
         # ── shared streaming state (was nonlocal / dict cells in on_message) ──
         self._live_sent_any = {"v": False}
@@ -375,6 +379,7 @@ class LiveRenderer:
         self._draft_msgs: list["discord.Message"] = []     # editable live-tail prose msgs
         self._placeholder: dict = {"msg": None}            # held open-block placeholder
         self._rendered_images: list[str] = []              # temp image paths to clean up
+        self._rendered_image_message_ids: dict[str, int] = {}
         self._first_reply = {"done": False}                # first content msg replies to user
         self._render_lock = asyncio.Lock()
 
@@ -410,6 +415,10 @@ class LiveRenderer:
     @property
     def rendered_images(self) -> list[str]:
         return self._rendered_images
+
+    @property
+    def rendered_image_message_ids(self) -> dict[str, int]:
+        return self._rendered_image_message_ids
 
     @property
     def tool_notice_task(self):
@@ -449,11 +458,14 @@ class LiveRenderer:
         await self._status.reposition()
         return m
 
+    def _present_prose(self, text: str) -> str:
+        """Transform raw prose without changing the stream's raw offsets."""
+        if self._adaptive_math:
+            text = format_math_for_discord(text)
+        return strip_numeric_inline_code(text)
+
     def _disp(self, text: str) -> str:
-        # Display-only transform: strip numeric inline-code backticks (only
-        # removes chars, never shifts the RAW offsets the streamer tracks)
-        # and hard-cap to stay under Discord's limit.
-        text = strip_numeric_inline_code(text)
+        """Apply the final per-message Discord hard cap."""
         if len(text) > self.DISCORD_HARD_CAP:
             text = text[:self.DISCORD_HARD_CAP - 1] + "…"
         return text
@@ -462,15 +474,14 @@ class LiveRenderer:
         """Render trailing prose into the editable draft messages, edits in
         place and appends as the tail grows. Idempotent (skips unchanged)."""
         prose = (prose or "").strip("\n")
-        if not prose.strip():
-            return
+        presented = self._present_prose(prose)
         chunks = await asyncio.to_thread(
-            self._split_message, prose, self.LIVE_DRAFT_LIMIT, numbered=False,
+            self._split_message, presented, self.LIVE_DRAFT_LIMIT, numbered=False,
         )
-        for i, chunk in enumerate(chunks):
-            disp = self._disp(chunk)
-            if not disp.strip():
-                continue
+        display_chunks = [
+            self._disp(chunk) for chunk in chunks if chunk.strip()
+        ]
+        for i, disp in enumerate(display_chunks):
             if i < len(self._draft_msgs):
                 existing = self._draft_msgs[i]
                 if getattr(existing, "content", None) == disp:
@@ -484,6 +495,15 @@ class LiveRenderer:
                 if sent is None:
                     return
                 self._draft_msgs.append(sent)
+
+        stale = self._draft_msgs[len(display_chunks):]
+        for message in stale:
+            try:
+                await message.delete()
+            except discord.errors.HTTPException:
+                pass
+        if stale:
+            del self._draft_msgs[len(display_chunks):]
 
     async def _finalize_text(self, prose: str) -> None:
         """Freeze the live-tail prose as immutable messages: render it once
@@ -523,9 +543,15 @@ class LiveRenderer:
         await self._hide_placeholder()
         if img_path:
             self._rendered_images.append(img_path)
-            f = discord.File(img_path)
+            description = None
+            if isinstance(seg, MathSegment):
+                description = latex_to_discord_text(seg.latex) or seg.latex
+                description = description.strip()[:1024] or None
+            f = discord.File(img_path, description=description)
             try:
-                await self._send_content(file=f)
+                sent = await self._send_content(file=f)
+                if sent is not None:
+                    self._rendered_image_message_ids[img_path] = sent.id
             finally:
                 f.close()
             return
@@ -556,7 +582,10 @@ class LiveRenderer:
             else:
                 # 純 CPU の regex 関数。to_thread の dispatch コストの方が
                 # 実行コストより高いので直接呼ぶ（毎 tick 実行される）。
-                settled, _pending, is_open = split_settled(full_text)
+                settled, _pending, is_open = split_settled(
+                    full_text,
+                    adaptive_math=self._adaptive_math,
+                )
                 settled_end = len(settled)
 
             # Emit every closed block in [_emitted, settled_end] in order.
@@ -567,7 +596,10 @@ class LiveRenderer:
             while _guard < 500:
                 _guard += 1
                 region = full_text[self._emitted["upto"]:settled_end]
-                span = first_block_span(region)
+                span = first_block_span(
+                    region,
+                    adaptive_math=self._adaptive_math,
+                )
                 if span is None:
                     break
                 start, end, seg = span

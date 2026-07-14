@@ -209,3 +209,50 @@ oracle の shared daemon（`mcp-oracle-shared`, supergateway 3.4.3 で stdio→H
 2. `npm pack @steipete/oracle@<new>` で素を取得し、旧 diff（infra/oracle-patches/<old>/*.diff）を参考に同等パッチを新 dist へ移植
 3. `infra/oracle-patches/<new>/files/` に移植済みファイルを置き、素との diff も保存
 4. launcher 起動（または apply 手動実行）で適用確認 → commit
+
+## 追補5（2026-07-10）: stateless gateway の子プロセス永久リーク — 「非常に遅い」の根本原因と修正
+
+MCP 経由の oracle が全体に激遅くなった件の調査・修正（ADR-0043）。
+
+### 根本原因（3段の複合、全て実測で確定）
+1. **リーク**: supergateway の stateless streamable HTTP モードは **HTTP POST 1件ごとに**
+   `oracle_mcp_launch.sh → volta shim → node oracle-mcp` のフルチェーンを spawn する設計。
+   ADR-0037 の killTree は `transport.onclose` / `onerror` にしか配線されておらず、
+   **正常完了時は onclose が発火しない** → 正常系では誰も子を殺さない。
+   journal 実測（7/8〜7/10）: spawn 20 / Reaping 0 / Child exited 0。node サーバー約20本が永久常駐。
+   しかも 20 本全部が Claude セッション接続時の initialize / tools/list / resources/list 由来
+   （tools/call は 0 件）。「~104MB の子を各セッションに持たせない」ための shared daemon が、
+   リクエスト単位で 104MB 子を無限量産していた
+2. **スロットリング増幅**: リークで cgroup が MemoryHigh=300M に張り付き
+   （RSS 302MB + **swap 881MB** ≈ 1.18GB、`memory.events high`=2,741、pgscan_direct 145万）。
+   以降の全 spawn / 応答が direct reclaim + swap thrash の中を走る。
+   実測: コールドスタート 1.18s（無圧）→ 1.97s（実経路）。tools/list 1回で high +193
+3. **正のフィードバック**: リクエストが来るほどリークが増え、圧が上がり、さらに遅くなる
+
+### 当てた修正（正本は全て infra/ 配下、apply スクリプトの自己修復レールに乗せた）
+| ファイル | 変更 |
+|---|---|
+| `supergateway .../stdioToStatelessStreamableHttp.js` | `res.on('close', () => killTree('res-close'))` を handleRequest 前に追加。res close（応答完了 or 切断）を stateless POST のライフサイクル終端として子グループを必ず回収。`express.json({limit:'8mb'})`（デフォルト100kbだと長い consult prompt が 413 死する地雷） |
+| `supergateway .../stdioToStatefulStreamableHttp.js` | **防衛的パッチ（新規、現構成では未使用）**。stateful は「セッション毎1子spawn + 素の `child.kill()`」で ADR-0037 と同型の孫孤児化バグ + async `transport.send()` unhandled rejection が未対策と判明。detached spawn + killTree + async catch + body limit を移植。**無防備な `--stateful` 切替は禁止**（このパッチ済みでも子はセッション数ぶん常駐するので、consult 頻度が低い現状は stateless 維持が合理的） |
+| `oracle .../node_modules/openai/lib/responses/ResponseAccumulator.{js,mjs}` | **追補4の keepalive パーサ bug 修正**。`assertNever()` が未知 stream イベント（keepalive 等）で throw → 非Pro consult がセッションごと死んでいた。警告のみ残して無視に変更（switch 後に snapshot を返すため状態は壊れない）。oracle 0.15.0 同梱の **openai@6.45.0 前提**。diff: `infra/oracle-patches/0.15.0/openai-6.45.0-keepalive.diff` |
+| `/etc/systemd/system/mcp-oracle-shared.service` | MemoryHigh 300M→**384M** / MemoryMax 400M→**512M**。修正後の定常は gateway ~30MB のみ、リクエスト中ピーク実測 146MB/本。384M で同時2本まで throttling なし |
+
+- `supergateway-3.4.3.diff` は**再生成済み**（旧 diff は 7/4 の async-send 分のみで ADR-0037 の killTree hunks が未収録だった。現在は stateless/sse/stateful 3ファイルの全パッチを収録）
+
+### 検証（2026-07-10、全て green）
+- restart 後: cgroup procs=1、MemoryCurrent 37MB（修正前 302MB + swap 881MB）
+- tools/list ×2 → 1.34s / 1.19s（修正前 1.97s）。各応答直後に
+  `Reaping child group ... reason=res-close` → `Child exited: signal=SIGTERM`、procs が 1 に復帰
+- consult dryRun 1.44s 完走
+- **実弾 gpt-5.5（非Pro）consult 3.97s で completed**（追補4時点では keepalive throw で死んでいた経路）
+- keepalive 単体テスト: `accumulateResponse({type:'keepalive'}, snap)` が throw せず snapshot 維持（CJS/MJS 両方）
+- consult 込みの MemoryPeak 183MB < high 384M、`memory.events high`=0、swap 0
+- mcp-papermcp（SSE 経路）: 影響なし（ActiveState=active, NRestarts=0）
+
+### 運用ノート
+- 毎リクエスト ~1.2s の spawn 税は stateless の構造上残る（consult は分単位なので誤差、
+  セッション接続時の tools/list 等も体感影響なし）。気になったら stateful 化を再検討
+  （その場合もパッチ済みファイルが正本に有り、`--stateful --sessionTimeout <ms>` を ExecStart に足すだけ。
+  ただしセッション毎 ~105MB 常駐と MemoryHigh の再見積もりが必要）
+- oracle バージョンアップ時は keepalive パッチ（openai SDK 配下）も上の手順で新 dist へ移植すること。
+  同梱 openai のバージョンが変わっていたら upstream が keepalive 対応済みか先に確認

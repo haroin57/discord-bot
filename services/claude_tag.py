@@ -48,11 +48,13 @@ from services.job_state import (
 )
 from services.claude_api.progress import SPINNER_EMOJI
 from utils.attachments import (
+    attachment_metadata_by_path,
     cleanup_attachments,
     download_arbitrary_attachments,
     download_attachments,
     download_text_attachments,
 )
+from services import r2_archive
 from utils.discord_helpers import fetch_channel_context, fetch_thread_context
 
 try:  # correlation is optional (bot.py also imports it defensively)
@@ -331,6 +333,17 @@ async def _build_task_prompt(
     http = await deps.get_http_session()
     all_atts = list(getattr(msg, "attachments", None) or [])
     image_paths = await download_attachments(http, all_atts)
+    if image_paths:
+        await asyncio.to_thread(
+            r2_archive.archive_images,
+            image_paths,
+            channel_id=msg.channel.id,
+            request_message_id=msg.id,
+            direction="inbound",
+            author_id=getattr(msg.author, "id", None),
+            source="discord-reaction-task",
+            per_path_metadata=attachment_metadata_by_path(all_atts, image_paths),
+        )
     text_atts = await download_text_attachments(http, all_atts)
     arbitrary_atts = await download_arbitrary_attachments(
         http, all_atts, caller_is_admin=author_is_admin,

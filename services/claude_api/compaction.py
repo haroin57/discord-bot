@@ -19,9 +19,26 @@ claude.exe embedded JS on 2026-06-12:
 - repeated failures trip a circuit breaker so a broken summarizer cannot
   add latency + cost to every turn (consecutiveFailures guard in the binary).
 
-Deliberate deviation: the official CLI summarizes with the main-loop model,
-but Fable 5 refuses exactly the long contexts compaction exists to shrink,
-so the summary call uses HISTORY_COMPACT_MODEL (Opus 4.8) instead.
+Deliberate deviations from the official CLI:
+
+- the CLI summarizes with the main-loop model, but Fable 5 refuses exactly
+  the long contexts compaction exists to shrink, so the summary call uses
+  HISTORY_COMPACT_MODEL (Opus 4.8) instead;
+- the CLI template demands an <analysis> scratchpad before the <summary>;
+  we ask for the <summary> alone. The scratchpad was ALWAYS discarded
+  (extract_summary strips it) and this model already has an adaptive
+  thinking channel for exactly that work — paying for the reasoning twice
+  was the bulk of the 4-8 minute production runtimes (26-28K output tokens
+  per compact, ~3-4K of them usable; journal 2026-07-05..07);
+- boundary compaction runs as a BACKGROUND task (start_background_compaction)
+  so the triggering turn never waits the minutes the summary takes. The turn
+  proceeds with the raw window (plus the structure-safe microcompact in
+  entry.py) and the NEXT turn reloads the collapsed replay. Because rows can
+  be appended while the summary is in flight, the summary row's
+  keep_tail_rows is recomputed at append time against a fresh row load —
+  anchored on the last summarized row's (timestamp, role, content) identity —
+  so concurrently-appended rows land in the verbatim tail instead of being
+  silently dropped from replay.
 """
 
 from __future__ import annotations
@@ -119,8 +136,14 @@ def compact_threshold_tokens() -> int:
     pct = getattr(config, "HISTORY_COMPACT_PCT_OVERRIDE", 0) or 0
     if pct > 0:
         return max(_COMPACT_FLOOR_TOKENS, int(win * pct / 100.0))
-    reserve = int(getattr(config, "CLAUDE_MAX_TOKENS", 64000)) + _COMPACT_HEADROOM_TOKENS
-    return max(_COMPACT_FLOOR_TOKENS, min(win - reserve, win - 1000))
+    # free-code parity (autoCompact.ts getAutoCompactThreshold):
+    # window − min(model_max_output, 20K) − 13K buffer.
+    reserved_summary = min(
+        int(getattr(config, "CLAUDE_MAX_TOKENS", 64000)),
+        int(getattr(config, "RESERVED_SUMMARY_TOKENS", 20000)),
+    )
+    buffer = int(getattr(config, "AUTOCOMPACT_BUFFER_TOKENS", 13000))
+    return max(_COMPACT_FLOOR_TOKENS, min(win - reserved_summary - buffer, win - 1000))
 
 
 def proactive_hard_threshold_tokens() -> int:
@@ -133,11 +156,12 @@ def proactive_hard_threshold_tokens() -> int:
     before it can reach a boundary — the overflow/crash case the external
     review said must NOT be removed. Percent via PROACTIVE_COMPACT_HARD_PCT.
     """
-    import config
-    win = effective_context_window()
-    pct = getattr(config, "PROACTIVE_COMPACT_HARD_PCT", 97) or 97
-    # The in-loop fold is the HIGHER gate — never below the boundary trigger.
-    return max(int(win * pct / 100.0), compact_threshold_tokens())
+    # free-code parity: the CLI uses ONE threshold for both the boundary check
+    # and the per-turn in-loop check (autoCompactIfNeeded). Delegate so the
+    # in-loop fold fires at the same point as boundary compaction. The
+    # "once per request" cap (tool_loop proactive_compacted) and the
+    # rapid-refill breaker keep this from thrashing on a giant single turn.
+    return compact_threshold_tokens()
 
 
 def record_proactive_compaction(channel_id: int) -> None:
@@ -192,12 +216,12 @@ COMPACT_INSTRUCTIONS = """CRITICAL: Respond with TEXT ONLY. Do NOT call any tool
 - Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
 - You already have all the context you need in the conversation above.
 - Tool calls will be REJECTED and will waste your only turn — you will fail the task.
-- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
+- Your entire response must be plain text: a single <summary> block. Do NOT write an <analysis> block or any other text outside <summary>.
 
 Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
 This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.
 
-Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts and ensure you've covered all necessary points. In your analysis process:
+Before writing the summary, work through the following checklist in your private reasoning to organize your thoughts and ensure you've covered all necessary points — do NOT write this analysis out in the response:
 
 1. Chronologically analyze each message and section of the conversation. For each section thoroughly identify:
    - The user's explicit requests and intents
@@ -231,10 +255,6 @@ Your summary should include the following sections:
 Here's an example of how your output should be structured:
 
 <example>
-<analysis>
-[Your thought process, ensuring all points are covered thoroughly and accurately]
-</analysis>
-
 <summary>
 1. Primary Request and Intent:
    [Detailed description]
@@ -348,11 +368,13 @@ def wrap_summary(
     summary_text: str,
     transcript_path: str | None,
     kept_verbatim: bool,
+    auto_continue: bool = False,
 ) -> str:
     """Continuation wrapper around an extracted summary (binary fn X0$).
 
-    No "Continue the conversation…" leg: in this bot a fresh user turn always
-    follows the summary, so the model never has to self-resume.
+    ``auto_continue`` adds the free-code self-resume leg (prompt.ts:361-364,
+    suppressFollowUpQuestions=true) for AUTO compaction (boundary/in-loop),
+    where the fold happens mid-request. Manual /compact passes False.
     """
     out = f"{CONTINUATION_PREAMBLE}\n{extract_summary(summary_text)}"
     if transcript_path:
@@ -363,6 +385,14 @@ def wrap_summary(
         )
     if kept_verbatim:
         out += "\nRecent messages are preserved verbatim."
+    if auto_continue:
+        out += (
+            "\nContinue the conversation from where it left off without asking "
+            "the user any further questions. Resume directly — do not "
+            "acknowledge the summary, do not recap what was happening, do not "
+            "preface with \"I'll continue\" or similar. Pick up the last task "
+            "as if the break never happened."
+        )
     return out
 
 
@@ -525,12 +555,79 @@ class CompactionResult:
         return (self.retained_chars / self.source_chars * 100) if self.source_chars else 0.0
 
 
+# Per-channel serialization + background dispatch. One compaction per channel
+# at a time: a background boundary run, an in-loop proactive fold, and /compact
+# must never double-summarize the same window (the LLM call costs minutes).
+_compact_locks: dict[int, asyncio.Lock] = {}
+_bg_tasks: dict[int, asyncio.Task] = {}
+
+
+def _channel_lock(channel_id: int) -> asyncio.Lock:
+    return _compact_locks.setdefault(channel_id, asyncio.Lock())
+
+
+def start_background_compaction(channel_id: int, api_client) -> bool:
+    """Dispatch compact_channel_history(force=True) as a background task.
+
+    Returns True when a new task was spawned, False when one is already in
+    flight for this channel (the caller proceeds without waiting either way).
+    Used by the boundary path in entry.py so the triggering turn never blocks
+    on the minutes-long summary call: this turn rides the raw window (plus
+    entry.py's structure-safe microcompact), the summary row lands mid-flight,
+    and the NEXT turn reloads the collapsed replay. No status callback — the
+    whole point is that the user never watches this run.
+    """
+    task = _bg_tasks.get(channel_id)
+    if task is not None and not task.done():
+        return False
+
+    async def _run() -> None:
+        try:
+            await compact_channel_history(channel_id, api_client, None, force=True)
+        except Exception as exc:  # noqa: BLE001 — background task must not die loudly
+            log.warning(
+                "[ch=%d] background compaction task failed (non-fatal): %s",
+                channel_id, exc,
+            )
+        finally:
+            _bg_tasks.pop(channel_id, None)
+
+    _bg_tasks[channel_id] = asyncio.create_task(_run())
+    return True
+
+
 async def compact_channel_history(
     channel_id: int,
     api_client,
     status_callback=None,
     *,
     force: bool = False,
+    custom_instructions: str | None = None,
+    auto_continue: bool = True,
+) -> "CompactionResult | None":
+    """Serialized (per channel) entry point — see _compact_channel_history.
+
+    All callers — background boundary task, in-loop proactive fold, /compact —
+    funnel through the same per-channel lock. A caller that waits out another
+    compaction then re-runs against the freshly collapsed window, where the
+    keep-boundary guard ("nothing left to summarize") turns the duplicate run
+    into a cheap no-op instead of a second LLM call.
+    """
+    async with _channel_lock(channel_id):
+        return await _compact_channel_history(
+            channel_id, api_client, status_callback, force=force,
+            custom_instructions=custom_instructions, auto_continue=auto_continue,
+        )
+
+
+async def _compact_channel_history(
+    channel_id: int,
+    api_client,
+    status_callback=None,
+    *,
+    force: bool = False,
+    custom_instructions: str | None = None,
+    auto_continue: bool = True,
 ) -> "CompactionResult | None":
     """Summarize the older replay window into a compact-summary JSONL row.
 
@@ -626,12 +723,23 @@ async def compact_channel_history(
         # regardless of actual quota (observed 2026-06-13: every compaction
         # 429'd while same-minute main-loop calls returned 200 — compaction
         # had never succeeded in production).
+        def _build_summary_content(_flat: str) -> str:
+            _c = (
+                "Here is the conversation transcript to summarize:\n\n"
+                f"{_flat}\n\n{COMPACT_INSTRUCTIONS}"
+            )
+            # free-code /compact parity: focus instructions after the base
+            # prompt (prompt.ts:296-298 "Additional Instructions").
+            if custom_instructions and custom_instructions.strip():
+                _c += (
+                    "\n\nAdditional focus instructions for this compaction:\n"
+                    f"{custom_instructions.strip()}"
+                )
+            return _c
+
         compact_messages = [{
             "role": "user",
-            "content": (
-                "Here is the conversation transcript to summarize:\n\n"
-                f"{flat}\n\n{COMPACT_INSTRUCTIONS}"
-            ),
+            "content": _build_summary_content(flat),
         }]
         compact_system = [
             {"type": "text",
@@ -642,16 +750,43 @@ async def compact_channel_history(
                                "scope": "global"}},
             {"type": "text", "text": COMPACT_SYSTEM_PROMPT},
         ]
-        resp = await api_client.beta.messages.create(
-            model=HISTORY_COMPACT_MODEL,
-            max_tokens=MAX_SUMMARY_OUTPUT_TOKENS,
-            system=compact_system,
-            messages=compact_messages,
-            betas=MODEL_BETAS,
-            metadata=get_metadata(),
-            thinking=THINKING_CONFIG,
-            output_config={"effort": HISTORY_COMPACT_EFFORT},
-        )
+        # free-code parity: thinking disabled for the summary turn
+        # (compact.ts:1329 streaming path) — the summary needs no reasoning
+        # channel, and adaptive thinking was the bulk of the 4-8min runtimes.
+        # PTL retry (truncateHeadForPTLRetry, compact.ts:262,479-509): if the
+        # summary request itself is prompt-too-long, drop the oldest half and
+        # retry up to 3 times.
+        _ptl_attempts = 0
+        while True:
+            try:
+                resp = await api_client.beta.messages.create(
+                    model=HISTORY_COMPACT_MODEL,
+                    max_tokens=MAX_SUMMARY_OUTPUT_TOKENS,
+                    system=compact_system,
+                    messages=compact_messages,
+                    betas=MODEL_BETAS,
+                    metadata=get_metadata(),
+                    thinking={"type": "disabled"},
+                )
+                break
+            except Exception as _exc:  # noqa: BLE001
+                _low = str(_exc).lower()
+                _is_ptl = (
+                    "prompt is too long" in _low
+                    or "prompt too long" in _low
+                    or getattr(_exc, "status_code", None) == 413
+                )
+                if _is_ptl and _ptl_attempts < 3 and len(flat) > 40000:
+                    _ptl_attempts += 1
+                    flat = flat[len(flat) // 2:]  # drop the oldest half
+                    compact_messages[0]["content"] = _build_summary_content(flat)
+                    log.warning(
+                        "[ch=%d] compaction PTL retry %d/3: halved summary "
+                        "input to %d chars",
+                        channel_id, _ptl_attempts, len(flat),
+                    )
+                    continue
+                raise
         text = "".join(
             getattr(block, "text", "")
             for block in (resp.content or [])
@@ -685,14 +820,16 @@ async def compact_channel_history(
     if "<summary>" not in (text or ""):
         _stop = getattr(resp, "stop_reason", None)
         if _stop == "max_tokens":
-            # Budget-exhaustion pattern (2026-07-06): at effort=max the adaptive
-            # <analysis> ate the whole output cap before <summary> was emitted.
-            # Distinct from a genuine summarizer refusal so a re-tightened cap is
-            # obvious in the logs. Raise HISTORY_COMPACT_MAX_TOKENS if this recurs.
+            # Budget-exhaustion pattern (2026-07-06): adaptive thinking ate the
+            # whole output cap before <summary> was emitted. Distinct from a
+            # genuine summarizer refusal so a re-tightened cap is obvious in
+            # the logs. Raise HISTORY_COMPACT_MAX_TOKENS (or lower
+            # HISTORY_COMPACT_EFFORT) if this recurs.
             log.warning(
                 "[ch=%d] compaction failed: output budget exhausted "
-                "(stop_reason=max_tokens, cap=%d, no <summary> — <analysis> "
-                "consumed the whole budget). Raise HISTORY_COMPACT_MAX_TOKENS.",
+                "(stop_reason=max_tokens, cap=%d, no <summary> — thinking "
+                "consumed the whole budget). Raise HISTORY_COMPACT_MAX_TOKENS "
+                "or lower HISTORY_COMPACT_EFFORT.",
                 channel_id, MAX_SUMMARY_OUTPUT_TOKENS,
             )
         else:
@@ -708,16 +845,52 @@ async def compact_channel_history(
         channel_id, len(text), "<analysis>" in text,
     )
 
+    # The summary call took minutes; rows may have been appended to the JSONL
+    # while it ran (background boundary compaction races the in-flight turn).
+    # keep_tail_rows counts rows IMMEDIATELY BEFORE the summary row, so a
+    # stale count from the pre-call snapshot would misattribute concurrently-
+    # appended rows to the tail and silently drop real tail rows from replay.
+    # Re-anchor on the last summarized row in a fresh load and count the
+    # actual tail: everything after it (original keep + concurrent appends)
+    # is verbatim. The search is capped at the original boundary index —
+    # head-trimming can only shift the anchor DOWN, and the cap keeps a
+    # value-identical row later in the window (same second, same role, same
+    # text) from being mistaken for the anchor.
+    last_old = old_rows[-1]
+    fresh_rows = await asyncio.to_thread(load_compaction_rows, channel_id)
+    anchor = None
+    for i in range(min(boundary - 1, len(fresh_rows) - 1), -1, -1):
+        r = fresh_rows[i]
+        if (
+            r.get("timestamp") == last_old.get("timestamp")
+            and r.get("role") == last_old.get("role")
+            and r.get("content") == last_old.get("content")
+        ):
+            anchor = i
+            break
+    if anchor is None:
+        log.warning(
+            "[ch=%d] compaction append aborted: summarized boundary row no "
+            "longer in the replay window (trimmed mid-run) — discarding this "
+            "summary rather than risking a misaligned verbatim tail",
+            channel_id,
+        )
+        return None
+    tail_rows = fresh_rows[anchor + 1:]
+    keep_tail = len(tail_rows)
+    keep_chars = sum(_row_chars(r) for r in tail_rows)
+
     wrapped = wrap_summary(
         text,
         transcript_path=history_file_path(channel_id),
-        kept_verbatim=bool(keep_rows),
+        kept_verbatim=bool(tail_rows),
+        auto_continue=auto_continue,
     )
     row = {
         "role": "user",
         "content": wrapped,
         "is_compact_summary": True,
-        "keep_tail_rows": len(keep_rows),
+        "keep_tail_rows": keep_tail,
         "compact_meta": {
             "model": HISTORY_COMPACT_MODEL,
             "summarized_rows": len(old_rows),
@@ -733,13 +906,13 @@ async def compact_channel_history(
     log.info(
         "[ch=%d] compaction done: summary_chars=%d keep_tail_rows=%d "
         "source_chars=%d compression=%.1f%% total_duration_ms=%d",
-        channel_id, len(wrapped), len(keep_rows), total_chars,
+        channel_id, len(wrapped), keep_tail, total_chars,
         (len(wrapped) + keep_chars) / total_chars * 100 if total_chars else 0.0,
         int((time.monotonic() - call_start) * 1000),
     )
     return CompactionResult(
         summarized_rows=len(old_rows),
-        kept_rows=len(keep_rows),
+        kept_rows=keep_tail,
         source_chars=total_chars,
         summary_chars=len(wrapped),
         kept_chars=keep_chars,

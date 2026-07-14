@@ -17,7 +17,8 @@ log = logging.getLogger(__name__)
 
 def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
     @tree.command(name="compact", description="このチャンネルの会話履歴を手動で圧縮する (admin only)")
-    async def compact_cmd(interaction: discord.Interaction):
+    @app_commands.describe(focus="要約で特に残したい観点（任意・free-codeの /compact <指示> と同じ）")
+    async def compact_cmd(interaction: discord.Interaction, focus: str | None = None):
         if not deps.is_admin(interaction.user):
             await interaction.response.send_message("admin only", ephemeral=True)
             return
@@ -42,7 +43,11 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
                     + int(_usage.get("cache_read_input_tokens", 0) or 0)
                     + int(_usage.get("cache_creation_input_tokens", 0) or 0)
                 )
-            result = await compact_channel_history(channel_id, api_client, force=True)
+            result = await compact_channel_history(
+                channel_id, api_client, force=True,
+                custom_instructions=focus,      # free-code: focus instructions
+                auto_continue=False,            # 手動は自己継続文言を付けない
+            )
         except Exception as exc:
             await interaction.followup.send(f"圧縮に失敗しました: {exc}", ephemeral=True)
             return
@@ -78,6 +83,12 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
             return
         try:
             report = clear_channel_context(channel_id)
+            from services.codex_app_server.manager import clear_codex_channel
+            codex_dropped = await clear_codex_channel(channel_id)
+            skill_overrides = getattr(deps, "skill_overrides", {})
+            skill_keys = [key for key in skill_overrides if key[0] == channel_id]
+            for key in skill_keys:
+                skill_overrides.pop(key, None)
         except Exception as exc:
             log.exception("/clear failed for ch=%s", channel_id)
             await interaction.response.send_message(
@@ -93,6 +104,8 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
         else:
             parts.append("-# 履歴ファイルは無かったのでスキップ")
         parts.append(f"-# in-memory session {report['sessions_dropped']} 件を破棄")
+        parts.append(f"-# Codex thread mapping {codex_dropped} 件を破棄")
+        parts.append(f"-# active skill {len(skill_keys)} 件を解除")
         parts.append("-# 次のメッセージから完全にフレッシュな会話が始まります。")
         await interaction.response.send_message("\n".join(parts), ephemeral=True)
 
@@ -103,6 +116,57 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
             return
         cid = interaction.channel_id
         uid = interaction.user.id
+        if cid is not None:
+            from services.provider_router import PROVIDER_CODEX, resolve_provider
+
+            key = (cid, uid)
+            provider_overrides = getattr(deps, "provider_overrides", {})
+            provider = resolve_provider(
+                explicit=provider_overrides.get(key),
+                model=deps.model_overrides.get(key),
+                restricted=False,
+            )
+            if provider == PROVIDER_CODEX:
+                from services.codex_app_server.manager import get_manager
+
+                state = get_manager().context(cid, uid)
+                if not state:
+                    await interaction.response.send_message(
+                        "このチャンネル × あなたのCodex threadはまだありません",
+                        ephemeral=True,
+                    )
+                    return
+                usage = state.get("token_usage_last") or {}
+                total = state.get("token_usage_total") or {}
+                window = int(state.get("model_context_window") or 0)
+
+                def _number(payload, *names):
+                    for name in names:
+                        value = payload.get(name)
+                        if isinstance(value, (int, float)):
+                            return int(value)
+                    return 0
+
+                inp = _number(usage, "inputTokens", "input_tokens")
+                cached = _number(
+                    usage, "cachedInputTokens", "cached_input_tokens",
+                    "cache_read_input_tokens",
+                )
+                out = _number(usage, "outputTokens", "output_tokens")
+                total_tokens = _number(total, "totalTokens", "total_tokens")
+                thread_id = str(state.get("thread_id") or "")
+                msg = (
+                    "**Codex app-server context**\n"
+                    f"- model: `{state.get('model') or '?'}`\n"
+                    f"- provider: `{state.get('model_provider') or '?'}`\n"
+                    f"- thread: `{thread_id[:12]}`\n"
+                    f"- last input/cache/output: {inp:,} / {cached:,} / {out:,}\n"
+                    f"- cumulative tokens: {total_tokens:,}\n"
+                    f"- context window: {window:,}\n"
+                    f"- native compaction observed: {bool(state.get('compacted'))}"
+                )
+                await interaction.response.send_message(msg, ephemeral=True)
+                return
         info = get_session(cid, uid) if cid is not None else None
         usage = getattr(info, "last_usage", None) if info else None
         if not usage:

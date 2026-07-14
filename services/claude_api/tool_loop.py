@@ -20,6 +20,7 @@ Notes:
 """
 
 import asyncio
+import inspect
 import logging
 import re
 import time
@@ -27,6 +28,7 @@ import uuid
 from dataclasses import dataclass
 
 import anthropic
+import httpx
 
 from config import (
     CLAUDE_MAX_TOKENS,
@@ -42,6 +44,9 @@ from config import (
     PROACTIVE_COMPACT_TRIGGER_TOKENS,
     SERVER_SIDE_FALLBACK_ENABLED,
     SLOW_FIRST_BYTE_MS,
+    STREAM_BYTE_IDLE_TIMEOUT_S,
+    STREAM_NONSTREAM_FALLBACK_ENABLED,
+    STREAM_NONSTREAM_TIMEOUT_S,
     STREAM_STALL_MAX_RETRIES,
     STREAM_STALL_RETRY_S,
     TEXT_INVOKE_RESCUE_ENABLED,
@@ -181,6 +186,22 @@ _TOOL_LOOP_WARN_NUDGE = (
 _CHECKPOINT_NOTE = (
     "-# ⏸️ 作業が長くなったのでここまでを保存しました。「続けて」で同じ文脈から再開できます。"
 )
+# ADR-0040: variant of the checkpoint note used when entry.py's policy
+# (``should_auto_resume``) says this request is about to be auto-resumed —
+# the user sees a "continuing…" line instead of being asked to type
+# 「続けて」 themselves.
+_AUTO_RESUME_NOTE = (
+    "-# ⏳ 作業が長くなったので一旦区切りました。続きを自動で実行します…"
+)
+# ADR-0040: synthetic user turn entry.py injects to continue a checkpointed
+# request. Worded as a user instruction because it IS one — it rides the same
+# persisted history the manual 「続けて」 would, so resume semantics are
+# byte-identical to the manual path.
+AUTO_RESUME_DIRECTIVE = (
+    "（自動継続）直前の応答は長さ上限で一旦区切られました。保存済みの文脈から"
+    "作業をそのまま続けてください。挨拶・状況の再説明・完了済み作業のやり直しは"
+    "不要です。残りを終えたら通常どおり結果をまとめてください。"
+)
 
 
 def _build_checkpoint_result(
@@ -194,6 +215,7 @@ def _build_checkpoint_result(
     prior_len: int | None,
     usage_totals: dict,
     paused_reason: str,
+    auto_resume_planned: bool = False,
 ) -> "AgentLoopResult":
     """Graceful checkpoint (ADR-0036): preserve work instead of discarding it.
 
@@ -202,14 +224,24 @@ def _build_checkpoint_result(
     returns a REAL session id and a non-sentinel reply. entry.py's existing
     persistence (set_session + JSONL slice) then saves the full structured
     transcript verbatim, so "続けて" resumes with all tool context intact.
+
+    ``auto_resume_planned`` (ADR-0040): entry.py's policy already committed to
+    continuing this request automatically — swap the 「続けて」 ask for a
+    "continuing…" note so the user is not prompted for an action that is about
+    to happen on its own.
     """
     accumulated = "\n\n".join(t for t in text_across_turns if t)
     body = accumulated or last_text
     if body:
-        text = body + "\n\n" + _CHECKPOINT_NOTE
+        note = _AUTO_RESUME_NOTE if auto_resume_planned else _CHECKPOINT_NOTE
+        text = body + "\n\n" + note
     else:
         # Model ran tools but emitted no prose — still give the user a handle.
-        text = "⏸️ 作業をここまで保存しました。「続けて」で同じ文脈から再開できます。"
+        text = (
+            "⏳ 作業をここまで保存しました。続きを自動で実行します…"
+            if auto_resume_planned
+            else "⏸️ 作業をここまで保存しました。「続けて」で同じ文脈から再開できます。"
+        )
     if fallback_used and not fallback_note_sent_live and body:
         text = _fallback_alert(current_model) + "\n\n" + text
     return AgentLoopResult(
@@ -1253,7 +1285,12 @@ async def _run_one_tool_inner(
             "is_error": True,
         }
 
-    allowed, reason = can_use_tool(tool_name, tool_input)
+    _gate_res = can_use_tool(tool_name, tool_input)
+    if inspect.isawaitable(_gate_res):
+        # permission ask（free-code移植）: ask ルールは Discord リアクション承認を
+        # await する。同期 gate（従来の restricted 等）はそのまま通る。
+        _gate_res = await _gate_res
+    allowed, reason = _gate_res
     if not allowed:
         await _safe_status(status_callback, "❌ ツール拒否")
         return {
@@ -1454,6 +1491,9 @@ async def run_agent_loop(
     budget_role: str = "admin",  # ADR-0036: "admin"/"restricted"/"subagent"
     request_budget=None,  # ADR-0036: RequestBudget override (else built from role)
     loop_detector=None,  # ADR-0036: ToolLoopDetector override (else built from role)
+    should_auto_resume=None,  # ADR-0040: (paused_reason:str)->bool — entry.py の
+    # 自動継続ポリシー。checkpoint 時に True を返すと「続けて」導線の代わりに
+    # 自動継続ノートを出す（実際の再実行は entry.py 側が行う）。
 ) -> AgentLoopResult:
     """Run the streaming + tool-use loop. See module docstring for invariants.
 
@@ -1556,8 +1596,18 @@ async def run_agent_loop(
     async def _emit_checkpoint(paused_reason: str) -> AgentLoopResult:
         """ADR-0036: graceful checkpoint を組み立てて返す。streaming 時は本文が
         既にライブ配信済みなので、末尾の resume ノートだけを追加でライブ送信して
-        ユーザーに「続けて」導線を見せる（fallback_alert と同じ流儀）。"""
+        ユーザーに導線を見せる（fallback_alert と同じ流儀）。ADR-0040: entry.py
+        が自動継続する場合は「続けて」の代わりに自動継続ノートを出す。"""
         _log_total_usage(channel_id, usage_totals)
+        will_resume = False
+        if should_auto_resume is not None:
+            try:
+                will_resume = bool(should_auto_resume(paused_reason))
+            except Exception as exc:  # noqa: BLE001 — ポリシー故障で checkpoint を殺さない
+                log.warning(
+                    "[ch=%d] should_auto_resume(%s) failed: %s",
+                    channel_id, paused_reason, exc,
+                )
         result = _build_checkpoint_result(
             text_across_turns=text_across_turns,
             last_text=last_text,
@@ -1568,10 +1618,12 @@ async def run_agent_loop(
             prior_len=prior_len,
             usage_totals=usage_totals,
             paused_reason=paused_reason,
+            auto_resume_planned=will_resume,
         )
         if incremental_text_callback is not None:
             _accumulated = "\n\n".join(t for t in text_across_turns if t)
-            _note = _CHECKPOINT_NOTE if _accumulated else result.text
+            _live_note = _AUTO_RESUME_NOTE if will_resume else _CHECKPOINT_NOTE
+            _note = _live_note if _accumulated else result.text
             try:
                 await incremental_text_callback(_note)
             except Exception as exc:  # noqa: BLE001 — 表示失敗で loop を殺さない
@@ -1661,11 +1713,32 @@ async def run_agent_loop(
         # inherit a stale tool identity.
         cur_tool: dict | None = None
         try:
-            async with api_client.beta.messages.stream(**stream_kwargs) as stream:
+            # Byte-layer stall detection (CLI-parity 2026-07-11): httpx's read
+            # timeout is the max gap between BYTES, and SSE pings are bytes —
+            # so a slow-but-alive upstream (long prefill keeps pinging) never
+            # trips it, only a genuinely dead connection does. This mirrors
+            # the CLI 2.1.170 byte watchdog (180s firstParty, oh_=180000),
+            # its PRIMARY detector. Per-request override only: the shared
+            # client keeps its 600s scalar because non-streaming calls
+            # receive zero bytes until generation completes and a 180s read
+            # cap would kill them. NOT added to stream_kwargs — those are
+            # reused by the fallback create(**stream_kwargs, timeout=1800)
+            # and a second timeout kwarg would TypeError.
+            _stream_timeout = httpx.Timeout(
+                connect=15.0,
+                read=float(STREAM_BYTE_IDLE_TIMEOUT_S),
+                write=60.0,
+                pool=60.0,
+            )
+            async with api_client.beta.messages.stream(
+                **stream_kwargs, timeout=_stream_timeout,
+            ) as stream:
                 # ADR-0038: idle-guard each event so a wedged upstream raises a
                 # catchable TimeoutError here instead of tripping the outer
                 # StallWatchdog's task-cancel. The heartbeat still feeds the
-                # watchdog backstop for stalls this guard can't see.
+                # watchdog backstop for stalls this guard can't see. Since the
+                # byte layer above owns "dead connection" at 180s, this event
+                # guard (300s) only fires when bytes flow but no event arrives.
                 async for event in _idle_guarded(stream, STREAM_STALL_RETRY_S):
                     stall_watchdog.heartbeat()
                     if ttft_ms is None:
@@ -1916,40 +1989,145 @@ async def run_agent_loop(
                                 log.warning(
                                     "server fallback alert callback failed: %s", exc
                                 )
-        except TimeoutError:
-            # ADR-0038: no SSE event for STREAM_STALL_RETRY_S — the upstream
-            # stream is wedged (server took the POST but streamed nothing).
-            # Recover here instead of letting the StallWatchdog cancel the whole
-            # task. A clean pre-first-byte stall (no prose streamed this turn,
+        except (
+            TimeoutError, httpx.ReadTimeout, anthropic.APITimeoutError,
+        ) as _stall_exc:
+            # ADR-0038 + byte layer (2026-07-11): the upstream stream is
+            # wedged. Recover here instead of letting the StallWatchdog cancel
+            # the whole task. Three detection layers land here, distinguished
+            # for the passive prod measurement (byte-vs-event trip ratio tells
+            # us whether pings actually flow during a long prefill):
+            #   - httpx.ReadTimeout  → BYTE layer: ≥STREAM_BYTE_IDLE_TIMEOUT_S
+            #     with zero bytes (pings included) — a genuinely dead
+            #     connection; immediate re-POST is correct.
+            #   - TimeoutError       → EVENT layer: bytes flowed (httpx quiet)
+            #     but no SSE event for STREAM_STALL_RETRY_S.
+            #   - APITimeoutError    → REQUEST leg: the SDK wrapped a timeout
+            #     before headers arrived (connect/TTFB) — pre-first-event by
+            #     definition, same recovery family (CLI treats its stale-
+            #     connection case identically: retry streaming, then fall
+            #     back). Caught here BEFORE the anthropic.AnthropicError
+            #     handler below by except-clause ordering.
+            # A clean pre-first-byte stall (no prose streamed this turn,
             # so nothing was appended to `history` — the user turn was appended
             # once before the loop) is re-issued as the SAME request via
             # `continue`; it cannot duplicate visible output. Once prose has
             # streamed, or the retry budget is spent, preserve the work with a
             # graceful checkpoint ("続けて" resumes) rather than dying.
+            if isinstance(_stall_exc, httpx.ReadTimeout):
+                _stall_layer = "byte"
+            elif isinstance(_stall_exc, anthropic.APITimeoutError):
+                _stall_layer = "request"
+            else:
+                _stall_layer = "event"
+            # Deliberately NO watchdog heartbeat here (ADR-0045): the CLI's
+            # async-agent backstop is a hard 600s no-progress ceiling that is
+            # NOT fed during recovery legs — a recovery chain that can't
+            # finish inside the ceiling is killed as "stream watchdog did not
+            # recover", by design. Ordering: byte 180 < event 300 = fallback
+            # 300 < backstop 600.
             _produced = bool(live_turn_text.strip())
             if not _produced and stall_retries < STREAM_STALL_MAX_RETRIES:
                 stall_retries += 1
                 _backoff = min(2 ** stall_retries, 8)
                 log.warning(
-                    "[ch=%d] turn=%d stream stall (idle ≥%ds) → retry %d/%d "
+                    "[ch=%d] turn=%d stream stall (layer=%s, %r) → retry %d/%d "
                     "after %ds",
-                    channel_id, turn + 1, STREAM_STALL_RETRY_S,
+                    channel_id, turn + 1, _stall_layer, _stall_exc,
                     stall_retries, STREAM_STALL_MAX_RETRIES, _backoff,
                 )
-                await _safe_status(status_callback, "⏳ 応答待ち・再試行中")
+                await _safe_status(
+                    status_callback,
+                    f"⏳ 応答待ち・再試行中 ({stall_retries}/{STREAM_STALL_MAX_RETRIES})",
+                )
                 await asyncio.sleep(_backoff)
                 continue
-            if _produced:
-                # Fold the partial prose already shown to the user into the
-                # transcript so the checkpoint isn't missing this turn's head.
-                text_across_turns.append(live_turn_text)
-            log.warning(
-                "[ch=%d] turn=%d stream stall (idle ≥%ds, produced=%s, "
-                "retries=%d) → graceful checkpoint",
-                channel_id, turn + 1, STREAM_STALL_RETRY_S, _produced,
-                stall_retries,
-            )
-            return await _emit_checkpoint("stream_stall")
+            # CLI-parity (2026-07-09): streaming retry budget exhausted on a
+            # clean pre-first-byte stall. The Claude Code CLI falls back to a
+            # single NON-streaming request here ("falling back to non-streaming
+            # mode") rather than dying — a blocking messages.create sidesteps the
+            # per-chunk SSE idle watchdog, keeps the prompt+cache intact, and
+            # needs no second API call. On success we set final_msg and fall
+            # through to the shared post-processing below (which appends the
+            # assistant turn and delivers the prose via incremental_text_callback,
+            # exactly like the streaming path — no double-send). On failure, or
+            # once prose has already streamed, we preserve work with a checkpoint.
+            if not _produced and STREAM_NONSTREAM_FALLBACK_ENABLED:
+                log.warning(
+                    "[ch=%d] turn=%d stream stall exhausted (retries=%d) → "
+                    "non-streaming fallback",
+                    channel_id, turn + 1, stall_retries,
+                )
+                await _safe_status(status_callback, "🐢 非ストリーミングで取得中…")
+                _ns_final = None
+                try:
+                    _ns_final = await asyncio.wait_for(
+                        # SDK-level timeout stays deliberately generous (1800s)
+                        # so the SDK's "large max_tokens without streaming"
+                        # guard never trips; the REAL deadline is the outer
+                        # STREAM_NONSTREAM_TIMEOUT_S (300s — CLI parity: fL9
+                        # passes _ef() = API_TIMEOUT_MS || 300000ms local as
+                        # its per-request timeout, 2.1.170). This leg runs
+                        # under the 600s backstop unfed, exactly like the
+                        # CLI's fallback under its async-agent watchdog.
+                        api_client.beta.messages.create(
+                            **stream_kwargs, timeout=1800,
+                        ),
+                        STREAM_NONSTREAM_TIMEOUT_S,
+                    )
+                except Exception as _ns_exc:  # noqa: BLE001 - best-effort fallback
+                    # %r, not %s: str(TimeoutError()) == "" — the bare %s
+                    # produced "non-streaming fallback failed:  → checkpoint"
+                    # with the cause invisible (observed 2026-07-11).
+                    log.warning(
+                        "[ch=%d] non-streaming fallback failed: %r → checkpoint",
+                        channel_id, _ns_exc,
+                    )
+                if _ns_final is not None:
+                    # The recovery WAIT ran unfed (hard ceiling), but a
+                    # SUCCEEDED fallback is genuine progress — the CLI feeds
+                    # its backstop on the resulting yielded message (ADR-0045).
+                    # Heartbeat here so the unfed retry→fallback idle can't
+                    # cancel a fully-received, fully-paid response during the
+                    # post-processing / Discord delivery that follows.
+                    stall_watchdog.heartbeat()
+                    final_msg = _ns_final
+                    if ttft_ms is None:
+                        ttft_ms = int((time.monotonic() - request_start) * 1000)
+                    _log_turn_usage(
+                        channel_id, turn, final_msg, usage_totals,
+                        model=current_model, request_id="",
+                        duration_ms=int((time.monotonic() - request_start) * 1000),
+                        ttft_ms=ttft_ms, message_count=len(messages),
+                    )
+                    _this_turn_output = _usage_number(
+                        getattr(final_msg, "usage", None), "output_tokens",
+                    )
+                    _tok_base += _this_turn_output
+                    budget.add_output_tokens(_this_turn_output)
+                    if progress is not None:
+                        progress["tokens"] = _tok_base
+                    log.info(
+                        "[ch=%d] turn=%d non-streaming fallback succeeded "
+                        "(stop_reason=%s, output_tokens=%d)",
+                        channel_id, turn + 1,
+                        getattr(final_msg, "stop_reason", None), _this_turn_output,
+                    )
+                    # fall through to shared post-processing below.
+                else:
+                    return await _emit_checkpoint("stream_stall")
+            else:
+                if _produced:
+                    # Fold the partial prose already shown to the user into the
+                    # transcript so the checkpoint isn't missing this turn's head.
+                    text_across_turns.append(live_turn_text)
+                log.warning(
+                    "[ch=%d] turn=%d stream stall (layer=%s, %r, produced=%s, "
+                    "retries=%d) → graceful checkpoint",
+                    channel_id, turn + 1, _stall_layer, _stall_exc, _produced,
+                    stall_retries,
+                )
+                return await _emit_checkpoint("stream_stall")
         except anthropic.AnthropicError as exc:
             category = classify_anthropic_error(exc)
             log.error("agent loop API error turn=%d category=%s: %s",
@@ -2006,19 +2184,25 @@ async def run_agent_loop(
                 TEXT_INVOKE_RESCUE_ENABLED
                 and text_invoke_rescues < MAX_TEXT_INVOKE_RESCUES
             ):
-                rescued_results = await _attempt_text_invoke_rescue(
-                    turn_text,
-                    history=history,
-                    tools_for_api=tools_for_api,
-                    tool_schemas=tool_schemas,
-                    can_use_tool=can_use_tool,
-                    execute_tool=execute_tool,
-                    status_callback=status_callback,
-                    tool_invocation_callback=tool_invocation_callback,
-                    channel_id=channel_id,
-                    turn=turn,
-                    evidence=evidence,
-                )
+                # Rescue executes real tools too — same backstop deferral as
+                # the main tool phase (ADR-0045).
+                stall_watchdog.tool_begin()
+                try:
+                    rescued_results = await _attempt_text_invoke_rescue(
+                        turn_text,
+                        history=history,
+                        tools_for_api=tools_for_api,
+                        tool_schemas=tool_schemas,
+                        can_use_tool=can_use_tool,
+                        execute_tool=execute_tool,
+                        status_callback=status_callback,
+                        tool_invocation_callback=tool_invocation_callback,
+                        channel_id=channel_id,
+                        turn=turn,
+                        evidence=evidence,
+                    )
+                finally:
+                    stall_watchdog.tool_end()
             if rescued_results is not None:
                 text_invoke_rescues += 1
                 consecutive_empty = 0
@@ -2223,17 +2407,46 @@ async def run_agent_loop(
         # Read-only batches run concurrently (CLI isConcurrencySafe, audit
         # #12); tool_result order still follows tool_use order because
         # asyncio.gather preserves input order.
-        if len(tool_blocks) > 1 and all(
-            getattr(b, "name", "") in CONCURRENCY_SAFE_TOOLS
-            for b in tool_blocks
-        ):
-            tool_results = list(await asyncio.gather(
-                *(_run_one_tool(b, **_tool_kw) for b in tool_blocks)
-            ))
-        else:
-            tool_results = [
-                await _run_one_tool(b, **_tool_kw) for b in tool_blocks
-            ]
+        # tool_begin/tool_end (ADR-0045): the whole-task backstop defers
+        # while tools are in flight (CLI async-agent parity) — tool legs own
+        # their deadline via TOOL_CALL_TIMEOUT_S, and a sequential multi-tool
+        # phase can legitimately exceed the backstop's 600s.
+        stall_watchdog.tool_begin()
+        try:
+            # free-code parity (toolOrchestration.partitionToolCalls): 連続する
+            # concurrency-safe ブロックをバッチ並列（上限10）、非 safe は単体直列。
+            # 従来の「全ブロックが safe のときだけ全並列」は混在ターンで全直列だった。
+            tool_results = []
+            _safe_batch: list = []
+
+            async def _flush_batch() -> None:
+                if not _safe_batch:
+                    return
+                if len(_safe_batch) > 1:
+                    _sem = asyncio.Semaphore(10)
+
+                    async def _capped(blk):
+                        async with _sem:
+                            return await _run_one_tool(blk, **_tool_kw)
+
+                    tool_results.extend(await asyncio.gather(
+                        *(_capped(b) for b in list(_safe_batch))
+                    ))
+                else:
+                    tool_results.append(
+                        await _run_one_tool(_safe_batch[0], **_tool_kw)
+                    )
+                _safe_batch.clear()
+
+            for _blk in tool_blocks:
+                if getattr(_blk, "name", "") in CONCURRENCY_SAFE_TOOLS:
+                    _safe_batch.append(_blk)
+                else:
+                    await _flush_batch()
+                    tool_results.append(await _run_one_tool(_blk, **_tool_kw))
+            await _flush_batch()
+        finally:
+            stall_watchdog.tool_end()
 
         if not tool_results:
             # Tool Search 検索ターン: client 側 tool_use はゼロだが、result 未対の

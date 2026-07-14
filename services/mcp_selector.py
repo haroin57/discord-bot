@@ -22,6 +22,7 @@ from config import (
     MCP_SERVERS_BASE,
     MCP_SERVERS_DOCS,
     MCP_SERVERS_HEAVY,
+    MCP_SERVERS_INSHI,
     MCP_SERVERS_IOT,
     MCP_SERVERS_MEMORY,
     MCP_SERVERS_PAPER,
@@ -29,6 +30,7 @@ from config import (
     MCP_SERVERS_WEB,
     NATURE_REMO_ALLOWED_USER_IDS,
 )
+from services.mcp_control import filter_enabled_mcp_configs
 
 __all__ = [
     "get_mcp_servers_by_keys",
@@ -116,9 +118,22 @@ _REALESTATE_TRIGGERS = tuple(kw.lower() for kw in (
 ))
 
 
+# INSHI tier — 院試誤答DB (inshi-vault :8017)。院試関連の語だけで spawn する
+# （常駐 daemon への HTTP 接続なので spawn コスト自体はほぼゼロだが、
+# 無関係な会話でツール枠を8個食わないためのゲート）。
+_INSHI_TRIGGERS = tuple(kw.lower() for kw in (
+    "院試", "過去問", "誤答", "模試", "ドリル", "間違いノート",
+    "出題", "類題", "改題", "復習期限", "誤答db", "inshi", "白紙再現",
+    "問a", "問b", "問c", "問4", "問6", "問7",
+    "ポンピング", "双対", "シンプレックス", "mle", "採点",
+))
+
+
 def get_mcp_servers_by_keys(keys: list[str]) -> dict:
     """Reconstruct MCP server config dict from a list of server name keys."""
-    return {k: v for k, v in MCP_SERVERS.items() if k in keys}
+    return filter_enabled_mcp_configs(
+        {k: v for k, v in MCP_SERVERS.items() if k in keys}
+    )
 
 
 def pick_mcp_servers(raw_user_text: str, user_id: int | None = None) -> dict:
@@ -142,6 +157,8 @@ def pick_mcp_servers(raw_user_text: str, user_id: int | None = None) -> dict:
         servers.update(MCP_SERVERS_HEAVY)
     if any(kw in text for kw in _MEMORY_TRIGGERS):
         servers.update(MCP_SERVERS_MEMORY)
+    if any(kw in text for kw in _INSHI_TRIGGERS):
+        servers.update(MCP_SERVERS_INSHI)
     if any(kw in text for kw in _PAPER_TRIGGERS):
         servers.update(MCP_SERVERS_PAPER)
     if any(kw in text for kw in _DOCS_TRIGGERS) or _DOCS_BOUNDARY_RE.search(text):
@@ -160,7 +177,7 @@ def pick_mcp_servers(raw_user_text: str, user_id: int | None = None) -> dict:
         and any(kw in text for kw in _IOT_TRIGGERS)
     ):
         servers.update(MCP_SERVERS_IOT)
-    return servers
+    return filter_enabled_mcp_configs(servers)
 
 
 async def select_mcp_servers(
@@ -191,7 +208,7 @@ async def select_mcp_servers(
         )
         return keyword
     if MCP_SELECTOR_MODE == "semantic":
-        return semantic
+        return filter_enabled_mcp_configs(semantic)
     merged = dict(keyword)
     merged.update(semantic)
-    return merged
+    return filter_enabled_mcp_configs(merged)

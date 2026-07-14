@@ -95,3 +95,25 @@ class TestScratchFinalize:
 
         payload = sent_msg.edit.await_args.kwargs["content"]
         assert payload == "-# 💭 メモ「進捗」\n-# 💭 メモ「発見」"
+
+
+@pytest.mark.asyncio
+async def test_rendered_image_tracks_actual_discord_message_id(tmp_path, monkeypatch):
+    renderer, message, _status = _make_renderer()
+    image = tmp_path / "table.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
+    sent = MagicMock()
+    sent.id = 222222222222222
+    message.reply = AsyncMock(return_value=sent)
+    monkeypatch.setattr(
+        bot_ui, "render_table_image", AsyncMock(return_value=str(image))
+    )
+
+    await renderer._emit_block(
+        bot_ui.TableSegment("| A |\n|---|\n| 1 |", caption="table")
+    )
+
+    assert renderer.rendered_images == [str(image)]
+    assert renderer.rendered_image_message_ids == {
+        str(image): 222222222222222
+    }
