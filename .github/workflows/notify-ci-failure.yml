@@ -4,7 +4,11 @@ name: notify-ci-failure
 # GitHub Actions には CI 失敗を直接 Discord へ流す仕組みが無く、これまでは
 # auto_deploy.sh の poll (5分毎・デプロイ対象ブランチ限定) が間接的に拾うだけだった。
 # workflow_run はデフォルトブランチ(master)にあるこのファイルが評価されるため、
-# feature/PR/dev の失敗もここで即時に拾える。
+# feature/PR/dev の失敗もここで短い猶予後に拾える。
+#
+# workflow rerun は同じ run ID の attempt を更新する。最初の失敗を即時通知すると、
+# rerun が成功しても古い赤通知だけが Discord に残るため、短い猶予後に同じ run ID
+# を再取得し、元の attempt が現在も確定 failure の場合だけ通知する。
 #
 # 通知先はブランチ別。既存の notify-push.yml と同じ webhook secret を再利用する:
 #   master 失敗              → DISCORD_WEBHOOK_MASTER(+_2)
@@ -14,7 +18,12 @@ on:
     workflows: [test, lint, security, trusted-release]
     types: [completed]
 
-permissions: {}
+permissions:
+  actions: read
+
+concurrency:
+  group: notify-ci-failure-${{ github.event.workflow_run.id }}
+  cancel-in-progress: true
 
 jobs:
   notify:
@@ -22,7 +31,45 @@ jobs:
     # 失敗時のみ発火。success / cancelled / skipped は無視する。
     if: ${{ github.event.workflow_run.conclusion == 'failure' }}
     steps:
+      - name: Recheck latest workflow attempt after grace period
+        id: latest-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_API_URL: ${{ github.api_url }}
+          GH_REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ORIGINAL_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          sleep 60
+          [[ "${RUN_ID}" =~ ^[0-9]+$ ]]
+          [[ "${ORIGINAL_ATTEMPT}" =~ ^[0-9]+$ ]]
+          RUN="$(curl --fail --silent --show-error \
+            --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${GH_API_URL}/repos/${GH_REPOSITORY}/actions/runs/${RUN_ID}")"
+          LATEST_ATTEMPT="$(jq -er '.run_attempt | numbers' <<<"${RUN}")"
+          LATEST_STATUS="$(jq -er '.status | strings' <<<"${RUN}")"
+          LATEST_CONCLUSION="$(jq -er '
+            if .conclusion == null then ""
+            elif (.conclusion | type) == "string" then .conclusion
+            else error("invalid conclusion")
+            end
+          ' <<<"${RUN}")"
+
+          SHOULD_NOTIFY=false
+          if [[ "${LATEST_ATTEMPT}" == "${ORIGINAL_ATTEMPT}" \
+              && "${LATEST_STATUS}" == "completed" \
+              && "${LATEST_CONCLUSION}" == "failure" ]]; then
+            SHOULD_NOTIFY=true
+          fi
+          echo "latest attempt=${LATEST_ATTEMPT} status=${LATEST_STATUS} conclusion=${LATEST_CONCLUSION:-null} notify=${SHOULD_NOTIFY}"
+          printf 'should_notify=%s\n' "${SHOULD_NOTIFY}" >>"${GITHUB_OUTPUT}"
+
       - name: Notify branch-specific Discord channels on CI failure
+        if: steps.latest-run.outputs.should_notify == 'true'
         env:
           WEBHOOK_MASTER: ${{ secrets.DISCORD_WEBHOOK_MASTER }}
           WEBHOOK_MASTER_2: ${{ secrets.DISCORD_WEBHOOK_MASTER_2 }}
