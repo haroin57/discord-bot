@@ -645,7 +645,17 @@ def test_security_procedure_covers_home_acl_oauth_and_state_migration():
         ROOT / "infra/systemd/discord-bot-autodeploy.service",
         ROOT / "infra/systemd/discord-bot-dev-autodeploy.service",
     ):
-        assert "UMask=0022" in unit.read_text(encoding="utf-8")
+        text = unit.read_text(encoding="utf-8")
+        assert "UMask=0022" in text
+        assert "/var/lib/discord-bot-deploy/checkouts/" in text
+        assert "/home/ubuntu/discord-bot/scripts/auto_deploy.sh" not in text
+
+    prod_deploy = (
+        ROOT / "infra/systemd/discord-bot-autodeploy.service"
+    ).read_text(encoding="utf-8")
+    assert "Environment=AUTO_DEPLOY_PROFILE=core" in prod_deploy
+    assert "Environment=AUTO_DEPLOY_CONSUMERS=discord-bot" in prod_deploy
+    assert "Environment=AUTO_DEPLOY_READY_PORTS=3002" in prod_deploy
 
 
 def test_oracle_unit_and_patch_are_loopback_fail_closed():

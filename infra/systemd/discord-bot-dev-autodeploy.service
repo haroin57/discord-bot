@@ -10,26 +10,26 @@ Type=oneshot
 User=kanae-deploy
 Group=kanae-deploy
 SupplementaryGroups=kanae-code
-WorkingDirectory=/home/ubuntu/discord-bot
+WorkingDirectory=/var/lib/discord-bot-deploy/checkouts/dev
 EnvironmentFile=/etc/discord-bot/credentials/deploy.env
 Environment=HOME=/var/lib/discord-bot-deploy
 Environment=AUTO_DEPLOY_STATE_DIR=/var/lib/discord-bot-deploy/dev
 Environment=AUTO_DEPLOY_RELEASE_ROOT=/var/lib/discord-bot-releases/dev
 Environment=AUTO_DEPLOY_DISABLED=0
 Environment=AUTO_DEPLOY_TEST_MODE=0
-Environment=AUTO_DEPLOY_BOT_DIR=/home/ubuntu/discord-bot-dev
+Environment=AUTO_DEPLOY_BOT_DIR=/var/lib/discord-bot-deploy/checkouts/dev
 Environment=AUTO_DEPLOY_SERVICE=discord-bot-dev
 Environment=AUTO_DEPLOY_CONSUMERS=discord-bot-dev
 Environment=AUTO_DEPLOY_READY_PORTS=3003
 Environment=AUTO_DEPLOY_LIVENESS_URLS=
-Environment=AUTO_DEPLOY_RELEASE_GATE=/home/ubuntu/discord-bot-dev/scripts/release_gate.sh
+Environment=AUTO_DEPLOY_RELEASE_GATE=/var/lib/discord-bot-deploy/checkouts/dev/scripts/release_gate.sh
 Environment=AUTO_DEPLOY_TRUSTED_ROLLBACK_RUNNER=/usr/local/libexec/discord-bot-rollback
 Environment=AUTO_DEPLOY_RELEASE_PUBLISHER=/usr/local/libexec/discord-bot-release-publisher
 Environment=AUTO_DEPLOY_PUBLISHER_USE_SUDO=1
 Environment=AUTO_DEPLOY_GENERATION_OWNER_UID=0
 StateDirectory=discord-bot-deploy
 StateDirectoryMode=0700
-ExecStart=/home/ubuntu/discord-bot/scripts/auto_deploy.sh dev
+ExecStart=/var/lib/discord-bot-deploy/checkouts/dev/scripts/auto_deploy.sh dev
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=discord-bot-dev-autodeploy
@@ -37,7 +37,7 @@ UMask=0022
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/ubuntu/discord-bot-dev /var/lib/discord-bot-deploy /var/lib/discord-bot-releases/dev /var/lib/discord-bot-backup/release-gate
+ReadWritePaths=/var/lib/discord-bot-deploy /var/lib/discord-bot-releases/dev /var/lib/discord-bot-backup/release-gate
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

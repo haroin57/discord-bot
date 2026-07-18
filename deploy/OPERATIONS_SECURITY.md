@@ -6,6 +6,23 @@ rollback pins, or the trusted rollback runner.
 
 ## Provisioning contract
 
+Create the deployment checkouts outside developer worktrees before enabling
+either auto-deploy timer:
+
+```bash
+sudo install -d -o kanae-deploy -g kanae-deploy -m 0700 \
+  /var/lib/discord-bot-deploy/checkouts
+sudo -u kanae-deploy git clone --branch master --single-branch \
+  git@github.com:haroin57/discord-bot.git \
+  /var/lib/discord-bot-deploy/checkouts/prod
+sudo -u kanae-deploy git clone --branch dev --single-branch \
+  git@github.com:haroin57/discord-bot.git \
+  /var/lib/discord-bot-deploy/checkouts/dev
+```
+
+The deploy identity owns these two checkouts. Runtime identities receive source
+through immutable release generations and never read either checkout.
+
 Create the read-only source group and system users before installing the units.
 User creation and ACL installation are root provisioning actions and are never
 performed by deploy scripts.

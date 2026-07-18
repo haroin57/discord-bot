@@ -20,9 +20,9 @@ if ! [[ "${TARGET_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
 fi
 
 if [[ "${MODE}" == "prod" ]]; then
-    BOT_DIR="${RELEASE_GATE_BOT_DIR:-/home/ubuntu/discord-bot}"
+    BOT_DIR="${RELEASE_GATE_BOT_DIR:-/var/lib/discord-bot-deploy/checkouts/prod}"
 else
-    BOT_DIR="${RELEASE_GATE_BOT_DIR:-/home/ubuntu/discord-bot-dev}"
+    BOT_DIR="${RELEASE_GATE_BOT_DIR:-/var/lib/discord-bot-deploy/checkouts/dev}"
 fi
 
 log() { echo "[release_gate/${MODE}] $*"; }
