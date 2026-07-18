@@ -13,10 +13,10 @@ either auto-deploy timer:
 sudo install -d -o kanae-deploy -g kanae-deploy -m 0700 \
   /var/lib/discord-bot-deploy/checkouts
 sudo -u kanae-deploy git clone --branch master --single-branch \
-  git@github.com:haroin57/discord-bot.git \
+  https://github.com/haroin57/discord-bot.git \
   /var/lib/discord-bot-deploy/checkouts/prod
 sudo -u kanae-deploy git clone --branch dev --single-branch \
-  git@github.com:haroin57/discord-bot.git \
+  https://github.com/haroin57/discord-bot.git \
   /var/lib/discord-bot-deploy/checkouts/dev
 ```
 
