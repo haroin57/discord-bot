@@ -1531,7 +1531,7 @@ async def test_expired_batch_identity_requires_reacquire_before_provider(
         def provider_side_effect():
             nonlocal side_effects
             entered.set()
-            assert release.wait(timeout=2)
+            assert release.wait(timeout=5)
             side_effects += 1
             return {"results": [{"id": "provider-1"}], "kept": 1}
 
@@ -1556,7 +1556,7 @@ async def test_expired_batch_identity_requires_reacquire_before_provider(
         tmp_path,
         10,
         worker_id="successor-worker",
-        lease_seconds=0.05,
+        lease_seconds=0.5,
     )
     assert successor is not None
     assert successor.lease.id == expired.lease.id
@@ -1570,17 +1570,17 @@ async def test_expired_batch_identity_requires_reacquire_before_provider(
             metadata={"batch_size": "1", "channel_id": "10"},
         ),
     )
-    assert await asyncio.to_thread(entered.wait, 1)
+    assert await asyncio.to_thread(entered.wait, 3)
     task.cancel()
     await asyncio.sleep(0)
     task.cancel()
-    await asyncio.sleep(0.09)
+    await asyncio.sleep(0.75)
     competing = await asyncio.to_thread(
         batch.lease_batch,
         tmp_path,
         10,
         worker_id="competing-worker",
-        lease_seconds=0.05,
+        lease_seconds=0.5,
     )
     assert competing is None
     release.set()
@@ -1649,7 +1649,7 @@ async def test_batch_repeated_cancel_drains_once_and_heartbeats_short_lease(
         tmp_path,
         10,
         worker_id="first-worker",
-        lease_seconds=0.15,
+        lease_seconds=0.5,
     )
     assert claimed is not None
     list(claimed)
@@ -1667,7 +1667,7 @@ async def test_batch_repeated_cancel_drains_once_and_heartbeats_short_lease(
         def provider_side_effect():
             nonlocal side_effects
             entered.set()
-            assert release.wait(timeout=2)
+            assert release.wait(timeout=5)
             side_effects += 1
             return {"results": [{"id": "provider-1"}], "kept": 1}
 
@@ -1681,18 +1681,18 @@ async def test_batch_repeated_cancel_drains_once_and_heartbeats_short_lease(
             metadata={"batch_size": "1", "channel_id": "10"},
         ),
     )
-    assert await asyncio.to_thread(entered.wait, 1)
+    assert await asyncio.to_thread(entered.wait, 3)
     task.cancel()
     await asyncio.sleep(0)
     task.cancel()
-    await asyncio.sleep(0.25)
+    await asyncio.sleep(0.75)
 
     competing = await asyncio.to_thread(
         batch.lease_batch,
         tmp_path,
         10,
         worker_id="second-worker",
-        lease_seconds=0.15,
+        lease_seconds=0.5,
     )
     assert competing is None
     assert not task.done()

@@ -19,7 +19,7 @@ __all__ = ["render_math_image"]
 
 log = logging.getLogger(__name__)
 
-MATH_OUTPUT_DIR = "/tmp/math_renders"  # nosec B108
+MATH_OUTPUT_DIR = "/tmp/math_renders"
 
 # ---------------------------------------------------------------------------
 # CSS (Discord dark theme for math)
