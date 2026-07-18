@@ -1680,4 +1680,5 @@ def test_runtime_smoke_uses_only_release_dependencies_and_preserves_failures():
     assert '${BOT_VENV}/bin/ruff' not in smoke
     assert '${BOT_VENV}/bin/mypy' not in smoke
     assert "-p no:cacheprovider" in smoke
+    assert "umask 022" in smoke
     assert "| tail" not in smoke
