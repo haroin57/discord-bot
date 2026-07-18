@@ -26,6 +26,8 @@ Environment=AUTO_DEPLOY_TRUSTED_ROLLBACK_RUNNER=/usr/local/libexec/discord-bot-r
 Environment=AUTO_DEPLOY_RELEASE_PUBLISHER=/usr/local/libexec/discord-bot-release-publisher
 Environment=AUTO_DEPLOY_PUBLISHER_USE_SUDO=1
 Environment=AUTO_DEPLOY_GENERATION_OWNER_UID=0
+Environment=RELEASE_GATE_SNAPSHOT_SCRIPT=/usr/local/libexec/discord-bot-snapshot-client
+Environment=RELEASE_GATE_SNAPSHOT_ROOT=/var/lib/discord-bot-backup/release-gate-root
 StateDirectory=discord-bot-deploy
 StateDirectoryMode=0700
 ExecStart=/var/lib/discord-bot-deploy/checkouts/prod/scripts/auto_deploy.sh prod
@@ -41,7 +43,7 @@ UMask=0022
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/discord-bot-deploy /var/lib/discord-bot-releases/prod /var/lib/discord-bot-backup/release-gate
+ReadWritePaths=/var/lib/discord-bot-deploy /var/lib/discord-bot-releases/prod /var/lib/discord-bot-backup/release-gate-root /var/lib/kanae-bot/state
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -53,7 +55,7 @@ RestrictNamespaces=yes
 LockPersonality=yes
 RestrictRealtime=yes
 SystemCallArchitectures=native
-MemoryMax=1G
+MemoryMax=2G
 TasksMax=256
 
 [Install]

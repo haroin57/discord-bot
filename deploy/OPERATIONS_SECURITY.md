@@ -227,6 +227,12 @@ sudo install -o root -g root -m 0755 scripts/release_artifact_lib.sh \
   /usr/local/libexec/discord-bot-release-lib
 sudo install -o root -g root -m 0755 scripts/release_publisher.sh \
   /usr/local/libexec/discord-bot-release-publisher
+sudo install -o root -g root -m 0755 scripts/snapshot_state.sh \
+  /usr/local/libexec/discord-bot-snapshot-impl
+sudo install -o root -g root -m 0755 scripts/snapshot_helper.sh \
+  /usr/local/libexec/discord-bot-snapshot
+sudo install -o root -g root -m 0755 scripts/snapshot_client.sh \
+  /usr/local/libexec/discord-bot-snapshot-client
 sudo install -o root -g root -m 0644 \
   docs/2026-07-14-refactor-protected-manifest.sha256 \
   /etc/discord-bot/release/protected-manifest.sha256
@@ -237,6 +243,9 @@ kanae-deploy ALL=(root) NOPASSWD: DISCORD_RELEASE_RESTART, DISCORD_RELEASE_PUBLI
 EOF
 sudo chmod 0440 /etc/sudoers.d/discord-bot-deploy
 sudo visudo -cf /etc/sudoers.d/discord-bot-deploy
+sudo install -o root -g root -m 0440 infra/sudoers/discord-bot-snapshot \
+  /etc/sudoers.d/discord-bot-snapshot
+sudo visudo -cf /etc/sudoers.d/discord-bot-snapshot
 ```
 
 Each deploy builds a complete candidate under
@@ -295,13 +304,16 @@ There is no checkout-relative snapshot default.
 ```
 
 Install this JSON as `/etc/discord-bot/backup-state.inventory`, `root:root
-0644`. Grant `kanae-backup` and `kanae-deploy` read/traverse ACLs, including
-default ACLs on each live directory, but never write. The deploy identity needs
-the same read-only view for the production release-gate rehearsal. Grant the
-backup identity write permission only on
-`/var/lib/discord-bot-backup/snapshots`. Verify `sudo -u kanae-backup test -w
-<live-root>` and `sudo -u kanae-deploy test -w <live-root>` fail for every
-inventory entry. Run:
+0644`. The production release gate invokes the fixed root-owned snapshot helper;
+`kanae-deploy` does not receive read or write ACLs on `/var/lib/kanae-bot/state`.
+The production unit exposes that path as writable inside its mount namespace
+because SQLite online backup needs WAL shared-memory locking, but the directory's
+`0700` Unix permissions still deny the unprivileged deploy process. Only the
+allowlisted root helper can cross that boundary. Grant `kanae-backup` read-only
+access to every inventory root and write permission only on
+`/var/lib/discord-bot-backup/snapshots`. Verify `sudo -u kanae-deploy test -r
+/var/lib/kanae-bot/state/r2_catalog.sqlite` and `sudo -u kanae-deploy test -w
+/var/lib/kanae-bot/state` both fail. Run:
 
 Snapshot stability fingerprints cover non-database files. SQLite database,
 WAL, SHM, and rollback-journal bytes are intentionally excluded because a WAL
@@ -318,6 +330,8 @@ sudo install -d -o kanae-backup -g kanae-backup -m 0700 \
   /var/lib/discord-bot-backup/snapshots
 sudo install -d -o kanae-deploy -g kanae-deploy -m 0700 \
   /var/lib/discord-bot-backup/release-gate
+sudo install -d -o root -g root -m 0711 \
+  /var/lib/discord-bot-backup/release-gate-root
 
 sudo -u kanae-backup env \
   SNAPSHOT_STATE_INVENTORY=/etc/discord-bot/backup-state.inventory \

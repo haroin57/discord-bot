@@ -422,7 +422,13 @@ for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
             destination="${candidate}/${rel}"
             mkdir -p "$(dirname "${destination}")"
             sqlite_destination="${destination//\'/\'\'}"
-            sqlite3 "${db}" ".backup '${sqlite_destination}'" || attempt_ok=0
+            # The release controller runs with ProtectSystem=strict.  Open the
+            # live database explicitly read-only so SQLite does not require a
+            # writable source directory for journal/WAL setup.
+            if ! sqlite3 -readonly "${db}" ".backup '${sqlite_destination}'"; then
+                echo "[snapshot] SQLite backup failed: ${db}" >&2
+                attempt_ok=0
+            fi
         done < <(sqlite_files "${state_dir}")
         write_sqlite_logical_fingerprint \
             "${candidate}" "${ATTEMPT_ROOT}/fingerprints/${name}.sqlite" \

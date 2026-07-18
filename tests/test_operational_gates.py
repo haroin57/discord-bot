@@ -656,6 +656,31 @@ def test_security_procedure_covers_home_acl_oauth_and_state_migration():
     assert "Environment=AUTO_DEPLOY_PROFILE=core" in prod_deploy
     assert "Environment=AUTO_DEPLOY_CONSUMERS=discord-bot" in prod_deploy
     assert "Environment=AUTO_DEPLOY_READY_PORTS=3002" in prod_deploy
+    assert (
+        "Environment=RELEASE_GATE_SNAPSHOT_SCRIPT="
+        "/usr/local/libexec/discord-bot-snapshot-client" in prod_deploy
+    )
+    assert (
+        "Environment=RELEASE_GATE_SNAPSHOT_ROOT="
+        "/var/lib/discord-bot-backup/release-gate-root" in prod_deploy
+    )
+    assert "/var/lib/kanae-bot/state" in prod_deploy
+    assert "MemoryMax=2G" in prod_deploy
+
+
+def test_prod_snapshot_root_helper_is_fixed_and_fail_closed():
+    helper = (ROOT / "scripts/snapshot_helper.sh").read_text(encoding="utf-8")
+    client = (ROOT / "scripts/snapshot_client.sh").read_text(encoding="utf-8")
+    sudoers = (ROOT / "infra/sudoers/discord-bot-snapshot").read_text(
+        encoding="utf-8"
+    )
+
+    assert "SNAP_ROOT=/var/lib/discord-bot-backup/release-gate-root" in helper
+    assert "INVENTORY=/etc/discord-bot/backup-state.inventory" in helper
+    assert "SNAPSHOT_REQUIRE_READ_ONLY=0" in helper
+    assert '"${snapshot_real}" != "${root_real}"/*' in helper
+    assert 'exec /usr/bin/sudo -n -- /usr/local/libexec/discord-bot-snapshot "$@"' in client
+    assert "kanae-deploy ALL=(root) NOPASSWD: DISCORD_BOT_SNAPSHOT" in sudoers
 
 
 def test_oracle_unit_and_patch_are_loopback_fail_closed():
@@ -706,6 +731,7 @@ def test_deploy_scripts_share_pin_ready_and_non_destructive_contracts():
     assert "SNAPSHOT_STATE_INVENTORY" in snapshot
     assert "SNAPSHOT_STATE_DIR" not in snapshot
     assert "SNAPSHOT_BOT_DIR" not in snapshot
+    assert 'sqlite3 -readonly "${db}"' in snapshot
     assert "SNAPSHOT_INVENTORY_OWNER_UID=0" in release_gate
     assert 'READY_ATTEMPTS="${AUTO_DEPLOY_READY_ATTEMPTS:-36}"' in auto
     assert 'READY_ATTEMPTS="${DEPLOY_READY_ATTEMPTS:-36}"' in deploy
