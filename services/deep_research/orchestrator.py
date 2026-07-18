@@ -13,13 +13,15 @@
 - MCP は 1 プール共有 + server-key lock + wait_for。playwright は使わない。
 - 並列 searcher は専用 Semaphore で律速。watchdog の idle-cancel は子タスク単位で捕捉、
   本物の /abort は gather 越しに伝播する。
-- finally で stack.aclose()（MCP SIGTERM）。aclose 失敗時のみ kill_orphan を backstop。
+- finally で run 所有の stack.aclose()（MCP transport / subprocess group の回収）。
+  process-wide orphan sweep は他 workflow の MCP を巻き込むため実行しない。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Callable
@@ -27,6 +29,7 @@ from typing import Callable
 import discord
 
 from config import (
+    DEEP_RESEARCH_CLARIFY_TIMEOUT_S,
     DEEP_RESEARCH_LEAD_MODEL,
     DEEP_RESEARCH_MAGI_APPROVE_HINT,
     DEEP_RESEARCH_MAGI_ENABLED,
@@ -53,12 +56,10 @@ from services.claude_api.client_factory import make_api_client
 from services.claude_api.mcp_client import (
     STATIC_MCP_TOOL_SCHEMAS,
     McpPool,
-    kill_orphan_mcp_processes,
     mcp_tools_to_anthropic,
     static_mcp_tools_to_anthropic,
 )
 from services.claude_api.stall import StallWatchdog
-from services.claude_api.status import tool_oneline
 from services.claude_api.tool_loop import run_agent_loop
 from services.job_state import JobPhase, JobState, register_job, unregister_job
 from services.mcp_control import (
@@ -66,7 +67,25 @@ from services.mcp_control import (
     filter_enabled_mcp_keys,
 )
 
+from .agent_runner import (
+    AgentRunner,
+    ResearchAgentDef,
+    extract_central_question_and_plan,
+    extract_plan,
+    run_subagent,
+)
+from .discord_adapter import (
+    AgentView as _AgentView,
+    SearcherView as _SearcherView,
+    safe_edit as _adapter_safe_edit,
+    safe_send as _adapter_safe_send,
+    short as _adapter_short,
+    thread_name as _adapter_thread_name,
+    wait_for_reaction_or_reply,
+)
+from .evidence_registry import EvidenceRegistry
 from .magi import run_integrator, run_magi_lens
+from .magi_scheduler import MagiScheduler
 from .prompts import (
     CLARIFIER_SYSTEM,
     PLANNER_MAGI_SYSTEM,
@@ -86,51 +105,59 @@ from .prompts import (
     LENS_SPEC,
     REFINE_CQ_SYSTEM,
 )
-from .registry import (
-    ResearchAgentDef,
-    extract_central_question_and_plan,
-    extract_plan,
-    run_subagent,
-)
+from .run_state import DEFAULT_RUNS, ResearchRun
 from .sources import build_final_report
-from .types import LensResult, ResearchState, SubAgentResult
+from .types import ResearchState, SubAgentResult
 
 try:
     from services.correlation import new_request_id
 except ImportError:  # pragma: no cover
+
     def new_request_id() -> str:  # type: ignore[misc]
         return ""
+
 
 log = logging.getLogger(__name__)
 
 _SPIN = "🔬"
-_THREAD_NAME_MAX = 90
 # synthesizer の transient 失敗（429 等）時のリトライ前 backoff 秒。テストで 0 に上書き。
 _SYNTH_RETRY_BACKOFF_S = 3.0
 
-# Phase 0/1 とも MCP プールを1回の /research で1つだけ起動する。同時 /research が走ると
-# プールが多重起動して 8GB RAM を圧迫するので、1 件ずつに直列化する（busy は即拒否）。
-# asyncio は単一スレッドなので await を挟まずにフラグを立てれば race しない。
-_research_busy = False
+
+def _configured_max_concurrent_runs() -> int:
+    raw = os.getenv("DEEP_RESEARCH_MAX_CONCURRENT_RUNS", "2")
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        log.warning(
+            "invalid DEEP_RESEARCH_MAX_CONCURRENT_RUNS=%r; using 2",
+            raw,
+        )
+        return 2
+
+
+# Process-wide finite admission gate. Searcher parallelism remains a separate,
+# run-local limit; this gate bounds the number of complete research workflows.
+_RUN_ADMISSION = asyncio.Semaphore(_configured_max_concurrent_runs())
 
 # アクティブな研究スレッドの channel_id。on_message はここに含まれるスレッドのメッセージを
 # スキップする — 明確化の返信や後続メンションが bot.wait_for と on_message に二重処理され、
 # 別スレッドでタスクが多重起動するのを防ぐ（bot.wait_for は別リスナーなので、このセットに
 # 関係なく明確化返信は届く）。研究完了で外れ、スレッド内の通常チャットは復帰する。
-_active_threads: set[int] = set()
+_active_threads = DEFAULT_RUNS.active_threads
 
 
 def _mark_active(thread_id: int) -> None:
-    _active_threads.add(thread_id)
+    DEFAULT_RUNS.mark_thread(thread_id)
 
 
 def _unmark_active(thread_id: int) -> None:
-    _active_threads.discard(thread_id)
+    DEFAULT_RUNS.unmark_thread(thread_id)
 
 
 def is_active_research_thread(channel_id: int) -> bool:
     """on_message から呼ぶ: この channel_id がアクティブな研究スレッドなら True。"""
-    return channel_id in _active_threads
+    return DEFAULT_RUNS.is_active_thread(channel_id)
 
 
 @dataclass
@@ -138,9 +165,9 @@ class DeepResearchDeps:
     """bot-module が所有する依存の注入（claude_tag.TagDeps と同型。sessions は渡さない）。"""
 
     bot: discord.Client
-    send_segmented: Callable        # bot._send_segmented(message, text, files)
-    get_http_session: Callable      # bot.get_http_session
-    track_task: Callable            # bot._track_task
+    send_segmented: Callable  # bot._send_segmented(message, text, files)
+    get_http_session: Callable  # bot.get_http_session
+    track_task: Callable  # bot._track_task
 
 
 @dataclass
@@ -156,81 +183,19 @@ class _RunCtx:
     anchor: object
     counter: dict
     tool_cb: Callable
-    user: object = None      # 承認ゲートの待ち受け対象（FR-M1）
-    deps: object = None      # bot.wait_for アクセス用
+    user: object = None  # 承認ゲートの待ち受け対象（FR-M1）
+    deps: object = None  # bot.wait_for アクセス用
+    run: ResearchRun | None = None
+    agent_runner: AgentRunner | None = None
+    evidence: EvidenceRegistry | None = None
 
 
-class _SearcherView:
-    """1 searcher の個別ライブメッセージ（要望1/3）。
-
-    各 searcher が自分のメッセージだけを編集するので、別 rate bucket で並列に更新でき、
-    スレッド上で同時進行が見える。on_tool で現在のツール呼び出しを詳細表示する。
-    """
-
-    def __init__(self, idx: int, total: int, subq: str, msg) -> None:
-        self.idx = idx
-        self.total = total
-        self.subq = subq
-        self.msg = msg
-        self.calls = 0
-        self._t = 0.0
-        self._label = f"[{idx}/{total}] {_short(subq, 60)}"
-
-    async def waiting(self) -> None:
-        await _safe_edit(self.msg, f"⏳ {self._label} — 待機中")
-
-    async def searching(self) -> None:
-        await _safe_edit(self.msg, f"🔍 {self._label} — 探索中…")
-
-    async def on_tool(self, name: str, tool_input: dict) -> None:
-        self.calls += 1
-        now = asyncio.get_running_loop().time()
-        if now - self._t < 1.2:   # 自メッセージ bucket（~1edit/s）に合わせて throttle
-            return
-        self._t = now
-        await _safe_edit(self.msg, f"🔍 {self._label}\n-# {tool_oneline(name, tool_input)}")
-
-    async def finish(self, ok: bool) -> None:
-        if ok:
-            await _safe_edit(self.msg, f"✅ {self._label} — 検索 {self.calls} 回")
-        else:
-            await _safe_edit(self.msg, f"❌ {self._label} — 失敗")
-
-
-class _AgentView:
-    """汎用の個別ライブメッセージ（MAGI 3レンズ等。`_SearcherView` と同型）。
-
-    各エージェントが自分のメッセージだけを編集するので別 rate bucket で並列更新できる。
-    `on_tool` で検証検索のツール呼び出しを `tool_oneline` で詳細表示する。
-    """
-
-    def __init__(self, label: str, msg, *, emoji: str = "🔍") -> None:
-        self.label = label
-        self.msg = msg            # ステータス1行（待機/作業中/完了）。詳細推論ログは出さない。
-        self.emoji = emoji
-        self.calls = 0
-        self._t = 0.0
-
-    async def waiting(self) -> None:
-        await _safe_edit(self.msg, f"⏳ {self.label} — 待機中")
-
-    async def working(self, note: str = "作業中…") -> None:
-        await _safe_edit(self.msg, f"{self.emoji} {self.label} — {note}")
-
-    async def on_tool(self, name: str, tool_input: dict) -> None:
-        self.calls += 1
-        now = asyncio.get_running_loop().time()
-        if now - self._t < 1.2:
-            return
-        self._t = now
-        await _safe_edit(self.msg, f"{self.emoji} {self.label}\n-# {tool_oneline(name, tool_input)}")
-
-    async def finish(self, ok: bool, gist: str = "") -> None:
-        if ok:
-            tail = f" — {_short(gist, 80)}" if gist else " — 完了"
-            await _safe_edit(self.msg, f"✅ {self.label}{tail}")
-        else:
-            await _safe_edit(self.msg, f"❌ {self.label} — 失敗")
+async def _run_agent(ctx, **kwargs):
+    """run に注入された runner を使い、簡易テストctxでは既存関数へフォールバックする。"""
+    runner = getattr(ctx, "agent_runner", None)
+    if runner is not None:
+        return await runner.run(**kwargs)
+    return await run_subagent(**kwargs)
 
 
 async def _recall_user_memories(anchor, user, query: str, state: ResearchState) -> None:
@@ -251,7 +216,11 @@ async def _recall_user_memories(anchor, user, query: str, state: ResearchState) 
     await _safe_edit(anchor, f"{_SPIN} 長期記憶を確認しています…")
     try:
         memories = await search_memories_smart(
-            query, str(user.id), limit=MEM0_RECALL_LIMIT, rewrite=True, rerank=True,
+            query,
+            str(user.id),
+            limit=MEM0_RECALL_LIMIT,
+            rewrite=True,
+            rerank=True,
         )
     except asyncio.CancelledError:
         raise
@@ -266,16 +235,18 @@ async def _recall_user_memories(anchor, user, query: str, state: ResearchState) 
 
 def available_research_keys() -> list[str]:
     """env で実際に有効な Deep Research 用 MCP key（在るものだけ。Web+X+金融+学術を横断）。"""
-    return sorted(filter_enabled_mcp_keys(
-        k for k in DEEP_RESEARCH_MCP_KEYS if k in MCP_SERVERS
-    ))
+    return sorted(
+        filter_enabled_mcp_keys(k for k in DEEP_RESEARCH_MCP_KEYS if k in MCP_SERVERS)
+    )
 
 
 def has_required_web_backend() -> bool:
     """brave-search または tavily が利用可能か（FR-1 前提条件）。"""
-    return bool(filter_enabled_mcp_keys(
-        k for k in DEEP_RESEARCH_REQUIRED_WEB_KEYS if k in MCP_SERVERS_WEB
-    ))
+    return bool(
+        filter_enabled_mcp_keys(
+            k for k in DEEP_RESEARCH_REQUIRED_WEB_KEYS if k in MCP_SERVERS_WEB
+        )
+    )
 
 
 async def run_deep_research(
@@ -287,28 +258,70 @@ async def run_deep_research(
     skip_clarify: bool = False,
     depth: str = "standard",
 ) -> None:
-    """エントリ。busy なら拒否、そうでなければ直列化して 1 件実行。"""
-    global _research_busy
-    if _research_busy:
-        await _safe_send(channel, "⏳ 別の Deep Research が進行中です。完了してから再度どうぞ。")
-        return
-    _research_busy = True
+    """公開エントリ。各呼び出しを独立した run state で並行実行する。"""
+    acquired = False
+    run: ResearchRun | None = None
     try:
-        await _run(channel, user, query, deps, skip_clarify=skip_clarify, depth=depth)
+        await _RUN_ADMISSION.acquire()
+        acquired = True
+        rid = new_request_id()
+        run = DEFAULT_RUNS.create(query, run_id=rid or None)
+        try:
+            await _run(
+                channel,
+                user,
+                query,
+                deps,
+                skip_clarify=skip_clarify,
+                depth=depth,
+                run=run,
+            )
+        finally:
+            try:
+                await run.cleanup()
+            finally:
+                if not DEFAULT_RUNS.discard(run):
+                    log.error(
+                        "deep_research run=%s retained after incomplete cleanup: %s",
+                        run.run_id,
+                        run.cleanup_diagnostic,
+                    )
     finally:
-        _research_busy = False
+        if acquired:
+            _RUN_ADMISSION.release()
 
 
-async def _run(channel, user, query, deps, *, skip_clarify, depth) -> None:
-    state = ResearchState(query=query, clarified_query=query)
+async def _close_owned_mcp_stack(stack: AsyncExitStack, run: ResearchRun) -> None:
+    """run が所有する MCP transport と subprocess group だけを閉じる。"""
+    try:
+        # The stack contains only transports spawned through this run's pool.
+        # Their context exits own TERM/KILL for their exact process groups.
+        await run.close_owned_stack(stack.aclose)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.warning(
+            "deep_research run=%s MCP cleanup failed after bounded retries: %s",
+            run.run_id,
+            run.cleanup_diagnostic,
+            exc_info=True,
+        )
+
+
+async def _run(
+    channel, user, query, deps, *, skip_clarify, depth, run: ResearchRun
+) -> None:
+    state = run.state
     origin = await channel.send(
         f"{_SPIN} **Deep Research**: {_short(query)}\n-# スレッドで進行します。中断はスレッド内で `/abort`。"
     )
-    thread = await origin.create_thread(name=_thread_name(query), auto_archive_duration=1440)
+    thread = await origin.create_thread(
+        name=_thread_name(query), auto_archive_duration=1440
+    )
     anchor = await thread.send(f"{_SPIN} 準備中…")
 
     job = JobState(
-        rid=new_request_id(),
+        rid=run.run_id,
         channel_id=thread.id,
         user_id=getattr(user, "id", 0),
         task=asyncio.current_task(),
@@ -316,6 +329,7 @@ async def _run(channel, user, query, deps, *, skip_clarify, depth) -> None:
     register_job(job)
 
     stack = AsyncExitStack()
+    run.require_mcp_cleanup()
     ok_done = False
     _mark_active(thread.id)
     try:
@@ -326,10 +340,17 @@ async def _run(channel, user, query, deps, *, skip_clarify, depth) -> None:
             {k: MCP_SERVERS[k] for k in available_research_keys()}
         )
         if not has_required_web_backend():
-            await _safe_edit(anchor, "❌ 一般 Web 検索バックエンド（brave-search / tavily）が未設定です。")
+            await _safe_edit(
+                anchor,
+                "❌ 一般 Web 検索バックエンド（brave-search / tavily）が未設定です。",
+            )
             return
         api_client = await make_api_client(False)
-        pool = McpPool(stack=stack, available_configs=research_cfg)
+        pool = McpPool(
+            stack=stack,
+            available_configs=research_cfg,
+            process_observer=run.register_mcp_process,
+        )
         # static_mcp_schemas.json に在るもの（brave/x-scraper/nikkei/yfj/polymarket）は
         # 「静的広告 + lazy spawn」で、searcher が実際に呼んだ時だけ起動して RAM を節約。
         # 無いもの（tavily/scholarly）だけ eager spawn して live tool を広告する。
@@ -337,11 +358,15 @@ async def _run(channel, user, query, deps, *, skip_clarify, depth) -> None:
         spawn_keys = [k for k in research_cfg if k not in STATIC_MCP_TOOL_SCHEMAS]
         if spawn_keys:
             await pool.spawn_eager(spawn_keys)
-        tools_for_api = static_mcp_tools_to_anthropic(static_keys) + mcp_tools_to_anthropic(
+        tools_for_api = static_mcp_tools_to_anthropic(
+            static_keys
+        ) + mcp_tools_to_anthropic(
             {k: pool.handles[k] for k in spawn_keys if k in pool.handles}
         )
         if not tools_for_api:
-            await _safe_edit(anchor, "❌ 検索ツールの起動に失敗しました。後で再試行してください。")
+            await _safe_edit(
+                anchor, "❌ 検索ツールの起動に失敗しました。後で再試行してください。"
+            )
             return
 
         # --- リクエスト者の Mem0 長期記憶を recall（best-effort）---
@@ -352,7 +377,9 @@ async def _run(channel, user, query, deps, *, skip_clarify, depth) -> None:
         # --- 明確化（常に1回。skip_clarify でバイパス）---
         job.phase = JobPhase.PREPROCESSING
         if not skip_clarify:
-            await _clarify(thread, anchor, user, query, state, deps, api_client)
+            await _clarify(
+                thread, anchor, user, query, state, deps, api_client, run=run
+            )
 
         # --- 調査（multi-agent / single-agent）---
         job.phase = JobPhase.CALLING_CLAUDE
@@ -365,20 +392,33 @@ async def _run(channel, user, query, deps, *, skip_clarify, depth) -> None:
                 return
             counter["t"] = now
             await _safe_edit(
-                anchor, f"{_SPIN} 調査中… 検索 {counter['n']} 回 / ソース {len(state.sources)} 件",
+                anchor,
+                f"{_SPIN} 調査中… 検索 {counter['n']} 回 / ソース {len(state.sources)} 件",
             )
 
         ctx = _RunCtx(
-            api_client=api_client, pool=pool, server_locks={},
-            tools_for_api=tools_for_api, state=state, thread=thread,
-            anchor=anchor, counter=counter, tool_cb=tool_cb,
-            user=user, deps=deps,
+            api_client=api_client,
+            pool=pool,
+            server_locks={},
+            tools_for_api=tools_for_api,
+            state=state,
+            thread=thread,
+            anchor=anchor,
+            counter=counter,
+            tool_cb=tool_cb,
+            user=user,
+            deps=deps,
+            run=run,
+            agent_runner=AgentRunner(executor=run_subagent),
+            evidence=EvidenceRegistry(state),
         )
 
         if DEEP_RESEARCH_MULTI_AGENT:
             report = await _multi_agent_research(ctx)
         else:
-            await _safe_edit(anchor, f"{_SPIN} Web を調査しています…（数分かかることがあります）")
+            await _safe_edit(
+                anchor, f"{_SPIN} Web を調査しています…（数分かかることがあります）"
+            )
             report = await _single_agent_research(ctx)
 
         # --- 出力 ---
@@ -396,15 +436,22 @@ async def _run(channel, user, query, deps, *, skip_clarify, depth) -> None:
             # ハングか、Anthropic 過負荷の可能性が高い。失敗を黙って消すと「バグった」と
             # 見える）。
             if not state.plan and not state.sources:
-                hint = "❌ 調査に失敗しました。Anthropic API の過負荷（overloaded）か " \
-                       "外部 MCP の不調の可能性があります。少し時間を置いて再試行してください。"
+                hint = (
+                    "❌ 調査に失敗しました。Anthropic API の過負荷（overloaded）か "
+                    "外部 MCP の不調の可能性があります。少し時間を置いて再試行してください。"
+                )
             else:
                 hint = "❌ 調査に失敗しました（有効な結果が得られませんでした）。"
             await _safe_edit(anchor, hint)
         log.info(
             "deep_research done ok=%s multi=%s subqs=%d searches=%d sources=%d tokens=%d elapsed=%.0fs",
-            ok_done, DEEP_RESEARCH_MULTI_AGENT, len(state.plan), counter["n"],
-            len(state.sources), state.tokens_used, state.elapsed_s(),
+            ok_done,
+            DEEP_RESEARCH_MULTI_AGENT,
+            len(state.plan),
+            counter["n"],
+            len(state.sources),
+            state.tokens_used,
+            state.elapsed_s(),
         )
     except asyncio.CancelledError:
         await _safe_edit(anchor, "⏹️ 中断しました。")
@@ -416,14 +463,7 @@ async def _run(channel, user, query, deps, *, skip_clarify, depth) -> None:
         _unmark_active(thread.id)
         job.phase = JobPhase.DONE if ok_done else JobPhase.FAILED
         unregister_job(job)
-        try:
-            await stack.aclose()
-        except Exception:
-            log.warning("deep_research MCP stack aclose failed; killing orphans", exc_info=True)
-            try:
-                kill_orphan_mcp_processes()
-            except Exception:
-                pass
+        await _close_owned_mcp_stack(stack, run)
 
 
 # ---------------------------------------------------------------------------
@@ -437,10 +477,16 @@ async def _single_agent_research(ctx: _RunCtx) -> str | None:
         max_tool_turns=DEEP_RESEARCH_SINGLE_AGENT_MAX_TURNS,
         idle_timeout_s=DEEP_RESEARCH_SYNTH_IDLE_TIMEOUT_S,
     )
-    result = await run_subagent(
-        api_client=ctx.api_client, pool=ctx.pool, server_locks=ctx.server_locks,
-        defn=defn, briefing=build_research_briefing(ctx.state.clarified_query),
-        tools_for_api=ctx.tools_for_api, state=ctx.state, channel_id=ctx.thread.id,
+    result = await _run_agent(
+        ctx,
+        api_client=ctx.api_client,
+        pool=ctx.pool,
+        server_locks=ctx.server_locks,
+        defn=defn,
+        briefing=build_research_briefing(ctx.state.clarified_query),
+        tools_for_api=ctx.tools_for_api,
+        state=ctx.state,
+        channel_id=ctx.thread.id,
         tool_invocation_callback=ctx.tool_cb,
     )
     return result.summary_md if result.ok else None
@@ -466,26 +512,37 @@ async def _plan(ctx: _RunCtx) -> list[str]:
     )
     briefing = (
         build_plan_magi_briefing(
-            ctx.state.clarified_query, DEEP_RESEARCH_MAX_SUBAGENTS, ctx.state.user_memories,
+            ctx.state.clarified_query,
+            DEEP_RESEARCH_MAX_SUBAGENTS,
+            ctx.state.user_memories,
             min_subagents=DEEP_RESEARCH_MIN_SUBAGENTS,
         )
-        if magi else
-        build_plan_briefing(
-            ctx.state.clarified_query, DEEP_RESEARCH_MAX_SUBAGENTS,
+        if magi
+        else build_plan_briefing(
+            ctx.state.clarified_query,
+            DEEP_RESEARCH_MAX_SUBAGENTS,
             min_subagents=DEEP_RESEARCH_MIN_SUBAGENTS,
         )
     )
-    result = await run_subagent(
-        api_client=ctx.api_client, pool=ctx.pool, server_locks=ctx.server_locks,
-        defn=defn, briefing=briefing,
-        tools_for_api=[], state=ctx.state, channel_id=ctx.thread.id,
+    result = await _run_agent(
+        ctx,
+        api_client=ctx.api_client,
+        pool=ctx.pool,
+        server_locks=ctx.server_locks,
+        defn=defn,
+        briefing=briefing,
+        tools_for_api=[],
+        state=ctx.state,
+        channel_id=ctx.thread.id,
     )
     if not result.ok:
         return []
     if magi:
-        cq, subqs = extract_central_question_and_plan(result.summary_md, DEEP_RESEARCH_MAX_SUBAGENTS)
+        cq, subqs = extract_central_question_and_plan(
+            result.summary_md, DEEP_RESEARCH_MAX_SUBAGENTS
+        )
         if _meaningful_cq(cq):
-            ctx.state.central_question = cq   # Stage1 暫定（Stage2 で研ぎ直す）
+            ctx.state.central_question = cq  # Stage1 暫定（Stage2 で研ぎ直す）
         log.info("deep_research central_question (provisional): %r", (cq or "")[:300])
     else:
         subqs = extract_plan(result.summary_md, DEEP_RESEARCH_MAX_SUBAGENTS)
@@ -497,22 +554,32 @@ async def _plan(ctx: _RunCtx) -> list[str]:
         log.warning(
             "deep_research: planner produced %d sub-questions, below floor %d; "
             "requesting %d more",
-            len(subqs), DEEP_RESEARCH_MIN_SUBAGENTS, need,
+            len(subqs),
+            DEEP_RESEARCH_MIN_SUBAGENTS,
+            need,
         )
         try:
             comp_defn = ResearchAgentDef(
                 agent_type="planner_completion",
                 model=DEEP_RESEARCH_LEAD_MODEL,
                 system_prompt=PLANNER_SYSTEM,
-                max_tool_turns=1, idle_timeout_s=120,
+                max_tool_turns=1,
+                idle_timeout_s=120,
             )
-            comp = await run_subagent(
-                api_client=ctx.api_client, pool=ctx.pool, server_locks=ctx.server_locks,
+            comp = await _run_agent(
+                ctx,
+                api_client=ctx.api_client,
+                pool=ctx.pool,
+                server_locks=ctx.server_locks,
                 defn=comp_defn,
                 briefing=build_plan_completion_briefing(
-                    ctx.state.clarified_query, subqs, need,
+                    ctx.state.clarified_query,
+                    subqs,
+                    need,
                 ),
-                tools_for_api=[], state=ctx.state, channel_id=ctx.thread.id,
+                tools_for_api=[],
+                state=ctx.state,
+                channel_id=ctx.thread.id,
             )
             if comp.ok:
                 extra = extract_plan(comp.summary_md, need)
@@ -525,18 +592,26 @@ async def _plan(ctx: _RunCtx) -> list[str]:
                             break
                 log.info(
                     "deep_research: planner completion added %d sub-questions, total %d",
-                    len(extra), len(subqs),
+                    len(extra),
+                    len(subqs),
                 )
         except Exception:
-            log.warning("deep_research: planner completion failed (non-fatal)", exc_info=True)
+            log.warning(
+                "deep_research: planner completion failed (non-fatal)", exc_info=True
+            )
     return subqs
 
 
 async def _multi_agent_research(ctx: _RunCtx) -> str | None:
     plan = await _plan(ctx)
     if not plan:
-        log.info("deep_research: planner produced no sub-questions; falling back to single-agent")
-        await _safe_edit(ctx.anchor, f"{_SPIN} 計画を立てられなかったため単一エージェントで調査します…")
+        log.info(
+            "deep_research: planner produced no sub-questions; falling back to single-agent"
+        )
+        await _safe_edit(
+            ctx.anchor,
+            f"{_SPIN} 計画を立てられなかったため単一エージェントで調査します…",
+        )
         return await _single_agent_research(ctx)
     ctx.state.plan = plan
 
@@ -549,7 +624,9 @@ async def _multi_agent_research(ctx: _RunCtx) -> str | None:
     views: list[_SearcherView] = []
     for i, subq in enumerate(plan, 1):
         try:
-            m = await ctx.thread.send(f"⏳ [{i}/{len(plan)}] {_short(subq, 60)} — 待機中")
+            m = await ctx.thread.send(
+                f"⏳ [{i}/{len(plan)}] {_short(subq, 60)} — 待機中"
+            )
         except discord.HTTPException:
             m = None
         views.append(_SearcherView(i, len(plan), subq, m))
@@ -564,17 +641,26 @@ async def _multi_agent_research(ctx: _RunCtx) -> str | None:
     sema = asyncio.Semaphore(DEEP_RESEARCH_MAX_PARALLEL)
     done = {"n": 0}
 
-    async def _bounded(view: "_SearcherView", model_override: str | None = None) -> SubAgentResult:
+    async def _bounded(
+        view: "_SearcherView", model_override: str | None = None
+    ) -> SubAgentResult:
         # 専用 semaphore で実走を律速（claude_semaphore は通らないので subscriber
         # バケットの保護はこれが担う）。各 searcher はツール呼び出しを自分の view に
         # 詳細表示する（tool_invocation_callback=view.on_tool）。
         async with sema:
             await view.searching()
-            r = await run_subagent(
-                api_client=ctx.api_client, pool=ctx.pool, server_locks=ctx.server_locks,
-                defn=searcher_def, briefing=build_search_briefing(view.subq, ctx.state.clarified_query),
-                tools_for_api=ctx.tools_for_api, state=ctx.state, channel_id=ctx.thread.id,
-                tool_invocation_callback=view.on_tool, model_override=model_override,
+            r = await _run_agent(
+                ctx,
+                api_client=ctx.api_client,
+                pool=ctx.pool,
+                server_locks=ctx.server_locks,
+                defn=searcher_def,
+                briefing=build_search_briefing(view.subq, ctx.state.clarified_query),
+                tools_for_api=ctx.tools_for_api,
+                state=ctx.state,
+                channel_id=ctx.thread.id,
+                tool_invocation_callback=view.on_tool,
+                model_override=model_override,
             )
         done["n"] += 1
         await view.finish(r.ok and bool(r.summary_md.strip()))
@@ -589,14 +675,19 @@ async def _multi_agent_research(ctx: _RunCtx) -> str | None:
         # 集約され gather は止まらない（兄弟 searcher は継続）。本物の /abort は _run の
         # タスクごと cancel されるため gather 越しに CancelledError が伝播する。
         raw = await asyncio.gather(
-            *[_bounded(v, model_override) for v in views], return_exceptions=True,
+            *[_bounded(v, model_override) for v in views],
+            return_exceptions=True,
         )
         out: list[SubAgentResult] = []
         for view, res in zip(views, raw):
             if isinstance(res, SubAgentResult):
                 out.append(res)
             elif isinstance(res, BaseException):
-                out.append(SubAgentResult(subq=view.subq, summary_md="", ok=False, error=str(res)))
+                out.append(
+                    SubAgentResult(
+                        subq=view.subq, summary_md="", ok=False, error=str(res)
+                    )
+                )
         return out
 
     ctx.state.results = await _collect()
@@ -604,7 +695,8 @@ async def _multi_agent_research(ctx: _RunCtx) -> str | None:
         # 全 searcher 失敗（例: searcher モデルが subscription で無効）→ lead model で1回リトライ。
         log.warning(
             "deep_research: all searchers failed on %s; retrying with lead model %s",
-            DEEP_RESEARCH_SEARCHER_MODEL, DEEP_RESEARCH_LEAD_MODEL,
+            DEEP_RESEARCH_SEARCHER_MODEL,
+            DEEP_RESEARCH_LEAD_MODEL,
         )
         await _safe_edit(ctx.anchor, f"{_SPIN} 探索を再試行しています…")
         done["n"] = 0
@@ -618,7 +710,9 @@ async def _multi_agent_research(ctx: _RunCtx) -> str | None:
     # 予算（時間 / トークン）超過なら推論層をスキップして要約版に degrade。
     budget_reason = _over_budget(ctx.state)
     if budget_reason:
-        log.warning("deep_research over budget (%s); degrading to raw findings", budget_reason)
+        log.warning(
+            "deep_research over budget (%s); degrading to raw findings", budget_reason
+        )
         await _safe_edit(ctx.anchor, f"{_SPIN} 予算上限のため要約版を作成します…")
         return build_final_report(_degraded_report(ctx.state), ctx.state)
 
@@ -627,7 +721,9 @@ async def _multi_agent_research(ctx: _RunCtx) -> str | None:
         report = await _magi_inference(ctx)
         if report:
             return report
-        log.warning("deep_research: MAGI inference produced nothing; degrading to raw findings")
+        log.warning(
+            "deep_research: MAGI inference produced nothing; degrading to raw findings"
+        )
         return build_final_report(_degraded_report(ctx.state), ctx.state)
 
     await _safe_edit(ctx.anchor, f"{_SPIN} レポートを執筆しています…")
@@ -640,20 +736,30 @@ async def _multi_agent_research(ctx: _RunCtx) -> str | None:
     )
     synth: SubAgentResult | None = None
     for attempt in range(2):
-        synth = await run_subagent(
-            api_client=ctx.api_client, pool=ctx.pool, server_locks=ctx.server_locks,
-            defn=synth_def, briefing=build_synthesis_briefing(ctx.state),
-            tools_for_api=[], state=ctx.state, channel_id=ctx.thread.id,
+        synth = await _run_agent(
+            ctx,
+            api_client=ctx.api_client,
+            pool=ctx.pool,
+            server_locks=ctx.server_locks,
+            defn=synth_def,
+            briefing=build_synthesis_briefing(ctx.state),
+            tools_for_api=[],
+            state=ctx.state,
+            channel_id=ctx.thread.id,
         )
         if synth.ok and synth.summary_md.strip():
             break
         if attempt == 0:
-            log.warning("deep_research: synthesizer failed (%s); retrying once", synth.error)
+            log.warning(
+                "deep_research: synthesizer failed (%s); retrying once", synth.error
+            )
             await asyncio.sleep(_SYNTH_RETRY_BACKOFF_S)
     if synth is not None and synth.ok and synth.summary_md.strip():
         return build_final_report(synth.summary_md, ctx.state)
     # 最後の手段: searcher 結果を捨てず要約版で返す。
-    log.warning("deep_research: synthesizer failed after retry; degrading to raw findings")
+    log.warning(
+        "deep_research: synthesizer failed after retry; degrading to raw findings"
+    )
     return build_final_report(_degraded_report(ctx.state), ctx.state)
 
 
@@ -666,48 +772,21 @@ _MAGI_LENS_EMOJI = {"science": "🧪", "intuition": "💡", "skeptic": "🤔"}
 
 async def _magi_inference(ctx: _RunCtx) -> str | None:
     """事実収集後の MAGI 推論層。3レンズ独立推論 → integrator の BLUF レポート。"""
-    # Stage2: 集めた事実で中心的問いを研ぎ直す（帰納の本丸）。
-    await _refine_central_question(ctx)
-    # 推論前の承認ゲート（無制限待ち。リアクション/メンション=続行、リプライ=訂正）。
-    await _central_question_gate(ctx)
-
-    await _safe_edit(
-        ctx.anchor, f"{_SPIN} MAGI 推論中…（科学 / 直観 / 懐疑 が中心的問いに独立回答）",
+    scheduler = MagiScheduler(
+        max_parallel=DEEP_RESEARCH_MAX_PARALLEL,
+        lens_order=_MAGI_LENS_ORDER,
+        lens_spec=LENS_SPEC,
+        lens_emoji=_MAGI_LENS_EMOJI,
+        view_factory=_AgentView,
+        run_lens=run_magi_lens,
+        run_integrator=run_integrator,
+        safe_edit=_safe_edit,
     )
-    views: dict[str, _AgentView] = {}
-    for k in _MAGI_LENS_ORDER:
-        label = LENS_SPEC[k][0]
-        try:
-            m = await ctx.thread.send(f"⏳ {label} — 待機中")
-        except discord.HTTPException:
-            m = None
-        views[k] = _AgentView(label, m, emoji=_MAGI_LENS_EMOJI[k])
-
-    sema = asyncio.Semaphore(DEEP_RESEARCH_MAX_PARALLEL)
-
-    async def _one(k: str) -> LensResult:
-        # 詳細な推論ログはスレッドに出さない（進捗の1行ステータスのみ。最終統合は integrator）。
-        r = await run_magi_lens(ctx, k, views[k], sema)
-        await views[k].finish(r.ok, r.stance)
-        return r
-
-    raw = await asyncio.gather(*[_one(k) for k in _MAGI_LENS_ORDER], return_exceptions=True)
-    results: list[LensResult] = []
-    for k, r in zip(_MAGI_LENS_ORDER, raw):
-        if isinstance(r, LensResult):
-            results.append(r)
-        elif isinstance(r, BaseException):
-            results.append(LensResult(
-                lens_key=k, lens_label=LENS_SPEC[k][0], stance="", body="",
-                ok=False, error=str(r),
-            ))
-    ctx.state.lens_outputs = results
-    survivors = sum(1 for r in results if r.ok and r.body.strip())
-    if survivors == 0:
-        return None
-
-    await _safe_edit(ctx.anchor, f"{_SPIN} 🧩 3視点を統合しています…（合意と相違を抽出）")
-    return await run_integrator(ctx)
+    return await scheduler.run(
+        ctx,
+        refine=_refine_central_question,
+        approve=_central_question_gate,
+    )
 
 
 _CQ_LABELS = ("中心的問い", "核心")
@@ -734,7 +813,11 @@ def _parse_refined_cq(text: str) -> tuple[str, str]:
     def _value_for(label: str) -> str:
         for i, s in enumerate(lines):
             if s.startswith((f"{label}:", f"{label}：")):
-                rest = s.split("：", 1)[-1] if s.startswith(f"{label}：") else s.split(":", 1)[-1]
+                rest = (
+                    s.split("：", 1)[-1]
+                    if s.startswith(f"{label}：")
+                    else s.split(":", 1)[-1]
+                )
                 rest = rest.strip()
                 if rest:
                     return rest
@@ -764,18 +847,26 @@ async def _refine_central_question(ctx: _RunCtx) -> None:
     """Stage2: evidence を踏まえて中心的問いを研ぎ直し state に格納（Opus）。"""
     await _safe_edit(ctx.anchor, f"{_SPIN} 中心的問いを研ぎ直しています…")
     defn = ResearchAgentDef(
-        agent_type="cq_refiner", model=DEEP_RESEARCH_LEAD_MODEL,
-        system_prompt=REFINE_CQ_SYSTEM, max_tool_turns=1,
+        agent_type="cq_refiner",
+        model=DEEP_RESEARCH_LEAD_MODEL,
+        system_prompt=REFINE_CQ_SYSTEM,
+        max_tool_turns=1,
         idle_timeout_s=DEEP_RESEARCH_MAGI_IDLE_TIMEOUT_S,
     )
-    res = await run_subagent(
-        api_client=ctx.api_client, pool=ctx.pool, server_locks=ctx.server_locks,
+    res = await _run_agent(
+        ctx,
+        api_client=ctx.api_client,
+        pool=ctx.pool,
+        server_locks=ctx.server_locks,
         defn=defn,
         briefing=build_refine_cq_briefing(
-            ctx.state.central_question, build_evidence_digest(ctx.state),
+            ctx.state.central_question,
+            build_evidence_digest(ctx.state),
             ctx.state.user_memories,
         ),
-        tools_for_api=[], state=ctx.state, channel_id=ctx.thread.id,
+        tools_for_api=[],
+        state=ctx.state,
+        channel_id=ctx.thread.id,
     )
     if res.ok and res.summary_md.strip():
         cq, rationale = _parse_refined_cq(res.summary_md)
@@ -784,13 +875,15 @@ async def _refine_central_question(ctx: _RunCtx) -> None:
             ctx.state.central_question_rationale = rationale
         else:
             log.warning(
-                "deep_research: refined CQ unusable (%r); keeping prior/clarified", cq,
+                "deep_research: refined CQ unusable (%r); keeping prior/clarified",
+                cq,
             )
     if not _meaningful_cq(ctx.state.central_question):
         # planner も refine も実質的な問いを返せなかった → 調査テーマ自体を問いに使う。
         ctx.state.central_question = ctx.state.clarified_query
     log.info(
-        "deep_research central_question (refined): %r", ctx.state.central_question[:300],
+        "deep_research central_question (refined): %r",
+        ctx.state.central_question[:300],
     )
 
 
@@ -801,7 +894,8 @@ async def _present_cq(ctx: _RunCtx):
     if ctx.state.central_question_rationale:
         text += f"\n-# 核心: {_short(ctx.state.central_question_rationale, 200)}"
     text += (
-        f"\n-# この問いで MAGI 推論へ進みます。{DEEP_RESEARCH_MAGI_APPROVE_HINT} リアクション"
+        f"\n-# この問いで MAGI 推論へ進みます。{DEEP_RESEARCH_CLARIFY_TIMEOUT_S}秒以内に "
+        f"{DEEP_RESEARCH_MAGI_APPROVE_HINT} リアクション"
         "／メンションで承認、リプライ（または素のメッセージ）で訂正。`/abort` で中止。"
     )
     try:
@@ -810,63 +904,55 @@ async def _present_cq(ctx: _RunCtx):
         return None
 
 
-async def _await_reaction_or_reply(bot, uid, thread_id: int, target_msg):
-    """``target_msg`` へのリアクション or thread 内の本人メッセージを **無制限 OR 待ち**。
-
-    戻り: ``("reaction", None)`` か ``("message", msg)``。中心的問いゲートと明確化の両方で
-    共用する（時間制限なし。中断は /abort のタスクキャンセルで CancelledError 伝播）。
-    """
-    def _rcheck(payload) -> bool:
-        return (
-            getattr(payload, "message_id", None) == getattr(target_msg, "id", None)
-            and getattr(payload, "user_id", None) == uid
-        )
-
-    def _mcheck(m) -> bool:
-        return (
-            getattr(m.channel, "id", None) == thread_id
-            and getattr(m.author, "id", None) == uid
-            and not getattr(m.author, "bot", False)
-        )
-
-    reaction_task = asyncio.ensure_future(bot.wait_for("raw_reaction_add", check=_rcheck))
-    message_task = asyncio.ensure_future(bot.wait_for("message", check=_mcheck))
-    try:
-        done, _pending = await asyncio.wait(
-            {reaction_task, message_task}, return_when=asyncio.FIRST_COMPLETED,
-        )
-    finally:
-        for t in (reaction_task, message_task):
-            if not t.done():
-                t.cancel()
-                # cancel() だけだと pending task が浮いたまま GC 任せになり
-                # "Task was destroyed but it is pending!" になる。回収まで待つ。
-                try:
-                    await t
-                except asyncio.CancelledError:
-                    pass
-                except Exception:  # noqa: BLE001 - 回収時の例外は握る
-                    pass
-    if reaction_task in done and not reaction_task.cancelled():
-        return ("reaction", None)
-    return ("message", message_task.result())
+async def _await_reaction_or_reply(
+    bot,
+    uid,
+    thread_id: int,
+    target_msg,
+    *,
+    timeout_s=None,
+    run=None,
+):
+    """互換入口。実際の deadline と task 回収は Discord adapter が担当する。"""
+    timeout = DEEP_RESEARCH_CLARIFY_TIMEOUT_S if timeout_s is None else timeout_s
+    return await wait_for_reaction_or_reply(
+        bot,
+        uid,
+        thread_id,
+        target_msg,
+        timeout_s=timeout,
+        run=run,
+    )
 
 
 def _mentions_bot(bot, msg) -> bool:
     bot_id = getattr(getattr(bot, "user", None), "id", None)
-    return any(getattr(u, "id", None) == bot_id for u in (getattr(msg, "mentions", None) or []))
+    return any(
+        getattr(u, "id", None) == bot_id for u in (getattr(msg, "mentions", None) or [])
+    )
 
 
 async def _await_gate_response(ctx: _RunCtx, gate_msg) -> tuple[str, str]:
-    """ゲートの反応を無制限待ち。戻り: ("approve","") か ("correct", 訂正本文)。
+    """ゲートの反応を deadline まで待つ。戻りは approve または correct。
 
     Discord の「返信」機能は元発言者（=bot）を自動メンションするため、`_mentions_bot`
     だけで approve 判定すると **リプライ=訂正** が approve に化ける。`msg.reference` が
     立っていればリプライ＝訂正として扱い、純粋な @ メンション（reference 無し）だけを
     approve とみなす。
     """
+    run = getattr(ctx, "run", None)
+    if run:
+        run.begin_approval(DEEP_RESEARCH_CLARIFY_TIMEOUT_S)
+        timeout = run.approval_time_left()
+    else:
+        timeout = DEEP_RESEARCH_CLARIFY_TIMEOUT_S
     kind, msg = await _await_reaction_or_reply(
-        ctx.deps.bot, getattr(ctx.user, "id", None), ctx.thread.id, gate_msg,
+        ctx.deps.bot,
+        getattr(ctx.user, "id", None),
+        ctx.thread.id,
+        gate_msg,
+        timeout_s=timeout,
+        run=run,
     )
     if kind == "reaction":
         return ("approve", "")
@@ -877,13 +963,14 @@ async def _await_gate_response(ctx: _RunCtx, gate_msg) -> tuple[str, str]:
 
 
 async def _central_question_gate(ctx: _RunCtx) -> None:
-    """中心的問いの承認ゲート（FR-M1）。承認まで待つが、訂正は上限付き。
+    """中心的問いの承認ゲート（FR-M1）。承認は deadline、訂正は上限付き。
 
     訂正が ``DEEP_RESEARCH_MAX_CQ_CORRECTIONS`` 回に達したら最後に研ぎ直した
-    問いで自動続行する。無上限だと訂正を送り続けるだけで ``_research_busy`` を
-    任意時間占有できてしまう。bot/user 無しなら素通り。
+    問いで自動続行する。bot/user 無しなら素通りする。
     """
-    if not (ctx.deps and getattr(ctx.deps, "bot", None) is not None and ctx.user is not None):
+    if not (
+        ctx.deps and getattr(ctx.deps, "bot", None) is not None and ctx.user is not None
+    ):
         return
     corrections = 0
     while True:
@@ -894,8 +981,17 @@ async def _central_question_gate(ctx: _RunCtx) -> None:
             decision, text = await _await_gate_response(ctx, gate_msg)
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            await _safe_send(
+                ctx.thread,
+                "-# 承認待ちがタイムアウトしたため、この問いで続行します。",
+            )
+            return
         except Exception:
-            log.warning("deep_research CQ gate wait failed (non-fatal); proceeding", exc_info=True)
+            log.warning(
+                "deep_research CQ gate wait failed (non-fatal); proceeding",
+                exc_info=True,
+            )
             return
         if decision == "approve":
             await _safe_send(ctx.thread, "-# 承認を確認しました。MAGI 推論へ進みます。")
@@ -916,11 +1012,13 @@ async def _central_question_gate(ctx: _RunCtx) -> None:
         await _refine_central_question(ctx)
 
 
-async def _clarify(thread, anchor, user, query, state, deps, api_client) -> None:
-    """明確化質問を生成→投稿→**無制限**で返信待ち（中心的問いゲートと同じ運用）。
+async def _clarify(
+    thread, anchor, user, query, state, deps, api_client, *, run=None
+) -> None:
+    """明確化質問を生成し、run-scoped deadline まで返信を待つ。
 
     返信＝回答を畳み込む / リアクション・メンション＝確認なしで既定スコープ続行 /
-    `/abort`＝中断。時間制限は設けない（じっくり答えられるように）。
+    `/abort`＝中断。deadline 到達時は既定スコープで続行する。
     """
     await _safe_edit(anchor, f"{_SPIN} 調査方針を確認しています…")
 
@@ -959,19 +1057,37 @@ async def _clarify(thread, anchor, user, query, state, deps, api_client) -> None
         return
 
     q_msg = await thread.send(
-        "**調査前の確認です**（時間制限はありません。答えが決まったら返信してください。"
+        f"**調査前の確認です**（{DEEP_RESEARCH_CLARIFY_TIMEOUT_S}秒以内に返信してください。"
         "確認なしで進める場合はこのメッセージにリアクション／メンション、中断は `/abort`）\n"
         + questions[:1800]
     )
 
     try:
+        if run:
+            run.begin_approval(DEEP_RESEARCH_CLARIFY_TIMEOUT_S)
+            timeout = run.approval_time_left()
+        else:
+            timeout = DEEP_RESEARCH_CLARIFY_TIMEOUT_S
         kind, msg = await _await_reaction_or_reply(
-            deps.bot, getattr(user, "id", None), thread.id, q_msg,
+            deps.bot,
+            getattr(user, "id", None),
+            thread.id,
+            q_msg,
+            timeout_s=timeout,
+            run=run,
         )
     except asyncio.CancelledError:
         raise
+    except TimeoutError:
+        await _safe_send(
+            thread,
+            "-# 確認待ちがタイムアウトしたため、既定スコープで進めます。",
+        )
+        return
     except Exception:
-        log.warning("deep_research clarify wait failed (non-fatal); proceeding", exc_info=True)
+        log.warning(
+            "deep_research clarify wait failed (non-fatal); proceeding", exc_info=True
+        )
         return
 
     # clarify は「答えるか / スキップするか」の二択。メンションをスキップ扱いにしない
@@ -1015,28 +1131,16 @@ def _degraded_report(state: ResearchState) -> str:
 # helpers（transient な Discord エラーを握りつぶす）
 # ---------------------------------------------------------------------------
 def _short(text: str, n: int = 120) -> str:
-    t = (text or "").strip().replace("\n", " ")
-    return t if len(t) <= n else t[:n] + "…"
+    return _adapter_short(text, n)
 
 
 def _thread_name(query: str) -> str:
-    base = (query or "").strip().replace("\n", " ")
-    if not base:
-        base = "deep research"
-    return (f"🔬 {base}")[:_THREAD_NAME_MAX] or "deep research"
+    return _adapter_thread_name(query)
 
 
 async def _safe_edit(msg: discord.Message | None, content: str) -> None:
-    if msg is None:
-        return
-    try:
-        await msg.edit(content=content[:1990])
-    except discord.HTTPException:
-        pass
+    await _adapter_safe_edit(msg, content)
 
 
 async def _safe_send(channel, content: str) -> None:
-    try:
-        await channel.send(content)
-    except discord.HTTPException:
-        pass
+    await _adapter_safe_send(channel, content)

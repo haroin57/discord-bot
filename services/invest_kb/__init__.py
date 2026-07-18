@@ -9,16 +9,19 @@ Why separate from Mem0:
     them in parallel with Mem0 without contaminating fact distance space.
 
 Public API:
-    add_documents       — upsert idempotently via id PK
+    add_documents       — prepare and atomically replace source documents
+    replace_document    — atomic prepared-chunk replacement contract
     search_invest_kb    — Haiku rewrite + HyDE + dual-vector + Haiku rerank
     is_investment_query — gate to avoid Haiku spend on small talk
 """
 
 from services.invest_kb.ingest import upsert_documents as add_documents
+from services.invest_kb.client import replace_document
 from services.invest_kb.search import is_investment_query, search_invest_kb
 
 __all__ = [
     "add_documents",
     "is_investment_query",
+    "replace_document",
     "search_invest_kb",
 ]

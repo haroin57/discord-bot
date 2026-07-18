@@ -1,75 +1,19 @@
-"""Unit tests for mcp_mem0_server.py — mocks services.mem0 entirely."""
+"""Unit tests for mcp_mem0_server.py with fixture-scoped service mocks."""
 
-import importlib
-import sys
-import types
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Stub heavy dependencies before importing the module under test
-# ---------------------------------------------------------------------------
-
-def _stub_module(name: str, **attrs):
-    mod = types.ModuleType(name)
-    for k, v in attrs.items():
-        setattr(mod, k, v)
-    sys.modules[name] = mod
-    return mod
+import mcp_mem0_server as _m
 
 
-# mcp.server.fastmcp — the real `mcp` package is a real dependency
-# (installed via claude_code_sdk). Stubbing it would clobber `mcp.types`
-# for any subsequent test that imports claude_code_sdk, so we use the real
-# module here. dotenv is also a real dep.
-
-# services.mem0 — patch all five exported callables.
-# IMPORTANT: do NOT stub the real `services` package — that would mask the
-# actual package for unrelated tests (web_api / claude_sdk import via
-# `services.*`). Only replace `services.mem0` with our mock module
-# *if* it isn't already loaded; if the real one is loaded we monkeypatch
-# its attributes instead so other tests are unaffected.
-_MEM0_SVC_ATTRS = {
-    "add_memories": AsyncMock(),
-    "delete_memory": AsyncMock(),
-    "get_all_memories": AsyncMock(),
-    "search_memories": AsyncMock(),
-    "search_memories_smart": AsyncMock(),
-}
-# Always load the *real* services.mem0 first so that
-# `_REAL_MEM0_SVC` is a reference to the genuine module (needed for
-# post-test cleanup). Then overwrite its callables with our AsyncMocks
-# for the lifetime of this test file. A session-scoped finalizer restores
-# the real attributes so subsequent test files (test_bot.py,
-# test_oauth_manager.py, test_e2e_security.py ...) still see the genuine
-# `services.mem0` and can import `format_memories_for_prompt`.
-import services  # noqa: F401 — load the real `services` package
-import services.mem0 as _REAL_MEM0_SVC  # noqa: E402
-
-# Snapshot the real callables so we can restore them after this file's tests.
-_ORIGINAL_MEM0_SVC_ATTRS = {
-    name: getattr(_REAL_MEM0_SVC, name, None) for name in _MEM0_SVC_ATTRS
-}
-for _k, _v in _MEM0_SVC_ATTRS.items():
-    setattr(_REAL_MEM0_SVC, _k, _v)
-
-# Now import the module under test
-import mcp_mem0_server as _m  # noqa: E402
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _restore_mem0_service_after_module():
-    """Restore the real services.mem0 callables after this file."""
-    yield
-    for _k, _orig in _ORIGINAL_MEM0_SVC_ATTRS.items():
-        if _orig is not None:
-            setattr(_REAL_MEM0_SVC, _k, _orig)
-        else:
-            try:
-                delattr(_REAL_MEM0_SVC, _k)
-            except AttributeError:
-                pass
+_MEM0_SVC_ATTRS = (
+    "add_memories",
+    "delete_memory",
+    "get_all_memories",
+    "search_memories",
+    "search_memories_smart",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -81,22 +25,21 @@ VALID_UID = "573489206240870410"  # 先輩's default Discord snowflake
 
 def _svc(name: str):
     """Return the AsyncMock for a services.mem0 function."""
-    return sys.modules["services.mem0"].__dict__[name]
+    return getattr(_m, name)
 
 
 @pytest.fixture(autouse=True)
-def reset_mocks():
-    """Reset all service mocks before each test."""
+def reset_mocks(monkeypatch):
+    """Install fresh service mocks on the module under test for one test."""
     for name in _MEM0_SVC_ATTRS:
-        mock = _svc(name)
-        mock.reset_mock()
-        mock.return_value = None
+        monkeypatch.setattr(_m, name, AsyncMock(return_value=None))
     yield
 
 
 # ===========================================================================
 # _validated_user_id
 # ===========================================================================
+
 
 class TestValidatedUserId:
     def test_valid_snowflake(self):
@@ -135,6 +78,7 @@ class TestValidatedUserId:
 # _clamped_limit
 # ===========================================================================
 
+
 class TestClampedLimit:
     def test_normal_value(self):
         assert _m._clamped_limit(10) == 10
@@ -164,6 +108,7 @@ class TestClampedLimit:
 # ===========================================================================
 # _format_for_mcp
 # ===========================================================================
+
 
 class TestFormatForMcp:
     def test_basic(self):
@@ -200,11 +145,14 @@ class TestFormatForMcp:
 # search tool
 # ===========================================================================
 
+
 class TestSearchTool:
     @pytest.mark.asyncio
     async def test_plain_search_calls_search_memories(self):
         _svc("search_memories").return_value = [{"memory": "result1"}]
-        out = await _m.search(query="test query", limit=3, user_id=VALID_UID, smart=False)
+        out = await _m.search(
+            query="test query", limit=3, user_id=VALID_UID, smart=False
+        )
         _svc("search_memories").assert_awaited_once_with(
             query="test query", user_id=VALID_UID, limit=3
         )
@@ -213,7 +161,9 @@ class TestSearchTool:
     @pytest.mark.asyncio
     async def test_smart_search_calls_search_memories_smart(self):
         _svc("search_memories_smart").return_value = [{"memory": "smart_result"}]
-        out = await _m.search(query="smart test", limit=2, user_id=VALID_UID, smart=True)
+        out = await _m.search(
+            query="smart test", limit=2, user_id=VALID_UID, smart=True
+        )
         _svc("search_memories_smart").assert_awaited_once_with(
             query="smart test", user_id=VALID_UID, limit=2
         )
@@ -249,6 +199,7 @@ class TestSearchTool:
 # add tool
 # ===========================================================================
 
+
 class TestAddTool:
     @pytest.mark.asyncio
     async def test_basic_add_without_context(self):
@@ -281,33 +232,25 @@ class TestAddTool:
     @pytest.mark.asyncio
     async def test_add_returns_failed_when_result_falsy(self):
         _svc("add_memories").return_value = None
-        out = await _m.add(
-            user_message="u", assistant_message="a", user_id=VALID_UID
-        )
+        out = await _m.add(user_message="u", assistant_message="a", user_id=VALID_UID)
         assert "failed" in out
 
     @pytest.mark.asyncio
     async def test_add_invalid_user_id_rejected(self):
-        out = await _m.add(
-            user_message="u", assistant_message="a", user_id="short"
-        )
+        out = await _m.add(user_message="u", assistant_message="a", user_id="short")
         assert "rejected" in out
         _svc("add_memories").assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_add_result_without_results_key_returns_0(self):
         _svc("add_memories").return_value = {"other": "data"}
-        out = await _m.add(
-            user_message="u", assistant_message="a", user_id=VALID_UID
-        )
+        out = await _m.add(user_message="u", assistant_message="a", user_id=VALID_UID)
         assert "stored 0 new memories" in out
 
     @pytest.mark.asyncio
     async def test_add_non_dict_result_returns_0(self):
         _svc("add_memories").return_value = True
-        out = await _m.add(
-            user_message="u", assistant_message="a", user_id=VALID_UID
-        )
+        out = await _m.add(user_message="u", assistant_message="a", user_id=VALID_UID)
         assert "stored 0 new memories" in out
 
 
@@ -315,11 +258,13 @@ class TestAddTool:
 # list_all tool
 # ===========================================================================
 
+
 class TestListAllTool:
     @pytest.mark.asyncio
     async def test_list_returns_formatted_memories(self):
         _svc("get_all_memories").return_value = [
-            {"memory": "mem_a"}, {"memory": "mem_b"}
+            {"memory": "mem_a"},
+            {"memory": "mem_b"},
         ]
         out = await _m.list_all(user_id=VALID_UID, limit=10)
         assert "mem_a" in out
@@ -360,6 +305,7 @@ class TestListAllTool:
 # ===========================================================================
 # delete tool
 # ===========================================================================
+
 
 class TestDeleteTool:
     @pytest.mark.asyncio

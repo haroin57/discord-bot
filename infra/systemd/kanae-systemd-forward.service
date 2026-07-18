@@ -4,14 +4,37 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /home/ubuntu/discord-bot/scripts/systemd_forward.py
-EnvironmentFile=/home/ubuntu/discord-bot/.env.systemd-forward
-User=ubuntu
-Group=ubuntu
-SupplementaryGroups=systemd-journal
+WorkingDirectory=/var/lib/discord-bot-releases/prod/current/src
+ExecStart=/var/lib/discord-bot-releases/prod/current/venv/bin/python /var/lib/discord-bot-releases/prod/current/src/scripts/systemd_forward.py
+EnvironmentFile=/etc/discord-bot/credentials/systemd-forward.env
+User=kanae-systemd-forward
+Group=kanae-systemd-forward
+SupplementaryGroups=systemd-journal kanae-code
+Environment=HOME=/var/lib/kanae-systemd-forward
+StateDirectory=kanae-systemd-forward
+StateDirectoryMode=0700
 Restart=always
 RestartSec=10
 MemoryMax=100M
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target

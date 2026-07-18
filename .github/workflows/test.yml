@@ -1,94 +1,74 @@
 name: test
+
 on:
   push:
     branches: [master, main, dev, "feature/**"]
   pull_request:
-    branches: [master, dev]
+    branches: [master, main, dev]
   schedule:
-    - cron: '0 18 * * *'  # 03:00 JST nightly (legacy-inclusive full suite)
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DISCORD_TOKEN: dummy_test_token
+  ADMIN_USER_IDS: "1234567890"
+  ANTHROPIC_API_KEY: ci-dummy
+  OPENAI_API_KEY: ci-dummy
+  GOOGLE_AI_API_KEY: ci-dummy
+  PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
-  test:
+  collection-contract:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version-file: '.python-version'
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.lock ]; then
-            pip install -r requirements.lock
-          else
-            pip install -r requirements.txt
-          fi
-          # No `|| true`: silently skipping dev deps made red tests invisible
-          # (backlog P2, fixed as part of P0.5-d).
-          pip install -r requirements-dev.txt
-      - name: pytest (full suite)
-        env:
-          DISCORD_TOKEN: dummy_test_token
-          ADMIN_USER_IDS: "1234567890"
-          # Dummy values so config imports don't error at collection time.
-          # No real API calls are made — the suite is mock-heavy.
-          ANTHROPIC_API_KEY: ci-dummy
-          OPENAI_API_KEY: ci-dummy
-          GOOGLE_AI_API_KEY: ci-dummy
-          # GitHub runners have 4 cores; -n auto exploits all of them.
-          # test_oauth_manager.py has an xdist-awareness fixture that resets
-          # module globals between workers, so parallel runs are safe on CI
-          # (the only known parallel flap requires ~/.claude/.credentials.json
-          # to exist on disk, which CI runners don't have).
-        run: |
-          # Full suite replaced the old hand-maintained file list, which had
-          # drifted (fable fallback tests were never in CI — backlog P0).
-          # `legacy` + `integration` markers are excluded via pyproject addopts.
-          pytest -q -n auto
-      - name: Conflict-marker scan
-        run: |
-          if grep -rn "^<<<<<<<\|^>>>>>>>" --include='*.py' --include='*.md' .; then
-            echo "Merge conflict markers found"
-            exit 1
-          fi
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: ./.github/actions/setup-tests
+      - name: Reject collection-time test pollution
+        run: python scripts/check_test_isolation.py
+      - name: Collect all tests and run contracts
+        run: python scripts/run_test_lane.py collection-contract --workers auto
 
-  # P0.5-d governance: legacy-marked tests still run nightly so the marker
-  # can't silently rot into a false-green CI. Failures here mean either the
-  # legacy test should be deleted (via review) or a regression slipped in.
-  nightly-full:
-    if: github.event_name == 'schedule'
+  unit-fast:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version-file: '.python-version'
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.lock || pip install -r requirements.txt
-          pip install -r requirements-dev.txt
-      - name: pytest (everything incl. legacy)
-        env:
-          DISCORD_TOKEN: dummy_test_token
-          ADMIN_USER_IDS: "1234567890"
-          ANTHROPIC_API_KEY: ci-dummy
-          OPENAI_API_KEY: ci-dummy
-          GOOGLE_AI_API_KEY: ci-dummy
-        run: pytest -q -n auto -m "not integration"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: ./.github/actions/setup-tests
+      - name: Run isolated unit lane
+        run: python scripts/run_test_lane.py unit-fast --workers auto
+
+  characterization:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: ./.github/actions/setup-tests
+      - name: Run characterization lane
+        run: python scripts/run_test_lane.py characterization --workers auto
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: ./.github/actions/setup-tests
+      - name: Run integration lane
+        run: python scripts/run_test_lane.py integration --workers auto
+
+  offline-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: ./.github/actions/setup-tests
+      - name: Run deterministic offline evaluations
+        run: python scripts/run_test_lane.py offline-eval --workers auto
+
+  security:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security.yml

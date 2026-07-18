@@ -22,6 +22,7 @@ module names the file it was translated from.
 
 from .types import (
     Command,
+    CommandExecutionError,
     CommandType,
     ContentBlock,
     LocalCommand,
@@ -33,10 +34,13 @@ from .types import (
 )
 from .runtime import CommandRuntime, RecordingRuntime, ShellResult
 from .shell import execute_shell_commands_in_prompt, substitute_arguments
-from .registry import CommandRegistry
+from .registry import CommandInvocation, CommandMetadata, CommandRegistry
 
 __all__ = [
     "Command",
+    "CommandExecutionError",
+    "CommandInvocation",
+    "CommandMetadata",
     "CommandType",
     "ContentBlock",
     "LocalCommand",

@@ -6,13 +6,21 @@ Discord-style dark theme and clips a tight screenshot around the table element
 (top-level ``selector``), so the output is the table box, not a full page.
 """
 
-import hashlib
 import logging
-import os
 
 import markdown
 
 from utils.cf_browser import render_screenshot
+from utils.render_store import (
+    is_cached,
+    prepare,
+    publish_png,
+    remove_if_exists,
+    render_paths,
+    temporary_png_path,
+    write_html,
+    write_png,
+)
 
 __all__ = ["render_table_image"]
 
@@ -88,8 +96,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 # this allowlist (e.g. <script>, <img onerror=...>, on* attributes) is stripped
 # by bleach before the HTML is handed to headless Chromium.
 _TABLE_HTML_ALLOWED_TAGS = (
-    "table", "thead", "tbody", "tfoot", "tr", "th", "td",
-    "strong", "em", "b", "i", "code", "br", "span",
+    "table",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "th",
+    "td",
+    "strong",
+    "em",
+    "b",
+    "i",
+    "code",
+    "br",
+    "span",
 )
 _TABLE_HTML_ALLOWED_ATTRS = {"th": ["align"], "td": ["align"]}
 
@@ -103,6 +123,7 @@ def _md_table_to_html(md_table: str) -> str:
     --no-sandbox). Bleach removes anything outside the table-only allowlist.
     """
     import bleach
+
     raw_html = markdown.markdown(md_table, extensions=["tables"])
     return bleach.clean(
         raw_html,
@@ -119,7 +140,7 @@ async def render_table_image(
     output_dir: str = TABLE_OUTPUT_DIR,
 ) -> str | None:
     """Render a Markdown table as a PNG image. Returns the file path, or None on failure."""
-    os.makedirs(output_dir, exist_ok=True)
+    prepare(output_dir)
 
     # Cache key includes a template/sanitizer version so previously-rendered
     # PNGs that may have contained injected HTML are not served after the
@@ -127,20 +148,26 @@ async def render_table_image(
     # every sanitizer / template change.
     _TEMPLATE_VERSION = "3"  # bumped: Puppeteer daemon -> Cloudflare Browser Rendering
     cache_key = f"v{_TEMPLATE_VERSION}:{md_table}:{caption}"
-    table_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
-    out_path = os.path.join(output_dir, f"table_{table_hash}.png")
+    out_path, html_path = render_paths(
+        output_dir,
+        prefix="table",
+        cache_key=cache_key,
+    )
 
     # Cache hit
-    if os.path.isfile(out_path):
+    if is_cached(out_path):
         return out_path
 
     # Build HTML
     import html as _html
+
     table_html = _md_table_to_html(md_table)
     # Caption comes from an LLM-rendered markdown heading and can include
     # arbitrary user-controlled text; HTML-escape so it cannot inject <script>
     # or event-handler attributes into the rendered page.
-    caption_html = f'<div class="caption">{_html.escape(caption)}</div>' if caption else ""
+    caption_html = (
+        f'<div class="caption">{_html.escape(caption)}</div>' if caption else ""
+    )
     full_html = HTML_TEMPLATE.format(
         css=TABLE_CSS,
         caption_html=caption_html,
@@ -149,23 +176,26 @@ async def render_table_image(
 
     # Keep the .html on disk for debugging/parity; the remote browser renders
     # from the inlined string (it cannot see local files).
-    html_path = os.path.join(output_dir, f"table_{table_hash}.html")
-    with open(html_path, "w") as f:
-        f.write(full_html)
+    write_html(html_path, full_html)
 
     # Clip to the table container so the PNG is the table box (not a full page).
     # Tables use only local fonts + inline CSS, so no network wait is needed.
-    png_bytes = await render_screenshot(
-        full_html,
-        selector=".table-container",
-    )
-    if not png_bytes:
-        log.warning("Table render failed (Browser Rendering returned no image)")
-        return None
+    part_path = temporary_png_path(out_path)
     try:
-        with open(out_path, "wb") as f:
-            f.write(png_bytes)
+        png_bytes = await render_screenshot(
+            full_html,
+            selector=".table-container",
+        )
+        if not png_bytes:
+            log.warning("Table render failed (Browser Rendering returned no image)")
+            return None
+        write_png(part_path, png_bytes)
+        if not publish_png(part_path, out_path):
+            log.warning("Table render returned an incomplete PNG")
+            return None
     except OSError as e:
         log.error("Failed to write table PNG: %s", e)
         return None
-    return out_path if os.path.isfile(out_path) else None
+    finally:
+        remove_if_exists(part_path)
+    return out_path if is_cached(out_path) else None

@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from free_code_commands.runtime import Attribution, CommandRuntime, ShellResult
-from free_code_commands.types import ContentBlock, PromptCommand
+from free_code_commands.types import Command, ContentBlock
 
 # Commit/PR trailers the bot stamps (CLAUDE.md git convention). free-code sources
 # these from getAttributionTexts(); here they are the bot's standard trailers.
@@ -133,7 +133,9 @@ class BotCommandRuntime(CommandRuntime):
                 out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
             except asyncio.TimeoutError:
                 proc.kill()
-                return ShellResult(stdout="", stderr="command timed out", interrupted=True)
+                return ShellResult(
+                    stdout="", stderr="command timed out", interrupted=True
+                )
             return ShellResult(
                 stdout=out.decode("utf-8", "replace"),
                 stderr=err.decode("utf-8", "replace"),
@@ -182,13 +184,15 @@ class PreparedSlashTurn:
 def _blocks_to_text(blocks: list[ContentBlock]) -> str:
     """Join text content blocks (mirrors free-code's TextBlockParam join)."""
 
-    return "\n\n".join(b.text for b in blocks if b.type == "text" and b.text is not None)
+    return "\n\n".join(
+        b.text for b in blocks if b.type == "text" and b.text is not None
+    )
 
 
 async def build_prompt_command_turn(
-    command: PromptCommand,
+    command: Command,
     args: str,
-    runtime: Optional[CommandRuntime] = None,
+    expanded_blocks: list[ContentBlock],
     *,
     wrap_trusted: bool = True,
 ) -> PreparedSlashTurn:
@@ -209,11 +213,9 @@ async def build_prompt_command_turn(
             "commands are wired to Discord (see ADR-0048)."
         )
 
-    rt = runtime or BotCommandRuntime()
-
-    # Step 1 — expand.
-    blocks = await command.get_prompt_for_command(args, rt)
-    expanded = _blocks_to_text(blocks)
+    # Step 1 has already executed inside CommandRegistry.invoke.  The bridge only
+    # receives frozen metadata plus the callback result, never the callback itself.
+    expanded = _blocks_to_text(expanded_blocks)
 
     # Step 2 — metadata tags.
     tags = format_slash_command_loading_metadata(command.name, args.strip())
@@ -226,7 +228,9 @@ async def build_prompt_command_turn(
     # them (tags first, then the expanded template) so the model sees the same
     # content and ordering. Wrap as trusted admin input for the bot's trust model.
     body = f"{tags}\n\n{expanded}"
-    prompt = f"<trusted_user_input>\n{body}\n</trusted_user_input>" if wrap_trusted else body
+    prompt = (
+        f"<trusted_user_input>\n{body}\n</trusted_user_input>" if wrap_trusted else body
+    )
 
     return PreparedSlashTurn(
         prompt=prompt,

@@ -9,31 +9,32 @@ a context-manager-shaped wrapper; the tool_loop's entry function should
 own that stack so a crash anywhere in the loop guarantees ``aclose()``
 is called and child PIDs SIGTERMed.
 
-PID tracking is best-effort — stdio_client does not expose its subprocess
-handle, so ``kill_orphan_mcp_processes()`` falls back to the same cmdline
-substring scan as services/claude_sdk.py (``_MCP_CMDLINE_PATTERNS``).
+Local stdio transports expose their exact ``asyncio.subprocess.Process`` to an
+observer. Cleanup is restricted to those registered handles; this module never
+discovers processes from command lines, argv, or environment data.
 """
 
 import asyncio
 import json
 import logging
-import os
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-try:
-    import psutil  # type: ignore
-except ImportError:  # pragma: no cover
-    psutil = None  # type: ignore
-
 from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
+
+from services.claude_api.mcp_transport import ProcessObserver, managed_stdio_client
+from services.claude_api.subprocess_runner import (
+    await_before_deadline,
+    build_allowlisted_env,
+    deadline_after,
+)
 
 # SSE transport is still supported for remote MCP servers that expose it.
 try:
     from mcp.client.sse import sse_client  # type: ignore
+
     _HAS_SSE_TRANSPORT = True
 except ImportError:  # pragma: no cover
     sse_client = None  # type: ignore
@@ -42,31 +43,13 @@ except ImportError:  # pragma: no cover
 # streamable_http is optional / version-dependent — guard the import.
 try:
     from mcp.client.streamable_http import streamablehttp_client  # type: ignore
+
     _HAS_HTTP_TRANSPORT = True
 except ImportError:  # pragma: no cover
     streamablehttp_client = None  # type: ignore
     _HAS_HTTP_TRANSPORT = False
 
 log = logging.getLogger(__name__)
-
-# Cmdline substring patterns for orphan MCP cleanup. Kept in sync with
-# services/claude_sdk.py:245-260 so the cross-backend cleanup catches both
-# CLI-spawned and direct-API-spawned MCP children during the migration.
-_MCP_CMDLINE_PATTERNS = (
-    "mcp-server-",
-    "@modelcontextprotocol/server-",
-    "@playwright/mcp",
-    "playwright-mcp",
-    "brave-search-mcp",
-    "@upstash/context7-mcp",
-    "context7-mcp",
-    "x-scraper/mcp_server.py",
-    "scholarly-mcp/server.py",
-    "nikkei-indexes/mcp_server.py",
-    "yfj-quote/mcp_server.py",
-    "papermcp",
-    "tavily-mcp",
-)
 
 
 @dataclass
@@ -78,61 +61,153 @@ class McpServerHandle:
     tools: list[Any] = field(default_factory=list)  # mcp.Tool
 
 
+async def _enter_task_affine_session(
+    stack: AsyncExitStack,
+    session: ClientSession,
+) -> ClientSession:
+    """Enter a ClientSession and retry its task-affine exit after cancellation.
+
+    MCP's BaseSession enters an AnyIO TaskGroup in ``__aenter__``.  AnyIO
+    requires its cancel scope to be exited from that same asyncio task, so the
+    session cannot be closed in a shield helper task.  AsyncExitStack normally
+    pops an exit callback before awaiting it; if that one await is cancelled,
+    calling ``stack.aclose()`` again cannot retry the half-finished session
+    exit.  Register a retrying callback around this task-affine context only.
+    The first delivered cancellation is re-raised after the session has
+    finished closing, allowing the surrounding stack to clean later contexts.
+    """
+    entered = await session.__aenter__()
+
+    async def close_session(exc_type, exc, traceback) -> bool | None:
+        first_cancel: asyncio.CancelledError | None = None
+        while True:
+            try:
+                suppressed = await session.__aexit__(exc_type, exc, traceback)
+            except asyncio.CancelledError as cancel_exc:
+                if first_cancel is None:
+                    first_cancel = cancel_exc
+                continue
+            if first_cancel is not None:
+                raise first_cancel
+            return suppressed
+
+    stack.push_async_exit(close_session)
+    return entered
+
+
 async def _spawn_one(
     stack: AsyncExitStack,
     name: str,
     cfg: dict,
+    *,
+    process_observer: ProcessObserver | None = None,
 ) -> McpServerHandle:
     """Open transport, initialize session, list tools. Registers exits in stack."""
-    transport = cfg.get("type")
-    if transport == "sse":
-        if not _HAS_SSE_TRANSPORT:
-            raise RuntimeError(
-                f"MCP SSE transport not available, cannot spawn '{name}'",
+    startup_timeout = max(0.1, float(cfg.get("startup_timeout", 30.0)))
+    deadline = deadline_after(startup_timeout)
+    local_stack = AsyncExitStack()
+    await local_stack.__aenter__()
+    try:
+        transport = cfg.get("type")
+        if transport == "sse":
+            if not _HAS_SSE_TRANSPORT:
+                raise RuntimeError(
+                    f"MCP SSE transport not available, cannot spawn '{name}'",
+                )
+            read, write = await await_before_deadline(
+                local_stack.enter_async_context(
+                    sse_client(  # type: ignore[misc]
+                        cfg["url"],
+                        headers=cfg.get("headers") or {},
+                        timeout=cfg.get("timeout", 5),
+                        sse_read_timeout=cfg.get("sse_read_timeout", 300),
+                    )
+                ),
+                deadline,
             )
-        read, write = await stack.enter_async_context(
-            sse_client(  # type: ignore[misc]
+        elif transport == "http":
+            if not _HAS_HTTP_TRANSPORT:
+                raise RuntimeError(
+                    f"MCP HTTP transport not available, cannot spawn '{name}'",
+                )
+            ctx = streamablehttp_client(  # type: ignore[misc]
                 cfg["url"],
                 headers=cfg.get("headers") or {},
-                timeout=cfg.get("timeout", 5),
-                sse_read_timeout=cfg.get("sse_read_timeout", 300),
             )
-        )
-    elif transport == "http":
-        if not _HAS_HTTP_TRANSPORT:
-            raise RuntimeError(
-                f"MCP HTTP transport not available, cannot spawn '{name}'",
+            transport_result = await await_before_deadline(
+                local_stack.enter_async_context(ctx),
+                deadline,
             )
-        ctx = streamablehttp_client(  # type: ignore[misc]
-            cfg["url"],
-            headers=cfg.get("headers") or {},
-        )
-        transport_result = await stack.enter_async_context(ctx)
-        # streamablehttp_client yields (read, write, _close) in current SDK
-        read, write = transport_result[0], transport_result[1]
-    else:
-        params = StdioServerParameters(
-            command=cfg["command"],
-            args=cfg.get("args") or [],
-            env={**os.environ, **(cfg.get("env") or {})},
-        )
-        read, write = await stack.enter_async_context(stdio_client(params))
+            read, write = transport_result[0], transport_result[1]
+        else:
+            argv = [cfg["command"], *(cfg.get("args") or [])]
+            observer_kwargs = (
+                {"process_observer": process_observer}
+                if process_observer is not None
+                else {}
+            )
+            read, write = await await_before_deadline(
+                local_stack.enter_async_context(
+                    managed_stdio_client(
+                        argv,
+                        env=build_allowlisted_env(cfg.get("env") or {}),
+                        cwd=cfg.get("cwd"),
+                        deadline=deadline,
+                        **observer_kwargs,
+                    )
+                ),
+                deadline,
+            )
 
-    session = await stack.enter_async_context(ClientSession(read, write))
-    await session.initialize()
-    tools_resp = await session.list_tools()
+        session = await await_before_deadline(
+            _enter_task_affine_session(local_stack, ClientSession(read, write)),
+            deadline,
+        )
+        await await_before_deadline(session.initialize(), deadline)
+        tools_resp = await await_before_deadline(session.list_tools(), deadline)
+    except BaseException as exc:
+        # ClientSession owns an AnyIO TaskGroup whose cancel scope must be
+        # exited by the same asyncio task that entered it.  Moving aclose() to
+        # await_cleanup_task()'s helper task makes ClientSession.__aexit__ call
+        # cancel_scope.cancel() from the wrong task.  On an ordinary startup
+        # failure (for example, a stdio child exiting before initialize) that
+        # cancels this request task and turns a recoverable MCP error into an
+        # unhandled CancelledError at bot.on_message.
+        #
+        # AsyncExitStack continues unwinding its remaining callbacks when an
+        # additional cancellation arrives.  Keep the task-affine stack in the
+        # current task and, for a request that was already cancelled, preserve
+        # the first cancellation reason after cleanup finishes.
+        try:
+            await local_stack.aclose()
+        except BaseException as cleanup_exc:
+            if isinstance(exc, asyncio.CancelledError):
+                raise exc from cleanup_exc
+            raise
+        raise
+    await stack.enter_async_context(local_stack.pop_all())
     return McpServerHandle(key=name, session=session, tools=tools_resp.tools)
 
 
 async def spawn_servers(
     cfg: dict[str, dict],
     stack: AsyncExitStack,
+    *,
+    process_observer: ProcessObserver | None = None,
 ) -> dict[str, McpServerHandle]:
     """Spawn every server in ``cfg``; caller owns ``stack`` for cleanup."""
     handles: dict[str, McpServerHandle] = {}
     for name, server_cfg in cfg.items():
         try:
-            handles[name] = await _spawn_one(stack, name, server_cfg)
+            if process_observer is None:
+                handles[name] = await _spawn_one(stack, name, server_cfg)
+            else:
+                handles[name] = await _spawn_one(
+                    stack,
+                    name,
+                    server_cfg,
+                    process_observer=process_observer,
+                )
             log.info("MCP spawned: %s (%d tools)", name, len(handles[name].tools))
         except Exception as exc:
             log.error("MCP spawn failed for %s: %s", name, exc)
@@ -148,14 +223,16 @@ def mcp_tools_to_anthropic(handles: dict[str, McpServerHandle]) -> list[dict]:
     for h in handles.values():
         for tool in h.tools:
             qualified_name = f"mcp__{h.key}__{tool.name}"
-            out.append({
-                "name": qualified_name,
-                "description": getattr(tool, "description", "") or "",
-                "input_schema": (
-                    getattr(tool, "inputSchema", None)
-                    or {"type": "object", "properties": {}}
-                ),
-            })
+            out.append(
+                {
+                    "name": qualified_name,
+                    "description": getattr(tool, "description", "") or "",
+                    "input_schema": (
+                        getattr(tool, "inputSchema", None)
+                        or {"type": "object", "properties": {}}
+                    ),
+                }
+            )
     return out
 
 
@@ -240,7 +317,8 @@ def _load_static_schemas_from_disk() -> None:
     except (OSError, json.JSONDecodeError) as exc:
         log.warning(
             "static_mcp_schemas.json load failed (%s); WEB MCP tools "
-            "will fall back to keyword-gated advertisement", exc,
+            "will fall back to keyword-gated advertisement",
+            exc,
         )
         return
     if not isinstance(payload, dict):
@@ -288,7 +366,9 @@ def _parse_qualified_tool_name(qualified_name: str) -> tuple[str, str]:
     return server, tool_name
 
 
-async def _dispatch_tool_call(handle: McpServerHandle, tool_name: str, args: dict) -> str:
+async def _dispatch_tool_call(
+    handle: McpServerHandle, tool_name: str, args: dict
+) -> str:
     """Call a tool on a live handle and stringify the response content blocks.
 
     Anthropic's ``tool_result.content`` is a string, so TextContent /
@@ -348,6 +428,7 @@ class McpPool:
     available_configs: dict[str, dict]
     handles: dict[str, McpServerHandle] = field(default_factory=dict)
     _spawn_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    process_observer: ProcessObserver | None = None
 
     def __post_init__(self) -> None:
         # Snapshot the persistent override at pool construction. A command that
@@ -370,9 +451,19 @@ class McpPool:
                     f"MCP server '{name}' not configured "
                     f"(available: {list(self.available_configs)})"
                 )
-            handle = await _spawn_one(self.stack, name, cfg)
+            if self.process_observer is None:
+                handle = await _spawn_one(self.stack, name, cfg)
+            else:
+                handle = await _spawn_one(
+                    self.stack,
+                    name,
+                    cfg,
+                    process_observer=self.process_observer,
+                )
             log.info(
-                "MCP spawned (lazy): %s (%d tools)", name, len(handle.tools),
+                "MCP spawned (lazy): %s (%d tools)",
+                name,
+                len(handle.tools),
             )
             self.handles[name] = handle
             return handle
@@ -393,39 +484,10 @@ class McpPool:
 
 
 def kill_orphan_mcp_processes() -> int:
-    """SIGTERM → SIGKILL any descendant MCP-server processes.
+    """Compatibility no-op; global MCP process discovery is prohibited.
 
-    Best-effort defense-in-depth in case AsyncExitStack didn't get to clean
-    them up (process crash mid-loop, etc.). Cmdline-substring based so it
-    survives the npx wrapper / venv-python variations.
+    Exact observer handles are owned by ``managed_stdio_client`` and their
+    ``AsyncExitStack``. A synchronous process-wide sweep cannot prove that an
+    unregistered process belongs to this caller, so it must not signal one.
     """
-    if psutil is None:
-        return 0
-    killed = 0
-    try:
-        me = psutil.Process(os.getpid())
-        targets = []
-        for child in me.children(recursive=True):
-            try:
-                cmdline = " ".join(child.cmdline() or []).lower()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-            if any(pat in cmdline for pat in _MCP_CMDLINE_PATTERNS):
-                targets.append(child)
-        if not targets:
-            return 0
-        for p in targets:
-            try:
-                p.terminate()
-            except psutil.NoSuchProcess:
-                pass
-        gone, alive = psutil.wait_procs(targets, timeout=2)
-        for p in alive:
-            try:
-                p.kill()
-            except psutil.NoSuchProcess:
-                pass
-        killed = len(targets)
-    except Exception as exc:
-        log.debug("kill_orphan_mcp_processes failed: %s", exc)
-    return killed
+    return 0

@@ -11,13 +11,20 @@ After=chromadb-server.service
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/home/ubuntu/discord-bot
-Environment=HOME=/home/ubuntu
+User=kanae-mem0
+Group=kanae-mem0
+SupplementaryGroups=kanae-code
+WorkingDirectory=/var/lib/discord-bot-releases/prod/current/src
+EnvironmentFile=/etc/discord-bot/credentials/mcp-mem0.env
+Environment=HOME=/var/lib/kanae-mem0
+Environment=BOT_STATE_DIR=/var/lib/kanae-mem0/state
 Environment=MCP_HTTP_PORT=8013
-EnvironmentFile=/home/ubuntu/discord-bot/.env
-ExecStart=/home/ubuntu/discord-bot/.venv/bin/python /home/ubuntu/discord-bot/mcp_mem0_server.py
+Environment=PYTHON_DOTENV_DISABLED=1
+StateDirectory=kanae-mem0 kanae-mem0/state
+StateDirectoryMode=0700
+CacheDirectory=kanae-mem0
+CacheDirectoryMode=0700
+ExecStart=/var/lib/discord-bot-releases/prod/current/venv/bin/python /var/lib/discord-bot-releases/prod/current/src/mcp_mem0_server.py
 Restart=always
 RestartSec=5
 # Reap the whole cgroup (uvicorn workers, any thread pools) on stop/restart so
@@ -26,6 +33,7 @@ KillMode=control-group
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=mcp-mem0-shared
+UMask=0007
 
 # Resource caps. MemoryHigh = soft (cgroup reclaim pressure), MemoryMax = hard
 # kill. mem0 loads embeddings + the mem0 client; ~280MB observed as stdio child.
@@ -33,16 +41,25 @@ MemoryHigh=300M
 MemoryMax=450M
 LimitNOFILE=4096
 
-# Light hardening. Kept minimal: the process writes ChromaDB state under
-# /home/ubuntu and reads .env, so we avoid aggressive filesystem lockdown.
 NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/kanae-mem0 /var/cache/kanae-mem0
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
 LockPersonality=yes
+MemoryDenyWriteExecute=no
 RestrictRealtime=yes
 SystemCallArchitectures=native
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target

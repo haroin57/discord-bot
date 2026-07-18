@@ -4,6 +4,7 @@
 * :mod:`.local_commands` — ``type: 'local'`` (headless computations)
 * :mod:`.jsx_commands` — ``type: 'local-jsx'`` (interactive TUI, ported headlessly)
 
-Each module exposes ``COMMANDS`` — a list of :class:`~free_code_commands.types.Command`
-instances — which :mod:`free_code_commands._all` assembles into the registry.
+Each module exposes ``COMMANDS`` as a tuple of frozen, metadata-only
+:class:`~free_code_commands.types.Command` instances. Private immutable definitions
+are assembled into the registry without exposing callbacks or gate predicates.
 """

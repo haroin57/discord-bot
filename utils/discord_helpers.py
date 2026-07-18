@@ -2,12 +2,14 @@
 
 import re
 import logging
+from collections.abc import Collection
 from urllib.parse import urlparse
 
 import aiohttp
 import discord
 
 from utils.cache import TTLLRUCache
+from utils import context_gateway
 
 from config import (
     ADMIN_USER_IDS,
@@ -40,6 +42,7 @@ def _cache_get(key: tuple[int, int]) -> str | None:
 
 def _cache_set(key: tuple[int, int], text: str) -> None:
     _thread_context_cache.set(key, text)
+
 
 # ---------------------------------------------------------------------------
 # Mention stripping (pre-compiled regex cache)
@@ -171,9 +174,9 @@ def format_embed(embed: discord.Embed) -> str:
 MAX_CONTEXT_CHARS = 20000
 
 # 3-layer context hierarchy
-LAYER1_COUNT = 25      # Recent messages: full text
-LAYER2_COUNT = 15      # Earlier messages: summarized
-LAYER2_MAX_CHARS = 150 # Max chars per Layer 2 message
+LAYER1_COUNT = 25  # Recent messages: full text
+LAYER2_COUNT = 15  # Earlier messages: summarized
+LAYER2_MAX_CHARS = 150  # Max chars per Layer 2 message
 
 
 def _summarize_message(body: str, max_chars: int = LAYER2_MAX_CHARS) -> str:
@@ -270,6 +273,8 @@ async def fetch_thread_context(
     before_message: discord.Message,
     *,
     caller_is_admin: bool = False,
+    bot_user_id: int | None = None,
+    admin_user_ids: Collection[int] = ADMIN_USER_IDS,
 ) -> str:
     """Fetch past messages in a thread with layered context (capped at MAX_CONTEXT_CHARS).
 
@@ -277,36 +282,21 @@ async def fetch_thread_context(
     Layer 2 (messages 4-15): summarized to ~150 chars each.
     Layer 3 (16+): omitted — Mem0 long-term memory covers older context.
     """
-    cache_key = (thread.id, before_message.id, bool(caller_is_admin))
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    # Collect messages in chronological order (oldest_first=True)
-    collected: list[tuple[str, str]] = []
-    async for msg in thread.history(
-        limit=LAYER1_COUNT + LAYER2_COUNT,
-        before=before_message,
-        oldest_first=True,
-    ):
-        if not _should_include_msg(msg, caller_is_admin):
-            continue
-        body = _format_msg_body(msg)
-        if body:
-            collected.append((msg.author.display_name, body))
-
-    if not collected:
-        _cache_set(cache_key, "")
-        return ""
-
-    lines, _ = _build_layered_lines(collected, oldest_first=True)
-    result = (
-        f"[Thread: {thread.name} - past {len(collected)} messages]\n"
-        + "\n".join(lines)
-        + "\n[End of thread history]"
+    return await context_gateway.fetch_thread_context(
+        thread,
+        before_message,
+        caller_is_admin=caller_is_admin,
+        bot_user_id=bot_user_id,
+        admin_user_ids=admin_user_ids,
+        layer1_count=LAYER1_COUNT,
+        layer2_count=LAYER2_COUNT,
+        cache_get=_cache_get,
+        cache_set=_cache_set,
+        should_include=_should_include_msg,
+        format_body=_format_msg_body,
+        build_lines=_build_layered_lines,
+        max_context_chars=MAX_CONTEXT_CHARS,
     )
-    _cache_set(cache_key, result)
-    return result
 
 
 CHANNEL_CONTEXT_LIMIT = LAYER1_COUNT + LAYER2_COUNT  # 40
@@ -317,6 +307,8 @@ async def fetch_channel_context(
     before_message: discord.Message,
     *,
     caller_is_admin: bool = False,
+    bot_user_id: int | None = None,
+    admin_user_ids: Collection[int] = ADMIN_USER_IDS,
 ) -> str:
     """Fetch recent messages in a channel with layered context (capped at MAX_CONTEXT_CHARS).
 
@@ -324,34 +316,20 @@ async def fetch_channel_context(
     Layer 2 (messages 4-15): summarized to ~150 chars each.
     Layer 3 (16+): omitted — Mem0 long-term memory covers older context.
     """
-    cache_key = (channel.id, before_message.id, bool(caller_is_admin))
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    # channel.history default is newest-first, collect then reverse
-    collected_rev: list[tuple[str, str]] = []
-    async for msg in channel.history(limit=CHANNEL_CONTEXT_LIMIT, before=before_message):
-        if not _should_include_msg(msg, caller_is_admin):
-            continue
-        body = _format_msg_body(msg)
-        if body:
-            collected_rev.append((msg.author.display_name, body))
-
-    if not collected_rev:
-        _cache_set(cache_key, "")
-        return ""
-
-    # Reverse to chronological order for layering
-    collected_rev.reverse()
-    lines, _ = _build_layered_lines(collected_rev, oldest_first=True)
-    result = (
-        f"[Channel recent {len(collected_rev)} messages]\n"
-        + "\n".join(lines)
-        + "\n[End of channel history]"
+    return await context_gateway.fetch_channel_context(
+        channel,
+        before_message,
+        caller_is_admin=caller_is_admin,
+        bot_user_id=bot_user_id,
+        admin_user_ids=admin_user_ids,
+        context_limit=CHANNEL_CONTEXT_LIMIT,
+        cache_get=_cache_get,
+        cache_set=_cache_set,
+        should_include=_should_include_msg,
+        format_body=_format_msg_body,
+        build_lines=_build_layered_lines,
+        max_context_chars=MAX_CONTEXT_CHARS,
     )
-    _cache_set(cache_key, result)
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -360,29 +338,42 @@ async def fetch_channel_context(
 # Strict scheme + host match. The regex intentionally does NOT match
 # `https://discord.com@evil/channels/...` because `urlparse` will see the
 # host as `evil`, and we verify the parsed host below before dereferencing.
-_ALLOWED_DISCORD_HOSTS = frozenset({
-    "discord.com",
-    "discordapp.com",
-    "ptb.discord.com",
-    "canary.discord.com",
-})
+_ALLOWED_DISCORD_HOSTS = frozenset(
+    {
+        "discord.com",
+        "discordapp.com",
+        "ptb.discord.com",
+        "canary.discord.com",
+    }
+)
 # Text content types to download inline when resolving message links.
-_INLINE_TEXT_TYPES = frozenset({
-    "text/plain", "text/csv", "text/markdown", "text/html", "text/xml",
-    "application/json", "application/xml", "application/javascript",
-})
+_INLINE_TEXT_TYPES = frozenset(
+    {
+        "text/plain",
+        "text/csv",
+        "text/markdown",
+        "text/html",
+        "text/xml",
+        "application/json",
+        "application/xml",
+        "application/javascript",
+    }
+)
 _MAX_LINK_TEXT_BYTES = 100 * 1024  # 100KB cap
 
 DISCORD_MSG_URL_RE = re.compile(
-    r"https?://[\w.@:]*?discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)"
+    r"https?://[\w.@:]*?discord(?:app)?\.com/channels/"
+    r"(@me|\d+)/(\d+)/(\d+)(?![A-Za-z0-9_/%-])"
 )
 
 
-def _parse_and_verify_url(raw_url: str) -> tuple[int, int, int] | None:
-    """Parse a Discord message URL and return (guild_id, channel_id, message_id).
+def _parse_and_verify_url(raw_url: str) -> tuple[int | str, int, int] | None:
+    """Return ``(guild_scope, channel_id, message_id)`` for a Discord URL.
 
     Returns None if the URL is malformed, the host is not an allow-listed
     Discord host, or the path doesn't look like /channels/<id>/<id>/<id>.
+    ``guild_scope`` is an integer guild ID or the literal ``"@me"`` for a
+    direct-message link.
     This guards against `https://discord.com@evil.com/channels/...` style
     userinfo-spoofing attacks.
     """
@@ -396,10 +387,13 @@ def _parse_and_verify_url(raw_url: str) -> tuple[int, int, int] | None:
     if host not in _ALLOWED_DISCORD_HOSTS:
         return None
     parts = parsed.path.strip("/").split("/")
-    if len(parts) < 4 or parts[0] != "channels":
+    if len(parts) != 4 or parts[0] != "channels":
         return None
     try:
-        return int(parts[1]), int(parts[2]), int(parts[3])
+        guild_scope: int | str = (
+            "@me" if parts[1] == "@me" else int(parts[1])
+        )
+        return guild_scope, int(parts[2]), int(parts[3])
     except ValueError:
         return None
 
@@ -416,7 +410,9 @@ def _requester_can_read(channel: discord.abc.Messageable, requester) -> bool:
         # DM / group DM: only allow if requester is the channel's recipient.
         # discord.DMChannel has `.recipient`, GroupChannel has `.recipients`.
         recipient = getattr(channel, "recipient", None)
-        recipients = getattr(channel, "recipients", None) or ([] if recipient is None else [recipient])
+        recipients = getattr(channel, "recipients", None) or (
+            [] if recipient is None else [recipient]
+        )
         return any(getattr(r, "id", None) == requester.id for r in recipients)
     member = guild.get_member(requester.id)
     if member is None:
@@ -441,30 +437,57 @@ async def _resolve_one_link(
     verified = _parse_and_verify_url(match.group(0))
     if verified is None:
         return match, None
-    guild_id, channel_id, message_id = verified
+    guild_scope, channel_id, message_id = verified
     try:
-        channel = discord_client.get_channel(channel_id) or await discord_client.fetch_channel(channel_id)
+        channel = discord_client.get_channel(
+            channel_id
+        ) or await discord_client.fetch_channel(channel_id)
         if channel is None:
             return match, None
-        # Guild-id sanity check: the URL's guild must match the fetched channel's guild.
+        # Scope sanity check: @me links must resolve to a private channel, and
+        # numeric guild links must not cross into a different guild.
         channel_guild = getattr(channel, "guild", None)
-        if channel_guild is not None and channel_guild.id != guild_id:
+        if guild_scope == "@me" and channel_guild is not None:
             log.warning(
-                "Message link guild mismatch: url=%d fetched=%d", guild_id, channel_guild.id,
+                "Message link scope mismatch: url=@me fetched guild=%s",
+                channel_guild.id,
             )
             return match, None
-        # Authorization: the requester must be able to read the target channel.
-        # Admin users bypass this check — they have full access by definition.
-        if not caller_is_admin and requester is not None and not _requester_can_read(channel, requester):
+        if guild_scope != "@me" and (
+            channel_guild is None or channel_guild.id != guild_scope
+        ):
+            log.warning(
+                "Message link guild mismatch: url=%s fetched=%s",
+                guild_scope,
+                getattr(channel_guild, "id", None),
+            )
+            return match, None
+        # Authorization: DM membership is always enforced, including for an
+        # administrator. An admin may manage every guild channel visible to
+        # the bot, but that must not expose the bot's DM with another user.
+        # Guild links retain the existing admin bypass. Public bot call sites
+        # always supply the author as requester; missing DM provenance fails
+        # closed.
+        reject_for_permissions = False
+        if guild_scope == "@me":
+            reject_for_permissions = requester is None or not _requester_can_read(
+                channel, requester
+            )
+        elif not caller_is_admin and requester is not None:
+            reject_for_permissions = not _requester_can_read(channel, requester)
+        if reject_for_permissions:
             log.warning(
                 "Rejecting message-link resolution: user=%s lacks read access to channel=%s",
-                getattr(requester, "id", "?"), channel_id,
+                getattr(requester, "id", "?"),
+                channel_id,
             )
             return match, None
 
         msg = await channel.fetch_message(message_id)
 
-        parts: list[str] = [f"[Referenced message by {msg.author.display_name} in #{getattr(channel, 'name', channel_id)}]"]
+        parts: list[str] = [
+            f"[Referenced message by {msg.author.display_name} in #{getattr(channel, 'name', channel_id)}]"
+        ]
         if msg.content:
             parts.append(msg.content)
         for embed in msg.embeds:
@@ -474,7 +497,10 @@ async def _resolve_one_link(
         # Download text attachments inline (e.g. message.txt from long Discord messages)
         for attachment in msg.attachments:
             content_type = (attachment.content_type or "").split(";")[0].strip().lower()
-            if content_type in _INLINE_TEXT_TYPES and (attachment.size or 0) <= _MAX_LINK_TEXT_BYTES:
+            if (
+                content_type in _INLINE_TEXT_TYPES
+                and (attachment.size or 0) <= _MAX_LINK_TEXT_BYTES
+            ):
                 # SSRF guard mirrored from utils/attachments._host_is_allowed.
                 # Discord occasionally serves attachments from unexpected
                 # hosts (or a crafted message-link target could be spoofed
@@ -484,7 +510,10 @@ async def _resolve_one_link(
                 allowed = False
                 try:
                     parsed = urlparse(attachment_url)
-                    if parsed.scheme == "https" and (parsed.hostname or "").lower() in ALLOWED_ATTACHMENT_HOSTS:
+                    if (
+                        parsed.scheme == "https"
+                        and (parsed.hostname or "").lower() in ALLOWED_ATTACHMENT_HOSTS
+                    ):
                         allowed = True
                 except ValueError:
                     allowed = False
@@ -506,12 +535,16 @@ async def _resolve_one_link(
                                     if cl is not None:
                                         try:
                                             if int(cl) > _MAX_LINK_TEXT_BYTES:
-                                                parts.append(f"[Attachment: {attachment.filename}]")
+                                                parts.append(
+                                                    f"[Attachment: {attachment.filename}]"
+                                                )
                                                 continue
                                         except ValueError:
                                             pass
                                     data = b""
-                                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                                    async for chunk in resp.content.iter_chunked(
+                                        64 * 1024
+                                    ):
                                         data += chunk
                                         if len(data) > _MAX_LINK_TEXT_BYTES:
                                             data = b""
@@ -521,12 +554,15 @@ async def _resolve_one_link(
                                             text = data.decode("utf-8")
                                         except UnicodeDecodeError:
                                             text = data.decode("latin-1")
-                                        parts.append(f"[Attachment: {attachment.filename}]\n{text}")
+                                        parts.append(
+                                            f"[Attachment: {attachment.filename}]\n{text}"
+                                        )
                                         continue
                     except Exception as e:
                         log.warning(
                             "Failed to download linked attachment %s: %s",
-                            attachment.filename, e,
+                            attachment.filename,
+                            e,
                         )
             parts.append(f"[Attachment: {attachment.filename}]")
 
@@ -541,7 +577,9 @@ async def _resolve_one_link(
                     before=msg,
                     oldest_first=False,
                 ):
-                    if requester is not None and not _requester_can_read(channel, requester):
+                    if requester is not None and not _requester_can_read(
+                        channel, requester
+                    ):
                         continue
                     body = _format_msg_body(m)
                     if body:
@@ -554,13 +592,19 @@ async def _resolve_one_link(
                     after=msg,
                     oldest_first=True,
                 ):
-                    if requester is not None and not _requester_can_read(channel, requester):
+                    if requester is not None and not _requester_can_read(
+                        channel, requester
+                    ):
                         continue
                     body = _format_msg_body(m)
                     if body:
                         after_msgs.append((m.author.display_name, body))
 
-                all_ctx = before_msgs + [(msg.author.display_name, _format_msg_body(msg))] + after_msgs
+                all_ctx = (
+                    before_msgs
+                    + [(msg.author.display_name, _format_msg_body(msg))]
+                    + after_msgs
+                )
                 ctx_lines, _ = _build_layered_lines(all_ctx, oldest_first=True)
                 if ctx_lines:
                     parts.append(
@@ -569,12 +613,37 @@ async def _resolve_one_link(
                         + "\n".join(ctx_lines)
                         + "\n[End of cross-thread context]"
                     )
-                log.info("Cross-thread context fetched: thread=%s msgs=%d", channel.name, len(all_ctx))
+                log.info(
+                    "Cross-thread context fetched: thread=%s msgs=%d",
+                    channel.name,
+                    len(all_ctx),
+                )
             except Exception as e:
-                log.warning("Failed to fetch cross-thread context for %s: %s", channel_id, e)
+                log.warning(
+                    "Failed to fetch cross-thread context for %s: %s", channel_id, e
+                )
 
-        log.info("Resolved message link: guild=%s ch=%s msg=%s", guild_id, channel_id, message_id)
+        log.info(
+            "Resolved message link: guild=%s ch=%s msg=%s",
+            guild_scope,
+            channel_id,
+            message_id,
+        )
         return match, "\n".join(parts)
+    except discord.NotFound as e:
+        log.info("Message link target not found %s: %s", match.group(0), e)
+        return match, None
+    except discord.Forbidden as e:
+        log.warning("Message link target forbidden %s: %s", match.group(0), e)
+        return match, None
+    except (discord.HTTPException, discord.InvalidData) as e:
+        log.warning(
+            "Message link API failure %s (%s): %s",
+            match.group(0),
+            type(e).__name__,
+            e,
+        )
+        return match, None
     except Exception as e:
         log.warning("Failed to resolve message link %s: %s", match.group(0), e)
         return match, None
@@ -593,20 +662,18 @@ async def resolve_message_links(
     each target channel is checked for that user's read permission before
     dereferencing (prevents confused-deputy leaks).
     """
-    import asyncio
     matches = list(DISCORD_MSG_URL_RE.finditer(text))
     if not matches:
         return text
-
-    matches = matches[:MAX_RESOLVED_LINKS]
-    results = await asyncio.gather(*[
-        _resolve_one_link(discord_client, m, requester, caller_is_admin=caller_is_admin)
-        for m in matches
-    ])
-    for match, replacement in reversed(results):
-        if replacement is not None:
-            text = text[:match.start()] + replacement + text[match.end():]
-    return text
+    return await context_gateway.resolve_message_links(
+        discord_client,
+        text,
+        requester=requester,
+        caller_is_admin=caller_is_admin,
+        matches=matches,
+        max_links=MAX_RESOLVED_LINKS,
+        resolve_one=_resolve_one_link,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -622,14 +689,14 @@ async def resolve_channel_mention_contexts(
     current_channel_id: int,
     requester=None,
     caller_is_admin: bool = False,
+    bot_user_id: int | None = None,
+    admin_user_ids: Collection[int] = ADMIN_USER_IDS,
 ) -> str:
     """Detect <#channel_id> mentions that point to threads and fetch their context.
 
     Returns a formatted string of cross-thread contexts (empty string if none).
     Skips the current channel/thread to avoid duplication.
     """
-    import asyncio
-
     mentions = _CHANNEL_MENTION_RE.findall(text)
     if not mentions:
         return ""
@@ -648,52 +715,20 @@ async def resolve_channel_mention_contexts(
     if not channel_ids:
         return ""
 
-    async def _fetch_one(cid: int) -> str | None:
-        try:
-            channel = discord_client.get_channel(cid) or await discord_client.fetch_channel(cid)
-            if channel is None:
-                return None
-            if not isinstance(channel, discord.Thread):
-                return None
-            # Permission check
-            if requester is not None and not _requester_can_read(channel, requester):
-                log.warning(
-                    "Rejecting channel-mention context: user=%s lacks access to thread=%s",
-                    getattr(requester, "id", "?"), cid,
-                )
-                return None
-
-            collected: list[tuple[str, str]] = []
-            async for msg in channel.history(
-                limit=CROSS_THREAD_CONTEXT_MESSAGES * 2,
-                oldest_first=False,
-            ):
-                if not _should_include_msg(msg, caller_is_admin):
-                    continue
-                body = _format_msg_body(msg)
-                if body:
-                    collected.append((msg.author.display_name, body))
-            if not collected:
-                return None
-
-            collected.reverse()  # chronological
-            lines, _ = _build_layered_lines(collected, oldest_first=True)
-            result = (
-                f"[Cross-thread context: #{channel.name} ({len(collected)} recent messages)]\n"
-                + "\n".join(lines)
-                + "\n[End of cross-thread context]"
-            )
-            if len(result) > MAX_CROSS_THREAD_CHARS:
-                result = result[:MAX_CROSS_THREAD_CHARS] + "\n[...truncated...]"
-            log.info("Channel-mention context fetched: thread=%s msgs=%d", channel.name, len(collected))
-            return result
-        except Exception as e:
-            log.warning("Failed to fetch channel-mention context for %s: %s", cid, e)
-            return None
-
-    results = await asyncio.gather(*[_fetch_one(cid) for cid in channel_ids])
-    contexts = [r for r in results if r]
-    return "\n\n".join(contexts)
+    return await context_gateway.resolve_channel_mention_contexts(
+        discord_client,
+        channel_ids,
+        requester=requester,
+        caller_is_admin=caller_is_admin,
+        bot_user_id=bot_user_id,
+        admin_user_ids=admin_user_ids,
+        context_messages=CROSS_THREAD_CONTEXT_MESSAGES,
+        max_chars=MAX_CROSS_THREAD_CHARS,
+        requester_can_read=_requester_can_read,
+        should_include=_should_include_msg,
+        format_body=_format_msg_body,
+        build_lines=_build_layered_lines,
+    )
 
 
 class ReplyChainSender:

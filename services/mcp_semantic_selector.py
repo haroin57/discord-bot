@@ -22,11 +22,9 @@ import logging
 import os
 
 from config import (
-    ADMIN_USER_IDS,
     MCP_SEMANTIC_MIN_SIM,
     MCP_SEMANTIC_TOP_K,
     MCP_SERVERS,
-    NATURE_REMO_ALLOWED_USER_IDS,
     OPENAI_API_KEY,
     STATE_DIR,
 )
@@ -48,6 +46,12 @@ _index_lock = asyncio.Lock()
 _index_ready = False
 # 直近メッセージの埋め込みキャッシュ（連投・リトライ吸収）。
 _query_cache: TTLLRUCache[str, list[float]] = TTLLRUCache(maxsize=256, ttl_s=600.0)
+
+# These capabilities are intentionally keyword-only.  A low-confidence
+# embedding match must not eagerly start a private data/action server on an
+# unrelated admin message.  The keyword selector applies both an explicit
+# domain trigger and the corresponding user permission gate.
+_KEYWORD_ONLY_SERVERS = frozenset({"realestate", "nature-remo"})
 
 _openai_client = None
 
@@ -156,10 +160,8 @@ async def _ensure_index() -> bool:
 
 
 def _server_allowed(key: str, user_id: int | None) -> bool:
-    if key == "realestate":
-        return user_id is not None and user_id in ADMIN_USER_IDS
-    if key == "nature-remo":
-        return user_id is not None and user_id in NATURE_REMO_ALLOWED_USER_IDS
+    if key in _KEYWORD_ONLY_SERVERS:
+        return False
     return True
 
 

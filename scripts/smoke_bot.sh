@@ -8,8 +8,9 @@
 # Exit 0 = safe to restart. Non-zero = investigate first.
 set -euo pipefail
 
-BOT_DIR="/home/ubuntu/discord-bot"
-PY="${BOT_DIR}/.venv/bin/python"
+BOT_DIR="${BOT_DIR:-/home/ubuntu/discord-bot}"
+BOT_VENV="${BOT_VENV:?BOT_VENV must point to the SHA-specific external venv}"
+PY="${BOT_VENV}/bin/python"
 cd "${BOT_DIR}"
 
 echo "[smoke] 1/4 entry-point imports (bot, health_server, main_async, MCP servers)"
@@ -25,10 +26,10 @@ for mod in (
 EOF
 
 echo "[smoke] 2/4 ruff definite-bug tier"
-"${BOT_DIR}/.venv/bin/ruff" check . --quiet && echo "  - ruff OK"
+"${BOT_VENV}/bin/ruff" check . --quiet && echo "  - ruff OK"
 
 echo "[smoke] 3/4 mypy scoped files"
-"${BOT_DIR}/.venv/bin/mypy" --no-error-summary && echo "  - mypy OK"
+"${BOT_VENV}/bin/mypy" --no-error-summary && echo "  - mypy OK"
 
 echo "[smoke] 4/4 fast test subset (session/state/config surface)"
 "${PY}" -m pytest -q -x \

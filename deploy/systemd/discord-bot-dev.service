@@ -1,0 +1,66 @@
+[Unit]
+Description=Kanae Discord Bot Staging
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=kanae-bot-dev
+Group=kanae-bot-dev
+SupplementaryGroups=kanae-code
+WorkingDirectory=/var/lib/discord-bot-releases/dev/current/src
+EnvironmentFile=/etc/discord-bot/credentials/discord-bot-dev.env
+Environment=HOME=/var/lib/kanae-bot-dev
+Environment=BOT_STATE_DIR=/var/lib/kanae-bot-dev/state
+Environment=TMPDIR=/var/cache/kanae-bot-dev
+Environment=WRANGLER_CACHE_DIR=/var/cache/kanae-bot-dev/wrangler
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CODEX_BIN=/home/ubuntu/.volta/tools/image/packages/@openai/codex/bin/codex
+Environment=CODEX_APP_SERVER_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=R2_ARCHIVE_WRANGLER_BIN=/home/ubuntu/.volta/tools/image/packages/wrangler/lib/node_modules/wrangler/bin/wrangler.js
+Environment=PYTHON_DOTENV_DISABLED=1
+Environment=WEB_API_HOST=127.0.0.1
+Environment=WEB_API_PORT=3003
+Environment=OAUTH_PRIMARY_CREDENTIALS_PATH=/var/lib/kanae-bot-dev/.claude/.credentials.json
+Environment=OAUTH_FAILOVER_CREDENTIALS_PATH=/var/lib/kanae-bot-dev/.claude/.credentials-failover.json
+Environment=OAUTH_FAILOVER_ENABLED=true
+Environment=BOT_RELEASE_ROOT=/var/lib/discord-bot-releases/dev
+Environment=BOT_RELEASE_METADATA_PATH=/var/lib/discord-bot-releases/dev/current/release.json
+Environment=BOT_RELEASE_METADATA_OWNER=root
+StateDirectory=kanae-bot-dev kanae-bot-dev/state
+StateDirectoryMode=0700
+CacheDirectory=kanae-bot-dev
+CacheDirectoryMode=0700
+ExecStart=/var/lib/discord-bot-releases/dev/current/venv/bin/python /var/lib/discord-bot-releases/dev/current/src/main_async.py
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=1980s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=discord-bot-dev
+UMask=0007
+
+NoNewPrivileges=yes
+PrivateTmp=no
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/kanae-bot-dev /var/cache/kanae-bot-dev /tmp/discord_bot_attachments /tmp/mermaid_output /tmp/table_renders /tmp/math_renders
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictRealtime=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+MemoryMax=900M
+MemoryHigh=700M
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

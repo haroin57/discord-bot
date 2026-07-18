@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import AsyncExitStack
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,7 +24,8 @@ def _fake_tool(name: str, schema: dict | None = None):
     return SimpleNamespace(
         name=name,
         description=f"description of {name}",
-        inputSchema=schema or {"type": "object", "properties": {"q": {"type": "string"}}},
+        inputSchema=schema
+        or {"type": "object", "properties": {"q": {"type": "string"}}},
     )
 
 
@@ -33,7 +35,8 @@ class TestMcpToolsToAnthropic:
 
     def test_qualified_name_format(self):
         handle = McpServerHandle(
-            key="brave-search", session=MagicMock(),
+            key="brave-search",
+            session=MagicMock(),
             tools=[_fake_tool("brave_web_search")],
         )
         out = mcp_tools_to_anthropic({"brave-search": handle})
@@ -48,6 +51,7 @@ class TestMcpToolsToAnthropic:
         needs review (Plan risk #3).
         """
         from mcp import Tool
+
         assert "name" in Tool.model_fields
         assert "description" in Tool.model_fields
         assert "inputSchema" in Tool.model_fields
@@ -192,7 +196,9 @@ class TestSpawnServers:
             return McpServerHandle(key=name, session=MagicMock(), tools=[])
 
         async with AsyncExitStack() as stack:
-            with patch("services.claude_api.mcp_client._spawn_one", side_effect=_maybe_fail):
+            with patch(
+                "services.claude_api.mcp_client._spawn_one", side_effect=_maybe_fail
+            ):
                 handles = await spawn_servers(
                     {"bad": {"command": "false"}, "good": {"command": "true"}},
                     stack,
@@ -203,49 +209,24 @@ class TestSpawnServers:
 
 
 class TestKillOrphanMcpProcesses:
-    def test_returns_zero_when_no_psutil(self, monkeypatch):
-        monkeypatch.setattr("services.claude_api.mcp_client.psutil", None)
+    def test_compatibility_entrypoint_never_discovers_or_signals_processes(self):
         assert kill_orphan_mcp_processes() == 0
 
-    def test_terminates_mcp_cmdline_match(self, monkeypatch):
-        mcp = pytest.importorskip("psutil")  # noqa: F841
-        child = MagicMock()
-        child.cmdline.return_value = ["node", "@playwright/mcp", "--port"]
-        child.terminate = MagicMock()
-        child.kill = MagicMock()
-
-        me = MagicMock()
-        me.children.return_value = [child]
-
-        fake_psutil = MagicMock()
-        fake_psutil.Process.return_value = me
-        fake_psutil.NoSuchProcess = Exception
-        fake_psutil.AccessDenied = Exception
-        fake_psutil.wait_procs.return_value = ([child], [])
-        monkeypatch.setattr("services.claude_api.mcp_client.psutil", fake_psutil)
-
-        assert kill_orphan_mcp_processes() == 1
-        child.terminate.assert_called_once()
-
-    def test_ignores_non_mcp_children(self, monkeypatch):
-        child = MagicMock()
-        child.cmdline.return_value = ["python", "unrelated.py"]
-        me = MagicMock()
-        me.children.return_value = [child]
-        fake_psutil = MagicMock()
-        fake_psutil.Process.return_value = me
-        fake_psutil.NoSuchProcess = Exception
-        fake_psutil.AccessDenied = Exception
-        monkeypatch.setattr("services.claude_api.mcp_client.psutil", fake_psutil)
-        assert kill_orphan_mcp_processes() == 0
+        source = Path(mcp_client_mod.__file__).read_text(encoding="utf-8")
+        assert "process_iter" not in source
+        assert "children(recursive" not in source
+        assert ".cmdline(" not in source
+        assert "psutil" not in source
 
 
 def _make_handle(name: str, *, text: str = "ok") -> McpServerHandle:
     """Build a handle whose session.call_tool returns a single text block."""
     session = MagicMock()
-    session.call_tool = AsyncMock(return_value=SimpleNamespace(
-        content=[SimpleNamespace(type="text", text=text)],
-    ))
+    session.call_tool = AsyncMock(
+        return_value=SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=text)],
+        )
+    )
     return McpServerHandle(key=name, session=session, tools=[])
 
 
@@ -264,7 +245,9 @@ class TestMcpPool:
                 stack=stack,
                 available_configs={"mem0": {"command": "/bin/true"}},
             )
-            with patch("services.claude_api.mcp_client._spawn_one", side_effect=fake_spawn):
+            with patch(
+                "services.claude_api.mcp_client._spawn_one", side_effect=fake_spawn
+            ):
                 out = await pool.call_tool("mcp__mem0__search", {"q": "x"})
         assert out == "hi"
         assert spawn_calls == ["mem0"]
@@ -284,7 +267,9 @@ class TestMcpPool:
                 stack=stack,
                 available_configs={"mem0": {"command": "/bin/true"}},
             )
-            with patch("services.claude_api.mcp_client._spawn_one", side_effect=fake_spawn):
+            with patch(
+                "services.claude_api.mcp_client._spawn_one", side_effect=fake_spawn
+            ):
                 await pool.call_tool("mcp__mem0__search", {})
                 await pool.call_tool("mcp__mem0__add", {})
         assert spawn_calls == ["mem0"]  # only one spawn for two calls
@@ -317,7 +302,9 @@ class TestMcpPool:
                 stack=stack,
                 available_configs={"mem0": {"command": "/bin/true"}},
             )
-            with patch("services.claude_api.mcp_client._spawn_one", side_effect=slow_spawn):
+            with patch(
+                "services.claude_api.mcp_client._spawn_one", side_effect=slow_spawn
+            ):
                 task_a = asyncio.create_task(pool.call_tool("mcp__mem0__search", {}))
                 # Wait until the first spawn is in-flight, then fire the second
                 await spawn_started.wait()
@@ -331,6 +318,7 @@ class TestMcpPool:
     @pytest.mark.asyncio
     async def test_pool_spawn_eager_failure_non_fatal(self):
         """spawn_eager logs and skips broken servers; others still spawn."""
+
         async def maybe_fail(stack, name, cfg):
             if name == "bad":
                 raise RuntimeError("boom")
@@ -344,7 +332,9 @@ class TestMcpPool:
                     "good": {"command": "/bin/true"},
                 },
             )
-            with patch("services.claude_api.mcp_client._spawn_one", side_effect=maybe_fail):
+            with patch(
+                "services.claude_api.mcp_client._spawn_one", side_effect=maybe_fail
+            ):
                 await pool.spawn_eager(["bad", "good"])
         assert "good" in pool.handles
         assert "bad" not in pool.handles
@@ -359,8 +349,9 @@ class TestStaticSchemaMergeGuard:
 
         payload = {
             "broken-server": [],  # dump 失敗の残骸
-            "good-server": [{"name": "mcp__good-server__t",
-                             "description": "d", "input_schema": {}}],
+            "good-server": [
+                {"name": "mcp__good-server__t", "description": "d", "input_schema": {}}
+            ],
             "not-a-list": {"oops": True},
         }
         p = tmp_path / "static.json"

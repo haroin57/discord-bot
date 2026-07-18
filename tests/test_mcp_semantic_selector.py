@@ -78,12 +78,11 @@ class TestSemanticPick:
         assert out == {}
 
     @pytest.mark.asyncio
-    async def test_permission_gate_blocks_realestate(self, monkeypatch):
-        monkeypatch.setattr(sel, "ADMIN_USER_IDS", {42})
+    async def test_sensitive_realestate_server_is_keyword_only(self):
         out = await sel.pick_mcp_servers_semantic("いい物件ない？", user_id=99)
         assert "realestate" not in out
         out_admin = await sel.pick_mcp_servers_semantic("いい物件ない？", user_id=42)
-        assert "realestate" in out_admin
+        assert "realestate" not in out_admin
 
     @pytest.mark.asyncio
     async def test_empty_text_or_no_key(self, monkeypatch):

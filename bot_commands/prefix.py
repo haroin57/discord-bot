@@ -14,6 +14,9 @@ import discord
 log = logging.getLogger(__name__)
 
 _DELETE_KEYWORDS = {"!delete", "削除", "消して", "delete"}
+_PURGE_COUNT_USAGE = (
+    "⚠️ 件数は `!purge <N>`（1〜200）で指定してください。例: `!purge 10`"
+)
 
 
 async def handle_prefix_commands(
@@ -28,21 +31,31 @@ async def handle_prefix_commands(
     prefix command (processed or rejected) and on_message must stop."""
 
     # --- Quick command: delete replied-to message (admin only) ---
-    if bare_text in _DELETE_KEYWORDS and message.reference and message.reference.message_id:
+    if (
+        bare_text in _DELETE_KEYWORDS
+        and message.reference
+        and message.reference.message_id
+    ):
         if not caller_is_admin:
             await message.reply("❌ この操作はadminユーザーのみ使用できます。")
             return True
         try:
             ref_msg = message.reference.cached_message
             if ref_msg is None:
-                ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                ref_msg = await message.channel.fetch_message(
+                    message.reference.message_id
+                )
             await ref_msg.delete()
             # Also delete the command message itself for cleanliness
             try:
                 await message.delete()
             except discord.errors.HTTPException:
                 pass
-            log.info("Deleted message %s (requested by admin %s)", ref_msg.id, message.author.id)
+            log.info(
+                "Deleted message %s (requested by admin %s)",
+                ref_msg.id,
+                message.author.id,
+            )
         except discord.errors.NotFound:
             await message.reply("⚠️ そのメッセージはもう存在しません。")
         except discord.errors.Forbidden:
@@ -63,9 +76,10 @@ async def handle_prefix_commands(
     if bare_text == "!purge-from":
         _purge_mode = "from"
     elif bare_text.startswith("!purge-since "):
-        _purge_mode, _purge_arg = "since", bare_text[len("!purge-since "):].strip()
-    elif bare_text.startswith("!purge ") and bare_text[len("!purge "):].strip().isdigit():
-        _purge_mode, _purge_arg = "count", bare_text[len("!purge "):].strip()
+        _purge_mode, _purge_arg = "since", bare_text[len("!purge-since ") :].strip()
+    elif bare_text == "!purge" or bare_text.startswith("!purge "):
+        _purge_mode = "count"
+        _purge_arg = bare_text[len("!purge") :].strip()
 
     if not _purge_mode:
         return False
@@ -101,9 +115,7 @@ async def handle_prefix_commands(
                 hh, mm = (int(x) for x in _purge_arg.split(":"))
                 jst = timezone(timedelta(hours=9))
                 now_jst = datetime.now(jst)
-                after_dt = now_jst.replace(
-                    hour=hh, minute=mm, second=0, microsecond=0
-                )
+                after_dt = now_jst.replace(hour=hh, minute=mm, second=0, microsecond=0)
                 if after_dt > now_jst:  # time hasn't happened yet today -> yesterday
                     after_dt -= timedelta(days=1)
                 after_dt -= timedelta(seconds=1)  # make the boundary inclusive
@@ -113,7 +125,15 @@ async def handle_prefix_commands(
                 )
                 return True
         else:  # count
-            count_target = min(int(_purge_arg), MAX_PURGE)
+            try:
+                count_target = int(_purge_arg, 10)
+            except (TypeError, ValueError):
+                await message.reply(_PURGE_COUNT_USAGE)
+                return True
+            if count_target <= 0:
+                await message.reply(_PURGE_COUNT_USAGE)
+                return True
+            count_target = min(count_target, MAX_PURGE)
 
         deleted = 0
         if _purge_mode == "count":
@@ -137,13 +157,19 @@ async def handle_prefix_commands(
             _reason = f"purge requested by admin {message.author.id}"
             try:
                 purged = await message.channel.purge(
-                    after=after_dt, limit=MAX_PURGE, check=_is_bot_msg,
-                    bulk=True, reason=_reason,
+                    after=after_dt,
+                    limit=MAX_PURGE,
+                    check=_is_bot_msg,
+                    bulk=True,
+                    reason=_reason,
                 )
             except discord.errors.Forbidden:
                 purged = await message.channel.purge(
-                    after=after_dt, limit=MAX_PURGE, check=_is_bot_msg,
-                    bulk=False, reason=_reason,
+                    after=after_dt,
+                    limit=MAX_PURGE,
+                    check=_is_bot_msg,
+                    bulk=False,
+                    reason=_reason,
                 )
             deleted = len(purged)
         else:
@@ -164,7 +190,9 @@ async def handle_prefix_commands(
             pass
         log.info(
             "Purged %d bot message(s) (mode=%s, admin=%s)",
-            deleted, _purge_mode, message.author.id,
+            deleted,
+            _purge_mode,
+            message.author.id,
         )
         note = await message.channel.send(
             f"🧹 かなえの投稿を **{deleted}件** 削除しました。"

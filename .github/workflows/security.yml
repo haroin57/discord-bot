@@ -1,21 +1,29 @@
 name: security
+
 on:
-  push:
-    branches: [master, main]
+  workflow_call:
+    inputs:
+      candidate_sha:
+        description: Optional candidate SHA supplied by the trusted release controller.
+        required: false
+        type: string
+  workflow_dispatch:
   schedule:
     - cron: '0 6 * * 1'  # weekly Monday 06:00 UTC
+
+permissions:
+  contents: read
 
 jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          python-version-file: '.python-version'
-      - run: pip install pip-audit
-      - run: pip-audit -r requirements.txt --strict || true  # don't fail on known mem0ai CVE
+          ref: ${{ inputs.candidate_sha || github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tests
+      - name: Audit locked Python dependencies
+        run: python -m pip_audit -r requirements.lock --strict
       - name: Bandit static scan
-        run: |
-          pip install bandit
-          bandit -r services/ utils/ bot.py web_api.py main_async.py mcp_mem0_server.py -ll || true
+        run: bandit -r services/ utils/ bot.py web_api.py main_async.py mcp_mem0_server.py -ll

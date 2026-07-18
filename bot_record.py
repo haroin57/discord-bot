@@ -38,6 +38,7 @@ async def record_turn(
     track_task: Callable,
     load_history_channel: Callable,
     is_force_record_request: Callable[[str], bool],
+    request_id: str | None = None,
 ) -> None:
     """Accumulate this admin turn into the Mem0 batch and flush when full.
 
@@ -53,15 +54,17 @@ async def record_turn(
         BATCH_SIZE as _BATCH_SIZE,
     )
 
+    append_kwargs = {"request_id": request_id} if request_id else {}
     _turn_count = await asyncio.to_thread(
-        _batch_append_turn, STATE_DIR, message.channel.id,
-        raw_user_text, response_text,
+        _batch_append_turn,
+        STATE_DIR,
+        message.channel.id,
+        raw_user_text,
+        response_text,
+        **append_kwargs,
     )
 
-    _should_flush = (
-        _turn_count >= _BATCH_SIZE
-        or is_force_record_request(raw_user_text)
-    )
+    _should_flush = _turn_count >= _BATCH_SIZE or is_force_record_request(raw_user_text)
 
     # P1 (2026-05-12): system-message経路は廃止して複数人混入を遮断。
     _ctx_for_mem0 = ""
@@ -69,7 +72,9 @@ async def record_turn(
         _ctx_for_mem0 = conv_context or ""
         if not _ctx_for_mem0:
             try:
-                recent = await asyncio.to_thread(load_history_channel, message.channel.id)
+                recent = await asyncio.to_thread(
+                    load_history_channel, message.channel.id
+                )
                 if recent:
                     _ctx_for_mem0 = "\n".join(
                         f"{m['role']}: {m['content'][:300]}" for m in recent[-10:]
@@ -79,7 +84,9 @@ async def record_turn(
 
     if _should_flush:
         _batch_turns, _ = await asyncio.to_thread(
-            _batch_pop, STATE_DIR, message.channel.id,
+            _batch_pop,
+            STATE_DIR,
+            message.channel.id,
         )
 
         async def _mem0_batch_store():
@@ -88,7 +95,9 @@ async def record_turn(
                 summary_text = _build_batch_summary(_batch_turns)
                 log.info(
                     "Mem0 batch ingest: uid=%s turns=%d chars=%d",
-                    mem0_user_id, len(_batch_turns), len(summary_text),
+                    mem0_user_id,
+                    len(_batch_turns),
+                    len(summary_text),
                 )
                 await add_memories(
                     user_text=summary_text,
@@ -105,12 +114,16 @@ async def record_turn(
             except Exception as exc:
                 log.warning(
                     "Mem0 batch store failed: %s (user=%s, channel=%s)",
-                    exc, mem0_user_id, message.channel.id,
+                    exc,
+                    mem0_user_id,
+                    message.channel.id,
                 )
 
         track_task(_mem0_batch_store(), name="mem0_batch_store")
     else:
         log.debug(
             "Mem0 batch: ch=%s turns=%d/%d (waiting)",
-            message.channel.id, _turn_count, _BATCH_SIZE,
+            message.channel.id,
+            _turn_count,
+            _BATCH_SIZE,
         )

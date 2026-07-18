@@ -26,6 +26,7 @@ import discord
 from discord import app_commands
 
 from bot_commands._deps import CommandDeps
+from bot_commands.state import state_from_deps
 
 log = logging.getLogger(__name__)
 
@@ -39,15 +40,12 @@ _MAX_CHUNKS = 4
 
 
 def _load_commands() -> dict:
-    """Build the {name: PromptCommand} map for the wired subset (lazy import)."""
+    """Build the non-executable metadata map for the wired subset."""
 
-    from free_code_commands.commands.prompt_commands import (
-        commit,
-        review,
-        security_review,
-    )
+    from free_code_commands import build_registry
 
-    return {"commit": commit(), "review": review(), "security-review": security_review()}
+    registry = build_registry()
+    return {name: registry.get(name) for name in _WIRED_COMMANDS}
 
 
 def _chunk(text: str, limit: int = _CHUNK_LIMIT) -> list[str]:
@@ -82,7 +80,9 @@ def _chunk(text: str, limit: int = _CHUNK_LIMIT) -> list[str]:
     return out or [text[:limit]]
 
 
-async def _run(interaction: discord.Interaction, deps: CommandDeps, command, args: str) -> None:
+async def _run(
+    interaction: discord.Interaction, deps: CommandDeps, command, args: str
+) -> None:
     """Execute one free-code prompt command as a tool-enabled channel turn."""
 
     if not deps.is_admin(interaction.user):
@@ -90,7 +90,9 @@ async def _run(interaction: discord.Interaction, deps: CommandDeps, command, arg
         return
     channel_id = interaction.channel_id
     if channel_id is None:
-        await interaction.response.send_message("チャンネル外では使えません", ephemeral=True)
+        await interaction.response.send_message(
+            "チャンネル外では使えません", ephemeral=True
+        )
         return
 
     # Public defer: the command runs in the main conversation (free-code parity),
@@ -101,29 +103,57 @@ async def _run(interaction: discord.Interaction, deps: CommandDeps, command, arg
 
     # Steps 1-4: expand + tags + allowedTools via the bridge (the shared algorithm).
     try:
-        from services.free_code_bridge import BotCommandRuntime, build_prompt_command_turn
+        from services.free_code_bridge import (
+            BotCommandRuntime,
+            build_prompt_command_turn,
+        )
 
-        prepared = await build_prompt_command_turn(command, args, BotCommandRuntime())
+        from free_code_commands import build_registry
+
+        runtime = BotCommandRuntime()
+
+        async def _prepare(resolved, expanded_blocks):
+            return await build_prompt_command_turn(
+                resolved,
+                args,
+                expanded_blocks,
+            )
+
+        text = f"/{command.name} {args}".rstrip()
+        invocation = await build_registry().invoke(
+            text,
+            runtime,
+            executor=_prepare,
+        )
+        if invocation is None:
+            await interaction.followup.send(
+                f"`/{command.name}` は現在の実行環境では利用できません。"
+            )
+            return
+        prepared = invocation.result
     except Exception as exc:
         log.exception("/%s prompt build failed", command.name)
-        await interaction.followup.send(f"`/{command.name}` のプロンプト構築に失敗しました: {exc}")
+        await interaction.followup.send(
+            f"`/{command.name}` のプロンプト構築に失敗しました: {exc}"
+        )
         return
 
     # Step 5: run the model with tools, on the channel session, serialised by the
     # per-channel semaphore (same gate on_message uses).
     author = getattr(interaction.user, "display_name", None) or interaction.user.name
     key = (channel_id, interaction.user.id)
-    model = deps.model_overrides.get(key)
-    effort = deps.effort_overrides.get(key)
+    state = state_from_deps(deps)
+    model = state.model(key)
+    effort = state.effort(key)
     active_skill_prompt = ""
-    skill_selection = getattr(deps, "skill_overrides", {}).get(key)
+    skill_selection = state.skill(key)
     if skill_selection is not None:
         from services.skills import SkillError, render_active_skill_prompt
 
         try:
             active_skill_prompt = render_active_skill_prompt(skill_selection)
         except SkillError as exc:
-            getattr(deps, "skill_overrides", {}).pop(key, None)
+            state.clear_skill(key)
             log.warning("active skill cleared for /%s: %s", command.name, exc)
 
     try:
@@ -131,9 +161,8 @@ async def _run(interaction: discord.Interaction, deps: CommandDeps, command, arg
         from services.session import shared_sessions
 
         sessions = shared_sessions()
-        provider_overrides = getattr(deps, "provider_overrides", {})
         provider = resolve_provider(
-            explicit=provider_overrides.get(key),
+            explicit=state.provider(key),
             model=model,
             restricted=False,
         )
@@ -161,7 +190,9 @@ async def _run(interaction: discord.Interaction, deps: CommandDeps, command, arg
             response_text, _session, _resumed = await _invoke()
     except Exception as exc:
         log.exception("/%s tool turn failed for ch=%s", command.name, channel_id)
-        await interaction.followup.send(f"`/{command.name}` の実行に失敗しました: {exc}")
+        await interaction.followup.send(
+            f"`/{command.name}` の実行に失敗しました: {exc}"
+        )
         return
 
     text = (response_text or "").strip() or "（応答が空でした）"

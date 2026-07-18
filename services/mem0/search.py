@@ -13,7 +13,11 @@ from services.mem0.client import (
     _get_mem0,
     _refresh_mem0_client_token,
 )
-from services.oauth_manager import ensure_valid_token, get_access_token, init as oauth_init
+from services.oauth_manager import (
+    ensure_valid_token,
+    get_access_token,
+    init as oauth_init,
+)
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +40,11 @@ def should_use_memory_llm_mode(query: str, *, enabled: bool = True) -> bool:
 
 
 def _is_fact_valid(
-    r: dict, current_channel_id=None, *, check_scope: bool = True,
+    r: dict,
+    current_channel_id=None,
+    *,
+    expected_user_id: str | None = None,
+    check_scope: bool = True,
 ) -> bool:
     """Phase B-2: hide facts that the conflict-detection layer
     soft-archived (valid_to <= now). The flag MEM0_HIDE_ARCHIVED is the
@@ -51,6 +59,18 @@ def _is_fact_valid(
     channel 付きで行う（内側でやるとチャンネル間でキャッシュ汚染する）。
     """
     md = r.get("metadata") or {}
+    fact_id = r.get("id") or r.get("memory_id")
+    if fact_id:
+        from services.mem0.integrity import canonical_fact_visible
+
+        if not canonical_fact_visible(
+            str(fact_id),
+            str(expected_user_id or ""),
+            current_channel_id=(
+                str(current_channel_id) if current_channel_id is not None else None
+            ),
+        ):
+            return False
     # Phase C/R: scope フィルタ（conversation 限定 fact の誤注入防止）
     try:
         from config import MEM0_SCOPE_FILTER_ENABLED
@@ -59,10 +79,7 @@ def _is_fact_valid(
     if MEM0_SCOPE_FILTER_ENABLED and check_scope:
         scope = md.get("scope") or "global"
         if scope.startswith("conversation"):
-            want = (
-                f"conversation:{current_channel_id}"
-                if current_channel_id else ""
-            )
+            want = f"conversation:{current_channel_id}" if current_channel_id else ""
             if scope != want:
                 return False
     # Phase B-2: valid_to soft-archive
@@ -82,8 +99,11 @@ def _is_fact_valid(
 
 
 async def search_memories(
-    query: str, user_id: str, limit: int = 8,
-    *, apply_distance_filter: bool = True,
+    query: str,
+    user_id: str,
+    limit: int = 8,
+    *,
+    apply_distance_filter: bool = True,
     current_channel_id: str | None = None,
 ) -> list[dict]:
     """Semantic search for relevant memories with relevance filtering.
@@ -105,21 +125,36 @@ async def search_memories(
         await ensure_valid_token()
         _refresh_mem0_client_token()
         t0 = time.perf_counter()
-        raw = await asyncio.to_thread(mem.search, query=query, user_id=user_id, limit=limit)
+        raw = await asyncio.to_thread(
+            mem.search, query=query, user_id=user_id, limit=limit
+        )
         latency_ms = (time.perf_counter() - t0) * 1000.0
-        results = raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+        results = (
+            raw.get("results", [])
+            if isinstance(raw, dict)
+            else (raw if isinstance(raw, list) else [])
+        )
         log.info(
             "mem0_search_latency_ms=%.1f query=%r user_id=%s limit=%d hits=%d",
-            latency_ms, (query or "")[:80], user_id, limit, len(results),
+            latency_ms,
+            (query or "")[:80],
+            user_id,
+            limit,
+            len(results),
         )
         filtered = [
-            r for r in results
+            r
+            for r in results
             if (
                 not apply_distance_filter
                 or r.get("score") is None
                 or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
             )
-            and _is_fact_valid(r, current_channel_id)
+            and _is_fact_valid(
+                r,
+                current_channel_id,
+                expected_user_id=str(user_id),
+            )
         ]
         return filtered
     except Exception as exc:
@@ -128,15 +163,21 @@ async def search_memories(
 
 
 async def search_memories_multi(
-    queries: list[str], user_id: str, limit: int = 8,
-    *, current_channel_id: str | None = None,
+    queries: list[str],
+    user_id: str,
+    limit: int = 8,
+    *,
+    current_channel_id: str | None = None,
 ) -> list[dict]:
     """Search with multiple queries and merge deduplicated results."""
     if not queries:
         return []
     tasks = [
         search_memories(
-            q, user_id, limit=limit, current_channel_id=current_channel_id,
+            q,
+            user_id,
+            limit=limit,
+            current_channel_id=current_channel_id,
         )
         for q in queries
     ]
@@ -163,8 +204,11 @@ async def search_memories_multi(
 # BM25 hybrid retrieval (Phase A-1 of mem0-recall-hybrid-hyde-kg)
 # ---------------------------------------------------------------------------
 async def search_memories_hybrid(
-    query: str, user_id: str, limit: int = 8,
-    *, apply_distance_filter: bool = True,
+    query: str,
+    user_id: str,
+    limit: int = 8,
+    *,
+    apply_distance_filter: bool = True,
     current_channel_id: str | None = None,
 ) -> list[dict]:
     """Run vector search and BM25 in parallel, fuse via Reciprocal Rank Fusion.
@@ -183,22 +227,33 @@ async def search_memories_hybrid(
         MEM0_HYBRID_ENABLED, MEM0_BM25_RRF_K, MEM0_BM25_LIMIT = True, 60, 20
     if not MEM0_HYBRID_ENABLED:
         return await search_memories(
-            query, user_id, limit=limit,
+            query,
+            user_id,
+            limit=limit,
             apply_distance_filter=apply_distance_filter,
             current_channel_id=current_channel_id,
         )
 
     from services.mem0 import bm25_index
+
     vector_task = search_memories(
-        query, user_id, limit=limit,
+        query,
+        user_id,
+        limit=limit,
         apply_distance_filter=apply_distance_filter,
         current_channel_id=current_channel_id,
     )
     bm25_task = asyncio.to_thread(
-        bm25_index.search_bm25, query, user_id, MEM0_BM25_LIMIT,
+        bm25_index.search_bm25,
+        query,
+        user_id,
+        MEM0_BM25_LIMIT,
+        current_channel_id=current_channel_id,
     )
     vector_hits, bm25_hits = await asyncio.gather(
-        vector_task, bm25_task, return_exceptions=True,
+        vector_task,
+        bm25_task,
+        return_exceptions=True,
     )
     if isinstance(vector_hits, Exception):
         log.warning("hybrid: vector search failed: %s", vector_hits)
@@ -206,20 +261,43 @@ async def search_memories_hybrid(
     if isinstance(bm25_hits, Exception):
         log.warning("hybrid: bm25 search failed: %s", bm25_hits)
         bm25_hits = []
+    elif os.environ.get("MEM0_INTEGRITY_MODE", "legacy").lower() != "legacy":
+        from services.mem0.integrity import get_repository
+
+        repository = get_repository()
+        bm25_hits = [
+            hit
+            for hit in bm25_hits
+            if repository.get_fact(str(hit.get("id") or "")) is not None
+            and _is_fact_valid(
+                hit,
+                current_channel_id,
+                expected_user_id=str(user_id),
+            )
+        ]
     fused = bm25_index.rrf_merge(
-        vector_hits, bm25_hits, k=MEM0_BM25_RRF_K, limit=limit,
+        vector_hits,
+        bm25_hits,
+        k=MEM0_BM25_RRF_K,
+        limit=limit,
     )
     if bm25_hits:
         log.info(
             "hybrid: q=%r vector=%d bm25=%d fused=%d",
-            (query or "")[:60], len(vector_hits), len(bm25_hits), len(fused),
+            (query or "")[:60],
+            len(vector_hits),
+            len(bm25_hits),
+            len(fused),
         )
     return fused
 
 
 async def _search_multi_hybrid(
-    queries: list[str], user_id: str, limit: int = 8,
-    *, apply_distance_filter: bool = True,
+    queries: list[str],
+    user_id: str,
+    limit: int = 8,
+    *,
+    apply_distance_filter: bool = True,
     current_channel_id: str | None = None,
 ) -> list[dict]:
     """Multi-query merge that uses ``search_memories_hybrid`` per query.
@@ -233,7 +311,9 @@ async def _search_multi_hybrid(
         return []
     tasks = [
         search_memories_hybrid(
-            q, user_id, limit=limit,
+            q,
+            user_id,
+            limit=limit,
             apply_distance_filter=apply_distance_filter,
             current_channel_id=current_channel_id,
         )
@@ -333,11 +413,13 @@ async def _extract_keywords_via_llm(query: str) -> str:
         return ""
     try:
         from services.mem0.client import get_anthropic_client
+
         client = await get_anthropic_client()
         if client is None:
             return ""
         safe_query = q[:500].replace("{", "{{").replace("}", "}}")
         from services.mem0.cli_compat import cli_messages_create, extract_text
+
         resp = await cli_messages_create(
             client,
             model=os.environ.get("MEM0_KEYWORD_MODEL", "claude-haiku-4-5-20251001"),
@@ -350,6 +432,7 @@ async def _extract_keywords_via_llm(query: str) -> str:
         )
         text = strip_json_fence(extract_text(resp))
         import json as _json
+
         data = _json.loads(text)
         kws = [str(k).strip() for k in data.get("keywords", []) if str(k).strip()]
         aliases = [str(a).strip() for a in data.get("aliases", []) if str(a).strip()]
@@ -382,17 +465,20 @@ async def _generate_hypothetical_fact(query: str) -> str:
         return ""
     try:
         from config import MEM0_HYDE_ENABLED
+
         if not MEM0_HYDE_ENABLED:
             return ""
     except Exception:
         pass
     try:
         from services.mem0.client import get_anthropic_client
+
         client = await get_anthropic_client()
         if client is None:
             return ""
         safe_query = q[:500].replace("{", "{{").replace("}", "}}")
         from services.mem0.cli_compat import cli_messages_create, extract_text
+
         resp = await cli_messages_create(
             client,
             model=os.environ.get("MEM0_HYDE_MODEL", "claude-haiku-4-5-20251001"),
@@ -405,6 +491,7 @@ async def _generate_hypothetical_fact(query: str) -> str:
         )
         text = strip_json_fence(extract_text(resp))
         import json as _json
+
         out = _json.loads(text).get("hypothetical", "")
         if isinstance(out, str):
             return out.strip()
@@ -418,12 +505,14 @@ async def _rewrite_query(query: str) -> list[str]:
     """Expand a user query into canonical-keyword variants via Haiku."""
     try:
         from services.mem0.client import get_anthropic_client
+
         client = await get_anthropic_client()
         if client is None:
             return []
         # M2: length-cap and escape braces to prevent format-string injection
         safe_query = query[:500].replace("{", "{{").replace("}", "}}")
         from services.mem0.cli_compat import cli_messages_create, extract_text
+
         resp = await cli_messages_create(
             client,
             model=os.environ.get("MEM0_REWRITE_MODEL", "claude-haiku-4-5-20251001"),
@@ -439,6 +528,7 @@ async def _rewrite_query(query: str) -> list[str]:
         )
         text = strip_json_fence(extract_text(resp))
         import json as _json
+
         data = _json.loads(text)
         out = data.get("queries", [])
         return [q for q in out if isinstance(q, str) and q.strip()][:5]
@@ -462,17 +552,22 @@ def _apply_reinforcement_boost(memories: list[dict]) -> None:
         return
     try:
         from services.mem0.reinforce import reinforcement_boost
+
         for m in memories:
             boost = reinforcement_boost(m.get("metadata"))
             if boost:
                 current = m.get("score") if m.get("score") is not None else 1.0
                 m["score"] = max(0.0, current - boost)
-        memories.sort(key=lambda x: x.get("score") if x.get("score") is not None else 99)
+        memories.sort(
+            key=lambda x: x.get("score") if x.get("score") is not None else 99
+        )
     except Exception as exc:
         log.warning("reinforcement_boost failed (non-fatal): %s", exc)
 
 
-async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> list[dict]:
+async def _rerank_memories(
+    query: str, memories: list[dict], top_k: int = 5
+) -> list[dict]:
     """LLM-based re-ranking of Mem0 candidates by relevance to the original query.
 
     Before handing the candidate list to the LLM we apply a Hebbian-style
@@ -491,6 +586,7 @@ async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> 
         return memories
     try:
         from services.mem0.client import get_anthropic_client
+
         client = await get_anthropic_client()
         if client is None:
             return memories[:top_k]
@@ -502,10 +598,11 @@ async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> 
             # wrap each candidate in untrusted delimiters and escape braces
             safe_mem = mem_text.replace("{", "{{").replace("}", "}}")
             candidates_lines.append(
-                f"{i+1}: <untrusted_candidate>{safe_mem}</untrusted_candidate>"
+                f"{i + 1}: <untrusted_candidate>{safe_mem}</untrusted_candidate>"
             )
         candidates = "\n".join(candidates_lines)
         from services.mem0.cli_compat import cli_messages_create, extract_text
+
         resp = await cli_messages_create(
             client,
             model=os.environ.get("MEM0_RERANK_MODEL", "claude-haiku-4-5-20251001"),
@@ -514,7 +611,9 @@ async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> 
             # MEM0_RERANK_MAX_TOKENS if needed.
             max_tokens=int(os.environ.get("MEM0_RERANK_MAX_TOKENS", "400")),
             user_message=_RERANK_PROMPT.format(
-                query=safe_query, top_k=top_k, candidates=candidates,
+                query=safe_query,
+                top_k=top_k,
+                candidates=candidates,
             ),
             task_prompt=(
                 "You rerank Mem0 candidate memories by relevance to the "
@@ -523,6 +622,7 @@ async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> 
         )
         text = strip_json_fence(extract_text(resp))
         import json as _json
+
         idxs = _json.loads(text).get("top", [])
         picked = []
         for idx in idxs:
@@ -571,7 +671,8 @@ def _fire_recall_reinforcement(results: list[dict]) -> None:
     if not MEM0_RECALL_REINFORCE_ENABLED or not results:
         return
     ids = [
-        r.get("id") for r in results
+        r.get("id")
+        for r in results
         if r.get("id") and not r.get("_core") and not r.get("_episode_bundle")
     ]
     if not ids:
@@ -580,6 +681,7 @@ def _fire_recall_reinforcement(results: list[dict]) -> None:
     async def _do():
         try:
             from services.mem0.reinforce import reinforce_on_recall
+
             mem = await asyncio.to_thread(_get_mem0)
             if not mem:
                 return
@@ -600,7 +702,9 @@ def _fire_recall_reinforcement(results: list[dict]) -> None:
 
 
 async def get_episode_facts(
-    episode_id: str, user_id: str, limit: int = 30,
+    episode_id: str,
+    user_id: str,
+    limit: int = 30,
 ) -> list[dict]:
     """Phase C-3: fetch every Mem0 fact tagged with a given episode_id.
 
@@ -634,7 +738,9 @@ async def get_episode_facts(
         # SDK doesn't accept `filters` — fall back to a full pull + filter.
         try:
             raw = await asyncio.to_thread(
-                mem.get_all, user_id=user_id, limit=max(limit * 10, 200),
+                mem.get_all,
+                user_id=user_id,
+                limit=max(limit * 10, 200),
             )
         except Exception as exc:
             log.warning("get_episode_facts fallback get_all failed: %s", exc)
@@ -644,8 +750,7 @@ async def get_episode_facts(
         return []
     rows = raw.get("results", []) if isinstance(raw, dict) else (raw or [])
     filtered = [
-        r for r in rows
-        if (r.get("metadata") or {}).get("episode_id") == episode_id
+        r for r in rows if (r.get("metadata") or {}).get("episode_id") == episode_id
     ]
     return filtered[:limit]
 
@@ -661,6 +766,7 @@ def _expand_query_via_morpho(query: str) -> str:
     """
     try:
         from services.mem0 import morpho
+
         return morpho.extract_query_keywords(query)
     except Exception as exc:
         log.warning("morpho query expansion failed (non-fatal): %s", exc)
@@ -685,18 +791,19 @@ async def _expand_query_via_graph(query: str, user_id: str) -> list[str]:
         return []
     try:
         from services.mem0 import graph
+
         entity = await asyncio.to_thread(
-            graph.find_entity, q, user_id, fuzzy=False,
+            graph.find_entity,
+            q,
+            user_id,
+            fuzzy=False,
         )
         if entity is None:
             return []
         aliases = await asyncio.to_thread(graph.get_aliases, entity.id)
         q_low = q.lower()
         extras = {entity.canonical_name, *aliases}
-        return [
-            a for a in extras
-            if a and a.strip() and a.strip().lower() != q_low
-        ]
+        return [a for a in extras if a and a.strip() and a.strip().lower() != q_low]
     except Exception as exc:
         log.warning("alias expansion failed (non-fatal): %s", exc)
         return []
@@ -711,8 +818,10 @@ _CORE_CACHE_KEEP = 10  # キャッシュに保持する上限（取り出しは 
 
 
 async def get_core_memories(
-    user_id: str, max_items: int = 3,
-    *, current_channel_id: str | None = None,
+    user_id: str,
+    max_items: int = 3,
+    *,
+    current_channel_id: str | None = None,
 ) -> list[dict]:
     """常時注入すべきコア事実（imp=5, tier∈{Live,Hot}）を返す。
 
@@ -734,11 +843,17 @@ async def get_core_memories(
     hit = _CORE_CACHE.get(user_id)
     if hit is not None and now - hit[0] < MEM0_CORE_CACHE_TTL_S:
         return [
-            dict(m) for m in hit[1]
-            if _is_fact_valid(m, current_channel_id)
+            dict(m)
+            for m in hit[1]
+            if _is_fact_valid(
+                m,
+                current_channel_id,
+                expected_user_id=str(user_id),
+            )
         ][:max_items]
     try:
         from services.mem0.client import get_all_memories
+
         all_mems = await get_all_memories(user_id)
         core: list[dict] = []
         for m in all_mems:
@@ -752,7 +867,11 @@ async def get_core_memories(
             if imp < 5 or md.get("tier") not in (0, 1):
                 continue
             # scope はここで判定しない（キャッシュ汚染防止）。valid_to のみ。
-            if not _is_fact_valid(m, check_scope=False):
+            if not _is_fact_valid(
+                m,
+                expected_user_id=str(user_id),
+                check_scope=False,
+            ):
                 continue
             core.append(m)
         # tier 昇順（Live が先）→ 直近 reinforce 降順。importance は全件 5。
@@ -767,8 +886,13 @@ async def get_core_memories(
             m["_core"] = True
         _CORE_CACHE[user_id] = (now, core)
         return [
-            dict(m) for m in core
-            if _is_fact_valid(m, current_channel_id)
+            dict(m)
+            for m in core
+            if _is_fact_valid(
+                m,
+                current_channel_id,
+                expected_user_id=str(user_id),
+            )
         ][:max_items]
     except Exception as exc:
         log.warning("core memory fetch failed (non-fatal): %s", exc)
@@ -776,7 +900,9 @@ async def get_core_memories(
 
 
 def _merge_core_first(
-    core: list[dict], results: list[dict], limit: int,
+    core: list[dict],
+    results: list[dict],
+    limit: int,
 ) -> list[dict]:
     """core を先頭に固定しつつ総数を limit に保つマージ。
 
@@ -836,8 +962,7 @@ def assess_recall_confidence(candidates: list[dict]) -> dict:
     float|None, "candidate_count": int}``.
     """
     distances = [
-        c.get("score") for c in candidates
-        if isinstance(c.get("score"), (int, float))
+        c.get("score") for c in candidates if isinstance(c.get("score"), (int, float))
     ]
     best_distance = min(distances) if distances else None
     if best_distance is None or best_distance >= _FOK_NO_MEMORY_DISTANCE:
@@ -854,8 +979,12 @@ def assess_recall_confidence(candidates: list[dict]) -> dict:
 
 
 async def _finalize_smart_result(
-    query_results: list[dict], core_task, limit: int,
-    confidence: dict, *, fok_block: bool,
+    query_results: list[dict],
+    core_task,
+    limit: int,
+    confidence: dict,
+    *,
+    fok_block: bool,
 ) -> list[dict]:
     """Merge core memories in (unconditionally — they don't depend on this
     query's recall confidence) and, when the FOK gate fired, append the
@@ -865,10 +994,12 @@ async def _finalize_smart_result(
     core = await core_task if core_task is not None else []
     merged = _merge_core_first(core, query_results, limit)
     if fok_block:
-        merged = list(merged) + [{
-            "_fok_no_memory": True,
-            "best_distance": confidence.get("best_distance"),
-        }]
+        merged = list(merged) + [
+            {
+                "_fok_no_memory": True,
+                "best_distance": confidence.get("best_distance"),
+            }
+        ]
     return merged
 
 
@@ -888,7 +1019,9 @@ async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[st
     if alias_variants:
         log.info(
             "alias_expand: %r → +%d variants: %s",
-            query, len(alias_variants), alias_variants[:5],
+            query,
+            len(alias_variants),
+            alias_variants[:5],
         )
         for a in alias_variants:
             if a not in queries:
@@ -915,14 +1048,17 @@ async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[st
         if llm_keywords and llm_keywords not in queries:
             log.info(
                 "llm_keywords: %r → %r",
-                (query or "")[:60], llm_keywords[:120],
+                (query or "")[:60],
+                llm_keywords[:120],
             )
             queries.append(llm_keywords)
     return queries
 
 
 async def _expand_episode_bundle(
-    reranked: list[dict], user_id: str, current_channel_id: "str | None",
+    reranked: list[dict],
+    user_id: str,
+    current_channel_id: "str | None",
 ) -> int:
     """Phase C-3: append sibling facts from the top-1 hit's episode.
 
@@ -946,9 +1082,15 @@ async def _expand_episode_bundle(
         # 通らないので、ここで archived / 他会話 scope を落とす
         # （bundle 経由の誤注入・archived 復活を防ぐ）。
         extras = [
-            r for r in bundle
-            if r.get("id") and r.get("id") not in seen
-            and _is_fact_valid(r, current_channel_id)
+            r
+            for r in bundle
+            if r.get("id")
+            and r.get("id") not in seen
+            and _is_fact_valid(
+                r,
+                current_channel_id,
+                expected_user_id=str(user_id),
+            )
         ]
         if not extras:
             return 0
@@ -968,7 +1110,12 @@ async def _expand_episode_bundle(
 
 
 def _log_smart_metrics(
-    query: str, candidates: list[dict], kept: int, bundle_added: int, *, rerank: bool,
+    query: str,
+    candidates: list[dict],
+    kept: int,
+    bundle_added: int,
+    *,
+    rerank: bool,
 ) -> None:
     """Phase B-3: one-line metric so a week of journalctl reduces to
     hit-rate stats with grep. Keys are positional for a simple regex."""
@@ -981,20 +1128,29 @@ def _log_smart_metrics(
         log.info(
             "[MEM0_METRICS query_len=%d candidates=%d kept=%d bundle=%d "
             "hybrid=%s hyde=%s rerank=on]",
-            len(query or ""), len(candidates), kept, bundle_added,
-            bool(_hyb), bool(_hyde),
+            len(query or ""),
+            len(candidates),
+            kept,
+            bundle_added,
+            bool(_hyb),
+            bool(_hyde),
         )
     else:
         log.info(
             "[MEM0_METRICS query_len=%d candidates=%d kept=%d "
             "hybrid=plain hyde=off rerank=off]",
-            len(query or ""), len(candidates), kept,
+            len(query or ""),
+            len(candidates),
+            kept,
         )
 
 
 async def search_memories_smart(
-    query: str, user_id: str, limit: int = 5,
-    rewrite: bool = True, rerank: bool = True,
+    query: str,
+    user_id: str,
+    limit: int = 5,
+    rewrite: bool = True,
+    rerank: bool = True,
     include_core: bool = False,
     current_channel_id: str | None = None,
 ) -> list[dict]:
@@ -1016,7 +1172,8 @@ async def search_memories_smart(
         asyncio.create_task(
             get_core_memories(user_id, current_channel_id=current_channel_id)
         )
-        if include_core else None
+        if include_core
+        else None
     )
     queries = await _expand_queries(query, user_id, rewrite=rewrite)
     # Phase A-1: hybrid retrieval (vector + BM25 RRF fusion). Falls back to
@@ -1028,7 +1185,9 @@ async def search_memories_smart(
     # 関連度を判定するのに、その前段で「遠いが関連ある」候補を機械的に
     # 落とすのは設計矛盾（rerank=False パスは従来通り距離ゲート維持）。
     candidates = await _search_multi_hybrid(
-        queries, user_id, limit=20,
+        queries,
+        user_id,
+        limit=20,
         apply_distance_filter=not rerank,
         current_channel_id=current_channel_id,
     )
@@ -1039,7 +1198,9 @@ async def search_memories_smart(
     # intent but didn't make the cosine cut. Non-fatal on failure.
     try:
         candidates = await _graph_expand_candidates(
-            candidates, user_id, current_channel_id=current_channel_id,
+            candidates,
+            user_id,
+            current_channel_id=current_channel_id,
         )
     except Exception as exc:
         log.warning("graph_expand failed (non-fatal): %s", exc)
@@ -1052,8 +1213,11 @@ async def search_memories_smart(
     confidence = assess_recall_confidence(candidates)
     log.info(
         "[FOK query_len=%d status=%s best_distance=%s candidates=%d]",
-        len(query or ""), confidence["status"],
-        "none" if confidence["best_distance"] is None else f'{confidence["best_distance"]:.3f}',
+        len(query or ""),
+        confidence["status"],
+        "none"
+        if confidence["best_distance"] is None
+        else f"{confidence['best_distance']:.3f}",
         confidence["candidate_count"],
     )
     try:
@@ -1070,9 +1234,13 @@ async def search_memories_smart(
         log.info(
             "[FOK_GATE query_len=%d best_distance=%s] no_memory — skipping rerank/plain search",
             len(query or ""),
-            "none" if confidence["best_distance"] is None else f'{confidence["best_distance"]:.3f}',
+            "none"
+            if confidence["best_distance"] is None
+            else f"{confidence['best_distance']:.3f}",
         )
-        return await _finalize_smart_result([], core_task, limit, confidence, fok_block=True)
+        return await _finalize_smart_result(
+            [], core_task, limit, confidence, fok_block=True
+        )
 
     if rerank:
         # LLM rerank already judged per-fact relevance against the query.
@@ -1082,13 +1250,21 @@ async def search_memories_smart(
         # loose sanity gate instead, since no LLM judge ran there.
         reranked = await _rerank_memories(query, candidates, top_k=limit)
         bundle_added = await _expand_episode_bundle(
-            reranked, user_id, current_channel_id,
+            reranked,
+            user_id,
+            current_channel_id,
         )
         _log_smart_metrics(
-            query, candidates, len(reranked), bundle_added, rerank=True,
+            query,
+            candidates,
+            len(reranked),
+            bundle_added,
+            rerank=True,
         )
         _fire_recall_reinforcement(reranked)
-        return await _finalize_smart_result(reranked, core_task, limit, confidence, fok_block=False)
+        return await _finalize_smart_result(
+            reranked, core_task, limit, confidence, fok_block=False
+        )
 
     # Per-user recency/engagement ordering on the plain path too (no LLM).
     # Re-sorts candidates by boosted distance so well-reinforced facts win
@@ -1096,37 +1272,62 @@ async def search_memories_smart(
     # rerank=True (recall-intent) path, so normal turns had no per-user bias.
     _apply_reinforcement_boost(candidates)
     from services.mem0.client import MEM0_RELEVANCE_MAX_DISTANCE
+
     filtered = [
-        r for r in candidates[:limit]
-        if r.get("score") is None
-        or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
+        r
+        for r in candidates[:limit]
+        if r.get("score") is None or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
     ]
     _log_smart_metrics(query, candidates, len(filtered), 0, rerank=False)
     _fire_recall_reinforcement(filtered)
-    return await _finalize_smart_result(filtered, core_task, limit, confidence, fok_block=False)
+    return await _finalize_smart_result(
+        filtered, core_task, limit, confidence, fok_block=False
+    )
 
 
 # Phase ④: spreading-activation graph expansion tunables. See
 # _graph_expand_candidates' docstring for the model this implements
 # (Collins & Loftus 1975-style activation decaying with graph distance).
 _GRAPH_SPREAD_MAX_HOPS = int(os.environ.get("MEM0_GRAPH_SPREAD_MAX_HOPS", "2"))
-_GRAPH_SPREAD_DECAY_GAMMA = float(os.environ.get("MEM0_GRAPH_SPREAD_DECAY_GAMMA", "0.5"))
-_GRAPH_SPREAD_MIN_ACTIVATION = float(os.environ.get("MEM0_GRAPH_SPREAD_MIN_ACTIVATION", "0.05"))
+_GRAPH_SPREAD_DECAY_GAMMA = float(
+    os.environ.get("MEM0_GRAPH_SPREAD_DECAY_GAMMA", "0.5")
+)
+_GRAPH_SPREAD_MIN_ACTIVATION = float(
+    os.environ.get("MEM0_GRAPH_SPREAD_MIN_ACTIVATION", "0.05")
+)
 # Sibling distance = BASE - WEIGHT * activation, floored at MIN_DISTANCE.
 # BASE stays above a typical real cosine hit's distance so graph-expanded
 # facts never systematically outrank genuine vector/BM25 matches; WEIGHT
 # controls how much a strong activation can still pull one forward.
-_GRAPH_SIBLING_BASE_DISTANCE = float(os.environ.get("MEM0_GRAPH_SIBLING_BASE_DISTANCE", "0.9"))
-_GRAPH_SIBLING_ACTIVATION_WEIGHT = float(os.environ.get("MEM0_GRAPH_SIBLING_ACTIVATION_WEIGHT", "0.4"))
-_GRAPH_SIBLING_MIN_DISTANCE = float(os.environ.get("MEM0_GRAPH_SIBLING_MIN_DISTANCE", "0.3"))
+_GRAPH_SIBLING_BASE_DISTANCE = float(
+    os.environ.get("MEM0_GRAPH_SIBLING_BASE_DISTANCE", "0.9")
+)
+_GRAPH_SIBLING_ACTIVATION_WEIGHT = float(
+    os.environ.get("MEM0_GRAPH_SIBLING_ACTIVATION_WEIGHT", "0.4")
+)
+_GRAPH_SIBLING_MIN_DISTANCE = float(
+    os.environ.get("MEM0_GRAPH_SIBLING_MIN_DISTANCE", "0.3")
+)
 # Phase ④ priming top-up: a flat activation bonus for entities touched
 # recently in this session (see services/mem0/priming.py), independent of
 # any stored edge.
-_PRIMING_ACTIVATION_BONUS = float(os.environ.get("MEM0_PRIMING_ACTIVATION_BONUS", "0.1"))
+_PRIMING_ACTIVATION_BONUS = float(
+    os.environ.get("MEM0_PRIMING_ACTIVATION_BONUS", "0.1")
+)
+
+
+def _canonical_graph_fact_id(row: dict) -> str:
+    metadata = row.get("metadata")
+    canonical_id = metadata.get("canonical_id") if isinstance(metadata, dict) else None
+    return str(canonical_id or row.get("id") or row.get("memory_id") or "")
 
 
 async def _graph_expand_candidates(
-    candidates: list[dict], user_id: str, *, top_seed: int = 3, per_entity: int = 5,
+    candidates: list[dict],
+    user_id: str,
+    *,
+    top_seed: int = 3,
+    per_entity: int = 5,
     current_channel_id: str | None = None,
 ) -> list[dict]:
     """Multi-hop spreading-activation graph expansion (Phase ④) via
@@ -1162,17 +1363,25 @@ async def _graph_expand_candidates(
         return candidates
     from services.mem0 import graph, priming
     from services.mem0.client import _get_mem0
+
     # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
     mem = await asyncio.to_thread(_get_mem0)
     if mem is None:
         return candidates
 
-    seen_ids = {c.get("id") for c in candidates if c.get("id")}
+    seen_provider_ids = {
+        str(c.get("id") or c.get("memory_id"))
+        for c in candidates
+        if c.get("id") or c.get("memory_id")
+    }
+    seen_graph_ids = {
+        fact_id for c in candidates if (fact_id := _canonical_graph_fact_id(c))
+    }
 
     # --- seed activation from the top cosine candidates -----------------
     frontier: dict[int, float] = {}
     for c in candidates[:top_seed]:
-        fid = c.get("id")
+        fid = _canonical_graph_fact_id(c)
         if not fid:
             continue
         score = c.get("score")
@@ -1198,7 +1407,9 @@ async def _graph_expand_candidates(
             entity_activation[eid] = max(act, entity_activation.get(eid, 0.0))
             try:
                 neighbors = await asyncio.to_thread(
-                    graph.get_co_occurring_entities, eid, limit=per_entity,
+                    graph.get_co_occurring_entities,
+                    eid,
+                    limit=per_entity,
                 )
             except Exception:
                 continue
@@ -1207,7 +1418,8 @@ async def _graph_expand_candidates(
                 if propagated < _GRAPH_SPREAD_MIN_ACTIVATION:
                     continue
                 if propagated > max(
-                    entity_activation.get(other_id, 0.0), next_frontier.get(other_id, 0.0),
+                    entity_activation.get(other_id, 0.0),
+                    next_frontier.get(other_id, 0.0),
                 ):
                     next_frontier[other_id] = propagated
         if not next_frontier:
@@ -1221,7 +1433,9 @@ async def _graph_expand_candidates(
     try:
         primed = priming.get_primed_entities(user_id, current_channel_id)
         for eid in primed:
-            entity_activation[eid] = entity_activation.get(eid, 0.0) + _PRIMING_ACTIVATION_BONUS
+            entity_activation[eid] = (
+                entity_activation.get(eid, 0.0) + _PRIMING_ACTIVATION_BONUS
+            )
         priming.touch(user_id, current_channel_id, seed_entity_ids)
     except Exception as exc:
         log.warning("priming buffer failed (non-fatal): %s", exc)
@@ -1231,13 +1445,15 @@ async def _graph_expand_candidates(
     for eid, act in entity_activation.items():
         try:
             related = await asyncio.to_thread(
-                graph.get_related_facts, eid, limit=per_entity,
-                exclude_fact_ids=list(seen_ids),
+                graph.get_related_facts,
+                eid,
+                limit=per_entity,
+                exclude_fact_ids=list(seen_graph_ids),
             )
         except Exception:
             continue
         for fid in related:
-            if fid in seen_ids:
+            if fid in seen_graph_ids:
                 continue
             if act > fact_best_activation.get(fid, 0.0):
                 fact_best_activation[fid] = act
@@ -1247,15 +1463,37 @@ async def _graph_expand_candidates(
 
     siblings: list[dict] = []
     for fid, act in fact_best_activation.items():
+        provider_id = fid
+        if os.environ.get("MEM0_INTEGRITY_MODE", "legacy").lower() != "legacy":
+            from services.mem0.integrity import get_repository
+
+            canonical = await asyncio.to_thread(get_repository().get_fact, fid)
+            # Managed graph rows are canonical projections. An orphan graph
+            # row, a deleted fact, or a fact without a vector binding must
+            # never revive data through the shadow search path.
+            if not canonical or canonical.get("status") != "active":
+                continue
+            if canonical.get("user_id") != str(user_id):
+                continue
+            provider_id = str(canonical.get("legacy_id") or "")
+            if not provider_id:
+                continue
+        if provider_id in seen_provider_ids:
+            continue
         try:
-            fact = await asyncio.to_thread(mem.get, fid)
+            fact = await asyncio.to_thread(mem.get, provider_id)
         except Exception:
             continue
         # Phase R: graph 経由の sibling は search_memories の validity
         # フィルタを通らないので、archived / 他会話 scope をここで落とす。
         if not (
-            isinstance(fact, dict) and fact.get("memory")
-            and _is_fact_valid(fact, current_channel_id)
+            isinstance(fact, dict)
+            and fact.get("memory")
+            and _is_fact_valid(
+                fact,
+                current_channel_id,
+                expected_user_id=str(user_id),
+            )
         ):
             continue
         distance = max(
@@ -1266,13 +1504,16 @@ async def _graph_expand_candidates(
         fact["_graph_expanded"] = True
         fact["_graph_activation"] = act
         siblings.append(fact)
-        seen_ids.add(fid)
+        seen_graph_ids.add(fid)
+        seen_provider_ids.add(provider_id)
 
     if siblings:
         log.info(
             "graph_expand: added %d sibling facts via spreading activation "
             "(max_hops=%d, entities_activated=%d)",
-            len(siblings), _GRAPH_SPREAD_MAX_HOPS, len(entity_activation),
+            len(siblings),
+            _GRAPH_SPREAD_MAX_HOPS,
+            len(entity_activation),
         )
         candidates = candidates + siblings
     return candidates

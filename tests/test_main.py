@@ -15,9 +15,11 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _reload_main(monkeypatch, tmp_path):
     """Import main with patched config paths and return the module."""
     import config as _config
+
     monkeypatch.setattr(_config, "BOT_DIR", str(tmp_path))
     monkeypatch.setattr(_config, "STATE_DIR", str(tmp_path))
     monkeypatch.setattr(_config, "DISCORD_TOKEN", "fake-token")
@@ -33,6 +35,7 @@ def _reload_main(monkeypatch, tmp_path):
 # _setup_logging
 # ---------------------------------------------------------------------------
 
+
 class TestSetupLogging:
     def _cleanup(self, mod):
         if mod._log_listener:
@@ -40,8 +43,7 @@ class TestSetupLogging:
             mod._log_listener = None
         root = logging.getLogger()
         root.handlers[:] = [
-            h for h in root.handlers
-            if not isinstance(h, logging.handlers.QueueHandler)
+            h for h in root.handlers if not isinstance(h, logging.handlers.QueueHandler)
         ]
 
     def test_adds_queue_handler(self, monkeypatch, tmp_path):
@@ -66,10 +68,59 @@ class TestSetupLogging:
         mod._setup_logging()  # must not raise
         self._cleanup(mod)
 
+    def test_reconfiguration_reuses_owned_handler_and_restores_root(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mod = _reload_main(monkeypatch, tmp_path)
+        root = logging.getLogger()
+        original_level = root.level
+
+        class ExternalHandler(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.was_closed = False
+
+            def close(self):
+                self.was_closed = True
+                super().close()
+
+        external = ExternalHandler()
+        root.addHandler(external)
+        lifecycle = mod.RootLifecycle()
+        try:
+            mod._setup_logging(lifecycle)
+            first_listener = mod._log_listener
+            mod._setup_logging(lifecycle)
+            owned = [
+                handler
+                for handler in root.handlers
+                if getattr(handler, "_discord_bot_logging_owner", None)
+                == mod._QUEUE_HANDLER_OWNER
+            ]
+
+            assert len(owned) == 1
+            assert mod._log_listener is first_listener
+            assert external in root.handlers
+            assert external.was_closed is False
+
+            lifecycle.close()
+            assert owned[0] not in root.handlers
+            assert external in root.handlers
+            assert external.was_closed is False
+            assert root.level == original_level
+        finally:
+            if not lifecycle.closed:
+                lifecycle.close()
+            root.removeHandler(external)
+            external.close()
+
 
 # ---------------------------------------------------------------------------
 # _acquire_pidlock
 # ---------------------------------------------------------------------------
+
 
 class TestAcquirePidlock:
     def test_writes_pid_to_file(self, monkeypatch, tmp_path):
@@ -145,13 +196,11 @@ class TestAcquirePidlock:
         monkeypatch.setattr(atexit, "register", _capture_register)
         mod._acquire_pidlock()
 
-        # The _release closure is the last atexit callback registered
-        release_callbacks = [(fn, a, kw) for fn, a, kw in registered if fn.__name__ == "_release"]
-        assert release_callbacks, "Expected _release atexit callback"
-
-        release_fn = release_callbacks[-1][0]
-        # Call it directly — exercises lines 95-107
-        release_fn()
+        close_callbacks = [
+            (fn, a, kw) for fn, a, kw in registered if fn.__name__ == "close"
+        ]
+        assert close_callbacks, "Expected RootLifecycle.close atexit callback"
+        close_callbacks[-1][0]()
 
         # Pidfile should be removed
         assert not os.path.isfile(pid_path)
@@ -177,16 +226,69 @@ class TestAcquirePidlock:
         if mod._pidfile_handle:
             mod._pidfile_handle.close()
 
-        release_callbacks = [(fn, a, kw) for fn, a, kw in registered if fn.__name__ == "_release"]
-        release_fn = release_callbacks[-1][0]
-        release_fn()  # must not raise
+        close_callbacks = [
+            (fn, a, kw) for fn, a, kw in registered if fn.__name__ == "close"
+        ]
+        close_callbacks[-1][0]()  # must not raise
+
+    def test_symlink_pidfile_is_rejected_without_truncating_target(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mod = _reload_main(monkeypatch, tmp_path)
+        victim = tmp_path / "victim"
+        victim.write_text("keep", encoding="utf-8")
+        pid_path = tmp_path / "bot-symlink.pid"
+        pid_path.symlink_to(victim)
+        monkeypatch.setattr(mod, "PIDFILE", str(pid_path))
+
+        with pytest.raises(OSError):
+            mod._acquire_pidlock()
+
+        assert victim.read_text(encoding="utf-8") == "keep"
+
+    def test_release_does_not_unlink_replacement_path(self, monkeypatch, tmp_path):
+        mod = _reload_main(monkeypatch, tmp_path)
+        pid_path = tmp_path / "bot-replaced.pid"
+        monkeypatch.setattr(mod, "PIDFILE", str(pid_path))
+        mod._acquire_pidlock()
+        owner = mod._root_lifecycle
+        assert owner is not None
+
+        pid_path.unlink()
+        pid_path.write_text("replacement", encoding="utf-8")
+        owner.close()
+
+        assert pid_path.read_text(encoding="utf-8") == "replacement"
 
 
 # ---------------------------------------------------------------------------
 # main()
 # ---------------------------------------------------------------------------
 
+
 class TestMain:
+    class _Bootstrap:
+        def __init__(self, tmp_path, *, token="fake-token", initialize_error=None):
+            self.settings = types.SimpleNamespace(
+                bot_dir=str(tmp_path),
+                state_dir=str(tmp_path),
+                discord_token=token,
+            )
+            self.initialize_error = initialize_error
+            self.initialize_calls = 0
+            self.shutdown_calls = 0
+
+        def initialize(self):
+            self.initialize_calls += 1
+            if self.initialize_error is not None:
+                raise self.initialize_error
+            return self.settings
+
+        def shutdown_sync(self):
+            self.shutdown_calls += 1
+
     def _make_fake_bot_module(self):
         fake_bot_module = types.ModuleType("bot")
         fake_bot_module.bot = types.SimpleNamespace(run=lambda token: None)
@@ -194,52 +296,88 @@ class TestMain:
 
     def test_raises_system_exit_on_invalid_token(self, monkeypatch, tmp_path):
         mod = _reload_main(monkeypatch, tmp_path)
-        monkeypatch.setattr(mod, "_setup_logging", lambda: None)
-        monkeypatch.setattr(mod, "validate_discord_token", lambda: (_ for _ in ()).throw(RuntimeError("bad token")))
+        bootstrap = self._Bootstrap(
+            tmp_path,
+            initialize_error=mod.DiscordTokenError("bad token"),
+        )
+        monkeypatch.setattr(mod, "_runtime_bootstrap", bootstrap)
         monkeypatch.setattr("builtins.print", lambda *a, **kw: None)
 
         with pytest.raises(SystemExit) as exc_info:
             mod.main()
         assert exc_info.value.code == 1
+        assert bootstrap.shutdown_calls == 0
 
-    def test_validate_called_in_main(self, monkeypatch, tmp_path):
+    def test_non_token_initialization_error_runs_shutdown(self, monkeypatch, tmp_path):
         mod = _reload_main(monkeypatch, tmp_path)
+        bootstrap = self._Bootstrap(
+            tmp_path,
+            initialize_error=OSError("state load failed"),
+        )
+        monkeypatch.setattr(mod, "_runtime_bootstrap", bootstrap)
+
+        with pytest.raises(OSError, match="state load failed"):
+            mod.main()
+
+        assert bootstrap.shutdown_calls == 1
+
+    def test_settings_initialized_in_main(self, monkeypatch, tmp_path):
+        mod = _reload_main(monkeypatch, tmp_path)
+        bootstrap = self._Bootstrap(tmp_path)
+        monkeypatch.setattr(mod, "_runtime_bootstrap", bootstrap)
         monkeypatch.setattr(mod, "_setup_logging", lambda: None)
         monkeypatch.setattr(mod, "_acquire_pidlock", lambda: None)
-
-        calls = []
-
-        def _validate():
-            calls.append("validate")
-
-        monkeypatch.setattr(mod, "validate_discord_token", _validate)
 
         fake_bot_module = self._make_fake_bot_module()
         monkeypatch.setitem(sys.modules, "bot", fake_bot_module)
 
         mod.main()
-        assert "validate" in calls
+        assert bootstrap.initialize_calls == 1
+        assert bootstrap.shutdown_calls == 1
 
     def test_bot_run_called_with_token(self, monkeypatch, tmp_path):
         mod = _reload_main(monkeypatch, tmp_path)
+        bootstrap = self._Bootstrap(tmp_path, token="my-fake-token")
+        monkeypatch.setattr(mod, "_runtime_bootstrap", bootstrap)
         monkeypatch.setattr(mod, "_setup_logging", lambda: None)
         monkeypatch.setattr(mod, "_acquire_pidlock", lambda: None)
-        monkeypatch.setattr(mod, "validate_discord_token", lambda: None)
-        monkeypatch.setattr(mod, "DISCORD_TOKEN", "my-fake-token")
 
         run_calls = []
 
         fake_bot_module = types.ModuleType("bot")
-        fake_bot_module.bot = types.SimpleNamespace(run=lambda token: run_calls.append(token))
+        fake_bot_module.bot = types.SimpleNamespace(
+            run=lambda token: run_calls.append(token)
+        )
         monkeypatch.setitem(sys.modules, "bot", fake_bot_module)
 
         mod.main()
         assert run_calls == ["my-fake-token"]
+        assert bootstrap.shutdown_calls == 1
+
+    def test_bot_exception_still_runs_shutdown(self, monkeypatch, tmp_path):
+        mod = _reload_main(monkeypatch, tmp_path)
+        bootstrap = self._Bootstrap(tmp_path)
+        monkeypatch.setattr(mod, "_runtime_bootstrap", bootstrap)
+        monkeypatch.setattr(mod, "_setup_logging", lambda: None)
+        monkeypatch.setattr(mod, "_acquire_pidlock", lambda: None)
+
+        fake_bot_module = types.ModuleType("bot")
+
+        def _raise(_token):
+            raise OSError("discord failed")
+
+        fake_bot_module.bot = types.SimpleNamespace(run=_raise)
+        monkeypatch.setitem(sys.modules, "bot", fake_bot_module)
+
+        with pytest.raises(OSError, match="discord failed"):
+            mod.main()
+        assert bootstrap.shutdown_calls == 1
 
     def test_acquire_pidlock_called_before_bot_run(self, monkeypatch, tmp_path):
         mod = _reload_main(monkeypatch, tmp_path)
+        bootstrap = self._Bootstrap(tmp_path)
+        monkeypatch.setattr(mod, "_runtime_bootstrap", bootstrap)
         monkeypatch.setattr(mod, "_setup_logging", lambda: None)
-        monkeypatch.setattr(mod, "validate_discord_token", lambda: None)
 
         order = []
         pid_path = str(tmp_path / "order.pid")
@@ -275,28 +413,27 @@ class TestMain:
 
     def test_setup_logging_called_first(self, monkeypatch, tmp_path):
         mod = _reload_main(monkeypatch, tmp_path)
+        bootstrap = self._Bootstrap(tmp_path)
+        monkeypatch.setattr(mod, "_runtime_bootstrap", bootstrap)
         order = []
 
         def _logging():
             order.append("logging")
 
-        def _validate():
-            order.append("validate")
-
         monkeypatch.setattr(mod, "_setup_logging", _logging)
         monkeypatch.setattr(mod, "_acquire_pidlock", lambda: None)
-        monkeypatch.setattr(mod, "validate_discord_token", _validate)
 
         fake_bot_module = self._make_fake_bot_module()
         monkeypatch.setitem(sys.modules, "bot", fake_bot_module)
 
         mod.main()
-        assert order.index("logging") < order.index("validate")
+        assert order == ["logging"]
 
 
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
+
 
 class TestModuleConstants:
     def test_pidfile_and_log_listener_exist(self, monkeypatch, tmp_path):

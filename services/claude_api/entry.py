@@ -159,11 +159,15 @@ MODEL = CLAUDE_MODEL
 # hunting for tools that were no longer in her schema list. Static-advertise
 # + lazy-spawn matches the mem0 pattern. (news-curator removed 2026-06-19.)
 ALWAYS_ADVERTISED_MCP_KEYS = {
-    "mem0", "x-scraper", "brave-search",
+    "mem0",
+    "x-scraper",
+    "brave-search",
     # Market data (2026-06-13): replaces the Brave-search-the-finance-page
     # pattern for quotes, and feeds the VI strategy signal checks. Static
     # schemas + lazy spawn, same as the rest.
-    "nikkei-indexes", "yfj-quote", "polymarket",
+    "nikkei-indexes",
+    "yfj-quote",
+    "polymarket",
     # みんかぶFX オーダーブック (注文/建玉の価格帯別分布)。2026-06-24。
     "minkabu-fx",
 }
@@ -194,6 +198,7 @@ def strip_checkpoint_note(text: str) -> str:
     セグメントごと除去される。
     """
     from services.claude_api.tool_loop import _AUTO_RESUME_NOTE, _CHECKPOINT_NOTE
+
     out = text or ""
     for note in (
         _CHECKPOINT_NOTE,
@@ -257,7 +262,8 @@ def _classified_error_message(category: str, exc: BaseException | None = None) -
 
 
 def _prepend_context_snapshot(
-    user_content: "str | list[dict]", snapshot: str,
+    user_content: "str | list[dict]",
+    snapshot: str,
 ) -> "str | list[dict]":
     """Prepend the cached Mem0 snapshot to the next user turn.
 
@@ -334,9 +340,12 @@ def _resolve_session(
     # previously caused complete context loss on MCP tier escalation.
     merged = stored | chosen_mcp_keys
     info.mcp_server_keys = sorted(merged)
+    set_session(channel_id, user_id, info)
     log.info(
         "[ch=%d] MCP merge: %s + %s → %s",
-        channel_id, sorted(stored), sorted(chosen_mcp_keys - stored),
+        channel_id,
+        sorted(stored),
+        sorted(chosen_mcp_keys - stored),
         info.mcp_server_keys,
     )
     return get_mcp_servers_by_keys(info.mcp_server_keys), True
@@ -394,10 +403,10 @@ async def call_with_tools(
     tool_invocation_callback=None,
     scratch_stream_callback=None,
     scratch_finalize_callback=None,
-    thinking_stream_callback=None,     # async (partial_thinking:str)->None  (計画 preview)
-    thinking_finalize_callback=None,   # async ()->None  (thinking block closed)
-    verify_stream_callback=None,       # async (partial_thinking:str)->None  (検証 preview)
-    verify_finalize_callback=None,     # async ()->None  (verifier thinking block closed)
+    thinking_stream_callback=None,  # async (partial_thinking:str)->None  (計画 preview)
+    thinking_finalize_callback=None,  # async ()->None  (thinking block closed)
+    verify_stream_callback=None,  # async (partial_thinking:str)->None  (検証 preview)
+    verify_finalize_callback=None,  # async ()->None  (verifier thinking block closed)
     progress: "dict | None" = None,
     restricted: bool = False,
     raw_user_text: str = "",
@@ -407,8 +416,8 @@ async def call_with_tools(
     user_id: "int | None" = None,
     forced_model_override: "str | None" = None,
     forced_effort_override: "str | None" = None,
-    tier: "str | None" = None,        # 熟考P2: "chat" | "deliberate" | None(=従来)
-    route_judgment: bool = False,      # 熟考P5: 判断系の問い（MAGI-lite トリガー）
+    tier: "str | None" = None,  # 熟考P2: "chat" | "deliberate" | None(=従来)
+    route_judgment: bool = False,  # 熟考P5: 判断系の問い（MAGI-lite トリガー）
     active_skill_prompt: str = "",
 ) -> tuple[str, SessionInfo | None, bool]:
     """Direct-API replacement for services/claude_sdk.py:call_with_tools.
@@ -471,9 +480,9 @@ async def call_with_tools(
 
         # 4. Build the user message with optional inlined images.
         if image_blocks:
-            user_content: str | list[dict] = (
-                image_blocks + [{"type": "text", "text": prompt_text}]
-            )
+            user_content: str | list[dict] = image_blocks + [
+                {"type": "text", "text": prompt_text}
+            ]
         else:
             user_content = prompt_text
 
@@ -492,11 +501,11 @@ async def call_with_tools(
         latest_context_snapshot = ""
         if not restricted:
             try:
-                loaded_history, loaded_snapshot, loaded_snapshot_ts = (
-                    await asyncio.to_thread(
-                        load_api_replay_channel, channel_id
-                    )
-                )
+                (
+                    loaded_history,
+                    loaded_snapshot,
+                    loaded_snapshot_ts,
+                ) = await asyncio.to_thread(load_api_replay_channel, channel_id)
             except Exception as exc:
                 log.warning("[ch=%d] history load failed: %s", channel_id, exc)
             else:
@@ -504,6 +513,7 @@ async def call_with_tools(
                 if latest_context_snapshot and loaded_snapshot_ts:
                     try:
                         from datetime import datetime, timezone
+
                         snap_dt = datetime.fromisoformat(loaded_snapshot_ts)
                         if snap_dt.tzinfo is None:
                             snap_dt = snap_dt.replace(tzinfo=timezone.utc)
@@ -511,7 +521,8 @@ async def call_with_tools(
                         if age > _SNAPSHOT_MAX_AGE_S:
                             log.info(
                                 "[ch=%d] stale context snapshot dropped (age=%.0fs)",
-                                channel_id, age,
+                                channel_id,
+                                age,
                             )
                             latest_context_snapshot = ""
                     except (ValueError, TypeError):
@@ -533,6 +544,7 @@ async def call_with_tools(
                 if MICROCOMPACT_ENABLED and prior_history and loaded_snapshot_ts:
                     try:
                         from datetime import datetime, timezone
+
                         _sdt = datetime.fromisoformat(loaded_snapshot_ts)
                         if _sdt.tzinfo is None:
                             _sdt = _sdt.replace(tzinfo=timezone.utc)
@@ -549,7 +561,9 @@ async def call_with_tools(
                             log.info(
                                 "[ch=%d] microcompact: gap=%.0fmin, cleared old "
                                 "tool_results (~%d tokens reclaimed)",
-                                channel_id, _gap_min, _mc_saved,
+                                channel_id,
+                                _gap_min,
+                                _mc_saved,
                             )
                     except (ValueError, TypeError):
                         pass
@@ -575,14 +589,16 @@ async def call_with_tools(
         # free-code permission port: ルール評価（deny/ask/allow）＋Discord
         # リアクション承認（ask_bridge 経由）を既存 gate に重ねる。
         can_use_tool = wrap_permission_gate(
-            make_can_use_tool(restricted=restricted), restricted=restricted,
+            make_can_use_tool(restricted=restricted),
+            restricted=restricted,
         )
         tool_ctx = ToolContext(cwd=cwd, restricted=restricted, channel_id=channel_id)
 
         # 熟考 P1: tool 呼び出し台帳（観測層）。restricted には作らない。
         evidence = (
             new_evidence_index(channel_id)
-            if (DELIB_EVIDENCE_ENABLED and not restricted) else None
+            if (DELIB_EVIDENCE_ENABLED and not restricted)
+            else None
         )
 
         async with AsyncExitStack() as stack:
@@ -608,7 +624,8 @@ async def call_with_tools(
                 # tool_use; everything else is spawned eagerly so its tools
                 # show up in advertised_tools below.
                 eager_keys = [
-                    key for key in chosen_mcp_cfg
+                    key
+                    for key in chosen_mcp_cfg
                     if key not in always_advertised_mcp_keys
                 ]
                 if eager_keys:
@@ -618,6 +635,7 @@ async def call_with_tools(
             _agent_schema: dict | None = None
             if SUBAGENT_ENABLED and not restricted:
                 from services.claude_api.agent_tool import agent_tool_schema
+
                 _agent_schema = agent_tool_schema()
 
             def _build_tools() -> list[dict]:
@@ -647,7 +665,11 @@ async def call_with_tools(
             # parent_watchdog は subagent 実行中に親 StallWatchdog にハートビートを
             # 送るための参照。これが無いと subagent 実行中の沈黙で親が idle_timeout
             # で cancel され「subagent 完了前に親が exit」が起きる（haroin 2026-06-25）。
-            _agent_dispatch: dict = {"api_client": None, "model": None, "watchdog": None}
+            _agent_dispatch: dict = {
+                "api_client": None,
+                "model": None,
+                "watchdog": None,
+            }
 
             async def _execute_tool(name: str, args: dict) -> str:
                 if name == "Agent" and SUBAGENT_ENABLED and not restricted:
@@ -657,6 +679,7 @@ async def call_with_tools(
                         AgentToolCtx,
                         execute_agent_tool,
                     )
+
                     return await execute_agent_tool(
                         args,
                         AgentToolCtx(
@@ -680,7 +703,8 @@ async def call_with_tools(
                 try:
                     if await oauth_maybe_restore_primary():
                         await _safe_status(
-                            status_callback, "✅ メインアカウントに復帰",
+                            status_callback,
+                            "✅ メインアカウントに復帰",
                         )
                 except Exception as exc:
                     log.warning("oauth failback check failed: %s", exc)
@@ -704,7 +728,8 @@ async def call_with_tools(
                     status_msg = "✅ サブ枠が使えないためメインアカウントに復帰"
                 else:
                     switched = oauth_failover_to_secondary(
-                        reason, primary_retry_at=retry_at,
+                        reason,
+                        primary_retry_at=retry_at,
                     )
                     status_msg = "⚠️ メイン枠が使えないためサブアカウントに切替"
                 if not switched:
@@ -774,16 +799,20 @@ async def call_with_tools(
                         # token gate fired on stale usage and compacting again
                         # would summarize the summary.
                         from config import HISTORY_COMPACT_TRIGGER_CHARS
+
                         _replay_chars = estimate_replay_chars(prior_history)
                         if _replay_chars > HISTORY_COMPACT_TRIGGER_CHARS:
                             _spawned = start_background_compaction(
-                                channel_id, api_client,
+                                channel_id,
+                                api_client,
                             )
                             log.info(
                                 "[ch=%d] boundary compaction trigger: "
                                 "last_context_tokens=%d (trigger=%d) — "
                                 "dispatched to background (spawned=%s)",
-                                channel_id, _last_tokens, _compact_trigger,
+                                channel_id,
+                                _last_tokens,
+                                _compact_trigger,
                                 _spawned,
                             )
                         else:
@@ -791,7 +820,9 @@ async def call_with_tools(
                                 "[ch=%d] boundary compaction skipped: token "
                                 "gate is stale (tokens=%d > trigger=%d but "
                                 "replay is only %d chars — already collapsed)",
-                                channel_id, _last_tokens, _compact_trigger,
+                                channel_id,
+                                _last_tokens,
+                                _compact_trigger,
                                 _replay_chars,
                             )
                             over_tokens = False
@@ -815,12 +846,14 @@ async def call_with_tools(
                                 "[ch=%d] microcompact while boundary "
                                 "compaction runs in background: ~%d tokens "
                                 "reclaimed from old tool_results",
-                                channel_id, _emg_saved,
+                                channel_id,
+                                _emg_saved,
                             )
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
                         "[ch=%d] history compaction failed (non-fatal): %s",
-                        channel_id, exc,
+                        channel_id,
+                        exc,
                     )
 
             # 8. Retry loop around run_agent_loop. The loop range
@@ -850,6 +883,7 @@ async def call_with_tools(
                 CHECKPOINT_AUTO_RESUME_ENABLED,
                 CHECKPOINT_AUTO_RESUME_MAX,
             )
+
             _auto_resume_state = {"used": 0}
 
             def _should_auto_resume(reason: str) -> bool:
@@ -871,7 +905,10 @@ async def call_with_tools(
                 """
                 nonlocal proactive_fired
                 ok = await compact_channel_history(
-                    channel_id, api_client, status_callback, force=True,
+                    channel_id,
+                    api_client,
+                    status_callback,
+                    force=True,
                 )
                 if not ok:
                     return None
@@ -892,6 +929,7 @@ async def call_with_tools(
                     generate_plan,
                     render_plan_block,
                 )
+
                 await _safe_status(status_callback, "📋 計画中")
                 _plan = await generate_plan(
                     user_request=raw_user_text or prompt,
@@ -936,23 +974,25 @@ async def call_with_tools(
                         # 命令ではない。system prompt は cache 保護のため不変）。
                         if _plan_block:
                             user_content_for_loop = _prepend_context_snapshot(
-                                user_content_for_loop, _plan_block,
+                                user_content_for_loop,
+                                _plan_block,
                             )
                         # Replay the latest Mem0 snapshot only when the
                         # current prompt does not already carry one (short
                         # follow-up after a MEM0_MIN_QUERY_LENGTH-gated
                         # turn). Done once per request, not once per JSONL
                         # row, so we don't accumulate stale recall.
-                        if (
-                            latest_context_snapshot
-                            and not prompt_has_context_snapshot(prompt_text)
+                        if latest_context_snapshot and not prompt_has_context_snapshot(
+                            prompt_text
                         ):
                             user_content_for_loop = _prepend_context_snapshot(
                                 user_content_for_loop, latest_context_snapshot
                             )
                             log.info(
                                 "[PROMPT_BREAKDOWN ch=%d] context_snapshot re-injected: chars=%d resumable=%s",
-                                channel_id, len(latest_context_snapshot), resumable,
+                                channel_id,
+                                len(latest_context_snapshot),
+                                resumable,
                             )
                         # Phase 2 (ADR-0037): one-shot post-compaction recovery
                         # directive at the very front of the user turn (system
@@ -960,7 +1000,8 @@ async def call_with_tools(
                         # attempt; the flag was already consumed above.
                         if _inject_recovery:
                             user_content_for_loop = _prepend_context_snapshot(
-                                user_content_for_loop, RECOVERY_DIRECTIVE,
+                                user_content_for_loop,
+                                RECOVERY_DIRECTIVE,
                             )
                         # Measure final payload going to the Messages API
                         if isinstance(user_content_for_loop, str):
@@ -968,20 +1009,30 @@ async def call_with_tools(
                             _user_blocks = 1
                         else:
                             _user_chars = sum(
-                                len(b.get("text", "")) for b in user_content_for_loop
+                                len(b.get("text", ""))
+                                for b in user_content_for_loop
                                 if isinstance(b, dict)
                             )
                             _user_blocks = len(user_content_for_loop)
                         _hist_chars = sum(
-                            len(m.get("content", "")) if isinstance(m.get("content"), str) else 0
-                            for m in history_for_loop if isinstance(m, dict)
+                            len(m.get("content", ""))
+                            if isinstance(m.get("content"), str)
+                            else 0
+                            for m in history_for_loop
+                            if isinstance(m, dict)
                         )
                         log.info(
                             "[PROMPT_BREAKDOWN ch=%d] api_payload: prior_turns=%d prior_chars=%d "
                             "user_chars=%d user_blocks=%d system_chars=%d tools=%d resumable=%s attempt=%d",
-                            channel_id, len(history_for_loop), _hist_chars,
-                            _user_chars, _user_blocks, len(system_prompt or ""),
-                            len(advertised_tools), resumable, attempt + 1,
+                            channel_id,
+                            len(history_for_loop),
+                            _hist_chars,
+                            _user_chars,
+                            _user_blocks,
+                            len(system_prompt or ""),
+                            len(advertised_tools),
+                            resumable,
+                            attempt + 1,
                         )
                         # ADR-0010: once this session fell back to Opus, pin
                         # subsequent turns to Opus. Re-trying Fable on every
@@ -991,7 +1042,9 @@ async def call_with_tools(
                         # cold (cache_read=0 on every Fable turn). Restricted
                         # channels stay on the default model (no pinning).
                         sticky_model = (
-                            _get_sticky_model(channel_id, user_id) if not restricted else None
+                            _get_sticky_model(channel_id, user_id)
+                            if not restricted
+                            else None
                         )
                         effective_model = forced_model or sticky_model or MODEL
                         # Agent tool subagent はこの effective_model を継承する。
@@ -1014,7 +1067,9 @@ async def call_with_tools(
                             thinking_finalize_callback=thinking_finalize_callback,
                             progress=progress,
                             max_turns=max_turns,
-                            budget_role="restricted" if restricted else "admin",  # ADR-0036
+                            budget_role="restricted"
+                            if restricted
+                            else "admin",  # ADR-0036
                             stall_watchdog=watchdog,
                             api_client=api_client,
                             model=effective_model,
@@ -1032,8 +1087,10 @@ async def call_with_tools(
                             # actually Fable — never fall Opus back onto Opus.
                             refusal_fallback_model=(
                                 FABLE_REFUSAL_FALLBACK_MODEL
-                                if (FABLE_REFUSAL_FALLBACK_ENABLED
-                                    and "fable" in (effective_model or "").lower())
+                                if (
+                                    FABLE_REFUSAL_FALLBACK_ENABLED
+                                    and "fable" in (effective_model or "").lower()
+                                )
                                 else None
                             ),
                             # A sticky pin means a refusal fallback already
@@ -1042,7 +1099,8 @@ async def call_with_tools(
                             # (x-is-refusal-fallback: true, ADR-0010).
                             extra_headers=(
                                 {REFUSAL_FALLBACK_HEADER: "true"}
-                                if sticky_model else None
+                                if sticky_model
+                                else None
                             ),
                             # In-loop proactive compaction (audit #3): admin
                             # channels only — restricted is stateless, there
@@ -1054,7 +1112,8 @@ async def call_with_tools(
                             # 機能6: /effort command override (admin only).
                             output_config_override=(
                                 {"effort": forced_effort_override}
-                                if forced_effort_override else None
+                                if forced_effort_override
+                                else None
                             ),
                             # ADR-0040: checkpoint 時の自動継続ポリシー。
                             should_auto_resume=_should_auto_resume,
@@ -1063,7 +1122,8 @@ async def call_with_tools(
                         if getattr(result, "fallback_model", None):
                             log.warning(
                                 "[ch=%d] response generated via refusal fallback model=%s",
-                                channel_id, result.fallback_model,
+                                channel_id,
+                                result.fallback_model,
                             )
                             if not restricted:
                                 # Pin the session so the next turn starts on
@@ -1096,8 +1156,11 @@ async def call_with_tools(
                         category = classify_anthropic_error(exc)
                         log.error(
                             "[ch=%d] api error attempt %d/%d type=%s: %s",
-                            channel_id, attempt + 1, TRANSIENT_MAX_ATTEMPTS,
-                            category, exc,
+                            channel_id,
+                            attempt + 1,
+                            TRANSIENT_MAX_ATTEMPTS,
+                            category,
+                            exc,
                         )
                         if category == "context_overflow":
                             # History too long — session must restart so
@@ -1127,14 +1190,20 @@ async def call_with_tools(
                                 forced_model = FABLE_REFUSAL_FALLBACK_MODEL
                                 log.warning(
                                     "[ch=%d] model %s not found → fallback to %s",
-                                    channel_id, effective_model, forced_model,
+                                    channel_id,
+                                    effective_model,
+                                    forced_model,
                                 )
                                 await _safe_status(
                                     status_callback,
                                     "⚠️ モデル不在のためフォールバック中",
                                 )
                                 continue
-                            return _classified_error_message(category, exc), None, resumable
+                            return (
+                                _classified_error_message(category, exc),
+                                None,
+                                resumable,
+                            )
                         if (
                             category == "invalid_request"
                             and TOOL_SEARCH_ENABLED
@@ -1164,12 +1233,15 @@ async def call_with_tools(
                             # A second auth failure falls through to the
                             # "real auth problem" branch below.
                             from services.oauth_manager import init as _oauth_reload
+
                             _oauth_reload()
                             api_client = await _make_api_client(restricted)
                             _agent_dispatch["api_client"] = api_client
                             log.info(
                                 "[ch=%d] auth retry after token reload (attempt %d→%d)",
-                                channel_id, attempt + 1, attempt + 2,
+                                channel_id,
+                                attempt + 1,
+                                attempt + 2,
                             )
                             await _safe_status(
                                 status_callback,
@@ -1180,12 +1252,17 @@ async def call_with_tools(
                             # auth (2nd time): reload でも直らない = 本当に
                             # credential が死んでいる → failover アカウントを試す。
                             if category == "auth" and await _try_failover(
-                                "auth", None,
+                                "auth",
+                                None,
                             ):
                                 continue
                             # max_turns: tool-loop hit the per-request turn
                             # cap — session history is still valid.
-                            return _classified_error_message(category, exc), None, resumable
+                            return (
+                                _classified_error_message(category, exc),
+                                None,
+                                resumable,
+                            )
                         if not _is_transient(category):
                             # Permanent errors (api_exit, invalid_request,
                             # unknown, billing) — retrying won't help. Return
@@ -1197,10 +1274,15 @@ async def call_with_tools(
                                 )
                                 # subscriber quota の credit 系 429 — failover へ
                                 if await _try_failover(
-                                    "quota", _failover_retry_at(exc),
+                                    "quota",
+                                    _failover_retry_at(exc),
                                 ):
                                     continue
-                            return _classified_error_message(category, exc), None, resumable
+                            return (
+                                _classified_error_message(category, exc),
+                                None,
+                                resumable,
+                            )
                         # Transient (overloaded / rate_limit): the loop runs
                         # `range(TRANSIENT_MAX_ATTEMPTS)`, so the final attempt
                         # is `TRANSIENT_MAX_ATTEMPTS - 1`. We MUST return the
@@ -1214,7 +1296,8 @@ async def call_with_tools(
                         # なら、backoff は数学的に全滅確定 — 即 failover。
                         if category == "rate_limit" and _quota_exhausted_signal():
                             if await _try_failover(
-                                "quota", _failover_retry_at(exc),
+                                "quota",
+                                _failover_retry_at(exc),
                             ):
                                 continue
                         if attempt >= TRANSIENT_MAX_ATTEMPTS - 1:
@@ -1222,12 +1305,17 @@ async def call_with_tools(
                             # だけ failover を試す（曖昧な 429 バーストが同一
                             # アカウントで解けなかったケースの受け皿）。
                             if category == "rate_limit" and await _try_failover(
-                                "quota", _failover_retry_at(exc),
+                                "quota",
+                                _failover_retry_at(exc),
                             ):
                                 continue
                             # keep the session alive so the next user message
                             # can resume without losing context.
-                            return _classified_error_message(category, exc), None, resumable
+                            return (
+                                _classified_error_message(category, exc),
+                                None,
+                                resumable,
+                            )
                         # Overload escape hatch (audit #6, CLI
                         # tengu_api_opus_fallback): when 529s have nearly
                         # exhausted the budget and we are still on Fable,
@@ -1243,7 +1331,9 @@ async def call_with_tools(
                             forced_model = FABLE_REFUSAL_FALLBACK_MODEL
                             log.warning(
                                 "[ch=%d] overload streak on %s → trying %s",
-                                channel_id, effective_model, forced_model,
+                                channel_id,
+                                effective_model,
+                                forced_model,
                             )
                         # Honor the server's retry-after when present (audit
                         # #5): the longer of server-requested wait and our
@@ -1259,18 +1349,27 @@ async def call_with_tools(
                                 log.warning(
                                     "[ch=%d] retry-after=%.0fs exceeds max %.0fs"
                                     " — giving up early",
-                                    channel_id, retry_after, RETRY_AFTER_MAX_S,
+                                    channel_id,
+                                    retry_after,
+                                    RETRY_AFTER_MAX_S,
                                 )
                                 # チャット応答としては待てない長さ = 実質 quota
                                 # 切れ。give-up の前に failover を試す。
                                 if category == "rate_limit" and await _try_failover(
-                                    "quota", time.time() + retry_after,
+                                    "quota",
+                                    time.time() + retry_after,
                                 ):
                                     continue
-                                return _classified_error_message(category, exc), None, resumable
+                                return (
+                                    _classified_error_message(category, exc),
+                                    None,
+                                    resumable,
+                                )
                             backoff = max(backoff, retry_after)
                         await _transient_backoff(
-                            attempt, backoff, status_callback=status_callback,
+                            attempt,
+                            backoff,
+                            status_callback=status_callback,
                         )
                     except httpx.RequestError as exc:
                         # SSE streaming 中の HTTP/2 接続切断 (GOAWAY /
@@ -1286,13 +1385,18 @@ async def call_with_tools(
                         # retry ロジックに合流させる。
                         log.warning(
                             "[ch=%d] transport error (bare) attempt %d/%d: %r",
-                            channel_id, attempt + 1, TRANSIENT_MAX_ATTEMPTS, exc,
+                            channel_id,
+                            attempt + 1,
+                            TRANSIENT_MAX_ATTEMPTS,
+                            exc,
                         )
                         if attempt >= TRANSIENT_MAX_ATTEMPTS - 1:
                             return _error_message("overloaded"), None, resumable
                         await _transient_backoff(
-                            attempt, compute_backoff(attempt),
-                            status_callback=status_callback, label="接続再試行中",
+                            attempt,
+                            compute_backoff(attempt),
+                            status_callback=status_callback,
+                            label="接続再試行中",
                         )
                     except BaseExceptionGroup as eg:
                         # SSE streaming中に httpx 層で接続が切れると
@@ -1308,7 +1412,10 @@ async def call_with_tools(
                         exc = transport_eg.exceptions[0]
                         log.warning(
                             "[ch=%d] transport error attempt %d/%d: %r",
-                            channel_id, attempt + 1, TRANSIENT_MAX_ATTEMPTS, exc,
+                            channel_id,
+                            attempt + 1,
+                            TRANSIENT_MAX_ATTEMPTS,
+                            exc,
                         )
                         if rest is not None:
                             # Mixed group — surface the non-transport sub-tree
@@ -1317,8 +1424,10 @@ async def call_with_tools(
                         if attempt >= TRANSIENT_MAX_ATTEMPTS - 1:
                             return _error_message("overloaded"), None, resumable
                         await _transient_backoff(
-                            attempt, compute_backoff(attempt),
-                            status_callback=status_callback, label="接続再試行中",
+                            attempt,
+                            compute_backoff(attempt),
+                            status_callback=status_callback,
+                            label="接続再試行中",
                         )
 
             # --- ADR-0040: checkpoint auto-resume ------------------------------
@@ -1338,6 +1447,7 @@ async def call_with_tools(
                 and _should_auto_resume(result.paused_reason)
             ):
                 from services.claude_api.tool_loop import AUTO_RESUME_DIRECTIVE
+
                 _resume_segments: list[str] = []
                 _resume_kw = dict(
                     history=history_for_loop,
@@ -1365,20 +1475,22 @@ async def call_with_tools(
                         TOOL_SEARCH_ENABLED and is_tool_search_active()
                     ),
                     evidence=evidence,
-                    proactive_compact=(
-                        _proactive_compact if not restricted else None
-                    ),
+                    proactive_compact=(_proactive_compact if not restricted else None),
                     refusal_fallback_model=(
                         FABLE_REFUSAL_FALLBACK_MODEL
-                        if (FABLE_REFUSAL_FALLBACK_ENABLED
-                            and "fable" in (
+                        if (
+                            FABLE_REFUSAL_FALLBACK_ENABLED
+                            and "fable"
+                            in (
                                 (result.fallback_model or effective_model) or ""
-                            ).lower())
+                            ).lower()
+                        )
                         else None
                     ),
                     output_config_override=(
                         {"effort": forced_effort_override}
-                        if forced_effort_override else None
+                        if forced_effort_override
+                        else None
                     ),
                     should_auto_resume=_should_auto_resume,
                 )
@@ -1392,24 +1504,32 @@ async def call_with_tools(
                     _n = _auto_resume_state["used"]
                     log.info(
                         "[ch=%d] checkpoint auto-resume %d: reason=%s",
-                        channel_id, _n, result.paused_reason,
+                        channel_id,
+                        _n,
+                        result.paused_reason,
                     )
                     await _safe_status(
-                        status_callback, f"⏳ 続きを自動実行中 ({_n})",
+                        status_callback,
+                        f"⏳ 続きを自動実行中 ({_n})",
                     )
                     _resume_segments.append(strip_checkpoint_note(response_text))
                     try:
                         async with StallWatchdog(
-                            channel_id, None, idle_timeout_s=600,
+                            channel_id,
+                            None,
+                            idle_timeout_s=600,
                         ) as _rwd:
                             r2 = await run_agent_loop(
-                                AUTO_RESUME_DIRECTIVE, channel_id,
-                                stall_watchdog=_rwd, **_resume_kw,
+                                AUTO_RESUME_DIRECTIVE,
+                                channel_id,
+                                stall_watchdog=_rwd,
+                                **_resume_kw,
                             )
                     except Exception as exc:  # noqa: BLE001 — resume は best-effort
                         log.warning(
                             "[ch=%d] auto-resume failed (checkpoint stands): %s",
-                            channel_id, exc,
+                            channel_id,
+                            exc,
                         )
                         _resume_segments.pop()
                         if incremental_text_callback is not None:
@@ -1430,7 +1550,8 @@ async def call_with_tools(
                         log.warning(
                             "[ch=%d] auto-resume produced no usable reply "
                             "(session=%s) — keeping checkpoint",
-                            channel_id, bool(r2.synthetic_session_id),
+                            channel_id,
+                            bool(r2.synthetic_session_id),
                         )
                         _resume_segments.pop()
                         if incremental_text_callback is not None:
@@ -1450,7 +1571,9 @@ async def call_with_tools(
                         _resume_kw["model"] = r2.fallback_model
                         if not restricted:
                             _record_sticky_model(
-                                channel_id, r2.fallback_model, user_id,
+                                channel_id,
+                                r2.fallback_model,
+                                user_id,
                             )
                     result = r2
                     response_text = r2.text
@@ -1498,7 +1621,8 @@ async def call_with_tools(
                     evidence=evidence,
                     output_config_override=(
                         {"effort": forced_effort_override}
-                        if forced_effort_override else None
+                        if forced_effort_override
+                        else None
                     ),
                 )
 
@@ -1509,11 +1633,15 @@ async def call_with_tools(
                     スライス（prior_len 起点）でそのまま JSONL に永続化される。
                     """
                     async with StallWatchdog(
-                        channel_id, None, idle_timeout_s=600,
+                        channel_id,
+                        None,
+                        idle_timeout_s=600,
                     ) as _vwd:
                         return await run_agent_loop(
-                            revise_prompt, channel_id,
-                            stall_watchdog=_vwd, **_revise_kw,
+                            revise_prompt,
+                            channel_id,
+                            stall_watchdog=_vwd,
+                            **_revise_kw,
                         )
 
                 # P5: MAGI-lite（判断系の問いのみ）— 3レンズ独立見解 + 合意度を
@@ -1524,6 +1652,7 @@ async def call_with_tools(
                             build_lens_revise_prompt,
                             run_lenses,
                         )
+
                         await _safe_status(status_callback, "🧠 多視点で再考中")
                         magi = await run_lenses(
                             question=raw_user_text or prompt,
@@ -1532,8 +1661,7 @@ async def call_with_tools(
                             model=effective_model,
                         )
                         if magi is not None and not magi.degraded:
-                            r2 = await _run_revision(
-                                build_lens_revise_prompt(magi))
+                            r2 = await _run_revision(build_lens_revise_prompt(magi))
                             if (
                                 r2.synthetic_session_id
                                 and r2.text.strip()
@@ -1545,7 +1673,8 @@ async def call_with_tools(
                     except Exception as exc:
                         log.warning(
                             "[ch=%d] magi_lite failed (non-fatal): %s",
-                            channel_id, exc,
+                            channel_id,
+                            exc,
                         )
 
                 # P2: verifier → revise（最大 DELIB_VERIFY_MAX_REVISIONS 回）→
@@ -1556,6 +1685,7 @@ async def call_with_tools(
                         build_revise_prompt,
                         verify_draft,
                     )
+
                     _v_model = DELIB_VERIFIER_MODEL or effective_model
                     _revisions = 0
                     while True:
@@ -1564,12 +1694,12 @@ async def call_with_tools(
                             user_request=raw_user_text or prompt,
                             draft=response_text,
                             evidence_digest=(
-                                evidence.digest() if evidence is not None
+                                evidence.digest()
+                                if evidence is not None
                                 else "(no tool calls)"
                             ),
                             evidence_root=(
-                                evidence.request_dir()
-                                if evidence is not None else None
+                                evidence.request_dir() if evidence is not None else None
                             ),
                             api_client=api_client,
                             channel_id=channel_id,
@@ -1585,7 +1715,8 @@ async def call_with_tools(
                             log.warning(
                                 "[ch=%d] delib_verify still failing after %d "
                                 "revision(s) → caveat degrade",
-                                channel_id, _revisions,
+                                channel_id,
+                                _revisions,
                             )
                             response_text = (
                                 response_text + "\n\n" + build_caveat(verdict)
@@ -1598,7 +1729,8 @@ async def call_with_tools(
                         except Exception as exc:
                             log.warning(
                                 "[ch=%d] delib revise failed (keep draft): %s",
-                                channel_id, exc,
+                                channel_id,
+                                exc,
                             )
                             break
                         if (
@@ -1627,8 +1759,12 @@ async def call_with_tools(
                     judge_lite,
                     should_run_judge,
                 )
+
                 if should_run_judge(
-                    response_text, evidence, tier=tier, restricted=restricted,
+                    response_text,
+                    evidence,
+                    tier=tier,
+                    restricted=restricted,
                 ):
                     _jl = await judge_lite(
                         user_request=raw_user_text or prompt,
@@ -1717,4 +1853,8 @@ async def call_with_tools(
             except Exception as exc:
                 log.warning("[ch=%d] history append failed: %s", channel_id, exc)
 
-        return response_text, session_info if result.synthetic_session_id else None, resumable
+        return (
+            response_text,
+            session_info if result.synthetic_session_id else None,
+            resumable,
+        )

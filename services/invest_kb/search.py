@@ -3,6 +3,7 @@
 Returned dicts mirror Mem0's search result shape so bot.py can pass them to
 `format_memories_for_prompt` with light wrapping for source attribution.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -22,30 +23,120 @@ log = logging.getLogger(__name__)
 # positives blow Haiku budget on chitchat.
 _GATE_KEYWORDS_JA = (
     # core finance vocabulary
-    "投資", "株式", "株価", "資産", "運用", "NISA", "iDeCo", "つみたて",
-    "ETF", "投資信託", "債券", "金利", "配当", "利回り", "インデックス",
-    "アクティブ", "PER", "PBR", "ROE", "ROA", "EPS", "決算", "有報",
-    "貸借", "損益", "自己資本", "バリュエーション", "ポートフォリオ",
-    "リバランス", "アセットアロケーション", "リスク資産", "ベンチマーク",
-    "TOPIX", "日経平均", "S&P", "ドルコスト", "リーマン", "暴落", "バブル",
-    "経常利益", "営業利益", "純資産", "時価総額", "ファンダメンタル",
+    "投資",
+    "株式",
+    "株価",
+    "資産",
+    "運用",
+    "NISA",
+    "iDeCo",
+    "つみたて",
+    "ETF",
+    "投資信託",
+    "債券",
+    "金利",
+    "配当",
+    "利回り",
+    "インデックス",
+    "アクティブ",
+    "PER",
+    "PBR",
+    "ROE",
+    "ROA",
+    "EPS",
+    "決算",
+    "有報",
+    "貸借",
+    "損益",
+    "自己資本",
+    "バリュエーション",
+    "ポートフォリオ",
+    "リバランス",
+    "アセットアロケーション",
+    "リスク資産",
+    "ベンチマーク",
+    "TOPIX",
+    "日経平均",
+    "S&P",
+    "ドルコスト",
+    "リーマン",
+    "暴落",
+    "バブル",
+    "経常利益",
+    "営業利益",
+    "純資産",
+    "時価総額",
+    "ファンダメンタル",
     # academic / theoretical concepts added in Patch 2b after the E2E run
     # showed gated=False on queries like "CAPM の前提と限界" — the KB now
     # covers these well so a missed gate is pure lost recall.
-    "CAPM", "資本資産価格モデル", "EMH", "効率的市場", "効率市場",
-    "現代ポートフォリオ理論", "MPT", "シャープレシオ", "シャープ・レシオ", "シャープ比",
-    "ファクター投資", "ファクター", "リスクプレミアム", "リスクフリー",
-    "信用リスク", "金利リスク", "為替リスク", "ボラティリティ", "標準偏差",
-    "ベータ", "アルファ", "市場ポートフォリオ", "分散投資", "シングルファクター",
-    "マルチファクター", "ロー・ボラティリティ", "クオリティ", "モメンタム",
-    "債券価格", "デュレーション", "信用格付け", "格付", "国債",
-    "確定拠出年金", "確定給付年金", "所得控除", "譲渡所得", "配当所得",
-    "特定口座", "一般口座", "源泉徴収", "総合課税", "申告分離",
-    "決算短信", "MD&A", "経営者の所信表明", "セグメント情報", "有価証券報告書",
+    "CAPM",
+    "資本資産価格モデル",
+    "EMH",
+    "効率的市場",
+    "効率市場",
+    "現代ポートフォリオ理論",
+    "MPT",
+    "シャープレシオ",
+    "シャープ・レシオ",
+    "シャープ比",
+    "ファクター投資",
+    "ファクター",
+    "リスクプレミアム",
+    "リスクフリー",
+    "信用リスク",
+    "金利リスク",
+    "為替リスク",
+    "ボラティリティ",
+    "標準偏差",
+    "ベータ",
+    "アルファ",
+    "市場ポートフォリオ",
+    "分散投資",
+    "シングルファクター",
+    "マルチファクター",
+    "ロー・ボラティリティ",
+    "クオリティ",
+    "モメンタム",
+    "債券価格",
+    "デュレーション",
+    "信用格付け",
+    "格付",
+    "国債",
+    "確定拠出年金",
+    "確定給付年金",
+    "所得控除",
+    "譲渡所得",
+    "配当所得",
+    "特定口座",
+    "一般口座",
+    "源泉徴収",
+    "総合課税",
+    "申告分離",
+    "決算短信",
+    "MD&A",
+    "経営者の所信表明",
+    "セグメント情報",
+    "有価証券報告書",
 )
-_GATE_KEYWORDS_EN = (
-    " invest", "stock", "equity", "bond", "yield", "dividend", "nisa",
-    "ideco", "etf", "valuation", "portfolio", "fund", "benchmark",
+_GATE_TERM_PATTERNS_EN = (
+    r"invest(?:ed|ing|ments?|ors?|s)?",
+    r"stocks?",
+    r"equit(?:y|ies)",
+    r"bonds?",
+    r"yields?",
+    r"dividends?",
+    r"nisa",
+    r"ideco",
+    r"etfs?",
+    r"valuations?",
+    r"portfolios?",
+    r"funds?",
+    r"benchmarks?",
+)
+_GATE_TERM_EN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:" + "|".join(_GATE_TERM_PATTERNS_EN) + r")(?![A-Za-z0-9_])",
+    re.IGNORECASE,
 )
 
 
@@ -53,14 +144,10 @@ def is_investment_query(text: str) -> bool:
     """Cheap keyword gate to decide whether to spend Haiku budget on a query."""
     if not text:
         return False
-    s = text.lower()
     for kw in _GATE_KEYWORDS_JA:
         if kw in text:  # JP keywords are case-irrelevant
             return True
-    for kw in _GATE_KEYWORDS_EN:
-        if kw in s:
-            return True
-    return False
+    return _GATE_TERM_EN_RE.search(text) is not None
 
 
 def _row_to_result(row: dict, score: float) -> dict:
@@ -91,6 +178,7 @@ def _row_to_result(row: dict, score: float) -> dict:
 
 async def _embed_one(text: str) -> list[float]:
     from services.invest_kb.embed import embed_batch
+
     out = await embed_batch([text])
     return out[0] if out else []
 
@@ -99,6 +187,11 @@ async def _vector_search(tbl, vec: list[float], col: str, limit: int) -> list[di
     """Run a single ANN search on the given vector column."""
     if not vec:
         return []
+    return await asyncio.to_thread(_vector_search_sync, tbl, vec, col, limit)
+
+
+def _vector_search_sync(tbl, vec: list[float], col: str, limit: int) -> list[dict]:
+    """Synchronous LanceDB ANN call, invoked only through an offload boundary."""
     # LanceDB returns _distance ascending (lower = closer for cosine).
     df = (
         tbl.search(vec, vector_column_name=col)
@@ -156,18 +249,20 @@ async def search_invest_kb(
       5. RRF merge into top-20
       6. Haiku rerank -> top-`limit`
     """
-    from services.invest_kb.client import get_table
+    from services.invest_kb.client import get_table_async
+
     q = (query or "").strip()
     if not q:
         return []
-    tbl = get_table()
-    if tbl.count_rows() == 0:
+    tbl = await get_table_async()
+    if await asyncio.to_thread(tbl.count_rows) == 0:
         return []
 
     queries: list[str] = [q]
     hyde_text = ""
     if use_haiku:
         from services.invest_kb import haiku
+
         rewrite_task = asyncio.create_task(haiku.rewrite_query(q))
         hyde_task = asyncio.create_task(haiku.hyde(q))
         rewrites, hyde_text = await asyncio.gather(rewrite_task, hyde_task)
@@ -177,6 +272,7 @@ async def search_invest_kb(
 
     # Embed all variants in one batched call.
     from services.invest_kb.embed import embed_batch
+
     vecs = await embed_batch(queries)
 
     # ANN each variant against both vectors, in parallel.
@@ -194,12 +290,16 @@ async def search_invest_kb(
     # doesn't actually cover. Drop everything below the gate so we just return
     # zero hits instead of injecting noise.
     from config import INVEST_KB_MIN_SCORE
+
     if INVEST_KB_MIN_SCORE > 0:
-        merged = [m for m in merged if m.get("cosine_score", 0.0) >= INVEST_KB_MIN_SCORE]
+        merged = [
+            m for m in merged if m.get("cosine_score", 0.0) >= INVEST_KB_MIN_SCORE
+        ]
 
     # Final rerank
     if use_haiku and len(merged) > limit:
         from services.invest_kb import haiku
+
         return await haiku.rerank(q, merged, top_k=limit)
     return merged[:limit]
 
@@ -212,7 +312,7 @@ def format_for_prompt(results: list[dict], *, max_chars: int = 1500) -> str:
     used = 0
     for r in results:
         md = r.get("metadata") or {}
-        tag = f"{md.get('source','?')}:{md.get('source_id','?')}"
+        tag = f"{md.get('source', '?')}:{md.get('source_id', '?')}"
         body = (r.get("memory") or "").strip().replace("\n", " ")
         title = md.get("title")
         prefix = f"- [{tag}] "

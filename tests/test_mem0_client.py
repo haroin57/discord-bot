@@ -1,7 +1,6 @@
 """Unit tests for services/mem0/client.py — all external I/O is mocked."""
 
 import asyncio
-import importlib
 import sys
 import types
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,38 +11,9 @@ import pytest
 # Stub heavy deps that client.py imports at module level or lazily
 # ---------------------------------------------------------------------------
 
-# IMPORTANT: do NOT replace `config`, `services.oauth_manager`, `mem0`, or
-# `anthropic` in sys.modules with bare stubs — that clobbers them for every
-# other test file in the same pytest session. Load the real modules and
-# override only the specific callables/attributes we need, restoring them
-# in a module-scoped finalizer.
-
-# Real config — required so `from config import ADMIN_USER_IDS` etc still
-# work for unrelated tests (test_web_api, test_bot ...). We override
-# STATE_DIR per-test via monkeypatch instead of stubbing the whole module.
-import config as _REAL_CONFIG  # noqa: E402
-
-# Real oauth_manager — override only the callables we mock here, then
-# restore originals at module teardown.
-import services.oauth_manager as _REAL_OAUTH  # noqa: E402
-_OAUTH_OVERRIDES = {
-    "ensure_valid_token": AsyncMock(return_value=None),
-    "get_access_token": MagicMock(return_value="test-token-abc"),
-    "init": MagicMock(return_value=True),
-}
-_ORIGINAL_OAUTH_ATTRS = {
-    name: getattr(_REAL_OAUTH, name, None) for name in _OAUTH_OVERRIDES
-}
-for _k, _v in _OAUTH_OVERRIDES.items():
-    setattr(_REAL_OAUTH, _k, _v)
-
-# mem0.Memory — only stub if the real `mem0` package is not installed.
-# Tests that need a specific Memory mock use patch.dict("sys.modules", ...)
-# inside the test body to scope the override.
-if "mem0" not in sys.modules:
-    _mem0_pkg = types.ModuleType("mem0")
-    _mem0_pkg.Memory = MagicMock()
-    sys.modules["mem0"] = _mem0_pkg
+# Dependency replacements stay inside fixtures or test bodies. Collection
+# imports the real application module without mutating sys.modules or the
+# oauth_manager module shared by other test files.
 
 # anthropic.AsyncAnthropic — real anthropic is installed (claude_code_sdk
 # depends on it), so just leave the real module in place.
@@ -51,26 +21,11 @@ if "mem0" not in sys.modules:
 # Now import the module under test.
 import services.mem0.client as client_mod  # noqa: E402
 
-importlib.reload(client_mod)
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _restore_oauth_after_module():
-    """Restore real services.oauth_manager callables after this file's tests."""
-    yield
-    for _k, _orig in _ORIGINAL_OAUTH_ATTRS.items():
-        if _orig is not None:
-            setattr(_REAL_OAUTH, _k, _orig)
-        else:
-            try:
-                delattr(_REAL_OAUTH, _k)
-            except AttributeError:
-                pass
-
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
 # ---------------------------------------------------------------------------
+
 
 def _reset_singletons():
     """Reset all module-level singletons between tests."""
@@ -86,7 +41,9 @@ def reset_state(monkeypatch):
     _reset_singletons()
     # Reset oauth mocks to clean state
     monkeypatch.setattr(client_mod, "ensure_valid_token", AsyncMock(return_value=None))
-    monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value="test-token-abc"))
+    monkeypatch.setattr(
+        client_mod, "get_access_token", MagicMock(return_value="test-token-abc")
+    )
     monkeypatch.setattr(client_mod, "oauth_init", MagicMock(return_value=True))
     # Default tests to embedded mode so they don't hit the HTTP heartbeat.
     # Tests that exercise server-mode init must override this.
@@ -99,6 +56,7 @@ def reset_state(monkeypatch):
 # _get_mem0 tests
 # ---------------------------------------------------------------------------
 
+
 class TestGetMem0:
     def test_returns_instance_on_success(self, monkeypatch, tmp_path):
         """_get_mem0 returns a Memory instance when everything succeeds."""
@@ -108,7 +66,9 @@ class TestGetMem0:
 
         monkeypatch.setattr("config.STATE_DIR", str(tmp_path))
 
-        with patch.dict("sys.modules", {"mem0": types.SimpleNamespace(Memory=mock_memory_cls)}):
+        with patch.dict(
+            "sys.modules", {"mem0": types.SimpleNamespace(Memory=mock_memory_cls)}
+        ):
             result = client_mod._get_mem0()
 
         assert result is mock_memory
@@ -120,7 +80,9 @@ class TestGetMem0:
 
         monkeypatch.setattr("config.STATE_DIR", str(tmp_path))
 
-        with patch.dict("sys.modules", {"mem0": types.SimpleNamespace(Memory=mock_memory_cls)}):
+        with patch.dict(
+            "sys.modules", {"mem0": types.SimpleNamespace(Memory=mock_memory_cls)}
+        ):
             result = client_mod._get_mem0()
 
         assert result is None
@@ -133,21 +95,27 @@ class TestGetMem0:
 
         monkeypatch.setattr("config.STATE_DIR", str(tmp_path))
 
-        with patch.dict("sys.modules", {"mem0": types.SimpleNamespace(Memory=mock_memory_cls)}):
+        with patch.dict(
+            "sys.modules", {"mem0": types.SimpleNamespace(Memory=mock_memory_cls)}
+        ):
             r1 = client_mod._get_mem0()
             r2 = client_mod._get_mem0()
 
         assert r1 is r2
         assert mock_memory_cls.from_config.call_count == 1
 
-    def test_failure_triggers_cooldown_no_retry_within_window(self, monkeypatch, tmp_path):
+    def test_failure_triggers_cooldown_no_retry_within_window(
+        self, monkeypatch, tmp_path
+    ):
         """After failed init, calls within cooldown window return None without re-init."""
         mock_memory_cls = MagicMock()
         mock_memory_cls.from_config = MagicMock(side_effect=Exception("boom"))
 
         monkeypatch.setattr("config.STATE_DIR", str(tmp_path))
 
-        with patch.dict("sys.modules", {"mem0": types.SimpleNamespace(Memory=mock_memory_cls)}):
+        with patch.dict(
+            "sys.modules", {"mem0": types.SimpleNamespace(Memory=mock_memory_cls)}
+        ):
             r1 = client_mod._get_mem0()
             r2 = client_mod._get_mem0()
 
@@ -161,11 +129,15 @@ class TestGetMem0:
         mock_memory = MagicMock()
         mock_memory_cls = MagicMock()
         # First call raises, second call succeeds
-        mock_memory_cls.from_config = MagicMock(side_effect=[Exception("boom"), mock_memory])
+        mock_memory_cls.from_config = MagicMock(
+            side_effect=[Exception("boom"), mock_memory]
+        )
 
         monkeypatch.setattr("config.STATE_DIR", str(tmp_path))
 
-        with patch.dict("sys.modules", {"mem0": types.SimpleNamespace(Memory=mock_memory_cls)}):
+        with patch.dict(
+            "sys.modules", {"mem0": types.SimpleNamespace(Memory=mock_memory_cls)}
+        ):
             r1 = client_mod._get_mem0()
             assert r1 is None
             # Force cooldown to have already expired
@@ -192,10 +164,13 @@ class TestGetMem0:
         mock_memory_cls = MagicMock()
         mock_memory_cls.from_config = MagicMock(return_value=mock_memory)
 
-        with patch.dict("sys.modules", {
-            "mem0": types.SimpleNamespace(Memory=mock_memory_cls),
-            "requests": types.SimpleNamespace(get=mock_get),
-        }):
+        with patch.dict(
+            "sys.modules",
+            {
+                "mem0": types.SimpleNamespace(Memory=mock_memory_cls),
+                "requests": types.SimpleNamespace(get=mock_get),
+            },
+        ):
             result = client_mod._get_mem0()
 
         assert result is mock_memory
@@ -204,7 +179,9 @@ class TestGetMem0:
         assert "127.0.0.1:8765" in url
         assert "/api/v2/heartbeat" in url
 
-    def test_server_mode_heartbeat_failure_marks_init_failed(self, monkeypatch, tmp_path):
+    def test_server_mode_heartbeat_failure_marks_init_failed(
+        self, monkeypatch, tmp_path
+    ):
         """If heartbeat fails, init is marked failed without attempting Memory.from_config."""
         monkeypatch.setenv("CHROMA_MODE", "server")
         monkeypatch.setattr("config.STATE_DIR", str(tmp_path))
@@ -213,10 +190,13 @@ class TestGetMem0:
         mock_memory_cls = MagicMock()
         mock_memory_cls.from_config = MagicMock()
 
-        with patch.dict("sys.modules", {
-            "mem0": types.SimpleNamespace(Memory=mock_memory_cls),
-            "requests": types.SimpleNamespace(get=mock_get),
-        }):
+        with patch.dict(
+            "sys.modules",
+            {
+                "mem0": types.SimpleNamespace(Memory=mock_memory_cls),
+                "requests": types.SimpleNamespace(get=mock_get),
+            },
+        ):
             result = client_mod._get_mem0()
 
         assert result is None
@@ -233,8 +213,11 @@ class TestGetMem0:
         monkeypatch.setattr("config.STATE_DIR", str(tmp_path))
 
         import logging
+
         with caplog.at_level(logging.ERROR, logger="services.mem0.client"):
-            with patch.dict("sys.modules", {"mem0": types.SimpleNamespace(Memory=mock_memory_cls)}):
+            with patch.dict(
+                "sys.modules", {"mem0": types.SimpleNamespace(Memory=mock_memory_cls)}
+            ):
                 client_mod._get_mem0()
 
         assert any("OAuth init failed" in r.message for r in caplog.records)
@@ -244,10 +227,13 @@ class TestGetMem0:
 # _refresh_mem0_client_token tests
 # ---------------------------------------------------------------------------
 
+
 class TestRefreshMem0ClientToken:
     def test_no_op_when_no_instance(self, monkeypatch):
         """Does nothing if _mem0_instance is None."""
-        monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value="new-token"))
+        monkeypatch.setattr(
+            client_mod, "get_access_token", MagicMock(return_value="new-token")
+        )
         client_mod._mem0_instance = None
         client_mod._last_token = None
         client_mod._refresh_mem0_client_token()  # must not raise
@@ -255,7 +241,9 @@ class TestRefreshMem0ClientToken:
     def test_no_op_when_token_unchanged(self, monkeypatch):
         """Does not update when token is the same as _last_token."""
         token = "same-token"
-        monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value=token))
+        monkeypatch.setattr(
+            client_mod, "get_access_token", MagicMock(return_value=token)
+        )
         client_mod._last_token = token
 
         mock_llm = MagicMock()
@@ -269,7 +257,9 @@ class TestRefreshMem0ClientToken:
 
     def test_updates_token_on_rotation(self, monkeypatch):
         """Updates auth_token when new token differs from _last_token."""
-        monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value="new-token"))
+        monkeypatch.setattr(
+            client_mod, "get_access_token", MagicMock(return_value="new-token")
+        )
         client_mod._last_token = "old-token"
 
         mock_client = MagicMock(spec=["auth_token"])
@@ -284,7 +274,9 @@ class TestRefreshMem0ClientToken:
 
     def test_handles_exception_gracefully(self, monkeypatch):
         """Swallows exceptions raised during token refresh."""
-        monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value="new-token"))
+        monkeypatch.setattr(
+            client_mod, "get_access_token", MagicMock(return_value="new-token")
+        )
         client_mod._last_token = "old-token"
 
         bad_llm = MagicMock()
@@ -295,7 +287,9 @@ class TestRefreshMem0ClientToken:
 
     def test_no_op_when_token_is_none(self, monkeypatch):
         """Does nothing if get_access_token returns None."""
-        monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value=None))
+        monkeypatch.setattr(
+            client_mod, "get_access_token", MagicMock(return_value=None)
+        )
         client_mod._mem0_instance = MagicMock()
         client_mod._refresh_mem0_client_token()  # must not raise
 
@@ -303,6 +297,7 @@ class TestRefreshMem0ClientToken:
 # ---------------------------------------------------------------------------
 # _build_config tests
 # ---------------------------------------------------------------------------
+
 
 class TestBuildConfig:
     def test_default_config_structure(self, monkeypatch, tmp_path):
@@ -339,6 +334,7 @@ class TestBuildConfig:
         monkeypatch.setattr("config.STATE_DIR", str(tmp_path))
         cfg = client_mod._build_config()
         import os
+
         assert os.path.isdir(cfg["vector_store"]["config"]["path"])
 
     def test_default_collection_name(self, monkeypatch, tmp_path):
@@ -353,12 +349,15 @@ class TestBuildConfig:
         monkeypatch.setattr("config.STATE_DIR", str(tmp_path))
         monkeypatch.setenv("MEM0_COLLECTION_NAME", "kanae_memories_infer")
         cfg = client_mod._build_config()
-        assert cfg["vector_store"]["config"]["collection_name"] == "kanae_memories_infer"
+        assert (
+            cfg["vector_store"]["config"]["collection_name"] == "kanae_memories_infer"
+        )
 
 
 # ---------------------------------------------------------------------------
 # get_all_memories tests
 # ---------------------------------------------------------------------------
+
 
 class TestGetAllMemories:
     async def test_returns_list_when_result_is_dict(self, monkeypatch, tmp_path):
@@ -421,6 +420,7 @@ class TestGetAllMemories:
 # delete_memory tests
 # ---------------------------------------------------------------------------
 
+
 class TestDeleteMemory:
     async def test_returns_true_on_success(self, monkeypatch):
         mock_mem = MagicMock()
@@ -457,10 +457,15 @@ class TestDeleteMemory:
 # get_anthropic_client tests
 # ---------------------------------------------------------------------------
 
+
 class TestGetAnthropicClient:
     async def test_returns_none_when_no_token(self, monkeypatch):
-        monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value=None))
-        monkeypatch.setattr(client_mod, "ensure_valid_token", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            client_mod, "get_access_token", MagicMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            client_mod, "ensure_valid_token", AsyncMock(return_value=None)
+        )
         monkeypatch.setattr(client_mod, "oauth_init", MagicMock(return_value=True))
         # "No auth at all" means no OAuth token AND no fallback keys. The real
         # .env ships an OPENCODE_API_KEY, so clear both module-level fallback
@@ -473,22 +478,32 @@ class TestGetAnthropicClient:
         assert result is None
 
     async def test_builds_client_on_first_call(self, monkeypatch):
-        monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value="tok-1"))
-        monkeypatch.setattr(client_mod, "ensure_valid_token", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            client_mod, "get_access_token", MagicMock(return_value="tok-1")
+        )
+        monkeypatch.setattr(
+            client_mod, "ensure_valid_token", AsyncMock(return_value=None)
+        )
         monkeypatch.setattr(client_mod, "oauth_init", MagicMock(return_value=True))
 
         mock_client = MagicMock()
         mock_cls = MagicMock(return_value=mock_client)
 
-        with patch.dict("sys.modules", {"anthropic": types.SimpleNamespace(AsyncAnthropic=mock_cls)}):
+        with patch.dict(
+            "sys.modules", {"anthropic": types.SimpleNamespace(AsyncAnthropic=mock_cls)}
+        ):
             result = await client_mod.get_anthropic_client()
 
         assert result is mock_client
         mock_cls.assert_called_once_with(auth_token="tok-1", max_retries=0)
 
     async def test_returns_cached_client_on_same_token(self, monkeypatch):
-        monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value="tok-same"))
-        monkeypatch.setattr(client_mod, "ensure_valid_token", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            client_mod, "get_access_token", MagicMock(return_value="tok-same")
+        )
+        monkeypatch.setattr(
+            client_mod, "ensure_valid_token", AsyncMock(return_value=None)
+        )
         monkeypatch.setattr(client_mod, "oauth_init", MagicMock(return_value=True))
 
         mock_client = MagicMock()
@@ -499,8 +514,12 @@ class TestGetAnthropicClient:
         assert result is mock_client
 
     async def test_rebuilds_client_on_token_rotation(self, monkeypatch):
-        monkeypatch.setattr(client_mod, "get_access_token", MagicMock(return_value="tok-new"))
-        monkeypatch.setattr(client_mod, "ensure_valid_token", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            client_mod, "get_access_token", MagicMock(return_value="tok-new")
+        )
+        monkeypatch.setattr(
+            client_mod, "ensure_valid_token", AsyncMock(return_value=None)
+        )
         monkeypatch.setattr(client_mod, "oauth_init", MagicMock(return_value=True))
 
         old_client = MagicMock()
@@ -510,7 +529,9 @@ class TestGetAnthropicClient:
         new_client = MagicMock()
         mock_cls = MagicMock(return_value=new_client)
 
-        with patch.dict("sys.modules", {"anthropic": types.SimpleNamespace(AsyncAnthropic=mock_cls)}):
+        with patch.dict(
+            "sys.modules", {"anthropic": types.SimpleNamespace(AsyncAnthropic=mock_cls)}
+        ):
             result = await client_mod.get_anthropic_client()
 
         assert result is new_client

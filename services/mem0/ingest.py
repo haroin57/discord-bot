@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 # never grows without limit. Offline hash sweep cleans any historical dups.
 import hashlib as _hashlib
 from collections import OrderedDict as _OrderedDict
+
 _INSERT_SEEN: "_OrderedDict[str, str]" = _OrderedDict()
 _INSERT_SEEN_LOCK = asyncio.Lock()
 _INSERT_SEEN_MAX = 8000
@@ -45,7 +46,186 @@ async def _claim_insert(user_id: str, text: str) -> bool:
     return True
 
 
+def _batch_lease_error(reason: str) -> dict:
+    return {
+        "error": f"BatchLeaseUnavailableError: {reason}",
+        "error_code": "batch_lease_unavailable",
+        "results": [],
+        "kept": 0,
+        "skipped": {
+            "low_importance": 0,
+            "other_speaker": 0,
+            "near_dup": 0,
+        },
+    }
+
+
+def _batch_metadata_error(
+    metadata: dict | None, *, inherited_claim: bool
+) -> str | None:
+    if not isinstance(metadata, dict):
+        return "batch work context requires metadata"
+    if "batch_size" not in metadata:
+        return "batch_size is required for batch work"
+    batch_size = metadata.get("batch_size")
+    try:
+        parsed_size = int(batch_size)
+    except (TypeError, ValueError):
+        return "batch_size must be a positive integer"
+    if isinstance(batch_size, bool) or parsed_size <= 0:
+        return "batch_size must be a positive integer"
+    channel_id = metadata.get("channel_id")
+    if channel_id is None or not str(channel_id).strip():
+        return "channel_id is required for batch work"
+    source = metadata.get("source")
+    if source not in (None, "", "batch"):
+        return "batch work source conflicts with the durable lease"
+    if metadata.get("idempotency_key"):
+        return "batch idempotency_key must come from the durable lease"
+    if not inherited_claim:
+        return "batch work has no inherited durable lease identity"
+    return None
+
+
 async def add_memories(
+    messages: list[dict] | None = None,
+    user_id: str | None = None,
+    metadata: dict | None = None,
+    *,
+    user_text: str | None = None,
+    assistant_text: str | None = None,
+    context_hint: str = "",
+    subject: str = "self",
+    pre_extracted_facts: list[dict] | None = None,
+) -> dict | None:
+    """Run batch ingestion behind a cancellation-safe durable lease."""
+    from services.mem0.batch import current_compat_batch_claims
+
+    inherited_claims = current_compat_batch_claims()
+    metadata_source = metadata.get("source") if isinstance(metadata, dict) else None
+    batch_hint = bool(inherited_claims) or (
+        isinstance(metadata, dict)
+        and (
+            "batch_size" in metadata
+            or metadata_source == "batch"
+            or ("idempotency_key" in metadata and metadata_source != "replay")
+        )
+    )
+    if not batch_hint:
+        return await _add_memories_impl(
+            messages,
+            user_id,
+            metadata,
+            user_text=user_text,
+            assistant_text=assistant_text,
+            context_hint=context_hint,
+            subject=subject,
+            pre_extracted_facts=pre_extracted_facts,
+        )
+
+    metadata_error = _batch_metadata_error(
+        metadata,
+        inherited_claim=bool(inherited_claims),
+    )
+    if metadata_error is not None:
+        return _batch_lease_error(metadata_error)
+
+    from config import STATE_DIR
+    from services.mem0.batch import begin_compat_batch
+
+    batch_operation = begin_compat_batch(STATE_DIR, metadata["channel_id"])
+    if batch_operation is None:
+        return _batch_lease_error(
+            "batch lease expired or its owner token does not match",
+        )
+
+    from services.mem0.batch import complete_cleanup
+
+    batch_metadata = dict(metadata or {})
+    batch_metadata["source"] = "batch"
+    batch_metadata["idempotency_key"] = batch_operation.idempotency_key
+    provider_task = None
+    first_cancel = None
+    result = None
+    provider_error: BaseException | str | None = None
+    completion_error: BaseException | None = None
+    try:
+        if not await batch_operation.start() or not await batch_operation.fence():
+            provider_error = "batch lease lost before provider call"
+            result = _batch_lease_error(provider_error)
+        else:
+            provider_task = batch_operation.provider_task(
+                _add_memories_impl(
+                    messages,
+                    user_id,
+                    batch_metadata,
+                    user_text=user_text,
+                    assistant_text=assistant_text,
+                    context_hint=context_hint,
+                    subject=subject,
+                    pre_extracted_facts=pre_extracted_facts,
+                ),
+            )
+            try:
+                result = await asyncio.shield(provider_task)
+            except asyncio.CancelledError as cancelled:
+                first_cancel = cancelled
+                try:
+                    result = await complete_cleanup(provider_task)
+                except BaseException as exc:
+                    provider_error = exc
+            except BaseException as exc:
+                provider_error = exc
+        if provider_error is None:
+            if result is None:
+                provider_error = "Mem0 unavailable"
+            elif isinstance(result, dict) and result.get("error"):
+                provider_error = str(result["error"])
+    except asyncio.CancelledError as cancelled:
+        first_cancel = first_cancel or cancelled
+        provider_error = (
+            provider_error or "batch worker cancelled before provider completion"
+        )
+    finally:
+        finish_task = asyncio.create_task(
+            batch_operation.finish(provider_error),
+            name=f"mem0-batch-finish-{batch_operation.batch.lease.id}",
+        )
+        try:
+            if first_cancel is not None:
+                await complete_cleanup(finish_task)
+            else:
+                try:
+                    await asyncio.shield(finish_task)
+                except asyncio.CancelledError as cancelled:
+                    first_cancel = cancelled
+                    await complete_cleanup(finish_task)
+        except BaseException as finish_error:
+            log.warning("Mem0 batch lease completion failed: %s", finish_error)
+            completion_error = finish_error
+        close_task = asyncio.create_task(
+            batch_operation.close(),
+            name=f"mem0-batch-close-{batch_operation.batch.lease.id}",
+        )
+        if first_cancel is not None:
+            await complete_cleanup(close_task)
+        else:
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError as cancelled:
+                first_cancel = cancelled
+                await complete_cleanup(close_task)
+
+    if first_cancel is not None:
+        raise first_cancel
+    if completion_error is not None:
+        raise completion_error
+    if isinstance(provider_error, BaseException):
+        raise provider_error
+    return result
+
+
+async def _add_memories_impl(
     messages: list[dict] | None = None,
     user_id: str | None = None,
     metadata: dict | None = None,
@@ -94,13 +274,20 @@ async def add_memories(
 
     # Late import so .env reload (via restart) is honored
     from config import (
-        MEM0_GATE_ENABLED, MEM0_GATE_MIN_IMPORTANCE,
-        MEM0_CLIENT_DEDUP_ENABLED, MEM0_CLIENT_DEDUP_THRESHOLD,
-        MEM0_DEDUP_TWO_STAGE, MEM0_DEDUP_SEARCH_LIMIT, MEM0_DEDUP_DRY_RUN,
-        MEM0_CONFLICT_DETECTION_ENABLED, MEM0_DEDUP_SUPERSET_MERGE,
+        MEM0_GATE_ENABLED,
+        MEM0_GATE_MIN_IMPORTANCE,
+        MEM0_CLIENT_DEDUP_ENABLED,
+        MEM0_CLIENT_DEDUP_THRESHOLD,
+        MEM0_DEDUP_TWO_STAGE,
+        MEM0_DEDUP_SEARCH_LIMIT,
+        MEM0_DEDUP_DRY_RUN,
+        MEM0_CONFLICT_DETECTION_ENABLED,
+        MEM0_DEDUP_SUPERSET_MERGE,
         MEM0_RELATION_EXTRACT_ENABLED,
-        MEM0_ATTRIBUTE_ENABLED, MEM0_ATTRIBUTE_CONFLICT_ENABLED,  # Phase A
-        MEM0_CONDITION_ENABLED, MEM0_SCOPE_ENABLED,  # Phase B/C
+        MEM0_ATTRIBUTE_ENABLED,
+        MEM0_ATTRIBUTE_CONFLICT_ENABLED,  # Phase A
+        MEM0_CONDITION_ENABLED,
+        MEM0_SCOPE_ENABLED,  # Phase B/C
         MEM0_TYPED_VALUE_ENABLED,  # v5 T7
         MEM0_FACT_STORE_ENABLED,  # v5 T8a
     )
@@ -109,6 +296,7 @@ async def add_memories(
         await ensure_valid_token()
         _refresh_mem0_client_token()
         import time as _time
+
         # Caller-supplied metadata is allowlisted before merging so it cannot
         # overwrite trust-relevant keys (gate_version, timestamp, importance,
         # category, tags). New caller-controlled keys must be added here
@@ -124,8 +312,14 @@ async def add_memories(
         # a consolidation-generated schema fact was generalized from, so a
         # schema row's provenance is inspectable without a separate table.
         _ALLOWED_CALLER_META = {
-            "channel_id", "channel_name", "source",
-            "persona", "episode_id", "interest_tags", "derived_from",
+            "channel_id",
+            "channel_name",
+            "source",
+            "persona",
+            "episode_id",
+            "interest_tags",
+            "derived_from",
+            "idempotency_key",
         }
         base_meta = {
             "timestamp": int(_time.time()),
@@ -164,7 +358,9 @@ async def add_memories(
                 # used to return; relations are handed off to the graph layer in
                 # _insert_one below.
                 _signals = await extract_full_signals(
-                    user_text, assistant_text, context_hint,
+                    user_text,
+                    assistant_text,
+                    context_hint,
                     user_id=str(user_id) if user_id else None,
                 )
                 facts = _signals.get("facts", [])
@@ -173,13 +369,15 @@ async def add_memories(
             # turn produced unexpected dedup hits (candidate vs existing).
             if facts:
                 _previews = [
-                    f"[{f.get('speaker','?')}|imp={f.get('importance','?')}] "
+                    f"[{f.get('speaker', '?')}|imp={f.get('importance', '?')}] "
                     f"{(f.get('text') or '')[:120]}"
                     for f in facts
                 ]
                 log.info(
                     "Mem0 gate: extracted %d facts user=...%s | %s",
-                    len(facts), str(user_id)[-4:], " || ".join(_previews),
+                    len(facts),
+                    str(user_id)[-4:],
+                    " || ".join(_previews),
                 )
 
             # Cheap synchronous filter pass first — drops obvious non-self /
@@ -222,7 +420,9 @@ async def add_memories(
                 dedup_results = await asyncio.gather(
                     *(
                         search_memories(
-                            f["text"], user_id, limit=search_limit,
+                            f["text"],
+                            user_id,
+                            limit=search_limit,
                             current_channel_id=_dedup_ch,
                         )
                         for f in candidates
@@ -233,20 +433,34 @@ async def add_memories(
                 if MEM0_DEDUP_TWO_STAGE:
                     from services.mem0.dedup import check_near_dup
                     from services.mem0.reinforce import reinforce_existing
+
                     kept = []
+
                     # Run 2-stage checks in parallel
                     async def _check_one(f, near):
                         if isinstance(near, Exception):
                             return (f, False, None, None, None)
-                        is_dup, reason, existing_id, conflict_type, merged_text = await check_near_dup(
-                            f["text"], f.get("category"), near,
+                        (
+                            is_dup,
+                            reason,
+                            existing_id,
+                            conflict_type,
+                            merged_text,
+                        ) = await check_near_dup(
+                            f["text"],
+                            f.get("category"),
+                            near,
                             dry_run=MEM0_DEDUP_DRY_RUN,
                             detect_conflict=MEM0_CONFLICT_DETECTION_ENABLED,
                             allow_merge=MEM0_DEDUP_SUPERSET_MERGE,
                         )
                         return (f, is_dup, existing_id, conflict_type, merged_text)
+
                     check_results = await asyncio.gather(
-                        *(_check_one(f, near) for f, near in zip(candidates, dedup_results)),
+                        *(
+                            _check_one(f, near)
+                            for f, near in zip(candidates, dedup_results)
+                        ),
                     )
                     reinforced_ids: list[str] = []
                     # Phase B-2 / 止揚: facts that update / correct / merge with
@@ -254,7 +468,13 @@ async def add_memories(
                     # *after* the new (or synthesized) row is inserted, so we
                     # record the (existing_id, conflict_type) pair here.
                     conflict_archive: list[tuple[str, str]] = []
-                    for f, is_dup, existing_id, conflict_type, merged_text in check_results:
+                    for (
+                        f,
+                        is_dup,
+                        existing_id,
+                        conflict_type,
+                        merged_text,
+                    ) in check_results:
                         if is_dup and not MEM0_DEDUP_DRY_RUN:
                             skip_dup += 1
                             if existing_id:
@@ -297,7 +517,8 @@ async def add_memories(
                             kept.append(f)
                             continue
                         if any(
-                            (r.get("score") if r.get("score") is not None else 99) <= MEM0_CLIENT_DEDUP_THRESHOLD
+                            (r.get("score") if r.get("score") is not None else 99)
+                            <= MEM0_CLIENT_DEDUP_THRESHOLD
                             for r in near
                         ):
                             skip_dup += 1
@@ -312,11 +533,14 @@ async def add_memories(
                 # in-flight / recently inserted this process (defeats the
                 # parallel-ingest exact-dup race). Gated by env.
                 from config import MEM0_INGEST_HASH_DEDUP
+
                 if MEM0_INGEST_HASH_DEDUP and not await _claim_insert(
                     user_id, f.get("text", "")
                 ):
-                    log.info("ingest hash-dedup: skipped in-flight dup: %r",
-                             (f.get("text") or "")[:60])
+                    log.info(
+                        "ingest hash-dedup: skipped in-flight dup: %r",
+                        (f.get("text") or "")[:60],
+                    )
                     return None
                 fact_meta = dict(base_meta)
                 imp = int(f.get("importance", 3))
@@ -340,13 +564,15 @@ async def add_memories(
                     str(t).replace(",", " ") for t in raw_tags if str(t).strip()
                 )
                 # Coerce category/subcategory to strings; None is rejected.
-                fact_meta.update({
-                    "category":    str(f.get("category") or "meta"),
-                    "subcategory": str(f.get("subcategory") or ""),
-                    "importance":  imp,
-                    "tier":        tier,
-                    "tags":        tags_csv,
-                })
+                fact_meta.update(
+                    {
+                        "category": str(f.get("category") or "meta"),
+                        "subcategory": str(f.get("subcategory") or ""),
+                        "importance": imp,
+                        "tier": tier,
+                        "tags": tags_csv,
+                    }
+                )
                 # Phase A: attribute(統制語彙)を付与。決定的 conflict ルートの
                 # キー。空文字列は付けない(ChromaDB metadata を無駄に増やさない)。
                 _attr = f.get("attribute") or ""
@@ -357,8 +583,8 @@ async def add_memories(
                 _val = f.get("value")
                 if MEM0_TYPED_VALUE_ENABLED and isinstance(_val, dict):
                     import json as _json_mod
-                    fact_meta["value_json"] = _json_mod.dumps(
-                        _val, ensure_ascii=False)
+
+                    fact_meta["value_json"] = _json_mod.dumps(_val, ensure_ascii=False)
                 # Phase B: condition(time:/context:)を付与。
                 _cond = f.get("condition") or ""
                 if MEM0_CONDITION_ENABLED and _cond:
@@ -379,10 +605,16 @@ async def add_memories(
                 # contain (e.g. channel_id when called from a script).
                 fact_meta = {k: v for k, v in fact_meta.items() if v is not None}
                 try:
+                    from services.mem0.integrity import get_application_service
+
+                    _memory_service = get_application_service()
                     res = await asyncio.to_thread(
-                        mem.add,
-                        [{"role": "user", "content": f["text"]}],
-                        user_id=user_id, metadata=fact_meta, infer=False,
+                        _memory_service.create_fact,
+                        mem,
+                        user_id=str(user_id),
+                        text=f["text"],
+                        metadata=fact_meta,
+                        entities=f.get("entities") or [],
                     )
                 except Exception as e:
                     log.warning("Mem0 raw insert failed: %s", e)
@@ -391,14 +623,19 @@ async def add_memories(
                 # fact. Errors are non-fatal — the fact is already stored.
                 try:
                     entities = f.get("entities") or []
-                    if entities and isinstance(res, dict):
+                    if (
+                        entities
+                        and isinstance(res, dict)
+                        and not res.get("_projections_managed")
+                    ):
                         fact_ids: list[str] = []
-                        for r in (res.get("results") or []):
+                        for r in res.get("results") or []:
                             fid = r.get("id") if isinstance(r, dict) else None
                             if fid:
                                 fact_ids.append(fid)
                         if fact_ids:
                             from services.mem0 import graph
+
                             linked_eids: list[int] = []
                             for ent in entities:
                                 if not isinstance(ent, dict):
@@ -410,12 +647,17 @@ async def add_memories(
                                     continue
                                 eid = await asyncio.to_thread(
                                     graph.upsert_entity,
-                                    name, etype, str(user_id), aliases=aliases,
+                                    name,
+                                    etype,
+                                    str(user_id),
+                                    aliases=aliases,
                                 )
                                 if eid:
                                     linked_eids.append(eid)
                                     for fid in fact_ids:
-                                        await asyncio.to_thread(graph.add_edge, fid, eid)
+                                        await asyncio.to_thread(
+                                            graph.add_edge, fid, eid
+                                        )
                             # Phase ④: entities just mentioned prime this
                             # session's next search (see services/mem0/
                             # priming.py) — ingest and search share the same
@@ -423,8 +665,10 @@ async def add_memories(
                             # other.
                             if linked_eids:
                                 from services.mem0 import priming
+
                                 priming.touch(
-                                    str(user_id), base_meta.get("channel_id"),
+                                    str(user_id),
+                                    base_meta.get("channel_id"),
                                     linked_eids,
                                 )
                 except Exception as e:
@@ -433,14 +677,17 @@ async def add_memories(
                 # hybrid retrieval can rescue exact-term matches that cosine
                 # missed. Errors are non-fatal — the fact is already stored.
                 try:
-                    if isinstance(res, dict):
+                    if isinstance(res, dict) and not res.get("_projections_managed"):
                         from services.mem0 import bm25_index
-                        for r in (res.get("results") or []):
+
+                        for r in res.get("results") or []:
                             fid = r.get("id") if isinstance(r, dict) else None
                             if fid:
                                 await asyncio.to_thread(
                                     bm25_index.index_fact,
-                                    fid, f["text"], str(user_id),
+                                    fid,
+                                    f["text"],
+                                    str(user_id),
                                 )
                 except Exception as e:
                     log.warning("bm25 index update failed (non-fatal): %s", e)
@@ -451,21 +698,26 @@ async def add_memories(
                         MEM0_FACT_STORE_ENABLED
                         and _attr
                         and isinstance(res, dict)
+                        and not res.get("_projections_managed")
                     ):
                         from services.mem0 import fact_store
-                        for r in (res.get("results") or []):
+
+                        for r in res.get("results") or []:
                             fid = r.get("id") if isinstance(r, dict) else None
                             if fid:
                                 await asyncio.to_thread(
                                     fact_store.record_fact,
-                                    fid, str(user_id), _attr,
+                                    fid,
+                                    str(user_id),
+                                    _attr,
                                     value_text=f.get("text", ""),
                                     value_json=fact_meta.get("value_json"),
                                     condition=f.get("condition") or "",
                                     scope=fact_meta.get("scope", ""),
                                     source_conversation_id=(
                                         str(base_meta.get("channel_id"))
-                                        if base_meta.get("channel_id") else None
+                                        if base_meta.get("channel_id")
+                                        else None
                                     ),
                                 )
                 except Exception as e:
@@ -479,24 +731,30 @@ async def add_memories(
             if MEM0_ATTRIBUTE_CONFLICT_ENABLED and kept:
                 _already = (
                     {eid for eid, _ in conflict_archive}
-                    if 'conflict_archive' in locals() else set()
+                    if "conflict_archive" in locals()
+                    else set()
                 )
                 _attr_pairs = await _attribute_conflict_check(
-                    mem, user_id, kept, exclude_ids=_already,
+                    mem,
+                    user_id,
+                    kept,
+                    exclude_ids=_already,
                 )
                 if _attr_pairs:
-                    if 'conflict_archive' not in locals():
+                    if "conflict_archive" not in locals():
                         conflict_archive = []
                     conflict_archive.extend(_attr_pairs)
 
-            insert_results = await asyncio.gather(*(_insert_one(f) for f in kept)) if kept else []
+            insert_results = (
+                await asyncio.gather(*(_insert_one(f) for f in kept)) if kept else []
+            )
             results = [r for r in insert_results if r is not None]
 
             # Phase B-2: soft-archive outdated predecessors after the new
             # fact is in storage. Errors are non-fatal — the new fact is
             # already stored, the old one just won't be hidden.
             archived = 0
-            if 'conflict_archive' in locals() and conflict_archive:
+            if "conflict_archive" in locals() and conflict_archive:
                 archived = await _archive_outdated_facts(mem, conflict_archive)
 
             # Phase C-2: ingest entity-entity relations into the graph
@@ -507,7 +765,7 @@ async def add_memories(
             # a hallucinated edge spawn ghost entities.
             relations_added = 0
             relations_to_add = (
-                relations_payload if 'relations_payload' in locals() else []
+                relations_payload if "relations_payload" in locals() else []
             )
             if (
                 MEM0_RELATION_EXTRACT_ENABLED
@@ -515,31 +773,19 @@ async def add_memories(
                 and subject != "kanae"
             ):
                 try:
-                    from services.mem0 import graph
-                    for rel in relations_to_add:
-                        src_name = rel.get("src")
-                        rel_type = rel.get("rel_type")
-                        dst_name = rel.get("dst")
-                        if not (src_name and rel_type and dst_name):
-                            continue
-                        src_ent = await asyncio.to_thread(
-                            graph.find_entity, src_name, str(user_id), fuzzy=False,
-                        )
-                        dst_ent = await asyncio.to_thread(
-                            graph.find_entity, dst_name, str(user_id), fuzzy=False,
-                        )
-                        if not (src_ent and dst_ent):
-                            continue
-                        rid = await asyncio.to_thread(
-                            graph.add_relation,
-                            src_ent.id, rel_type, dst_ent.id, str(user_id),
-                        )
-                        if rid:
-                            relations_added += 1
+                    from services.mem0.integrity import get_application_service
+
+                    relations_added = await asyncio.to_thread(
+                        get_application_service().record_relations,
+                        mem,
+                        str(user_id),
+                        relations_to_add,
+                    )
                     if relations_added:
                         log.info(
                             "[REL_ADDED count=%d user=...%s]",
-                            relations_added, str(user_id)[-4:],
+                            relations_added,
+                            str(user_id)[-4:],
                         )
                 except Exception as exc:
                     log.warning("relation ingest failed (non-fatal): %s", exc)
@@ -547,8 +793,13 @@ async def add_memories(
             log.info(
                 "Mem0 gate: facts=%d kept=%d skip(low=%d,other=%d,dup=%d) "
                 "archived=%d user=...%s",
-                len(facts), len(kept), skip_low, skip_other, skip_dup,
-                archived, str(user_id)[-4:],
+                len(facts),
+                len(kept),
+                skip_low,
+                skip_other,
+                skip_dup,
+                archived,
+                str(user_id)[-4:],
             )
             # Phase B-3: structured one-line metric for grep-based weekly
             # health reports. Each key is positional so the parser stays
@@ -556,12 +807,24 @@ async def add_memories(
             log.info(
                 "[MEM0_INGEST_METRICS extracted=%d candidates=%d kept=%d "
                 "drop_low=%d drop_other=%d drop_dup=%d archived=%d]",
-                len(facts), len(candidates), len(kept),
-                skip_low, skip_other, skip_dup, archived,
+                len(facts),
+                len(candidates),
+                len(kept),
+                skip_low,
+                skip_other,
+                skip_dup,
+                archived,
             )
-            return {"results": results, "kept": len(kept), "skipped": {
-                "low_importance": skip_low, "other_speaker": skip_other, "near_dup": skip_dup,
-            }}
+            response = {
+                "results": results,
+                "kept": len(kept),
+                "skipped": {
+                    "low_importance": skip_low,
+                    "other_speaker": skip_other,
+                    "near_dup": skip_dup,
+                },
+            }
+            return response
 
         # ── 3. Legacy path: Mem0 standard fact extraction (fallback) ──
         # context_hint is INTENTIONALLY excluded from legacy_msgs even when
@@ -572,7 +835,9 @@ async def add_memories(
         # caller that passes a raw list with role=system can't re-introduce
         # the contamination vector.
         if messages:
-            legacy_msgs = [m for m in messages if m.get("role") in ("user", "assistant")]
+            legacy_msgs = [
+                m for m in messages if m.get("role") in ("user", "assistant")
+            ]
         else:
             legacy_msgs = []
         if not legacy_msgs:
@@ -585,8 +850,14 @@ async def add_memories(
         # (above) is the canonical source of taxonomy metadata; in legacy
         # fallback we accept the simpler Mem0 default and skip the redundant
         # classifier so this path costs 1 LLM call, not 2.
+        from services.mem0.integrity import get_application_service
+
         result = await asyncio.to_thread(
-            mem.add, legacy_msgs, user_id=user_id, metadata=base_meta
+            get_application_service().ingest_legacy_messages,
+            mem,
+            legacy_msgs,
+            user_id=user_id,
+            metadata=base_meta,
         )
         count = len(result.get("results", [])) if isinstance(result, dict) else 0
         if count:
@@ -607,7 +878,8 @@ async def add_memories(
         log.warning("Mem0 add error: %s", exc, exc_info=True)
         return {
             "error": f"{type(exc).__name__}: {exc}",
-            "results": [], "kept": 0,
+            "results": [],
+            "kept": 0,
             "skipped": {"low_importance": 0, "other_speaker": 0, "near_dup": 0},
         }
 
@@ -628,39 +900,45 @@ async def _archive_outdated_facts(mem, archive: list[tuple[str, str]]) -> int:
     if not archive:
         return 0
     import time as _time
+
     now = int(_time.time())
     success = 0
     for existing_id, ctype in archive:
         try:
-            existing = await asyncio.to_thread(mem.get, existing_id)
-            if not isinstance(existing, dict):
-                continue
-            text = existing.get("memory") or existing.get("text") or ""
-            if not text:
-                continue
-            partial = {"valid_to": now, "conflict_archived_as": ctype}
-            await asyncio.to_thread(
-                mem.update, memory_id=existing_id,
-                data=text, metadata=partial,
+            from services.mem0.integrity import get_application_service
+
+            service = get_application_service()
+            archived = await asyncio.to_thread(
+                service.archive,
+                mem,
+                existing_id,
+                reason=ctype,
             )
+            if not archived:
+                continue
             log.info(
                 "[CONFLICT_ARCHIVE existing_id=%s conflict_type=%s valid_to=%d]",
-                existing_id, ctype, now,
+                existing_id,
+                ctype,
+                now,
             )
             # v5 T8a: fact_store 側も supersede（Chroma soft-archive と対）。
             try:
                 from config import MEM0_FACT_STORE_ENABLED as _fs_on
-                if _fs_on:
+
+                if _fs_on and not service.canonical_enabled:
                     from services.mem0 import fact_store
-                    await asyncio.to_thread(
-                        fact_store.supersede_fact, existing_id)
+
+                    await asyncio.to_thread(fact_store.supersede_fact, existing_id)
             except Exception as exc2:  # noqa: BLE001
                 log.warning("fact_store supersede failed (non-fatal): %s", exc2)
             success += 1
         except Exception as exc:
             log.warning(
                 "conflict archive (%s, %s) failed (non-fatal): %s",
-                existing_id, ctype, exc,
+                existing_id,
+                ctype,
+                exc,
             )
     return success
 
@@ -679,14 +957,37 @@ async def _get_facts_by_attribute(mem, user_id, attribute: str) -> list[dict]:
     if not attribute:
         return []
     try:
+        from services.mem0.integrity import get_application_service
+
+        _memory_service = get_application_service()
+        if _memory_service.canonical_enabled:
+            rows = await asyncio.to_thread(
+                _memory_service.repository.active_facts_by_attribute,
+                str(user_id),
+                attribute,
+            )
+            if rows or _memory_service.mode == "canonical":
+                return [
+                    {
+                        "id": row.get("legacy_id") or row["fact_id"],
+                        "memory": row["text"],
+                        "metadata": row["metadata"],
+                    }
+                    for row in rows
+                ]
+    except Exception as exc:
+        log.warning("canonical attribute lookup failed, using projection: %s", exc)
+    try:
         from config import MEM0_FACT_STORE_ENABLED as _fs_on
     except Exception:
         _fs_on = False
     if _fs_on:
         try:
             from services.mem0 import fact_store
+
             rows = await asyncio.to_thread(
-                fact_store.get_active_facts, str(user_id), attribute)
+                fact_store.get_active_facts, str(user_id), attribute
+            )
             if rows:
                 return [
                     {
@@ -704,10 +1005,13 @@ async def _get_facts_by_attribute(mem, user_id, attribute: str) -> list[dict]:
         except Exception as exc:
             log.warning("fact_store lookup failed, falling back: %s", exc)
     import time as _time
+
     try:
         raw = await asyncio.to_thread(
-            mem.get_all, user_id=user_id,
-            filters={"attribute": attribute}, limit=50,
+            mem.get_all,
+            user_id=user_id,
+            filters={"attribute": attribute},
+            limit=50,
         )
     except TypeError:
         # SDK が filters を受け付けない → 全件 + Python フィルタ
@@ -746,6 +1050,7 @@ def _compare_typed_values_shadow(ex: dict, cand: dict, attr: str) -> None:
     """
     try:
         import json as _json_mod
+
         cand_val = cand.get("value")
         if not isinstance(cand_val, dict) or cand_val.get("type") != "quantity":
             return
@@ -762,18 +1067,24 @@ def _compare_typed_values_shadow(ex: dict, cand: dict, attr: str) -> None:
         else:
             verdict = "changed"
         log.info(
-            "[ATTR_VALUE_COMPARE attribute=%s verdict=%s existing=%s%s "
-            "candidate=%s%s]",
-            attr, verdict,
-            ex_val.get("value"), ex_val.get("unit"),
-            cand_val.get("value"), cand_val.get("unit"),
+            "[ATTR_VALUE_COMPARE attribute=%s verdict=%s existing=%s%s candidate=%s%s]",
+            attr,
+            verdict,
+            ex_val.get("value"),
+            ex_val.get("unit"),
+            cand_val.get("value"),
+            cand_val.get("unit"),
         )
     except Exception as exc:  # noqa: BLE001 - 観測用、絶対に本流を壊さない
         log.debug("typed value compare failed (non-fatal): %s", exc)
 
 
 async def _attribute_conflict_check(
-    mem, user_id, kept: list[dict], *, exclude_ids: set,
+    mem,
+    user_id,
+    kept: list[dict],
+    *,
+    exclude_ids: set,
 ) -> list[tuple[str, str]]:
     """Phase A-3: 決定的 conflict ルート（embedding 距離に依存しない）。
 
@@ -784,9 +1095,11 @@ async def _attribute_conflict_check(
     """
     from services.mem0.conflict import classify_conflict
     from services.mem0.attribute_registry import (
-        conditions_are_conflict_candidate, get_conflict_group,
+        conditions_are_conflict_candidate,
+        get_conflict_group,
         is_update_cardinality,
     )
+
     out: list[tuple[str, str]] = []
     seen = set(exclude_ids)
     for f in kept:
@@ -802,9 +1115,7 @@ async def _attribute_conflict_check(
         existing: list[dict] = []
         try:
             for group_attr in sorted(get_conflict_group(attr)):
-                existing.extend(
-                    await _get_facts_by_attribute(mem, user_id, group_attr)
-                )
+                existing.extend(await _get_facts_by_attribute(mem, user_id, group_attr))
         except Exception as exc:
             log.warning("attr conflict lookup failed (non-fatal): %s", exc)
             continue
@@ -841,7 +1152,10 @@ async def _attribute_conflict_check(
                 log.info(
                     "[ATTR_CONFLICT attribute=%s conflict_type=%s existing_id=%s "
                     "cand=%r]",
-                    attr, ctype, eid, cand_text[:60],
+                    attr,
+                    ctype,
+                    eid,
+                    cand_text[:60],
                 )
                 out.append((eid, ctype))
                 seen.add(eid)

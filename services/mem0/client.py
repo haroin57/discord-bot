@@ -5,7 +5,11 @@ import logging
 import os
 import time
 
-from services.oauth_manager import ensure_valid_token, get_access_token, init as oauth_init
+from services.oauth_manager import (
+    ensure_valid_token,
+    get_access_token,
+    init as oauth_init,
+)
 
 log = logging.getLogger(__name__)
 
@@ -82,8 +86,10 @@ async def get_anthropic_client():
         async with _async_anthropic_lock:
             if _async_anthropic_client is None or token != _async_anthropic_token:
                 from anthropic import AsyncAnthropic
+
                 _async_anthropic_client = AsyncAnthropic(
-                    auth_token=token, max_retries=0,
+                    auth_token=token,
+                    max_retries=0,
                 )
                 _async_anthropic_token = token
         return _async_anthropic_client
@@ -91,16 +97,24 @@ async def get_anthropic_client():
     # OAuth unavailable — fall back to DeepSeek V4 Flash.
     # Tier 1: OpenRouter (explicit key). Tier 2: OpenCode Zen (free key).
     if provider == "openrouter":
-        log.warning("get_anthropic_client: OAuth unavailable, using OpenRouter fallback (%s)", _DEEPSEEK_V4_FLASH)
+        log.warning(
+            "get_anthropic_client: OAuth unavailable, using OpenRouter fallback (%s)",
+            _DEEPSEEK_V4_FLASH,
+        )
         from openai import AsyncOpenAI
+
         return AsyncOpenAI(
             api_key=_OPENROUTER_API_KEY,
             base_url="https://openrouter.ai/api/v1",
             default_headers={"HTTP-Referer": "https://discord-bot.kanae.local"},
         )
     if provider == "opencode":
-        log.warning("get_anthropic_client: OAuth unavailable, using OpenCode Zen fallback (%s)", _DEEPSEEK_V4_FLASH)
+        log.warning(
+            "get_anthropic_client: OAuth unavailable, using OpenCode Zen fallback (%s)",
+            _DEEPSEEK_V4_FLASH,
+        )
         from openai import AsyncOpenAI
+
         return AsyncOpenAI(
             api_key=_OPENCODE_API_KEY,
             base_url="https://api.opencode.ai/v1",
@@ -305,6 +319,7 @@ def _ping_chromadb_if_server_mode() -> None:
     host = os.environ.get("CHROMA_HOST", "127.0.0.1")
     port = int(os.environ.get("CHROMA_PORT", "8765"))
     import requests
+
     r = requests.get(f"http://{host}:{port}/api/v2/heartbeat", timeout=5)
     r.raise_for_status()
 
@@ -330,10 +345,14 @@ def _get_mem0():
             return _mem0_instance
         log.warning(
             "Mem0 LLM provider drift (%s -> %s) — rebuilding instance",
-            _mem0_provider, desired,
+            _mem0_provider,
+            desired,
         )
         _mem0_instance = None
-    if _init_failed_at is not None and (time.monotonic() - _init_failed_at) < _INIT_RETRY_COOLDOWN_SEC:
+    if (
+        _init_failed_at is not None
+        and (time.monotonic() - _init_failed_at) < _INIT_RETRY_COOLDOWN_SEC
+    ):
         return None
 
     # Initialize OAuth BEFORE creating any Anthropic clients
@@ -349,7 +368,17 @@ def _get_mem0():
         _mem0_provider = _desired_llm_provider()
         _init_failed_at = None
         vs_cfg = cfg["vector_store"]["config"]
-        store_id = vs_cfg.get("path") or f'{vs_cfg.get("host")}:{vs_cfg.get("port")}'
+        store_id = vs_cfg.get("path") or f"{vs_cfg.get('host')}:{vs_cfg.get('port')}"
+        endpoint = (
+            f"file://{os.path.realpath(vs_cfg['path'])}"
+            if vs_cfg.get("path")
+            else f"http://{vs_cfg.get('host')}:{vs_cfg.get('port')}"
+        )
+        _mem0_instance.storage_identity = {
+            "backend": str(cfg["vector_store"]["provider"]),
+            "endpoint": endpoint,
+            "collection": str(vs_cfg.get("collection_name") or ""),
+        }
         log.info(
             "Mem0 ready — llm=%s provider=%s embedder=%s store=chroma(%s)",
             cfg["llm"]["config"]["model"],
@@ -357,6 +386,17 @@ def _get_mem0():
             cfg["embedder"]["config"]["model"],
             store_id,
         )
+        integrity_mode = os.environ.get("MEM0_INTEGRITY_MODE", "legacy").lower()
+        if integrity_mode in {"shadow", "canonical"}:
+            from services.mem0.integrity import (
+                ensure_projection_consumer,
+                get_application_service,
+            )
+
+            service = get_application_service()
+            if service.mode == "canonical":
+                service.verify_canonical_startup(_mem0_instance)
+            ensure_projection_consumer(lambda: _mem0_instance)
     except Exception as exc:
         log.error("Mem0 init failed: %s", exc, exc_info=True)
         _mem0_instance = None
@@ -368,6 +408,7 @@ def _get_mem0():
 # ---------------------------------------------------------------------------
 # Low-level housekeeping (direct Mem0 access — used by weekly_mem0_compact.py)
 # ---------------------------------------------------------------------------
+
 
 async def get_all_memories(user_id: str, limit: int | None = None) -> list[dict]:
     """Retrieve memories for a user.
@@ -389,14 +430,18 @@ async def get_all_memories(user_id: str, limit: int | None = None) -> list[dict]
         if limit is not None:
             kwargs["limit"] = limit
         raw = await asyncio.to_thread(mem.get_all, **kwargs)
-        return raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+        return (
+            raw.get("results", [])
+            if isinstance(raw, dict)
+            else (raw if isinstance(raw, list) else [])
+        )
     except Exception as exc:
         log.warning("Mem0 get_all error: %s", exc)
         return []
 
 
 async def delete_memory(memory_id: str) -> bool:
-    """Delete a specific memory by ID."""
+    """Delete a memory through the lifecycle application service."""
     # 初回 init は ChromaDB heartbeat (同期 requests) + Memory.from_config を
     # 含むためイベントループから直接呼ばない（最大5秒のループ停止になる）。
     mem = await asyncio.to_thread(_get_mem0)
@@ -405,8 +450,10 @@ async def delete_memory(memory_id: str) -> bool:
     try:
         await ensure_valid_token()  # refresh OAuth if needed
         _refresh_mem0_client_token()
-        await asyncio.to_thread(mem.delete, memory_id)
-        return True
+        from services.mem0.integrity import get_application_service
+
+        service = get_application_service()
+        return await asyncio.to_thread(service.delete, mem, memory_id)
     except Exception as exc:
         log.warning("Mem0 delete error: %s", exc)
         return False

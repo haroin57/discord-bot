@@ -12,6 +12,8 @@ from discord import app_commands
 
 import config
 from bot_commands._deps import CommandDeps
+from bot_commands.guards import require_admin_channel
+from bot_commands.responses import InteractionResponse
 from services import r2_archive
 
 _DISCORD_FILE_LIMIT = 24 * 1024 * 1024
@@ -24,31 +26,35 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
     )
     @app_commands.describe(count="表示件数（1〜20）")
     async def r2recent_cmd(interaction: discord.Interaction, count: int = 5):
-        if not deps.is_admin(interaction.user):
-            await interaction.response.send_message("admin only", ephemeral=True)
-            return
-        if interaction.channel_id is None:
-            await interaction.response.send_message("チャンネル外では使えません", ephemeral=True)
+        response = InteractionResponse(interaction)
+        context = await require_admin_channel(response, interaction, deps.is_admin)
+        if context is None:
             return
         count = max(1, min(count, 20))
+        await response.defer(ephemeral=True)
         rows = await asyncio.to_thread(
-            r2_archive.recent_images, interaction.channel_id, limit=count,
+            r2_archive.recent_images,
+            context.channel_id,
+            limit=count,
         )
         if not rows:
-            await interaction.response.send_message(
-                "このチャンネルのR2画像記録はありません。", ephemeral=True,
+            await response.send(
+                "このチャンネルのR2画像記録はありません。",
+                ephemeral=True,
             )
             return
         lines = ["**R2保存済み画像**"]
         for row in rows:
             meta = row.get("metadata") or {}
             name = meta.get("original_name") or Path(row["key"]).name
-            status = "送信済み" if row.get("upload_status") == "uploaded" else "送信待ち"
+            status = (
+                "送信済み" if row.get("upload_status") == "uploaded" else "送信待ち"
+            )
             lines.append(
                 f"- `{row.get('created_at', '')}` [{status}] {name} "
                 f"({row.get('direction', 'unknown')})\n  `{row['uri']}`"
             )
-        await interaction.response.send_message("\n".join(lines)[:1950], ephemeral=True)
+        await response.send("\n".join(lines)[:1950], ephemeral=True)
 
     @tree.command(
         name="r2fetch",
@@ -66,11 +72,15 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
             suffix = Path(original_name.removesuffix(".metadata.json")).suffix[:16]
             os.makedirs(config.ATTACHMENT_DIR, mode=0o700, exist_ok=True)
             fd, tmp_name = tempfile.mkstemp(
-                prefix="r2-fetch-", suffix=suffix, dir=config.ATTACHMENT_DIR,
+                prefix="r2-fetch-",
+                suffix=suffix,
+                dir=config.ATTACHMENT_DIR,
             )
             os.close(fd)
             try:
-                path = await asyncio.to_thread(r2_archive.fetch_object, normalized, tmp_name)
+                path = await asyncio.to_thread(
+                    r2_archive.fetch_object, normalized, tmp_name
+                )
                 size = path.stat().st_size
                 if size > _DISCORD_FILE_LIMIT:
                     await interaction.followup.send(
@@ -94,7 +104,9 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
                 except OSError:
                     pass
         except Exception as exc:
-            await interaction.followup.send(f"R2取得に失敗しました: {exc}", ephemeral=True)
+            await interaction.followup.send(
+                f"R2取得に失敗しました: {exc}", ephemeral=True
+            )
 
     @tree.command(
         name="r2sync",
@@ -117,4 +129,6 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
                 ephemeral=True,
             )
         except Exception as exc:
-            await interaction.followup.send(f"R2同期に失敗しました: {exc}", ephemeral=True)
+            await interaction.followup.send(
+                f"R2同期に失敗しました: {exc}", ephemeral=True
+            )

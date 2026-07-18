@@ -9,13 +9,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/home/ubuntu/discord-bot
-Environment=HOME=/home/ubuntu
+User=kanae-second-opinion
+Group=kanae-second-opinion
+SupplementaryGroups=kanae-code
+WorkingDirectory=/var/lib/discord-bot-releases/prod/current/src
+EnvironmentFile=/etc/discord-bot/credentials/mcp-second-opinion.env
+Environment=HOME=/var/lib/kanae-second-opinion
+Environment=BOT_STATE_DIR=/var/lib/kanae-second-opinion/state
 Environment=MCP_HTTP_PORT=8014
-EnvironmentFile=/home/ubuntu/discord-bot/.env
-ExecStart=/home/ubuntu/discord-bot/.venv/bin/python /home/ubuntu/discord-bot/second_opinion_mcp_server.py
+Environment=PYTHON_DOTENV_DISABLED=1
+StateDirectory=kanae-second-opinion kanae-second-opinion/state
+StateDirectoryMode=0700
+CacheDirectory=kanae-second-opinion
+CacheDirectoryMode=0700
+ExecStart=/var/lib/discord-bot-releases/prod/current/venv/bin/python /var/lib/discord-bot-releases/prod/current/src/second_opinion_mcp_server.py
 Restart=always
 RestartSec=5
 # Reap the whole cgroup: second_opinion shells out to agy/codex node CLIs; a
@@ -24,6 +31,7 @@ KillMode=control-group
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=mcp-second-opinion-shared
+UMask=0007
 
 # Resource caps. ~106MB observed as stdio child; short-lived child CLIs push
 # transient peaks, so MemoryMax leaves headroom above the steady state.
@@ -31,15 +39,25 @@ MemoryHigh=200M
 MemoryMax=300M
 LimitNOFILE=4096
 
-# Light hardening (see mem0 unit rationale).
 NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/kanae-second-opinion /var/cache/kanae-second-opinion
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
 LockPersonality=yes
+MemoryDenyWriteExecute=no
 RestrictRealtime=yes
 SystemCallArchitectures=native
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target

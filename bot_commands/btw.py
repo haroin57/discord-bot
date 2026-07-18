@@ -15,6 +15,10 @@ import discord
 from discord import app_commands
 
 from bot_commands._deps import CommandDeps
+from bot_commands.guards import require_admin_channel
+from bot_commands.responses import InteractionResponse
+from bot_commands.services import SideQuestionRequest, services_from_deps
+from bot_commands.state import state_from_deps
 
 log = logging.getLogger(__name__)
 
@@ -23,7 +27,7 @@ log = logging.getLogger(__name__)
 _btw_counts: dict[int, int] = {}
 
 _CHUNK_LIMIT = 1900  # header/footer 分の余白を残した Discord 2000 字上限
-_MAX_CHUNKS = 3      # ephemeral でも spam しないための打ち切り
+_MAX_CHUNKS = 3  # ephemeral でも spam しないための打ち切り
 
 
 def _chunk(text: str, limit: int = _CHUNK_LIMIT) -> list[str]:
@@ -65,57 +69,48 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
     )
     @app_commands.describe(question="ついでに聞きたいこと（この会話には残りません）")
     async def btw_cmd(interaction: discord.Interaction, question: str):
-        if not deps.is_admin(interaction.user):
-            await interaction.response.send_message("admin only", ephemeral=True)
-            return
-        channel_id = interaction.channel_id
-        if channel_id is None:
-            await interaction.response.send_message(
-                "チャンネル外では使えません", ephemeral=True,
-            )
+        response = InteractionResponse(interaction)
+        context = await require_admin_channel(response, interaction, deps.is_admin)
+        if context is None:
             return
         q = question.strip()
         if not q:
-            await interaction.response.send_message("質問が空です", ephemeral=True)
+            await response.send("質問が空です", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await response.defer(ephemeral=True)
 
-        key = (channel_id, interaction.user.id)
-        model = deps.model_overrides.get(key)
-        effort = deps.effort_overrides.get(key)
+        key = (context.channel_id, context.user_id)
+        state = state_from_deps(deps)
         author = (
-            getattr(interaction.user, "display_name", None)
-            or interaction.user.name
+            getattr(interaction.user, "display_name", None) or interaction.user.name
         )
         try:
-            # 遅延 import: startup 時の循環 import を避ける（/compact と同様）。
-            from services.claude_api.client_factory import make_api_client
-            from services.claude_api.side_question import answer_side_question
-
-            api_client = await make_api_client(restricted=False)
-            result = await answer_side_question(
-                channel_id,
-                q,
-                api_client,
-                user_id=interaction.user.id,
-                model=model,
-                effort=effort,
-                author=author,
+            result = await services_from_deps(deps).side_questions.answer(
+                SideQuestionRequest(
+                    channel_id=context.channel_id,
+                    user_id=context.user_id,
+                    question=q,
+                    author=author,
+                    provider=state.provider(key),
+                    model=state.model(key),
+                    effort=state.effort(key),
+                )
             )
         except Exception as exc:
-            log.exception("/btw failed for ch=%s", channel_id)
-            await interaction.followup.send(
-                f"横質問に失敗しました: {exc}", ephemeral=True,
+            log.exception("/btw failed for ch=%s", context.channel_id)
+            await response.send(
+                f"横質問に失敗しました: {exc}",
+                ephemeral=True,
             )
             return
 
-        _btw_counts[channel_id] = _btw_counts.get(channel_id, 0) + 1
-        earlier = _btw_counts[channel_id] - 1
+        _btw_counts[context.channel_id] = _btw_counts.get(context.channel_id, 0) + 1
+        earlier = _btw_counts[context.channel_id] - 1
 
         answer = result.answer.strip()
         if not answer:
-            await interaction.followup.send("（応答が空でした）", ephemeral=True)
+            await response.send("（応答が空でした）", ephemeral=True)
             return
 
         chunks = _chunk(answer)
@@ -142,4 +137,4 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
             if i == last:
                 parts.append(footer)
                 parts.extend(notes)
-            await interaction.followup.send("\n".join(parts), ephemeral=True)
+            await response.send("\n".join(parts), ephemeral=True)

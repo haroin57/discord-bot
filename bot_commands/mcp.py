@@ -9,7 +9,10 @@ import discord
 from discord import app_commands
 
 from bot_commands._deps import CommandDeps
+from bot_commands.guards import require_admin
+from bot_commands.responses import InteractionResponse
 from free_code_commands.runtime import CommandRuntime
+from free_code_commands.types import JsxOutcome
 from services.mcp_control import get_mcp_control
 from services.session import get_session
 
@@ -19,10 +22,16 @@ _SERVERS_PER_PAGE = 10
 _TOOLS_PER_PAGE = 15
 
 
-def _mcp_command():
-    from free_code_commands.commands import jsx_commands
+async def _invoke_mcp(args: str, runtime: CommandRuntime) -> JsxOutcome:
+    from free_code_commands import build_registry
 
-    return next(command for command in jsx_commands.COMMANDS if command.name == "mcp")
+    text = f"/mcp {args}".rstrip()
+    invocation = await build_registry().invoke(text, runtime)
+    if invocation is None:
+        raise RuntimeError("free-code /mcp is not available in this runtime")
+    if not isinstance(invocation.result, JsxOutcome):
+        raise TypeError("free-code /mcp returned an invalid result")
+    return invocation.result
 
 
 class _DiscordMcpRuntime(CommandRuntime):
@@ -33,9 +42,8 @@ class _DiscordMcpRuntime(CommandRuntime):
     def mcp_selected_keys(self) -> list[str]:
         if self.channel_id is None:
             return []
-        info = (
-            get_session(self.channel_id, self.user_id)
-            or get_session(self.channel_id, None)
+        info = get_session(self.channel_id, self.user_id) or get_session(
+            self.channel_id, None
         )
         return list(info.mcp_server_keys) if info is not None else []
 
@@ -55,15 +63,17 @@ class _McpServerSelect(discord.ui.Select):
             discord.SelectOption(
                 label=str(row["key"])[:100],
                 value=str(row["key"]),
-                description=(
-                    f"{_state_words(row)} | {row.get('transport', 'stdio')}"
-                )[:100],
+                description=(f"{_state_words(row)} | {row.get('transport', 'stdio')}")[
+                    :100
+                ],
                 default=row["key"] == owner.selected_key,
             )
             for row in rows
         ]
         if not options:
-            options = [discord.SelectOption(label="No configured servers", value="_none")]
+            options = [
+                discord.SelectOption(label="No configured servers", value="_none")
+            ]
         super().__init__(
             placeholder="Select an MCP server",
             min_values=1,
@@ -129,7 +139,7 @@ class _McpView(discord.ui.View):
 
     def page_rows(self) -> list[dict]:
         start = self.server_page * _SERVERS_PER_PAGE
-        return self.rows[start:start + _SERVERS_PER_PAGE]
+        return self.rows[start : start + _SERVERS_PER_PAGE]
 
     def selected_row(self) -> dict | None:
         return next(
@@ -228,7 +238,7 @@ class _McpView(discord.ui.View):
         pages = self._tool_page_count()
         self.tool_page = min(self.tool_page, pages - 1)
         start = self.tool_page * _TOOLS_PER_PAGE
-        shown = names[start:start + _TOOLS_PER_PAGE]
+        shown = names[start : start + _TOOLS_PER_PAGE]
         lines = [f"MCP tools: {self.selected_key} ({len(names)})", ""]
         lines.extend(f"- {name[:140]}" for name in shown)
         if not shown:
@@ -237,10 +247,12 @@ class _McpView(discord.ui.View):
         return "\n".join(lines)[:1950]
 
     async def _run(self, args: str):
-        return await _mcp_command().call(args, self.runtime)
+        return await _invoke_mcp(args, self.runtime)
 
     @discord.ui.button(label="Overview", style=discord.ButtonStyle.secondary, row=1)
-    async def overview(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def overview(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         self.mode = "overview"
         self.notice = ""
         self.refresh()
@@ -278,7 +290,9 @@ class _McpView(discord.ui.View):
         await interaction.response.edit_message(content=self.render(), view=self)
 
     @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, row=2)
-    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def previous(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         if self.mode == "tools":
             self.tool_page = max(0, self.tool_page - 1)
         else:
@@ -311,7 +325,19 @@ async def _server_autocomplete(
         app_commands.Choice(name=key, value=key)
         for key in keys
         if needle in key.lower()
-    ][:_SERVERS_PER_PAGE * 2 + 5]
+    ][: _SERVERS_PER_PAGE * 2 + 5]
+
+
+def _make_server_autocomplete(deps: CommandDeps):
+    async def guarded_autocomplete(
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        if not deps.is_admin(interaction.user):
+            return []
+        return await _server_autocomplete(interaction, current)
+
+    return guarded_autocomplete
 
 
 async def _handle(
@@ -320,22 +346,28 @@ async def _handle(
     action: str,
     server: str,
 ) -> None:
-    if not deps.is_admin(interaction.user):
-        await interaction.response.send_message("admin only", ephemeral=True)
+    response = InteractionResponse(interaction)
+    if not await require_admin(response, interaction, deps.is_admin):
         return
 
     action = (action or "status").lower()
     server = (server or "").strip()
     if action != "status" and not server:
-        await interaction.response.send_message(
+        await response.send(
             f"server is required for {action}.",
             ephemeral=True,
         )
         return
 
+    await response.defer(ephemeral=True)
     runtime = _DiscordMcpRuntime(interaction.channel_id, interaction.user.id)
     args = "" if action == "status" else f"{action} {server}"
-    outcome = await _mcp_command().call(args, runtime)
+    try:
+        outcome = await _invoke_mcp(args, runtime)
+    except Exception as exc:
+        log.exception("/mcp %s failed for server=%s", action, server)
+        await response.send(f"MCP command failed: {exc}", ephemeral=True)
+        return
     selected = server if server and server != "all" else None
     view = _McpView(runtime, owner_id=interaction.user.id, selected_key=selected)
     view.notice = outcome.message or ""
@@ -344,15 +376,13 @@ async def _handle(
     elif action != "status":
         view.mode = "detail"
     view.refresh()
-    await interaction.response.send_message(
+    message = await response.send(
         view.render(),
         view=view,
         ephemeral=True,
     )
-    try:
-        view.message = await interaction.original_response()
-    except (AttributeError, discord.HTTPException):
-        pass
+    if message is not None:
+        view.message = message
 
 
 def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
@@ -367,14 +397,16 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
         action="Operation to perform",
         server="Configured MCP server; all is valid for enable/disable",
     )(handler)
-    handler = app_commands.choices(action=[
-        app_commands.Choice(name="status", value="status"),
-        app_commands.Choice(name="tools", value="tools"),
-        app_commands.Choice(name="reconnect", value="reconnect"),
-        app_commands.Choice(name="enable", value="enable"),
-        app_commands.Choice(name="disable", value="disable"),
-    ])(handler)
-    handler = app_commands.autocomplete(server=_server_autocomplete)(handler)
+    handler = app_commands.choices(
+        action=[
+            app_commands.Choice(name="status", value="status"),
+            app_commands.Choice(name="tools", value="tools"),
+            app_commands.Choice(name="reconnect", value="reconnect"),
+            app_commands.Choice(name="enable", value="enable"),
+            app_commands.Choice(name="disable", value="disable"),
+        ]
+    )(handler)
+    handler = app_commands.autocomplete(server=_make_server_autocomplete(deps))(handler)
     tree.command(
         name="mcp",
         description="Manage MCP servers (admin only)",

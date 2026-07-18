@@ -22,6 +22,7 @@ from services.claude_api.tool_loop import (
     _join_final_text,
     _log_turn_usage,
     _normalize_history_for_api,
+    _response_blocks_to_dict,
     run_agent_loop,
 )
 
@@ -514,6 +515,115 @@ class TestBlockToDict:
         out = _block_to_dict(_block("thinking", thinking="...think..."))
         assert out["type"] == "thinking"
         assert out["thinking"] == "...think..."
+
+
+class TestResponseBlocksToDictFallbackContinuation:
+    @staticmethod
+    def _fallback(from_model, to_model):
+        return _block("fallback", **{
+            "from": {"model": from_model},
+            "to": {"model": to_model},
+        })
+
+    def test_final_fallback_boundary_filters_only_abandoned_client_blocks(self):
+        fallback = self._fallback("claude-fable-5", "claude-opus-4-8")
+        blocks = [
+            _block("text", text="visible prefix"),
+            _block("thinking", thinking="abandoned", signature="sig-old"),
+            _block("redacted_thinking", data="redacted-old"),
+            _block("connector_text", text="connector-old"),
+            _block("tool_use", id="old-tool", name="Read",
+                   input={"file_path": "/tmp/old"}),
+            _block("server_tool_use", id="server-old",
+                   name="tool_search_tool_regex", input={"query": "old"}),
+            _block("tool_search_tool_result", tool_use_id="server-old",
+                   content=[]),
+            fallback,
+            _block("thinking", thinking="answering", signature="sig-final"),
+            _block("text", text="final answer"),
+            _block("tool_use", id="final-tool", name="Read",
+                   input={"file_path": "/tmp/final"}),
+        ]
+
+        assert _response_blocks_to_dict(blocks) == [
+            {"type": "text", "text": "visible prefix"},
+            {
+                "type": "server_tool_use",
+                "id": "server-old",
+                "name": "tool_search_tool_regex",
+                "input": {"query": "old"},
+            },
+            {
+                "type": "tool_search_tool_result",
+                "tool_use_id": "server-old",
+                "content": [],
+            },
+            {
+                "type": "fallback",
+                "from": {"model": "claude-fable-5"},
+                "to": {"model": "claude-opus-4-8"},
+            },
+            {
+                "type": "thinking",
+                "thinking": "answering",
+                "signature": "sig-final",
+            },
+            {"type": "text", "text": "final answer"},
+            {
+                "type": "tool_use",
+                "id": "final-tool",
+                "name": "Read",
+                "input": {"file_path": "/tmp/final"},
+            },
+        ]
+
+    def test_multiple_fallbacks_use_last_boundary_and_keep_markers_in_place(self):
+        first = self._fallback("model-a", "model-b")
+        final = self._fallback("model-b", "model-c")
+        blocks = [
+            _block("thinking", thinking="a", signature="sig-a"),
+            first,
+            _block("text", text="visible between fallbacks"),
+            _block("thinking", thinking="b", signature="sig-b"),
+            _block("tool_use", id="tool-b", name="Read", input={}),
+            final,
+            _block("thinking", thinking="c", signature="sig-c"),
+            _block("text", text="model-c answer"),
+        ]
+
+        assert _response_blocks_to_dict(blocks) == [
+            {
+                "type": "fallback",
+                "from": {"model": "model-a"},
+                "to": {"model": "model-b"},
+            },
+            {"type": "text", "text": "visible between fallbacks"},
+            {
+                "type": "fallback",
+                "from": {"model": "model-b"},
+                "to": {"model": "model-c"},
+            },
+            {"type": "thinking", "thinking": "c", "signature": "sig-c"},
+            {"type": "text", "text": "model-c answer"},
+        ]
+
+    def test_unpaired_server_tool_before_final_fallback_is_dropped(self):
+        fallback = self._fallback("claude-fable-5", "claude-opus-4-8")
+        blocks = [
+            _block("server_tool_use", id="server-orphan",
+                   name="tool_search_tool_regex", input={"query": "orphan"}),
+            fallback,
+            _block("text", text="fallback answer"),
+        ]
+
+        assert _response_blocks_to_dict(blocks) == [
+            {
+                "type": "fallback",
+                "from": {"model": "claude-fable-5"},
+                "to": {"model": "claude-opus-4-8"},
+            },
+            {"type": "text", "text": "fallback answer"},
+        ]
 
 
 class TestJoinFinalText:
@@ -2205,6 +2315,65 @@ class TestServerSideFallback:
         client, _ = self._capture_client([], final)
         result = await self._run(client, watchdog=watchdog)
         assert result.fallback_model == "claude-opus-4-8"
+
+    @pytest.mark.asyncio
+    async def test_fallback_tool_turn_replays_only_answering_thinking(
+        self, watchdog,
+    ):
+        marker = _block(
+            "fallback",
+            **{
+                "from": SimpleNamespace(model="claude-fable-5"),
+                "to": SimpleNamespace(model="claude-opus-4-8"),
+            },
+        )
+        event = _block("content_block_start", content_block=marker)
+        responses = iter((
+            (
+                [event],
+                _final_msg([
+                    _block("thinking", thinking="fable", signature="sig-fable"),
+                    _block("text", text="partial"),
+                    marker,
+                    _block("thinking", thinking="opus", signature="sig-opus"),
+                    _block("tool_use", id="t1", name="Read", input={}),
+                ], "tool_use"),
+            ),
+            ([], _final_msg([_block("text", text="done")], "end_turn")),
+        ))
+        captured: list[dict] = []
+        client = MagicMock()
+
+        def stream_factory(**kwargs):
+            captured.append(kwargs)
+            events, final = next(responses)
+            return _FakeStream(events, final)
+
+        client.beta.messages.stream = stream_factory
+        result = await self._run(
+            client,
+            watchdog=watchdog,
+            max_turns=2,
+            tools_for_api=[{
+                "name": "Read", "description": "", "input_schema": {},
+            }],
+            execute_tool=AsyncMock(return_value="ok"),
+        )
+
+        assert result.text.endswith("partial\n\ndone")
+        replayed = captured[1]["messages"][1]["content"]
+        assert [block["type"] for block in replayed] == [
+            "text", "fallback", "thinking", "tool_use",
+        ]
+        assert replayed[1] == {
+            "type": "fallback",
+            "from": {"model": "claude-fable-5"},
+            "to": {"model": "claude-opus-4-8"},
+        }
+        assert replayed[2] == {
+            "type": "thinking", "thinking": "opus", "signature": "sig-opus",
+        }
+        assert "fallbacks" not in captured[1]["extra_body"]
 
     @pytest.mark.asyncio
     async def test_no_false_positive_when_model_matches(self, watchdog):

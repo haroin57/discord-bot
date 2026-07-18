@@ -86,6 +86,7 @@ def activation_to_tier(activation: float) -> int:
 def compute_fact_activation(metadata: dict, *, now: float | None = None) -> float:
     """Thin adapter from a fact's stored metadata to reinforce._actr_activation."""
     from services.mem0.reinforce import _actr_activation
+
     now = now if now is not None else time.time()
     try:
         created = int(metadata.get("created_at_unix") or metadata.get("timestamp") or 0)
@@ -172,25 +173,41 @@ async def recompute_tiers_for_user(user_id: str, *, dry_run: bool = True) -> dic
         transitions[key] = transitions.get(key, 0) + 1
         log.info(
             "[TIER_DECAY user=...%s id=%s activation=%.3f tier=%s->%d dry_run=%s]",
-            str(user_id)[-4:], r.get("id"), activation, old_tier, new_tier, dry_run,
+            str(user_id)[-4:],
+            r.get("id"),
+            activation,
+            old_tier,
+            new_tier,
+            dry_run,
         )
         if dry_run:
             changed += 1
             continue
         try:
-            text = r.get("memory") or r.get("text") or ""
+            from services.mem0.integrity import get_application_service
+
+            service = get_application_service()
             await asyncio.to_thread(
-                mem.update, memory_id=r.get("id"), data=text,
-                metadata={"tier": new_tier},
+                service.update_metadata,
+                mem,
+                r.get("id"),
+                {"tier": new_tier},
+                record=r,
+                operation="tier_decay",
             )
             changed += 1
         except Exception as exc:
-            log.warning("tier decay update failed for %s (non-fatal): %s", r.get("id"), exc)
+            log.warning(
+                "tier decay update failed for %s (non-fatal): %s", r.get("id"), exc
+            )
     return {"checked": checked, "changed": changed, "transitions": transitions}
 
 
 async def gist_compress_for_user(
-    user_id: str, *, dry_run: bool = True, max_clusters: int | None = None,
+    user_id: str,
+    *,
+    dry_run: bool = True,
+    max_clusters: int | None = None,
 ) -> dict:
     """Cluster Cold-tier, non-exempt facts by shared entity and collapse
     each cluster into fewer gist facts via ``dedup.synthesize_cluster``.
@@ -260,7 +277,12 @@ async def gist_compress_for_user(
         result["clusters"] += 1
         log.info(
             "[GIST_COMPRESS user=...%s entity_id=%s members=%d->%d dry_run=%s] %r",
-            str(user_id)[-4:], entity_id, len(members), len(consolidated), dry_run, consolidated,
+            str(user_id)[-4:],
+            entity_id,
+            len(members),
+            len(consolidated),
+            dry_run,
+            consolidated,
         )
         if dry_run:
             result["compressed"] += len(consolidated)
@@ -269,43 +291,45 @@ async def gist_compress_for_user(
         member_ids = [m.get("id") for m in members if m.get("id")]
         base_meta = {
             "category": (members[0].get("metadata") or {}).get("category", "meta"),
-            "importance": max(1, min(
-                int((m.get("metadata") or {}).get("importance", 2)) for m in members
-            )),
+            "importance": max(
+                1,
+                min(
+                    int((m.get("metadata") or {}).get("importance", 2)) for m in members
+                ),
+            ),
             "tier": 3,
             "gist_of": ",".join(member_ids),
             "timestamp": now_ts,
         }
-        new_ids: list[str] = []
-        for gist_text in consolidated:
-            try:
-                res = await asyncio.to_thread(
-                    mem.add, [{"role": "user", "content": gist_text}],
-                    user_id=user_id, metadata=dict(base_meta), infer=False,
-                )
-                for rr in ((res.get("results") or []) if isinstance(res, dict) else []):
-                    nid = rr.get("id")
-                    if nid:
-                        new_ids.append(nid)
-                        await asyncio.to_thread(graph.add_edge, nid, entity_id)
-            except Exception as exc:
-                log.warning("gist insert failed (non-fatal): %s", exc)
-        result["compressed"] += len(new_ids)
+        try:
+            from services.mem0.integrity import get_application_service
 
-        for m in members:
-            mid = m.get("id")
-            if not mid:
-                continue
-            try:
-                text = m.get("memory") or m.get("text") or ""
-                await asyncio.to_thread(
-                    mem.update, memory_id=mid, data=text,
-                    metadata={
-                        "valid_to": now_ts,
-                        "gist_superseded_by": ",".join(new_ids),
-                    },
-                )
-                result["archived"] += 1
-            except Exception as exc:
-                log.warning("gist archive failed for %s (non-fatal): %s", mid, exc)
+            service = get_application_service()
+            source_records = {
+                str(member["id"]): member for member in members if member.get("id")
+            }
+            created = await asyncio.to_thread(
+                service.consolidate,
+                mem,
+                user_id=str(user_id),
+                source_ids=member_ids,
+                outputs=[
+                    {"text": gist_text, "metadata": dict(base_meta)}
+                    for gist_text in consolidated
+                ],
+                reason="gist",
+                source_records=source_records,
+            )
+            new_ids = [
+                fact.get("legacy_id") or fact.get("fact_id")
+                for fact in created
+                if fact.get("legacy_id") or fact.get("fact_id")
+            ]
+            if not service.canonical_enabled:
+                for new_id in new_ids:
+                    await asyncio.to_thread(graph.add_edge, new_id, entity_id)
+            result["compressed"] += len(new_ids)
+            result["archived"] += len(member_ids)
+        except Exception as exc:
+            log.warning("gist consolidation failed (non-fatal): %s", exc)
     return result

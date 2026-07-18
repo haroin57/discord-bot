@@ -20,14 +20,15 @@ Already ported elsewhere (NOT re-stubbed here): ``commit``, ``commit-push-pr``
 
 from __future__ import annotations
 
+from ..registry import _local_command, _metadata_catalog
 from ..runtime import CommandRuntime
-from ..types import LocalCommand, LocalCommandResult
+from ..types import LocalCommandResult
 
 # Verbatim upstream stub shape, for reference / assertions.
 STUB_MESSAGE = "(internal ant-only command — implementation stripped from this build)"
 
 
-def _stub(name: str, *, extra_flag=None, **kw) -> LocalCommand:
+def _stub(name: str, *, extra_flag=None, **kw):
     """Build a disabled+hidden ant-gated stub matching the upstream shim.
 
     ``extra_flag`` documents a command that is *also* behind a bun feature flag
@@ -38,7 +39,7 @@ def _stub(name: str, *, extra_flag=None, **kw) -> LocalCommand:
     def _call(args: str, rt: CommandRuntime) -> LocalCommandResult:
         return LocalCommandResult.text(STUB_MESSAGE)
 
-    return LocalCommand(
+    return _local_command(
         name=name,
         description=kw.pop("description", "Internal (ant-only) command"),
         supports_non_interactive=False,
@@ -53,29 +54,31 @@ def _stub(name: str, *, extra_flag=None, **kw) -> LocalCommand:
 
 
 # Canonical names recovered from commands.ts's INTERNAL_ONLY_COMMANDS imports.
-COMMANDS: list[LocalCommand] = [
-    _stub("backfill-sessions"),   # backfill-sessions/index.js
-    _stub("break-cache"),         # break-cache/index.js
-    _stub("bughunter"),           # bughunter/index.js
-    _stub("ctx_viz"),             # ctx_viz/index.js
-    _stub("good-claude"),         # good-claude/index.js
-    _stub("issue"),               # issue/index.js
-    _stub("mock-limits"),         # mock-limits/index.js
-    _stub("reset-limits"),        # reset-limits/index.js (default export)
+_DEFINITIONS = (
+    _stub("backfill-sessions"),  # backfill-sessions/index.js
+    _stub("break-cache"),  # break-cache/index.js
+    _stub("bughunter"),  # bughunter/index.js
+    _stub("ctx_viz"),  # ctx_viz/index.js
+    _stub("good-claude"),  # good-claude/index.js
+    _stub("issue"),  # issue/index.js
+    _stub("mock-limits"),  # mock-limits/index.js
+    _stub("reset-limits"),  # reset-limits/index.js (default export)
     # reset-limits/index.js also exports resetLimitsNonInteractive (same stub); it
     # would collide by name with the above, so it is intentionally not duplicated.
-    _stub("onboarding"),          # onboarding/index.js
-    _stub("share"),               # share/index.js
-    _stub("summary"),             # summary/index.js
-    _stub("teleport"),            # teleport/index.js
-    _stub("ant-trace"),           # ant-trace/index.js
-    _stub("perf-issue"),          # perf-issue/index.js
-    _stub("env"),                 # env/index.js
-    _stub("oauth-refresh"),       # oauth-refresh/index.js
-    _stub("debug-tool-call"),     # debug-tool-call/index.js
-    _stub("agents-platform"),     # agents-platform/index.js (ant + source absent)
-    _stub("autofix-pr"),          # autofix-pr/index.js
+    _stub("onboarding"),  # onboarding/index.js
+    _stub("share"),  # share/index.js
+    _stub("summary"),  # summary/index.js
+    _stub("teleport"),  # teleport/index.js
+    _stub("ant-trace"),  # ant-trace/index.js
+    _stub("perf-issue"),  # perf-issue/index.js
+    _stub("env"),  # env/index.js
+    _stub("oauth-refresh"),  # oauth-refresh/index.js
+    _stub("debug-tool-call"),  # debug-tool-call/index.js
+    _stub("agents-platform"),  # agents-platform/index.js (ant + source absent)
+    _stub("autofix-pr"),  # autofix-pr/index.js
     # Also feature-gated upstream (kept as ant stubs here):
-    _stub("force-snip", extra_flag="HISTORY_SNIP"),      # force-snip.js
+    _stub("force-snip", extra_flag="HISTORY_SNIP"),  # force-snip.js
     _stub("subscribe-pr", extra_flag="KAIROS_GITHUB_WEBHOOKS"),  # subscribe-pr.js
-]
+)
+
+COMMANDS = _metadata_catalog(_DEFINITIONS)

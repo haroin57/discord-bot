@@ -2,12 +2,14 @@
 
 Covers: source machine-extraction + dedup, the guarded MCP call wrapper,
 run_subagent (fresh-context / bounded result / tool gating / source parsing via
-run_agent_loop), and the orchestrator (busy rejection, web-backend precondition,
-happy path with clarification timeout). All LLM/MCP/Discord I/O is mocked.
+run_agent_loop), and the orchestrator (parallel runs, web-backend precondition,
+Discord characterization, approval deadlines). All LLM/MCP/Discord I/O is mocked.
 """
 
 import asyncio
 import json
+import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,8 +19,24 @@ import config
 import services.deep_research.magi as magi
 import services.deep_research.orchestrator as orch
 import services.deep_research.registry as registry
+import services.deep_research.run_state as run_state_mod
+from services.deep_research.evidence_registry import verify_citation_support
+from services.deep_research.run_state import (
+    DEFAULT_RUNS,
+    OwnedMcpCleanupError,
+    ResearchRun,
+    RunRegistry,
+)
+from services.claude_api.subprocess_runner import (
+    ProcessCleanupPermissionError,
+    spawn_process,
+)
 from services.deep_research import sources as sources_mod
-from services.deep_research.registry import ResearchAgentDef, _guarded_call_tool, run_subagent
+from services.deep_research.registry import (
+    ResearchAgentDef,
+    _guarded_call_tool,
+    run_subagent,
+)
 from services.deep_research.types import LensResult, ResearchState, SubAgentResult
 
 
@@ -29,10 +47,12 @@ class TestSources:
     def test_register_source_dedup_and_sid(self):
         st = ResearchState(query="q")
         a = st.register_source(url="https://example.com/a", title="A")
-        a2 = st.register_source(url="https://example.com/a/", title="A dup")  # trailing slash
-        b = st.register_source(url="https://example.com/b#frag", title="B")   # fragment
+        a2 = st.register_source(
+            url="https://example.com/a/", title="A dup"
+        )  # trailing slash
+        b = st.register_source(url="https://example.com/b#frag", title="B")  # fragment
         assert a.sid == "S1" and b.sid == "S2"
-        assert a2 is a                       # deduped to the same SourceRef
+        assert a2 is a  # deduped to the same SourceRef
         assert len(st.sources) == 2
 
     def test_register_source_rejects_non_http(self):
@@ -43,12 +63,16 @@ class TestSources:
 
     def test_parse_sources_from_brave_json(self):
         st = ResearchState(query="q")
-        raw = json.dumps({
-            "web": {"results": [
-                {"title": "T1", "url": "https://x.com/1", "description": "d1"},
-                {"title": "T2", "url": "https://y.com/2"},
-            ]},
-        })
+        raw = json.dumps(
+            {
+                "web": {
+                    "results": [
+                        {"title": "T1", "url": "https://x.com/1", "description": "d1"},
+                        {"title": "T2", "url": "https://y.com/2"},
+                    ]
+                },
+            }
+        )
         refs = sources_mod.parse_sources("mcp__brave-search__brave_web_search", raw, st)
         assert [r.sid for r in refs] == ["S1", "S2"]
         assert st.sources[next(iter(st.sources))].source_type == "web"
@@ -65,15 +89,101 @@ class TestSources:
         refs = sources_mod.parse_sources("mcp__tavily__tavily_search", raw, st)
         urls = {r.url for r in refs}
         assert "https://foo.example/page" in urls
-        assert "https://bar.example/x" in urls   # trailing ). stripped
+        assert "https://bar.example/x" in urls  # trailing ). stripped
+
+    def test_parse_sources_text_fallback_preserves_supporting_context(self):
+        st = ResearchState(query="q")
+        raw = (
+            "Acme revenue increased 40 percent in fiscal 2025. Source: "
+            "https://acme.example/results"
+        )
+        refs = sources_mod.parse_sources("mcp__tavily__tavily_search", raw, st)
+
+        assert len(refs) == 1
+        assert "revenue increased 40 percent" in refs[0].snippet
+        checks = verify_citation_support(
+            "Acme revenue increased 40 percent in fiscal 2025. [S1]",
+            st,
+        )
+        assert len(checks) == 1 and checks[0].supported is True
+
+    def test_text_fallback_multiple_url_line_fails_closed_without_attribution(self):
+        st = ResearchState(query="q")
+        raw = (
+            "Acme revenue increased 40 percent https://a.example/results "
+            "while Acme revenue decreased 40 percent https://b.example/results"
+        )
+
+        refs = sources_mod.parse_sources("mcp__tavily__search", raw, st)
+
+        assert len(refs) == 2
+        assert [ref.snippet for ref in refs] == ["", ""]
+        checks = verify_citation_support(
+            "Acme revenue increased 40 percent. [S1] "
+            "Acme revenue decreased 40 percent. [S2]",
+            st,
+        )
+        assert [(check.sid, check.supported) for check in checks] == [
+            ("S1", False),
+            ("S2", False),
+        ]
+
+    def test_text_fallback_splits_explicit_url_local_records(self):
+        st = ResearchState(query="q")
+        raw = (
+            "Acme revenue increased 40 percent https://a.example/results; "
+            "Beta margin decreased 2 percent https://b.example/results"
+        )
+
+        refs = sources_mod.parse_sources("mcp__tavily__search", raw, st)
+
+        assert len(refs) == 2
+        assert "Acme revenue increased" in refs[0].snippet
+        assert "Beta" not in refs[0].snippet
+        assert "Beta margin decreased" in refs[1].snippet
+        assert "Acme" not in refs[1].snippet
+
+    def test_url_only_lines_use_only_their_immediate_local_record(self):
+        st = ResearchState(query="q")
+        raw = (
+            "Acme revenue increased 40 percent.\n"
+            "https://a.example/results\n"
+            "Beta margin decreased 2 percent.\n"
+            "https://b.example/results"
+        )
+
+        refs = sources_mod.parse_sources("mcp__tavily__search", raw, st)
+
+        assert len(refs) == 2
+        assert "Acme revenue increased" in refs[0].snippet
+        assert "Beta" not in refs[0].snippet
+        assert "Beta margin decreased" in refs[1].snippet
+        assert "Acme" not in refs[1].snippet
+
+    def test_adjacent_url_only_lines_have_no_ambiguous_shared_snippet(self):
+        st = ResearchState(query="q")
+        raw = (
+            "Acme revenue increased 40 percent.\n"
+            "https://a.example/results\n"
+            "https://b.example/results"
+        )
+
+        refs = sources_mod.parse_sources("mcp__tavily__search", raw, st)
+
+        assert len(refs) == 2
+        assert [ref.snippet for ref in refs] == ["", ""]
 
     def test_parse_sources_malformed_is_safe(self):
         st = ResearchState(query="q")
-        assert sources_mod.parse_sources("mcp__brave-search__x", "<<not json>>", st) == []
+        assert (
+            sources_mod.parse_sources("mcp__brave-search__x", "<<not json>>", st) == []
+        )
 
     def test_add_usage_accumulates(self):
         st = ResearchState(query="q")
-        st.add_usage({"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 10})
+        st.add_usage(
+            {"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 10}
+        )
         st.add_usage({"output_tokens": 5})
         assert st.tokens_used == 165
 
@@ -81,7 +191,10 @@ class TestSources:
         st = ResearchState(query="q")
         st.register_source(url="https://a.com")  # S1
         from services.deep_research.types import SubAgentResult
-        st.results.append(SubAgentResult(subq="x", summary_md="", cited_sids=["S1", "S9"]))
+
+        st.results.append(
+            SubAgentResult(subq="x", summary_md="", cited_sids=["S1", "S9"])
+        )
         assert sources_mod.verify_citations(st) == ["S9"]
 
 
@@ -94,9 +207,11 @@ class TestGuardedCallTool:
         pool = MagicMock()
         pool.call_tool = AsyncMock(return_value="result")
         server_locks: dict = {}
-        out = await _guarded_call_tool(pool, server_locks, "mcp__brave-search__brave_web_search", {"q": "x"})
+        out = await _guarded_call_tool(
+            pool, server_locks, "mcp__brave-search__brave_web_search", {"q": "x"}
+        )
         assert out == "result"
-        assert "brave-search" in server_locks          # per-server lock registered
+        assert "brave-search" in server_locks  # per-server lock registered
         pool.call_tool.assert_awaited_once()
 
 
@@ -110,24 +225,33 @@ class TestRunSubagent:
             captured["channel_id"] = channel_id
             captured.update(kwargs)
             res = MagicMock()
-            res.text = "x" * 200_000          # oversized -> must be capped
+            res.text = "x" * 200_000  # oversized -> must be capped
             res.usage_total = {"output_tokens": 42}
             return res
 
         pool = MagicMock()
-        pool.call_tool = AsyncMock(return_value=json.dumps({"url": "https://s.com/1", "title": "S"}))
+        pool.call_tool = AsyncMock(
+            return_value=json.dumps({"url": "https://s.com/1", "title": "S"})
+        )
         defn = ResearchAgentDef(
-            agent_type="researcher", model="claude-opus-4-8",
-            system_prompt="SYS", max_tool_turns=5,
+            agent_type="researcher",
+            model="claude-opus-4-8",
+            system_prompt="SYS",
+            max_tool_turns=5,
         )
         state = ResearchState(query="q")
         tools = [{"name": "mcp__brave-search__brave_web_search", "input_schema": {}}]
 
         with patch.object(registry, "run_agent_loop", new=fake_loop):
             result = await run_subagent(
-                api_client=MagicMock(), pool=pool, server_locks={},
-                defn=defn, briefing="BRIEF", tools_for_api=tools,
-                state=state, channel_id=999,
+                api_client=MagicMock(),
+                pool=pool,
+                server_locks={},
+                defn=defn,
+                briefing="BRIEF",
+                tools_for_api=tools,
+                state=state,
+                channel_id=999,
             )
 
         # fresh context: history is an empty list passed in
@@ -148,21 +272,27 @@ class TestRunSubagent:
         assert can_use_tool("Bash", {})[0] is False
         raw = await execute_tool("mcp__brave-search__brave_web_search", {"q": "x"})
         assert "s.com/1" in raw
-        assert len(state.sources) == 1            # parse_sources ran inside execute_tool
+        assert len(state.sources) == 1  # parse_sources ran inside execute_tool
 
     def test_is_transient_api_error_classification(self):
         # 一時的（リトライ対象）: 5xx / 529 / 401（OAuth refresh で復活する可能性）
         for status in (529, 500, 502, 503, 504, 401):
-            e = MagicMock(); e.status_code = status
-            assert registry._is_transient_api_error(e) is True, f"status={status} should be transient"
+            e = MagicMock()
+            e.status_code = status
+            assert registry._is_transient_api_error(e) is True, (
+                f"status={status} should be transient"
+            )
         e_text = Exception("overloaded_error: Overloaded")
         assert registry._is_transient_api_error(e_text) is True
         e_auth = Exception("authentication_error: Invalid authentication credentials")
         assert registry._is_transient_api_error(e_auth) is True
         # 一時的でない（即失敗）: 429（quota）/ 400・403・404（contract / forbidden / not found）
         for status in (400, 403, 404, 429):
-            e = MagicMock(); e.status_code = status
-            assert registry._is_transient_api_error(e) is False, f"status={status} should NOT be transient"
+            e = MagicMock()
+            e.status_code = status
+            assert registry._is_transient_api_error(e) is False, (
+                f"status={status} should NOT be transient"
+            )
 
     @pytest.mark.asyncio
     async def test_run_subagent_refreshes_oauth_token_before_each_retry(self):
@@ -172,28 +302,42 @@ class TestRunSubagent:
         async def fake_loop(prompt, channel_id, **kwargs):
             calls["loop"] += 1
             if calls["loop"] == 1:
-                exc = type("APIStatusError", (Exception,), {})("401 authentication_error")
+                exc = type("APIStatusError", (Exception,), {})(
+                    "401 authentication_error"
+                )
                 exc.status_code = 401
                 raise exc
-            res = MagicMock(); res.text = "ok"; res.usage_total = None
+            res = MagicMock()
+            res.text = "ok"
+            res.usage_total = None
             return res
 
         async def fake_ensure():
             calls["ensure"] += 1
 
-        defn = ResearchAgentDef(agent_type="integrator", model="m", system_prompt="s", max_tool_turns=1)
+        defn = ResearchAgentDef(
+            agent_type="integrator", model="m", system_prompt="s", max_tool_turns=1
+        )
         # 動的 import を差し替えるため、services.oauth_manager にモジュール属性を当てる
         import services.oauth_manager as om
-        with patch.object(registry, "run_agent_loop", new=fake_loop), \
-             patch.object(registry, "_TRANSIENT_BACKOFF_BASE_S", 0), \
-             patch.object(om, "ensure_valid_token", new=fake_ensure):
+
+        with (
+            patch.object(registry, "run_agent_loop", new=fake_loop),
+            patch.object(registry, "_TRANSIENT_BACKOFF_BASE_S", 0),
+            patch.object(om, "ensure_valid_token", new=fake_ensure),
+        ):
             result = await run_subagent(
-                api_client=MagicMock(), pool=MagicMock(), server_locks={},
-                defn=defn, briefing="b", tools_for_api=[],
-                state=ResearchState(query="q"), channel_id=1,
+                api_client=MagicMock(),
+                pool=MagicMock(),
+                server_locks={},
+                defn=defn,
+                briefing="b",
+                tools_for_api=[],
+                state=ResearchState(query="q"),
+                channel_id=1,
             )
         assert result.ok is True
-        assert calls["loop"] == 2          # 401 → リトライして 2 回目で成功
+        assert calls["loop"] == 2  # 401 → リトライして 2 回目で成功
         # ensure_valid_token は各試行の直前に呼ばれる（refresh で 401 を救う狙い）
         assert calls["ensure"] == 2
 
@@ -205,22 +349,35 @@ class TestRunSubagent:
         async def fake_loop(prompt, channel_id, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
-                exc = type("APIStatusError", (Exception,), {})("overloaded_error: Overloaded")
+                exc = type("APIStatusError", (Exception,), {})(
+                    "overloaded_error: Overloaded"
+                )
                 exc.status_code = 529
                 raise exc
-            res = MagicMock(); res.text = "ok"; res.usage_total = None
+            res = MagicMock()
+            res.text = "ok"
+            res.usage_total = None
             return res
 
-        defn = ResearchAgentDef(agent_type="planner", model="m", system_prompt="s", max_tool_turns=1)
-        with patch.object(registry, "run_agent_loop", new=fake_loop), \
-             patch.object(registry, "_TRANSIENT_BACKOFF_BASE_S", 0):
+        defn = ResearchAgentDef(
+            agent_type="planner", model="m", system_prompt="s", max_tool_turns=1
+        )
+        with (
+            patch.object(registry, "run_agent_loop", new=fake_loop),
+            patch.object(registry, "_TRANSIENT_BACKOFF_BASE_S", 0),
+        ):
             result = await run_subagent(
-                api_client=MagicMock(), pool=MagicMock(), server_locks={},
-                defn=defn, briefing="b", tools_for_api=[],
-                state=ResearchState(query="q"), channel_id=1,
+                api_client=MagicMock(),
+                pool=MagicMock(),
+                server_locks={},
+                defn=defn,
+                briefing="b",
+                tools_for_api=[],
+                state=ResearchState(query="q"),
+                channel_id=1,
             )
         assert result.ok is True
-        assert calls["n"] == 2          # 1回目失敗 → リトライして成功
+        assert calls["n"] == 2  # 1回目失敗 → リトライして成功
 
     @pytest.mark.asyncio
     async def test_run_subagent_no_retry_on_non_transient(self):
@@ -229,20 +386,31 @@ class TestRunSubagent:
 
         async def fake_loop(prompt, channel_id, **kwargs):
             calls["n"] += 1
-            exc = type("APIStatusError", (Exception,), {})("rate_limit_error: usage credits")
+            exc = type("APIStatusError", (Exception,), {})(
+                "rate_limit_error: usage credits"
+            )
             exc.status_code = 429
             raise exc
 
-        defn = ResearchAgentDef(agent_type="searcher", model="m", system_prompt="s", max_tool_turns=1)
-        with patch.object(registry, "run_agent_loop", new=fake_loop), \
-             patch.object(registry, "_TRANSIENT_BACKOFF_BASE_S", 0):
+        defn = ResearchAgentDef(
+            agent_type="searcher", model="m", system_prompt="s", max_tool_turns=1
+        )
+        with (
+            patch.object(registry, "run_agent_loop", new=fake_loop),
+            patch.object(registry, "_TRANSIENT_BACKOFF_BASE_S", 0),
+        ):
             result = await run_subagent(
-                api_client=MagicMock(), pool=MagicMock(), server_locks={},
-                defn=defn, briefing="b", tools_for_api=[],
-                state=ResearchState(query="q"), channel_id=1,
+                api_client=MagicMock(),
+                pool=MagicMock(),
+                server_locks={},
+                defn=defn,
+                briefing="b",
+                tools_for_api=[],
+                state=ResearchState(query="q"),
+                channel_id=1,
             )
         assert result.ok is False
-        assert calls["n"] == 1          # リトライせず即失敗
+        assert calls["n"] == 1  # リトライせず即失敗
 
     def test_compact_briefing_within_budget(self):
         # 予算内ならそのまま返す
@@ -269,15 +437,24 @@ class TestRunSubagent:
 
         async def fake_loop(prompt, channel_id, **kwargs):
             captured.update(kwargs)
-            res = MagicMock(); res.text = "ok"; res.usage_total = None
+            res = MagicMock()
+            res.text = "ok"
+            res.usage_total = None
             return res
 
-        defn = ResearchAgentDef(agent_type="searcher", model="m", system_prompt="s", max_tool_turns=1)
+        defn = ResearchAgentDef(
+            agent_type="searcher", model="m", system_prompt="s", max_tool_turns=1
+        )
         with patch.object(registry, "run_agent_loop", new=fake_loop):
             await run_subagent(
-                api_client=MagicMock(), pool=MagicMock(), server_locks={},
-                defn=defn, briefing="b", tools_for_api=[],
-                state=ResearchState(query="q"), channel_id=1,
+                api_client=MagicMock(),
+                pool=MagicMock(),
+                server_locks={},
+                defn=defn,
+                briefing="b",
+                tools_for_api=[],
+                state=ResearchState(query="q"),
+                channel_id=1,
             )
         betas = captured["extra_betas"]
         # context-1m は除外、それ以外は残る（oauth, prompt-caching 等の必須 beta は維持）
@@ -291,16 +468,25 @@ class TestRunSubagent:
 
         async def fake_loop(prompt, channel_id, **kwargs):
             captured["prompt"] = prompt
-            res = MagicMock(); res.text = "ok"; res.usage_total = None
+            res = MagicMock()
+            res.text = "ok"
+            res.usage_total = None
             return res
 
-        defn = ResearchAgentDef(agent_type="searcher", model="m", system_prompt="s", max_tool_turns=1)
-        huge_briefing = "Q" * 800_000   # 540K char budget を超える
+        defn = ResearchAgentDef(
+            agent_type="searcher", model="m", system_prompt="s", max_tool_turns=1
+        )
+        huge_briefing = "Q" * 800_000  # 540K char budget を超える
         with patch.object(registry, "run_agent_loop", new=fake_loop):
             await run_subagent(
-                api_client=MagicMock(), pool=MagicMock(), server_locks={},
-                defn=defn, briefing=huge_briefing, tools_for_api=[],
-                state=ResearchState(query="q"), channel_id=1,
+                api_client=MagicMock(),
+                pool=MagicMock(),
+                server_locks={},
+                defn=defn,
+                briefing=huge_briefing,
+                tools_for_api=[],
+                state=ResearchState(query="q"),
+                channel_id=1,
             )
         assert len(captured["prompt"]) < 800_000
         assert "省略しました" in captured["prompt"]
@@ -309,30 +495,42 @@ class TestRunSubagent:
     async def test_huge_tool_result_bounded_but_sources_fully_extracted(self):
         # 巨大な MCP 戻り値はモデル context 用に有界化するが、ソース抽出は全文から行う
         # （200k 超→context-1m long-context 課金 429 を防ぐ。通常chatの microcompact 相当）。
-        big = json.dumps([
-            {"url": f"https://s.com/{i}", "title": f"T{i}", "text": "x" * 500}
-            for i in range(200)
-        ])
+        big = json.dumps(
+            [
+                {"url": f"https://s.com/{i}", "title": f"T{i}", "text": "x" * 500}
+                for i in range(200)
+            ]
+        )
         assert len(big) > registry.DEEP_RESEARCH_MAX_TOOL_RESULT_CHARS
 
         async def fake_loop(prompt, channel_id, **kwargs):
             captured = kwargs
-            out = await captured["execute_tool"]("mcp__brave-search__brave_web_search", {"q": "x"})
-            res = MagicMock(); res.text = "ok"; res.usage_total = None
+            out = await captured["execute_tool"](
+                "mcp__brave-search__brave_web_search", {"q": "x"}
+            )
+            res = MagicMock()
+            res.text = "ok"
+            res.usage_total = None
             res._out = out
             fake_loop.captured_out = out
             return res
 
         pool = MagicMock()
         pool.call_tool = AsyncMock(return_value=big)
-        defn = ResearchAgentDef(agent_type="searcher", model="m", system_prompt="s", max_tool_turns=1)
+        defn = ResearchAgentDef(
+            agent_type="searcher", model="m", system_prompt="s", max_tool_turns=1
+        )
         state = ResearchState(query="q")
         with patch.object(registry, "run_agent_loop", new=fake_loop):
             await run_subagent(
-                api_client=MagicMock(), pool=pool, server_locks={},
-                defn=defn, briefing="b",
+                api_client=MagicMock(),
+                pool=pool,
+                server_locks={},
+                defn=defn,
+                briefing="b",
                 tools_for_api=[{"name": "mcp__brave-search__brave_web_search"}],
-                state=state, channel_id=1,
+                state=state,
+                channel_id=1,
             )
         out = fake_loop.captured_out
         # モデルに渡る本文は上限内に収まり、省略マーカーが付く
@@ -347,18 +545,26 @@ class TestRunSubagent:
             captured = kwargs
             # invoke execute_tool with a pool that raises
             out = await captured["execute_tool"]("mcp__brave-search__x", {})
-            res = MagicMock(); res.text = out; res.usage_total = None
+            res = MagicMock()
+            res.text = out
+            res.usage_total = None
             return res
 
         pool = MagicMock()
         pool.call_tool = AsyncMock(side_effect=asyncio.TimeoutError())
-        defn = ResearchAgentDef(agent_type="r", model="m", system_prompt="s", max_tool_turns=1)
+        defn = ResearchAgentDef(
+            agent_type="r", model="m", system_prompt="s", max_tool_turns=1
+        )
         with patch.object(registry, "run_agent_loop", new=fake_loop):
             result = await run_subagent(
-                api_client=MagicMock(), pool=pool, server_locks={},
-                defn=defn, briefing="b",
+                api_client=MagicMock(),
+                pool=pool,
+                server_locks={},
+                defn=defn,
+                briefing="b",
                 tools_for_api=[{"name": "mcp__brave-search__x"}],
-                state=ResearchState(query="q"), channel_id=1,
+                state=ResearchState(query="q"),
+                channel_id=1,
             )
         assert "tool_use_error" in result.summary_md
         assert "timed out" in result.summary_md
@@ -367,12 +573,20 @@ class TestRunSubagent:
     async def test_loop_exception_returns_not_ok(self):
         async def boom(*a, **k):
             raise RuntimeError("kaboom")
-        defn = ResearchAgentDef(agent_type="r", model="m", system_prompt="s", max_tool_turns=1)
+
+        defn = ResearchAgentDef(
+            agent_type="r", model="m", system_prompt="s", max_tool_turns=1
+        )
         with patch.object(registry, "run_agent_loop", new=boom):
             result = await run_subagent(
-                api_client=MagicMock(), pool=MagicMock(), server_locks={},
-                defn=defn, briefing="b", tools_for_api=[],
-                state=ResearchState(query="q"), channel_id=1,
+                api_client=MagicMock(),
+                pool=MagicMock(),
+                server_locks={},
+                defn=defn,
+                briefing="b",
+                tools_for_api=[],
+                state=ResearchState(query="q"),
+                channel_id=1,
             )
         assert result.ok is False
         assert "kaboom" in (result.error or "")
@@ -383,7 +597,9 @@ class TestRunSubagent:
 # ---------------------------------------------------------------------------
 def _make_deps():
     bot = MagicMock()
-    bot.wait_for = AsyncMock(side_effect=asyncio.TimeoutError())  # clarify times out by default
+    bot.wait_for = AsyncMock(
+        side_effect=asyncio.TimeoutError()
+    )  # clarify times out by default
     return orch.DeepResearchDeps(
         bot=bot,
         send_segmented=AsyncMock(),
@@ -405,31 +621,415 @@ def _make_channel():
     return channel, origin, thread, anchor
 
 
+class TestRunRegistry:
+    def test_create_retries_uuid_until_id_is_unique(self):
+        runs = RunRegistry()
+        first = runs.create("first", run_id="collision")
+        generated = [
+            SimpleNamespace(hex="collision"),
+            SimpleNamespace(hex="unique"),
+        ]
+
+        with patch(
+            "services.deep_research.run_state.uuid4", side_effect=generated
+        ) as uuid4:
+            second = runs.create("second", run_id="collision")
+
+        assert uuid4.call_count == 2
+        assert second.run_id == "unique"
+        assert runs.runs == {"collision": first, "unique": second}
+
+    def test_discard_rejects_different_object_with_same_id(self):
+        runs = RunRegistry()
+        registered = runs.create("registered", run_id="same")
+        stale = ResearchRun(state=ResearchState(query="stale"), run_id="same")
+
+        assert runs.discard(stale) is False
+        assert runs.runs == {"same": registered}
+        assert runs.discard(registered) is True
+        assert runs.runs == {}
+
+
 class TestOrchestrator:
+    def test_public_api_characterization(self):
+        import inspect
+        import services.deep_research as public
+
+        assert public.__all__ == [
+            "DeepResearchDeps",
+            "available_research_keys",
+            "has_required_web_backend",
+            "is_active_research_thread",
+            "run_deep_research",
+        ]
+        signature = inspect.signature(public.run_deep_research)
+        assert list(signature.parameters) == [
+            "channel",
+            "user",
+            "query",
+            "deps",
+            "skip_clarify",
+            "depth",
+        ]
+        assert signature.parameters["skip_clarify"].default is False
+        assert signature.parameters["depth"].default == "standard"
+
     @pytest.mark.asyncio
-    async def test_busy_rejects(self):
-        orch._research_busy = True
+    async def test_parallel_runs_have_independent_state(self):
+        release = asyncio.Event()
+        both_started = asyncio.Event()
+        seen = []
+
+        async def fake_run(channel, user, query, deps, *, skip_clarify, depth, run):
+            seen.append((query, run.run_id, run.state))
+            if len(seen) == 2:
+                both_started.set()
+            await release.wait()
+
+        with patch.object(orch, "_run", new=fake_run):
+            first = asyncio.create_task(
+                orch.run_deep_research(
+                    MagicMock(), MagicMock(id=1), "q1", _make_deps()
+                ),
+            )
+            second = asyncio.create_task(
+                orch.run_deep_research(
+                    MagicMock(), MagicMock(id=2), "q2", _make_deps()
+                ),
+            )
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+            assert len(DEFAULT_RUNS.runs) == 2
+            assert seen[0][1] != seen[1][1]
+            assert seen[0][2] is not seen[1][2]
+            release.set()
+            await asyncio.gather(first, second)
+        assert DEFAULT_RUNS.runs == {}
+
+    @pytest.mark.asyncio
+    async def test_failed_run_cleanup_never_sweeps_other_workflow_processes(self):
+        runs = RunRegistry()
+        run_a = runs.create("a", run_id="run-a")
+        run_b = runs.create("b", run_id="run-b")
+        run_a.require_mcp_cleanup()
+        failed_stack = MagicMock()
+        failed_stack.aclose = AsyncMock(side_effect=RuntimeError("close failed"))
+        other_workflow_stack = MagicMock()
+        other_workflow_stack.aclose = AsyncMock()
+
+        with patch.object(orch, "DEFAULT_RUNS", runs):
+            await orch._close_owned_mcp_stack(failed_stack, run_a)
+            first_cleanup_task = run_a._stack_cleanup_task
+            assert runs.discard(run_a) is False
+            assert runs.discard(run_b) is True
+            await orch._close_owned_mcp_stack(failed_stack, run_a)
+            assert run_a._stack_cleanup_task is not first_cleanup_task
+
+        assert failed_stack.aclose.await_count == 6
+        assert run_a._stack_cleanup_generation == 2
+        assert "generation=2" in (run_a.cleanup_diagnostic or "")
+        assert "attempt=3" in (run_a.cleanup_diagnostic or "")
+        assert "last_error=RuntimeError: close failed" in (
+            run_a.cleanup_diagnostic or ""
+        )
+        other_workflow_stack.aclose.assert_not_awaited()
+        assert not hasattr(orch, "kill_orphan_mcp_processes")
+
+    @pytest.mark.asyncio
+    async def test_owned_stack_cleanup_finishes_after_repeated_cancel(self):
+        run = ResearchRun(state=ResearchState(query="q"), run_id="owned")
+        run.require_mcp_cleanup()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        finalized = asyncio.Event()
+        close_calls = 0
+
+        async def aclose():
+            nonlocal close_calls
+            close_calls += 1
+            started.set()
+            try:
+                await release.wait()
+            finally:
+                finalized.set()
+
+        stack = SimpleNamespace(aclose=aclose)
+        closing = asyncio.create_task(run.close_owned_stack(stack.aclose))
+        await started.wait()
+        closing.cancel("first")
+        await asyncio.sleep(0)
+        closing.cancel("second")
+        await asyncio.sleep(0)
+        release.set()
+
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await closing
+
+        assert caught.value.args == ("first",)
+        assert finalized.is_set()
+        assert run._stack_cleanup_task is not None
+        assert run._stack_cleanup_task.done()
+        assert run._stack_cleanup_done is True
+        cleanup_task = run._stack_cleanup_task
+        await run.close_owned_stack(stack.aclose)
+        assert run._stack_cleanup_task is cleanup_task
+        assert close_calls == 1
+        assert not hasattr(orch, "kill_orphan_mcp_processes")
+
+    @pytest.mark.asyncio
+    async def test_concurrent_cleanup_callers_share_one_generation(self):
+        run = ResearchRun(state=ResearchState(query="q"), run_id="concurrent")
+        run.require_mcp_cleanup()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        process_cleanup_calls = 0
+
+        async def cleanup_processes():
+            nonlocal process_cleanup_calls
+            process_cleanup_calls += 1
+            started.set()
+            await release.wait()
+
+        run._cleanup_owned_processes = cleanup_processes
+        stack = SimpleNamespace(aclose=AsyncMock(return_value=None))
+        first = asyncio.create_task(run.close_owned_stack(stack.aclose))
+        await started.wait()
+        shared_task = run._stack_cleanup_task
+        second = asyncio.create_task(run.close_owned_stack(stack.aclose))
+        await asyncio.sleep(0)
+
+        assert run._stack_cleanup_task is shared_task
+        release.set()
+        await asyncio.gather(first, second)
+
+        assert process_cleanup_calls == 1
+        assert stack.aclose.await_count == 1
+        assert run._stack_cleanup_generation == 1
+        assert run._stack_cleanup_done is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="run-owned process groups require POSIX",
+    )
+    async def test_failed_aclose_cleans_only_directly_registered_handle(self):
+        command = "import time; time.sleep(60)"
+        run_a = ResearchRun(state=ResearchState(query="a"), run_id="run-a")
+        run_b = ResearchRun(state=ResearchState(query="b"), run_id="run-b")
+        run_a.require_mcp_cleanup()
+        run_b.require_mcp_cleanup()
+        proc_a = proc_b = None
         try:
-            channel, *_ = _make_channel()
-            await orch.run_deep_research(channel, MagicMock(id=1), "q", _make_deps())
-            channel.send.assert_awaited()           # busy notice
-            channel.send.return_value.create_thread.assert_not_called()
+            proc_a, proc_b = await asyncio.gather(
+                spawn_process(
+                    [sys.executable, "-c", command],
+                    env=dict(os.environ),
+                    cwd=None,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                ),
+                spawn_process(
+                    [sys.executable, "-c", command],
+                    env=dict(os.environ),
+                    cwd=None,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                ),
+            )
+            run_a.register_mcp_process(proc_a)
+            run_b.register_mcp_process(proc_b)
+
+            stack_a = SimpleNamespace(
+                aclose=AsyncMock(
+                    side_effect=[RuntimeError("transport close failed"), None]
+                )
+            )
+            await orch._close_owned_mcp_stack(stack_a, run_a)
+            await asyncio.wait_for(proc_a.wait(), timeout=3)
+
+            assert run_a._stack_cleanup_done is True
+            assert run_a._owned_mcp_processes == [proc_a]
+            assert proc_b.returncode is None
+
+            # A completed run is idempotent and never re-enters aclose.
+            await orch._close_owned_mcp_stack(stack_a, run_a)
+            assert stack_a.aclose.await_count == 2
         finally:
-            orch._research_busy = False
+            for proc in (proc_a, proc_b):
+                if proc is not None and proc.returncode is None:
+                    proc.terminate()
+                    await proc.wait()
+
+    def test_deep_research_ownership_contains_no_process_discovery(self):
+        import inspect
+
+        run_state_source = inspect.getsource(run_state_mod)
+        orchestrator_source = inspect.getsource(orch)
+        for forbidden in (
+            "psutil",
+            "_child_snapshot",
+            "cmdline",
+            "DEEP_RESEARCH_RUN_ID",
+            "_MCP_SPAWN_OWNERSHIP_LOCK",
+            "os.killpg",
+        ):
+            assert forbidden not in run_state_source
+            assert forbidden not in orchestrator_source
+
+    def test_run_observer_rejects_non_asyncio_process_handle(self):
+        run = ResearchRun(state=ResearchState(query="q"), run_id="observer")
+
+        with pytest.raises(RuntimeError, match="non-asyncio"):
+            run.register_mcp_process(SimpleNamespace(pid=1234, returncode=None))
+
+        assert run._owned_mcp_processes == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="run-owned process groups require POSIX",
+    )
+    async def test_failed_generation_retries_after_permission_recovery(self):
+        process = await spawn_process(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            env=dict(os.environ),
+            cwd=None,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        runs = RunRegistry()
+        run = runs.create("q", run_id="retry")
+        run.require_mcp_cleanup()
+        run.register_mcp_process(process)
+        stack = SimpleNamespace(aclose=AsyncMock(return_value=None))
+        original_cleanup = run_state_mod.wait_or_terminate_process_group
+        calls = 0
+
+        async def flaky_cleanup(owned_process):
+            nonlocal calls
+            calls += 1
+            if calls <= 3:
+                raise ProcessCleanupPermissionError("permission denied")
+            await original_cleanup(owned_process, grace_s=0.1)
+
+        try:
+            with (
+                patch.object(
+                    run_state_mod,
+                    "wait_or_terminate_process_group",
+                    new=flaky_cleanup,
+                ),
+                patch.object(run_state_mod, "_STACK_CLEANUP_BACKOFF_S", 0),
+            ):
+                with pytest.raises(OwnedMcpCleanupError):
+                    await run.close_owned_stack(stack.aclose)
+                first_cleanup_task = run._stack_cleanup_task
+                assert run.cleanup_discardable is False
+                assert runs.discard(run) is False
+                assert run._stack_closed is True
+                assert "generation=1" in (run.cleanup_diagnostic or "")
+                assert "attempt=3" in (run.cleanup_diagnostic or "")
+                assert f"live_pids={[process.pid]}" in (run.cleanup_diagnostic or "")
+                assert "ProcessCleanupPermissionError" in (run.cleanup_diagnostic or "")
+                await run.close_owned_stack(stack.aclose)
+
+            assert calls == 4
+            assert run._stack_cleanup_task is not first_cleanup_task
+            assert run._stack_cleanup_generation == 2
+            assert run._stack_cleanup_done is True
+            assert run.cleanup_discardable is True
+            assert run.cleanup_diagnostic is None
+            stack.aclose.assert_awaited_once_with()
+            assert runs.discard(run) is True
+        finally:
+            if process.returncode is None:
+                process.terminate()
+                await process.wait()
+
+    @pytest.mark.asyncio
+    async def test_process_wide_admission_bounds_runs_without_permit_leak(self):
+        runs = RunRegistry()
+        admission = asyncio.Semaphore(1)
+        first_started = asyncio.Event()
+        first_release = asyncio.Event()
+        seen: list[str] = []
+
+        async def fake_run(channel, user, query, deps, *, skip_clarify, depth, run):
+            seen.append(query)
+            if query == "first":
+                first_started.set()
+                await first_release.wait()
+
+        with (
+            patch.object(orch, "DEFAULT_RUNS", runs),
+            patch.object(orch, "_RUN_ADMISSION", admission),
+            patch.object(orch, "_run", new=fake_run),
+        ):
+            first = asyncio.create_task(
+                orch.run_deep_research(
+                    MagicMock(),
+                    MagicMock(id=1),
+                    "first",
+                    _make_deps(),
+                ),
+            )
+            await first_started.wait()
+            queued = asyncio.create_task(
+                orch.run_deep_research(
+                    MagicMock(),
+                    MagicMock(id=2),
+                    "queued",
+                    _make_deps(),
+                ),
+            )
+            await asyncio.sleep(0)
+            assert seen == ["first"]
+            queued.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await queued
+
+            first_release.set()
+            await first
+            await orch.run_deep_research(
+                MagicMock(),
+                MagicMock(id=3),
+                "third",
+                _make_deps(),
+            )
+
+        assert seen == ["first", "third"]
+        assert admission._value == 1
+        assert runs.runs == {}
+
+    def test_max_concurrent_runs_is_environment_configurable(self, monkeypatch):
+        monkeypatch.setenv("DEEP_RESEARCH_MAX_CONCURRENT_RUNS", "7")
+        assert orch._configured_max_concurrent_runs() == 7
+        monkeypatch.setenv("DEEP_RESEARCH_MAX_CONCURRENT_RUNS", "invalid")
+        assert orch._configured_max_concurrent_runs() == 2
 
     @pytest.mark.asyncio
     async def test_precondition_no_web_backend(self):
         channel, origin, thread, anchor = _make_channel()
-        with patch.object(orch, "MCP_SERVERS_WEB", {"x-scraper": {}}), \
-             patch.object(orch, "run_subagent", new=AsyncMock()) as rsa:
-            await orch.run_deep_research(channel, MagicMock(id=1), "q", _make_deps(), skip_clarify=True)
-        rsa.assert_not_awaited()                     # never ran the searcher
+        with (
+            patch.object(orch, "MCP_SERVERS_WEB", {"x-scraper": {}}),
+            patch.object(orch, "run_subagent", new=AsyncMock()) as rsa,
+        ):
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "q", _make_deps(), skip_clarify=True
+            )
+        rsa.assert_not_awaited()  # never ran the searcher
         # anchor edited with the precondition error (content= kwarg)
-        assert any("brave" in str(c.kwargs.get("content", "")) for c in anchor.edit.call_args_list)
+        assert any(
+            "brave" in str(c.kwargs.get("content", ""))
+            for c in anchor.edit.call_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_happy_path_single_agent(self):
         from services.deep_research.types import SubAgentResult
+
         channel, origin, thread, anchor = _make_channel()
         deps = _make_deps()
 
@@ -438,21 +1038,45 @@ class TestOrchestrator:
         fake_pool.handles = {}
         tools = [{"name": "mcp__brave-search__brave_web_search", "input_schema": {}}]
 
-        with patch.object(orch, "DEEP_RESEARCH_MULTI_AGENT", False), \
-             patch.object(orch, "MCP_SERVERS_WEB", {"brave-search": {"x": 1}, "x-scraper": {}}), \
-             patch.object(orch, "make_api_client", new=AsyncMock(return_value=MagicMock())), \
-             patch.object(orch, "McpPool", return_value=fake_pool), \
-             patch.object(orch, "mcp_tools_to_anthropic", return_value=tools), \
-             patch.object(orch, "run_subagent", new=AsyncMock(
-                 return_value=SubAgentResult(subq="b", summary_md="# レポート本文", ok=True),
-             )) as rsa:
+        with (
+            patch.object(orch, "DEEP_RESEARCH_MULTI_AGENT", False),
+            patch.object(
+                orch, "MCP_SERVERS_WEB", {"brave-search": {"x": 1}, "x-scraper": {}}
+            ),
+            patch.object(
+                orch, "make_api_client", new=AsyncMock(return_value=MagicMock())
+            ),
+            patch.object(orch, "McpPool", return_value=fake_pool),
+            patch.object(orch, "mcp_tools_to_anthropic", return_value=tools),
+            patch.object(
+                orch,
+                "run_subagent",
+                new=AsyncMock(
+                    return_value=SubAgentResult(
+                        subq="b", summary_md="# レポート本文", ok=True
+                    ),
+                ),
+            ) as rsa,
+        ):
             await orch.run_deep_research(
-                channel, MagicMock(id=1), "日経VIの現状", deps, skip_clarify=True,
+                channel,
+                MagicMock(id=1),
+                "日経VIの現状",
+                deps,
+                skip_clarify=True,
             )
 
-        channel.send.assert_awaited()                # origin message
-        origin.create_thread.assert_awaited_once()   # message-anchored thread
-        thread.send.assert_awaited()                 # anchor in thread
+        channel.send.assert_awaited()  # origin message
+        assert channel.send.await_args.args == (
+            "🔬 **Deep Research**: 日経VIの現状\n"
+            "-# スレッドで進行します。中断はスレッド内で `/abort`。",
+        )
+        origin.create_thread.assert_awaited_once()  # message-anchored thread
+        assert origin.create_thread.await_args.kwargs == {
+            "name": "🔬 日経VIの現状",
+            "auto_archive_duration": 1440,
+        }
+        thread.send.assert_awaited()  # anchor in thread
         rsa.assert_awaited_once()
         # report delivered into the thread via the shared segmented sender
         deps.send_segmented.assert_awaited_once()
@@ -461,37 +1085,55 @@ class TestOrchestrator:
 
     @pytest.mark.asyncio
     async def test_clarify_reaction_skips_to_default_scope(self):
-        # 時間制限は廃止。リアクションで「確認なし・既定スコープ続行」（タイムアウトに依存しない）。
+        # deadline 内のリアクションで「確認なし・既定スコープ続行」。
         channel, origin, thread, anchor = _make_channel()
         deps = _make_deps()
 
         async def _wf(event, *, check=None, timeout=None):
-            assert timeout is None              # 明確化に時間制限を渡さない
+            assert timeout is None  # deadline は adapter の OR 待ち全体に適用
             if event == "raw_reaction_add":
                 return SimpleNamespace(message_id=1, user_id=1)
-            await asyncio.Event().wait()        # message: 無制限に待つ（来ない）
+            await asyncio.Event().wait()  # message は reaction 勝利時に回収される
+
         deps.bot.wait_for = _wf
         deps.bot.user = SimpleNamespace(id=999)
-        fake_pool = MagicMock(); fake_pool.spawn_eager = AsyncMock(); fake_pool.handles = {}
+        fake_pool = MagicMock()
+        fake_pool.spawn_eager = AsyncMock()
+        fake_pool.handles = {}
         tools = [{"name": "mcp__brave-search__b", "input_schema": {}}]
 
         async def fake_clarify_loop(prompt, channel_id, **kwargs):
-            res = MagicMock(); res.text = "- 期間は？\n- 地域は？"; res.usage_total = None
+            res = MagicMock()
+            res.text = "- 期間は？\n- 地域は？"
+            res.usage_total = None
             return res
 
-        with patch.object(orch, "DEEP_RESEARCH_MULTI_AGENT", False), \
-             patch.object(orch, "MCP_SERVERS_WEB", {"brave-search": {"x": 1}}), \
-             patch.object(orch, "make_api_client", new=AsyncMock(return_value=MagicMock())), \
-             patch.object(orch, "McpPool", return_value=fake_pool), \
-             patch.object(orch, "mcp_tools_to_anthropic", return_value=tools), \
-             patch.object(orch, "run_agent_loop", new=fake_clarify_loop), \
-             patch.object(orch, "run_subagent", new=AsyncMock(
-                 return_value=SubAgentResult(subq="b", summary_md="R", ok=True),
-             )):
-            await orch.run_deep_research(channel, MagicMock(id=1), "q", deps, skip_clarify=False)
+        with (
+            patch.object(orch, "DEEP_RESEARCH_MULTI_AGENT", False),
+            patch.object(orch, "MCP_SERVERS_WEB", {"brave-search": {"x": 1}}),
+            patch.object(
+                orch, "make_api_client", new=AsyncMock(return_value=MagicMock())
+            ),
+            patch.object(orch, "McpPool", return_value=fake_pool),
+            patch.object(orch, "mcp_tools_to_anthropic", return_value=tools),
+            patch.object(orch, "run_agent_loop", new=fake_clarify_loop),
+            patch.object(
+                orch,
+                "run_subagent",
+                new=AsyncMock(
+                    return_value=SubAgentResult(subq="b", summary_md="R", ok=True),
+                ),
+            ),
+        ):
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "q", deps, skip_clarify=False
+            )
 
         sends = [str(c.args[0]) for c in thread.send.call_args_list]
-        assert any("確認" in s and "時間制限はありません" in s for s in sends)
+        assert any(
+            "確認" in s and f"{orch.DEEP_RESEARCH_CLARIFY_TIMEOUT_S}秒以内" in s
+            for s in sends
+        )
         assert any("既定スコープ" in s for s in sends)
 
     @pytest.mark.asyncio
@@ -504,7 +1146,7 @@ class TestOrchestrator:
         deps.bot.user = bot_user
         reply = SimpleNamespace(
             content="直近6ヶ月・日本SE市場で。学習投資は技術書/講座を含む",
-            mentions=[bot_user],   # ← Reply による auto-mention（バグの再現条件）
+            mentions=[bot_user],  # ← Reply による auto-mention（バグの再現条件）
             reference=SimpleNamespace(message_id=12345),
             channel=SimpleNamespace(id=555000),
             author=SimpleNamespace(id=1, bot=False),
@@ -514,27 +1156,38 @@ class TestOrchestrator:
             if event == "message":
                 return reply
             await asyncio.Event().wait()
+
         deps.bot.wait_for = _wf
-        fake_pool = MagicMock(); fake_pool.spawn_eager = AsyncMock(); fake_pool.handles = {}
+        fake_pool = MagicMock()
+        fake_pool.spawn_eager = AsyncMock()
+        fake_pool.handles = {}
         tools = [{"name": "mcp__brave-search__b", "input_schema": {}}]
         captured = {}
 
         async def fake_clarify_loop(prompt, channel_id, **kwargs):
-            res = MagicMock(); res.text = "- 期間は？\n- 対象市場は？"; res.usage_total = None
+            res = MagicMock()
+            res.text = "- 期間は？\n- 対象市場は？"
+            res.usage_total = None
             return res
 
         async def fake_sub(**kw):
             captured["clarified"] = kw["state"].clarified_query
             return SubAgentResult("r", "**レポート**", ok=True)
 
-        with patch.object(orch, "DEEP_RESEARCH_MULTI_AGENT", False), \
-             patch.object(orch, "MCP_SERVERS_WEB", {"brave-search": {"x": 1}}), \
-             patch.object(orch, "make_api_client", new=AsyncMock(return_value=MagicMock())), \
-             patch.object(orch, "McpPool", return_value=fake_pool), \
-             patch.object(orch, "mcp_tools_to_anthropic", return_value=tools), \
-             patch.object(orch, "run_agent_loop", new=fake_clarify_loop), \
-             patch.object(orch, "run_subagent", new=fake_sub):
-            await orch.run_deep_research(channel, MagicMock(id=1), "SE 投資", deps, skip_clarify=False)
+        with (
+            patch.object(orch, "DEEP_RESEARCH_MULTI_AGENT", False),
+            patch.object(orch, "MCP_SERVERS_WEB", {"brave-search": {"x": 1}}),
+            patch.object(
+                orch, "make_api_client", new=AsyncMock(return_value=MagicMock())
+            ),
+            patch.object(orch, "McpPool", return_value=fake_pool),
+            patch.object(orch, "mcp_tools_to_anthropic", return_value=tools),
+            patch.object(orch, "run_agent_loop", new=fake_clarify_loop),
+            patch.object(orch, "run_subagent", new=fake_sub),
+        ):
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "SE 投資", deps, skip_clarify=False
+            )
 
         # 回答が clarified_query に必ず畳み込まれる（auto-mention で approve に化けない）
         assert "直近6ヶ月" in captured["clarified"]
@@ -547,36 +1200,49 @@ class TestOrchestrator:
         channel, origin, thread, anchor = _make_channel()
         deps = _make_deps()
         reply = SimpleNamespace(
-            content="直近3ヶ月・日本市場で", mentions=[],
-            channel=SimpleNamespace(id=555000), author=SimpleNamespace(id=1, bot=False),
+            content="直近3ヶ月・日本市場で",
+            mentions=[],
+            channel=SimpleNamespace(id=555000),
+            author=SimpleNamespace(id=1, bot=False),
         )
 
         async def _wf(event, *, check=None, timeout=None):
             if event == "message":
                 return reply
-            await asyncio.Event().wait()        # reaction: 来ない（無制限）
+            await asyncio.Event().wait()  # reaction: 来ない（無制限）
+
         deps.bot.wait_for = _wf
         deps.bot.user = SimpleNamespace(id=999)
-        fake_pool = MagicMock(); fake_pool.spawn_eager = AsyncMock(); fake_pool.handles = {}
+        fake_pool = MagicMock()
+        fake_pool.spawn_eager = AsyncMock()
+        fake_pool.handles = {}
         tools = [{"name": "mcp__brave-search__b", "input_schema": {}}]
         captured = {}
 
         async def fake_clarify_loop(prompt, channel_id, **kwargs):
-            res = MagicMock(); res.text = "- 期間は？"; res.usage_total = None
+            res = MagicMock()
+            res.text = "- 期間は？"
+            res.usage_total = None
             return res
 
         async def fake_sub(**kw):
             captured["clarified"] = kw["state"].clarified_query
             return SubAgentResult("r", "**レポート**", ok=True)
 
-        with patch.object(orch, "DEEP_RESEARCH_MULTI_AGENT", False), \
-             patch.object(orch, "MCP_SERVERS_WEB", {"brave-search": {"x": 1}}), \
-             patch.object(orch, "make_api_client", new=AsyncMock(return_value=MagicMock())), \
-             patch.object(orch, "McpPool", return_value=fake_pool), \
-             patch.object(orch, "mcp_tools_to_anthropic", return_value=tools), \
-             patch.object(orch, "run_agent_loop", new=fake_clarify_loop), \
-             patch.object(orch, "run_subagent", new=fake_sub):
-            await orch.run_deep_research(channel, MagicMock(id=1), "日経VI", deps, skip_clarify=False)
+        with (
+            patch.object(orch, "DEEP_RESEARCH_MULTI_AGENT", False),
+            patch.object(orch, "MCP_SERVERS_WEB", {"brave-search": {"x": 1}}),
+            patch.object(
+                orch, "make_api_client", new=AsyncMock(return_value=MagicMock())
+            ),
+            patch.object(orch, "McpPool", return_value=fake_pool),
+            patch.object(orch, "mcp_tools_to_anthropic", return_value=tools),
+            patch.object(orch, "run_agent_loop", new=fake_clarify_loop),
+            patch.object(orch, "run_subagent", new=fake_sub),
+        ):
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "日経VI", deps, skip_clarify=False
+            )
 
         # 返信が clarified_query に畳み込まれて調査に渡る
         assert "直近3ヶ月" in captured["clarified"]
@@ -589,23 +1255,33 @@ class TestOrchestrator:
 class TestExtractPlan:
     def test_json_array(self):
         from services.deep_research.registry import extract_plan
+
         assert extract_plan('["q1", "q2", "q3"]', 4) == ["q1", "q2", "q3"]
 
     def test_fenced_with_prose(self):
         from services.deep_research.registry import extract_plan
+
         assert extract_plan('plan:\n```json\n["a","b"]\n```', 4) == ["a", "b"]
 
     def test_bullet_fallback_and_dedup(self):
         from services.deep_research.registry import extract_plan
-        out = extract_plan("- 最初の質問はこれ\n- 最初の質問はこれ\n2. 次の質問はあれ", 4)
+
+        out = extract_plan(
+            "- 最初の質問はこれ\n- 最初の質問はこれ\n2. 次の質問はあれ", 4
+        )
         assert out == ["最初の質問はこれ", "次の質問はあれ"]
 
     def test_limit(self):
         from services.deep_research.registry import extract_plan
-        assert extract_plan('["aaaaaa","bbbbbb","cccccc","dddddd"]', 2) == ["aaaaaa", "bbbbbb"]
+
+        assert extract_plan('["aaaaaa","bbbbbb","cccccc","dddddd"]', 2) == [
+            "aaaaaa",
+            "bbbbbb",
+        ]
 
     def test_empty(self):
         from services.deep_research.registry import extract_plan
+
         assert extract_plan("", 4) == []
 
 
@@ -617,7 +1293,9 @@ class TestMultiAgent:
             patch.object(orch, "DEEP_RESEARCH_MAX_PARALLEL", 2),
             patch.object(orch, "DEEP_RESEARCH_MAX_SUBAGENTS", 4),
             patch.object(orch, "MCP_SERVERS_WEB", {"brave-search": {"x": 1}}),
-            patch.object(orch, "make_api_client", new=AsyncMock(return_value=MagicMock())),
+            patch.object(
+                orch, "make_api_client", new=AsyncMock(return_value=MagicMock())
+            ),
             patch.object(orch, "McpPool", return_value=fake_pool),
             patch.object(orch, "mcp_tools_to_anthropic", return_value=tools),
             patch.object(orch, "run_subagent", new=fake_subagent),
@@ -627,7 +1305,9 @@ class TestMultiAgent:
     async def test_plan_search_synthesize(self):
         channel, origin, thread, anchor = _make_channel()
         deps = _make_deps()
-        fake_pool = MagicMock(); fake_pool.spawn_eager = AsyncMock(); fake_pool.handles = {}
+        fake_pool = MagicMock()
+        fake_pool.spawn_eager = AsyncMock()
+        fake_pool.handles = {}
         tools = [{"name": "mcp__brave-search__b", "input_schema": {}}]
         calls = {"planner": 0, "searcher": 0, "synthesizer": 0}
 
@@ -636,33 +1316,48 @@ class TestMultiAgent:
             state = kw["state"]
             calls[defn.agent_type] += 1
             if defn.agent_type == "planner":
-                return SubAgentResult(subq="p", summary_md='["サブ質問1", "サブ質問2", "サブ質問3"]', ok=True)
+                return SubAgentResult(
+                    subq="p",
+                    summary_md='["サブ質問1", "サブ質問2", "サブ質問3"]',
+                    ok=True,
+                )
             if defn.agent_type == "searcher":
-                state.register_source(url=f"https://s.com/{calls['searcher']}", title="t")
-                return SubAgentResult(subq=kw["briefing"], summary_md="findings...", ok=True)
+                state.register_source(
+                    url=f"https://s.com/{calls['searcher']}", title="t"
+                )
+                return SubAgentResult(
+                    subq=kw["briefing"], summary_md="findings...", ok=True
+                )
             if defn.agent_type == "synthesizer":
-                return SubAgentResult(subq="synth", summary_md="**最終レポート**", ok=True)
+                return SubAgentResult(
+                    subq="synth", summary_md="**最終レポート**", ok=True
+                )
             return SubAgentResult(subq="?", summary_md="", ok=False)
 
         from contextlib import ExitStack
+
         with ExitStack() as es:
             for p in self._patches(fake_subagent, fake_pool, tools):
                 es.enter_context(p)
-            await orch.run_deep_research(channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True)
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True
+            )
 
         assert calls["planner"] == 1
-        assert calls["searcher"] == 3          # 3 sub-questions
+        assert calls["searcher"] == 3  # 3 sub-questions
         assert calls["synthesizer"] == 1
         deps.send_segmented.assert_awaited_once()
         _a, sent_text, _f = deps.send_segmented.call_args.args
         assert "**最終レポート**" in sent_text
-        assert "情報ソース" in sent_text        # 機械収集ソースが決定的に付与される
+        assert "情報ソース" in sent_text  # 機械収集ソースが決定的に付与される
 
     @pytest.mark.asyncio
     async def test_partial_searcher_failure_still_synthesizes(self):
         channel, origin, thread, anchor = _make_channel()
         deps = _make_deps()
-        fake_pool = MagicMock(); fake_pool.spawn_eager = AsyncMock(); fake_pool.handles = {}
+        fake_pool = MagicMock()
+        fake_pool.spawn_eager = AsyncMock()
+        fake_pool.handles = {}
         tools = [{"name": "mcp__brave-search__b", "input_schema": {}}]
 
         async def fake_subagent(**kw):
@@ -671,17 +1366,24 @@ class TestMultiAgent:
                 return SubAgentResult(subq="p", summary_md='["q1", "q2"]', ok=True)
             if defn.agent_type == "searcher":
                 if "q2" in kw["briefing"]:
-                    raise RuntimeError("searcher boom")   # captured by gather(return_exceptions)
-                return SubAgentResult(subq=kw["briefing"], summary_md="ok findings", ok=True)
+                    raise RuntimeError(
+                        "searcher boom"
+                    )  # captured by gather(return_exceptions)
+                return SubAgentResult(
+                    subq=kw["briefing"], summary_md="ok findings", ok=True
+                )
             if defn.agent_type == "synthesizer":
                 return SubAgentResult(subq="synth", summary_md="**レポート**", ok=True)
             return SubAgentResult(subq="?", summary_md="", ok=False)
 
         from contextlib import ExitStack
+
         with ExitStack() as es:
             for p in self._patches(fake_subagent, fake_pool, tools):
                 es.enter_context(p)
-            await orch.run_deep_research(channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True)
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True
+            )
 
         # one searcher failed but synthesis still produced a report
         deps.send_segmented.assert_awaited_once()
@@ -692,26 +1394,35 @@ class TestMultiAgent:
     async def test_plan_failure_falls_back_to_single_agent(self):
         channel, origin, thread, anchor = _make_channel()
         deps = _make_deps()
-        fake_pool = MagicMock(); fake_pool.spawn_eager = AsyncMock(); fake_pool.handles = {}
+        fake_pool = MagicMock()
+        fake_pool.spawn_eager = AsyncMock()
+        fake_pool.handles = {}
         tools = [{"name": "mcp__brave-search__b", "input_schema": {}}]
         seen = {"researcher": 0}
 
         async def fake_subagent(**kw):
             defn = kw["defn"]
             if defn.agent_type == "planner":
-                return SubAgentResult(subq="p", summary_md="(計画できません)", ok=False)  # plan fails
-            if defn.agent_type == "researcher":          # single-agent fallback
+                return SubAgentResult(
+                    subq="p", summary_md="(計画できません)", ok=False
+                )  # plan fails
+            if defn.agent_type == "researcher":  # single-agent fallback
                 seen["researcher"] += 1
-                return SubAgentResult(subq="r", summary_md="**フォールバックレポート**", ok=True)
+                return SubAgentResult(
+                    subq="r", summary_md="**フォールバックレポート**", ok=True
+                )
             return SubAgentResult(subq="?", summary_md="", ok=False)
 
         from contextlib import ExitStack
+
         with ExitStack() as es:
             for p in self._patches(fake_subagent, fake_pool, tools):
                 es.enter_context(p)
-            await orch.run_deep_research(channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True)
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True
+            )
 
-        assert seen["researcher"] == 1                   # fell back to single-agent
+        assert seen["researcher"] == 1  # fell back to single-agent
         _a, sent_text, _f = deps.send_segmented.call_args.args
         assert sent_text == "**フォールバックレポート**"
 
@@ -738,9 +1449,9 @@ class TestCitation:
         st = self._state_with_sources()
         out = sources_mod.build_final_report("本文 [S1] と [S5]", st)
         assert "**情報ソース**" in out
-        assert "<https://a.com/1>" in out      # cited S1 listed
+        assert "<https://a.com/1>" in out  # cited S1 listed
         assert "<https://b.com/2>" not in out  # S2 not cited -> not listed
-        assert "⚠️" in out and "S5" in out      # hallucinated citation flagged
+        assert "⚠️" in out and "S5" in out  # hallucinated citation flagged
 
     def test_build_final_report_no_sources(self):
         st = ResearchState(query="q")
@@ -750,6 +1461,561 @@ class TestCitation:
         st = self._state_with_sources()
         out = sources_mod.build_final_report("引用なし本文", st)
         assert "<https://a.com/1>" in out and "<https://b.com/2>" in out
+
+    def test_existing_sid_does_not_false_positive_as_supported(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://weather.example/1",
+            title="Tokyo weather report",
+            snippet="Tokyo will be sunny with a high of 28 degrees.",
+        )
+        report = "Acme revenue increased 40 percent in fiscal 2025. [S1]"
+        checks = verify_citation_support(report, st)
+        assert [(check.sid, check.supported) for check in checks] == [("S1", False)]
+        assert "支持関係を確認できません" in sources_mod.build_final_report(report, st)
+
+    def test_matching_numeric_and_lexical_evidence_is_supported(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://acme.example/results",
+            title="Acme fiscal 2025 results",
+            snippet="Acme revenue increased 40 percent in fiscal 2025.",
+        )
+        checks = verify_citation_support(
+            "Acme revenue increased 40 percent in fiscal 2025. [S1]",
+            st,
+        )
+        assert len(checks) == 1 and checks[0].supported is True
+
+    @pytest.mark.parametrize(
+        ("evidence", "claim", "reason"),
+        [
+            (
+                "Acme revenue increased 40 percent in fiscal 2025.",
+                "Acme revenue decreased 40 percent in fiscal 2025. [S1]",
+                "direction-mismatch",
+            ),
+            (
+                "東京都の人口は増加した。",
+                "東京都の人口は減少した。[S1]",
+                "direction-mismatch",
+            ),
+            (
+                "The trial found the drug improves patient survival.",
+                "The trial found the drug does not improve patient survival. [S1]",
+                "polarity-mismatch",
+            ),
+            (
+                "Operating margin changed by +5% in fiscal 2025.",
+                "Operating margin changed by -5% in fiscal 2025. [S1]",
+                "numeric-mismatch",
+            ),
+            (
+                "Higher rates cause lower investment.",
+                "Lower investment causes higher rates. [S1]",
+                "causal-direction-mismatch",
+            ),
+            (
+                "Alice defeated Bob in the final.",
+                "Bob defeated Alice in the final. [S1]",
+                "relation-direction-mismatch",
+            ),
+        ],
+    )
+    def test_semantic_reversals_are_rejected(self, evidence, claim, reason):
+        st = ResearchState(query="q")
+        st.register_source(url="https://evidence.example/1", snippet=evidence)
+
+        checks = verify_citation_support(claim, st)
+
+        assert len(checks) == 1
+        assert checks[0].supported is False
+        assert checks[0].reason == reason
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "The directors gave approval to the acquisition on Tuesday. [S1]",
+            "Directors gave the acquisition their approval Tuesday. [S1]",
+        ],
+    )
+    def test_general_paraphrases_normalize_to_same_relation(self, claim):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/merger",
+            snippet="The board approved the merger on Tuesday.",
+        )
+
+        checks = verify_citation_support(claim, st)
+
+        assert len(checks) == 1
+        assert checks[0].supported is True
+        assert checks[0].reason == "relation-match"
+
+    def test_relation_mismatch_remains_fail_closed(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/merger",
+            snippet="The board rejected the merger.",
+        )
+
+        checks = verify_citation_support(
+            "The directors approved the acquisition. [S1]",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].supported is False
+        assert checks[0].reason == "relation-mismatch"
+
+    @pytest.mark.parametrize(
+        "evidence",
+        [
+            "The allegation that Alice defeated Bob was rejected.",
+            "Alice denied the claim that she defeated Bob.",
+            "A report said that Alice defeated Bob.",
+            "The statement that Alice defeated Bob was false.",
+        ],
+    )
+    def test_unasserted_embedded_relation_does_not_support_positive_claim(
+        self,
+        evidence,
+    ):
+        st = ResearchState(query="q")
+        st.register_source(url="https://example.test/attitude", snippet=evidence)
+
+        checks = verify_citation_support("Alice defeated Bob. [S1]", st)
+
+        assert len(checks) == 1
+        assert checks[0].supported is False
+        assert checks[0].reason == "relation-attitude-unsupported"
+
+    @pytest.mark.parametrize(
+        "evidence",
+        [
+            "Alice allegedly defeated Bob.",
+            "Alice reportedly defeated Bob.",
+            "An unverified report claimed that Alice defeated Bob.",
+            "Alice may have defeated Bob.",
+            "Alice might have defeated Bob.",
+            "Alice defeated Bob, but the claim was rejected.",
+            "The denied claim was that Alice defeated Bob.",
+            "Alice defeated Bob, according to an unverified report.",
+            "The report that Alice defeated Bob was unconfirmed.",
+            "It is false that Alice defeated Bob.",
+            "Alice can defeat Bob.",
+            "Alice could defeat Bob.",
+            "Alice would defeat Bob.",
+            "Alice should defeat Bob.",
+            "Alice will defeat Bob.",
+            "If Alice defeats Bob, the title changes hands.",
+            "Alice defeats Bob only if the appeal fails.",
+            "Alice possibly defeated Bob.",
+            "Alice likely defeated Bob.",
+            "Alice seems to have defeated Bob.",
+            "Alice defeated Bob, but this was never confirmed.",
+            "Alice defeated Bob; the allegation was later denied.",
+            "Alice defeated Bob, conditional on a disputed ruling.",
+            "A report confirmed that Alice will defeat Bob.",
+        ],
+    )
+    def test_hedged_or_rejected_relation_is_fail_closed(self, evidence):
+        st = ResearchState(query="q")
+        st.register_source(url="https://example.test/hedged", snippet=evidence)
+
+        checks = verify_citation_support("Alice defeated Bob. [S1]", st)
+
+        assert len(checks) == 1
+        assert checks[0].supported is False
+        assert checks[0].reason == "relation-attitude-unsupported"
+
+    def test_explicitly_confirmed_relation_remains_supported(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/confirmed",
+            snippet="A verified report confirmed that Alice defeated Bob.",
+        )
+
+        checks = verify_citation_support("Alice defeated Bob. [S1]", st)
+
+        assert len(checks) == 1
+        assert checks[0].supported is True
+        assert checks[0].reason == "relation-match"
+
+    def test_percent_word_and_symbol_are_normalized(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://acme.example/results",
+            snippet="Acme revenue increased 40 percent in fiscal 2025.",
+        )
+
+        checks = verify_citation_support(
+            "Acme revenue increased 40% in fiscal 2025. [S1]",
+            st,
+        )
+
+        assert len(checks) == 1 and checks[0].supported is True
+
+    @pytest.mark.parametrize(
+        "evidence",
+        [
+            "The board wasn't supporting the merger.",
+            "The board wasn’t supporting the merger.",
+            "The board weren't supporting the merger.",
+            "The board weren’t supporting the merger.",
+            "The board hasn't supported the merger.",
+            "The board hasn’t supported the merger.",
+            "The board hadn't supported the merger.",
+            "The board hadn’t supported the merger.",
+            "The board couldn't support the merger.",
+            "The board couldn’t support the merger.",
+        ],
+    )
+    def test_negated_contractions_reject_positive_claim(self, evidence):
+        st = ResearchState(query="q")
+        st.register_source(url="https://example.test/negation", snippet=evidence)
+
+        checks = verify_citation_support(
+            "The board supported the merger. [S1]",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].supported is False
+        assert checks[0].reason == "polarity-mismatch"
+
+    @pytest.mark.parametrize(
+        "evidence",
+        [
+            "Acme revenue increased by 40 percentage points.",
+            "Acme revenue increased by 40 basis points.",
+        ],
+    )
+    def test_percent_does_not_equal_other_rate_units(self, evidence):
+        st = ResearchState(query="q")
+        st.register_source(url="https://example.test/rates", snippet=evidence)
+
+        checks = verify_citation_support(
+            "Acme revenue increased by 40%. [S1]",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].supported is False
+        assert checks[0].reason == "numeric-mismatch"
+
+    @pytest.mark.parametrize(
+        "evidence",
+        [
+            "Carol defeated Dave. Alice defeated Bob in the final.",
+            "Carol defeated Dave, and Alice defeated Bob in the final.",
+        ],
+    )
+    def test_relation_searches_all_evidence_frames(self, evidence):
+        st = ResearchState(query="q")
+        st.register_source(url="https://example.test/matches", snippet=evidence)
+
+        checks = verify_citation_support(
+            "Alice defeated Bob in the final. [S1]",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].supported is True
+        assert checks[0].reason == "relation-match"
+
+    def test_passive_evidence_without_agent_is_fail_closed(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/passive",
+            snippet="Bob was defeated in the final.",
+        )
+
+        checks = verify_citation_support(
+            "Alice defeated Bob in the final. [S1]",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].supported is False
+        assert checks[0].reason == "relation-agent-missing"
+
+    def test_modified_passive_without_agent_does_not_reach_lexical_fallback(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/passive-modified",
+            snippet="Bob was reportedly decisively defeated in the final.",
+        )
+
+        checks = verify_citation_support(
+            "Alice defeated Bob in the final. [S1]",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].supported is False
+        assert checks[0].reason == "relation-agent-missing"
+
+    @pytest.mark.parametrize("connector", ["before", "after"])
+    def test_all_claim_frames_around_temporal_clause_are_required(self, connector):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/compound",
+            snippet="Alice defeated Bob. Carol supported Dave.",
+        )
+
+        checks = verify_citation_support(
+            f"Alice defeated Bob {connector} Carol defeated Dave. [S1]",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].supported is False
+        assert checks[0].reason == "relation-mismatch"
+
+    @pytest.mark.parametrize("connector", ["when", "because", "although", "as"])
+    def test_all_claim_frames_around_additional_connectors_are_required(
+        self,
+        connector,
+    ):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/compound-connectors",
+            snippet="Alice defeated Bob. Carol supported Dave.",
+        )
+
+        checks = verify_citation_support(
+            f"Alice defeated Bob {connector} Carol defeated Dave. [S1]",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].supported is False
+        assert checks[0].reason == "relation-mismatch"
+
+    def test_all_coordinated_relation_frames_in_one_clause_are_required(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/coordinated",
+            snippet="Alice surpassed Bob.",
+        )
+
+        checks = verify_citation_support(
+            "Alice defeated and surpassed Bob. [S1]",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].supported is False
+        assert checks[0].reason == "relation-mismatch"
+
+    def test_forward_and_reverse_relation_in_same_evidence_is_ambiguous(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/ambiguous-direction",
+            snippet="Alice defeated Bob. Bob defeated Alice.",
+        )
+
+        checks = verify_citation_support(
+            "Alice defeated Bob. [S1]",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].supported is False
+        assert checks[0].reason == "relation-direction-ambiguous"
+
+    def test_compact_percentage_point_abbreviation_matches_full_unit(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/pp",
+            snippet="Acme margin increased by 40 percentage points.",
+        )
+
+        checks = verify_citation_support(
+            "Acme margin increased by 40pp. [S1]",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].supported is True
+
+    def test_compact_pp_and_bp_are_distinct_units(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/bp",
+            snippet="Acme margin increased by 40bp.",
+        )
+
+        checks = verify_citation_support(
+            "Acme margin increased by 40pp. [S1]",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].supported is False
+        assert checks[0].reason == "numeric-mismatch"
+
+    def test_compact_bps_matches_basis_points_but_not_percentage_points(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/bps",
+            snippet="Acme margin increased by 40 basis points.",
+        )
+
+        matching = verify_citation_support(
+            "Acme margin increased by 40bps. [S1]",
+            st,
+        )
+        mismatching = verify_citation_support(
+            "Acme margin increased by 40pp. [S1]",
+            st,
+        )
+
+        assert matching[0].supported is True
+        assert mismatching[0].supported is False
+        assert mismatching[0].reason == "numeric-mismatch"
+
+    def test_same_sentence_multiple_citations_are_checked_independently(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/alice",
+            snippet="Alice defeated Bob in the final.",
+        )
+        st.register_source(
+            url="https://example.test/carol",
+            snippet="Carol defeated Dave in the final.",
+        )
+
+        checks = verify_citation_support(
+            "Alice defeated Bob in the final. [S1][S2]",
+            st,
+        )
+
+        assert [(check.sid, check.supported) for check in checks] == [
+            ("S1", True),
+            ("S2", False),
+        ]
+
+    def test_clause_end_citation_binds_only_to_immediately_preceding_clause(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/alice-clause",
+            snippet="Alice defeated Bob in the final.",
+        )
+
+        checks = verify_citation_support(
+            "Alice defeated Bob [S1], while Carol supported Dave.",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].supported is True
+        assert "Carol" not in checks[0].claim
+
+    def test_consecutive_citations_after_clause_keep_the_same_claim(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/alice-one",
+            snippet="Alice defeated Bob in the final.",
+        )
+        st.register_source(
+            url="https://example.test/alice-two",
+            snippet="Alice defeated Bob in the final.",
+        )
+
+        checks = verify_citation_support(
+            "Alice defeated Bob in the final; [S1][S2]",
+            st,
+        )
+
+        assert [(check.sid, check.supported) for check in checks] == [
+            ("S1", True),
+            ("S2", True),
+        ]
+        assert checks[0].claim == checks[1].claim
+
+    def test_quoted_claim_reversed_by_narrative_is_fail_closed(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/quote",
+            snippet=(
+                'The article quoted "Alice defeated Bob", but concluded '
+                "Alice did not defeat Bob."
+            ),
+        )
+
+        checks = verify_citation_support(
+            "Alice defeated Bob. [S1]",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].supported is False
+        assert checks[0].reason == "polarity-ambiguous"
+
+    def test_citation_only_line_inherits_preceding_claim(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://acme.example/results",
+            snippet="Acme revenue increased 40 percent in fiscal 2025.",
+        )
+
+        checks = verify_citation_support(
+            "Acme revenue increased 40 percent in fiscal 2025.\n[S1]",
+            st,
+        )
+
+        assert len(checks) == 1
+        assert checks[0].claim == "Acme revenue increased 40 percent in fiscal 2025"
+        assert checks[0].supported is True
+
+    def test_english_periods_keep_multiple_citations_on_their_own_claims(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://acme.example/results",
+            snippet="Acme revenue increased 40 percent.",
+        )
+        st.register_source(
+            url="https://beta.example/results",
+            snippet="Beta margin decreased 2 percent.",
+        )
+
+        checks = verify_citation_support(
+            "Acme revenue increased 40 percent [S1]. "
+            "Beta margin decreased 2 percent [S2].",
+            st,
+        )
+
+        assert [(check.sid, check.supported) for check in checks] == [
+            ("S1", True),
+            ("S2", True),
+        ]
+        assert "Beta" not in checks[0].claim
+        assert "Acme" not in checks[1].claim
+
+    def test_period_trailing_and_split_citations_bind_to_local_claims(self):
+        st = ResearchState(query="q")
+        st.register_source(
+            url="https://example.test/local-alice",
+            snippet="Alice defeated Bob.",
+        )
+        st.register_source(
+            url="https://example.test/local-carol",
+            snippet="Carol supported Dave.",
+        )
+
+        checks = verify_citation_support(
+            "Alice defeated Bob. [S1] and Carol supported Dave [S2]",
+            st,
+        )
+
+        assert [(check.sid, check.supported) for check in checks] == [
+            ("S1", True),
+            ("S2", True),
+        ]
+        assert checks[0].claim == "Alice defeated Bob"
+        assert checks[1].claim == "Carol supported Dave"
 
 
 # ---------------------------------------------------------------------------
@@ -772,19 +2038,23 @@ def _phase3_patches(fake_subagent, fake_pool, tools, extra=None):
 
 class TestPhase3:
     def _pool_tools(self):
-        fp = MagicMock(); fp.spawn_eager = AsyncMock(); fp.handles = {}
+        fp = MagicMock()
+        fp.spawn_eager = AsyncMock()
+        fp.handles = {}
         return fp, [{"name": "mcp__brave-search__b", "input_schema": {}}]
 
     @pytest.mark.asyncio
     async def test_budget_degrade_skips_synthesizer(self):
         from contextlib import ExitStack
+
         channel, origin, thread, anchor = _make_channel()
         deps = _make_deps()
         fp, tools = self._pool_tools()
         synth_calls = []
 
         async def fake(**kw):
-            d = kw["defn"]; st = kw["state"]
+            d = kw["defn"]
+            st = kw["state"]
             if d.agent_type == "planner":
                 return SubAgentResult("p", '["q1", "q2"]', ok=True)
             if d.agent_type == "searcher":
@@ -799,15 +2069,18 @@ class TestPhase3:
         with ExitStack() as es:
             for p in _phase3_patches(fake, fp, tools, extra):
                 es.enter_context(p)
-            await orch.run_deep_research(channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True)
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True
+            )
 
-        assert synth_calls == []                       # synthesizer skipped (over budget)
+        assert synth_calls == []  # synthesizer skipped (over budget)
         _a, sent_text, _f = deps.send_segmented.call_args.args
-        assert "簡易版" in sent_text                    # degraded report
+        assert "簡易版" in sent_text  # degraded report
 
     @pytest.mark.asyncio
     async def test_synthesizer_retry_on_transient_failure(self):
         from contextlib import ExitStack
+
         channel, origin, thread, anchor = _make_channel()
         deps = _make_deps()
         fp, tools = self._pool_tools()
@@ -830,15 +2103,18 @@ class TestPhase3:
         with ExitStack() as es:
             for p in _phase3_patches(fake, fp, tools, extra):
                 es.enter_context(p)
-            await orch.run_deep_research(channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True)
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True
+            )
 
-        assert synth_n["n"] == 2                        # retried once
+        assert synth_n["n"] == 2  # retried once
         _a, sent_text, _f = deps.send_segmented.call_args.args
         assert "やり直しレポート" in sent_text
 
     @pytest.mark.asyncio
     async def test_all_searchers_fail_retries_with_lead_model(self):
         from contextlib import ExitStack
+
         channel, origin, thread, anchor = _make_channel()
         deps = _make_deps()
         fp, tools = self._pool_tools()
@@ -850,9 +2126,11 @@ class TestPhase3:
                 return SubAgentResult("p", '["q1", "q2"]', ok=True)
             if d.agent_type == "searcher":
                 rounds["searcher"] += 1
-                if kw.get("model_override"):           # lead-model retry round
+                if kw.get("model_override"):  # lead-model retry round
                     return SubAgentResult(kw["briefing"], "recovered", ok=True)
-                return SubAgentResult(kw["briefing"], "", ok=False, error="model not found")
+                return SubAgentResult(
+                    kw["briefing"], "", ok=False, error="model not found"
+                )
             if d.agent_type == "synthesizer":
                 return SubAgentResult("s", "**復活レポート**", ok=True)
             return SubAgentResult("?", "", ok=False)
@@ -860,9 +2138,11 @@ class TestPhase3:
         with ExitStack() as es:
             for p in _phase3_patches(fake, fp, tools):
                 es.enter_context(p)
-            await orch.run_deep_research(channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True)
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True
+            )
 
-        assert rounds["searcher"] == 4                 # 2 subqs × 2 rounds (initial + lead retry)
+        assert rounds["searcher"] == 4  # 2 subqs × 2 rounds (initial + lead retry)
         _a, sent_text, _f = deps.send_segmented.call_args.args
         assert "復活レポート" in sent_text
 
@@ -882,9 +2162,11 @@ class TestActiveThread:
     @pytest.mark.asyncio
     async def test_thread_active_during_run_and_cleared_after(self):
         orch._active_threads.clear()
-        channel, origin, thread, anchor = _make_channel()   # thread.id = 555000
+        channel, origin, thread, anchor = _make_channel()  # thread.id = 555000
         deps = _make_deps()
-        fp = MagicMock(); fp.spawn_eager = AsyncMock(); fp.handles = {}
+        fp = MagicMock()
+        fp.spawn_eager = AsyncMock()
+        fp.handles = {}
         tools = [{"name": "mcp__brave-search__b", "input_schema": {}}]
         seen = {}
 
@@ -892,15 +2174,21 @@ class TestActiveThread:
             seen["active_during"] = orch.is_active_research_thread(555000)
             return SubAgentResult("r", "**レポート**", ok=True)
 
-        with patch.object(orch, "DEEP_RESEARCH_MULTI_AGENT", False), \
-             patch.object(orch, "MCP_SERVERS_WEB", {"brave-search": {"x": 1}}), \
-             patch.object(orch, "make_api_client", new=AsyncMock(return_value=MagicMock())), \
-             patch.object(orch, "McpPool", return_value=fp), \
-             patch.object(orch, "mcp_tools_to_anthropic", return_value=tools), \
-             patch.object(orch, "run_subagent", new=fake):
-            await orch.run_deep_research(channel, MagicMock(id=1), "q", deps, skip_clarify=True)
+        with (
+            patch.object(orch, "DEEP_RESEARCH_MULTI_AGENT", False),
+            patch.object(orch, "MCP_SERVERS_WEB", {"brave-search": {"x": 1}}),
+            patch.object(
+                orch, "make_api_client", new=AsyncMock(return_value=MagicMock())
+            ),
+            patch.object(orch, "McpPool", return_value=fp),
+            patch.object(orch, "mcp_tools_to_anthropic", return_value=tools),
+            patch.object(orch, "run_subagent", new=fake),
+        ):
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "q", deps, skip_clarify=True
+            )
 
-        assert seen["active_during"] is True                 # suppressed on_message during run
+        assert seen["active_during"] is True  # suppressed on_message during run
         assert orch.is_active_research_thread(555000) is False  # cleared in finally
 
 
@@ -911,9 +2199,12 @@ class TestSearcherViews:
     @pytest.mark.asyncio
     async def test_per_searcher_messages_and_tool_callback(self):
         from contextlib import ExitStack
+
         channel, origin, thread, anchor = _make_channel()
         deps = _make_deps()
-        fp = MagicMock(); fp.spawn_eager = AsyncMock(); fp.handles = {}
+        fp = MagicMock()
+        fp.spawn_eager = AsyncMock()
+        fp.handles = {}
         tools = [{"name": "mcp__brave-search__b", "input_schema": {}}]
         cbs = []
 
@@ -931,7 +2222,9 @@ class TestSearcherViews:
         with ExitStack() as es:
             for p in _phase3_patches(fake, fp, tools):
                 es.enter_context(p)
-            await orch.run_deep_research(channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True)
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True
+            )
 
         # each searcher got its own _SearcherView.on_tool as tool_invocation_callback
         assert len(cbs) == 2
@@ -966,18 +2259,28 @@ class TestEffortThreading:
 
         async def fake_loop(prompt, channel_id, **kwargs):
             captured.update(kwargs)
-            res = MagicMock(); res.text = "ok"; res.usage_total = None
+            res = MagicMock()
+            res.text = "ok"
+            res.usage_total = None
             return res
 
         defn = ResearchAgentDef(
-            agent_type="magi_lead", model="claude-opus-4-8",
-            system_prompt="s", max_tool_turns=1, effort="max",
+            agent_type="magi_lead",
+            model="claude-opus-4-8",
+            system_prompt="s",
+            max_tool_turns=1,
+            effort="max",
         )
         with patch.object(registry, "run_agent_loop", new=fake_loop):
             await run_subagent(
-                api_client=MagicMock(), pool=MagicMock(), server_locks={},
-                defn=defn, briefing="b", tools_for_api=[],
-                state=ResearchState(query="q"), channel_id=1,
+                api_client=MagicMock(),
+                pool=MagicMock(),
+                server_locks={},
+                defn=defn,
+                briefing="b",
+                tools_for_api=[],
+                state=ResearchState(query="q"),
+                channel_id=1,
             )
         assert captured["output_config_override"] == {"effort": "max"}
 
@@ -987,15 +2290,24 @@ class TestEffortThreading:
 
         async def fake_loop(prompt, channel_id, **kwargs):
             captured.update(kwargs)
-            res = MagicMock(); res.text = "ok"; res.usage_total = None
+            res = MagicMock()
+            res.text = "ok"
+            res.usage_total = None
             return res
 
-        defn = ResearchAgentDef(agent_type="searcher", model="m", system_prompt="s", max_tool_turns=1)
+        defn = ResearchAgentDef(
+            agent_type="searcher", model="m", system_prompt="s", max_tool_turns=1
+        )
         with patch.object(registry, "run_agent_loop", new=fake_loop):
             await run_subagent(
-                api_client=MagicMock(), pool=MagicMock(), server_locks={},
-                defn=defn, briefing="b", tools_for_api=[],
-                state=ResearchState(query="q"), channel_id=1,
+                api_client=MagicMock(),
+                pool=MagicMock(),
+                server_locks={},
+                defn=defn,
+                briefing="b",
+                tools_for_api=[],
+                state=ResearchState(query="q"),
+                channel_id=1,
             )
         assert captured["output_config_override"] is None
 
@@ -1003,18 +2315,21 @@ class TestEffortThreading:
 class TestCentralQuestionParsing:
     def test_json_object_with_cq_and_subqs(self):
         cq, subqs = registry.extract_central_question_and_plan(
-            '{"central_question": "本質は何か", "subquestions": ["q1", "q2"]}', 4,
+            '{"central_question": "本質は何か", "subquestions": ["q1", "q2"]}',
+            4,
         )
         assert cq == "本質は何か"
         assert subqs == ["q1", "q2"]
 
     def test_falls_back_to_array_with_empty_cq(self):
         cq, subqs = registry.extract_central_question_and_plan('["a", "b"]', 4)
-        assert cq == ""                      # CQ は Stage2 で埋まる
+        assert cq == ""  # CQ は Stage2 で埋まる
         assert subqs == ["a", "b"]
 
     def test_refined_cq_parser(self):
-        cq, rationale = orch._parse_refined_cq("中心的問い: 研いだ問い\n核心: 事実の緊張に根ざす")
+        cq, rationale = orch._parse_refined_cq(
+            "中心的問い: 研いだ問い\n核心: 事実の緊張に根ざす"
+        )
         assert cq == "研いだ問い"
         assert rationale == "事実の緊張に根ざす"
 
@@ -1028,9 +2343,11 @@ class TestCentralQuestionParsing:
             "過熱と急落の緊張に根ざす"
         )
         cq, rationale = orch._parse_refined_cq(text)
-        assert cq == "現在のAIブームはバブルであり、2026年6月の急落はその崩壊の始まりか？"
+        assert (
+            cq == "現在のAIブームはバブルであり、2026年6月の急落はその崩壊の始まりか？"
+        )
         assert rationale == "過熱と急落の緊張に根ざす"
-        assert cq != "中心的問い:"        # ラベル退行を起こさない
+        assert cq != "中心的問い:"  # ラベル退行を起こさない
 
     def test_refined_cq_parser_label_only_is_blank(self):
         cq, _ = orch._parse_refined_cq("中心的問い:\n核心:")
@@ -1045,15 +2362,24 @@ class TestCentralQuestionParsing:
 
 class TestLensParseAnonymize:
     def test_parse_lens_output_stance(self):
-        assert magi.parse_lens_output("STANCE: 私の立場\n【手堅い結論】\n- x") == "私の立場"
+        assert (
+            magi.parse_lens_output("STANCE: 私の立場\n【手堅い結論】\n- x")
+            == "私の立場"
+        )
 
     def test_parse_lens_output_fallback(self):
-        assert magi.parse_lens_output("結論からいうと真だ\n根拠は…").startswith("結論からいうと真だ")
+        assert magi.parse_lens_output("結論からいうと真だ\n根拠は…").startswith(
+            "結論からいうと真だ"
+        )
 
     def test_anonymize_hides_lens_identity(self):
         lenses = [
-            LensResult("science", "科学（メルキオール）", "S", "科学の本文 [S1]", ok=True),
-            LensResult("intuition", "直観（バルタザール）", "I", "直観の本文 [S2]", ok=True),
+            LensResult(
+                "science", "科学（メルキオール）", "S", "科学の本文 [S1]", ok=True
+            ),
+            LensResult(
+                "intuition", "直観（バルタザール）", "I", "直観の本文 [S2]", ok=True
+            ),
             LensResult("skeptic", "懐疑（カスパー）", "K", "懐疑の本文 [S3]", ok=True),
         ]
         out = magi.anonymize(lenses)
@@ -1079,6 +2405,7 @@ class TestSubagentParallelismFloor:
 
     def test_build_plan_briefing_carries_min_floor(self):
         from services.deep_research.prompts import build_plan_briefing
+
         b = build_plan_briefing("テーマ", max_subagents=6, min_subagents=5)
         assert "最低 5 個必須" in b
         assert "5〜6 個" in b
@@ -1090,6 +2417,7 @@ class TestSubagentParallelismFloor:
 
     def test_build_plan_magi_briefing_carries_min_floor(self):
         from services.deep_research.prompts import build_plan_magi_briefing
+
         b = build_plan_magi_briefing("テーマ", max_subagents=6, min_subagents=5)
         assert "最低 5 個必須" in b
         assert "5〜6 個" in b
@@ -1098,9 +2426,12 @@ class TestSubagentParallelismFloor:
     async def test_plan_completion_when_planner_underdelivers(self):
         # 回帰: rid 9e974424 で planner が 1 個しか返さなかった → 補完呼び出しで MIN を満たす
         from contextlib import ExitStack
+
         channel, origin, thread, anchor = _make_channel()
         deps = _make_magi_deps(_approve_by_reaction())
-        fp = MagicMock(); fp.spawn_eager = AsyncMock(); fp.handles = {}
+        fp = MagicMock()
+        fp.spawn_eager = AsyncMock()
+        fp.handles = {}
         tools = [{"name": "mcp__brave-search__b"}]
         calls = {"planner": 0, "completion": 0}
 
@@ -1109,7 +2440,9 @@ class TestSubagentParallelismFloor:
             if d.agent_type == "planner":
                 calls["planner"] += 1
                 # わざと 1 個だけ返す
-                return SubAgentResult("p", '{"central_question":"CQ","subquestions":["q1"]}', ok=True)
+                return SubAgentResult(
+                    "p", '{"central_question":"CQ","subquestions":["q1"]}', ok=True
+                )
             if d.agent_type == "planner_completion":
                 calls["completion"] += 1
                 # 補完で 4 個追加
@@ -1131,7 +2464,9 @@ class TestSubagentParallelismFloor:
                 es.enter_context(p)
             es.enter_context(patch.object(orch, "DEEP_RESEARCH_MIN_SUBAGENTS", 5))
             es.enter_context(patch.object(orch, "DEEP_RESEARCH_MAX_SUBAGENTS", 6))
-            await orch.run_deep_research(channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True)
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True
+            )
 
         # planner 1回 + 補完 1回 → 合計 5 サブ質問になる
         assert calls["planner"] == 1
@@ -1140,9 +2475,12 @@ class TestSubagentParallelismFloor:
     @pytest.mark.asyncio
     async def test_plan_passes_min_subagents_to_builder(self):
         from contextlib import ExitStack
+
         channel, origin, thread, anchor = _make_channel()
         deps = _make_magi_deps(_approve_by_reaction())
-        fp = MagicMock(); fp.spawn_eager = AsyncMock(); fp.handles = {}
+        fp = MagicMock()
+        fp.spawn_eager = AsyncMock()
+        fp.handles = {}
         tools = [{"name": "mcp__brave-search__b"}]
         seen = {}
 
@@ -1151,7 +2489,11 @@ class TestSubagentParallelismFloor:
             if d.agent_type == "planner":
                 seen["briefing"] = kw["briefing"]
                 # ちょうど5つ返す
-                return SubAgentResult("p", '{"central_question":"CQ","subquestions":["q1","q2","q3","q4","q5"]}', ok=True)
+                return SubAgentResult(
+                    "p",
+                    '{"central_question":"CQ","subquestions":["q1","q2","q3","q4","q5"]}',
+                    ok=True,
+                )
             if d.agent_type == "searcher":
                 return SubAgentResult(kw["briefing"], "f", ok=True)
             if d.agent_type == "cq_refiner":
@@ -1169,7 +2511,9 @@ class TestSubagentParallelismFloor:
                 es.enter_context(p)
             es.enter_context(patch.object(orch, "DEEP_RESEARCH_MIN_SUBAGENTS", 5))
             es.enter_context(patch.object(orch, "DEEP_RESEARCH_MAX_SUBAGENTS", 6))
-            await orch.run_deep_research(channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True)
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True
+            )
         # planner briefing に最低数の指示が乗ってる
         assert "最低 5 個必須" in seen["briefing"]
 
@@ -1187,6 +2531,7 @@ class TestMem0InjectionScope:
             build_plan_magi_briefing,
             build_refine_cq_briefing,
         )
+
         block = "[Mem0 — この人についての長期記憶]\n- 先輩は VI 戦略を作成中\n[End of Mem0 memories]"
         for fn, args in [
             (build_clarify_briefing, ("q",)),
@@ -1196,33 +2541,44 @@ class TestMem0InjectionScope:
         ]:
             empty = fn(*args, "")
             with_mem = fn(*args, block)
-            assert "<retrieved_memories" not in empty   # 記憶なしでは挿入されない
-            assert "<retrieved_memories" in with_mem    # ありなら header 付きで先頭注入
+            assert "<retrieved_memories" not in empty  # 記憶なしでは挿入されない
+            assert "<retrieved_memories" in with_mem  # ありなら header 付きで先頭注入
             assert "VI 戦略" in with_mem
 
     @pytest.mark.asyncio
     async def test_mem0_recall_runs_and_injects_into_4_phases(self):
         from contextlib import ExitStack
+
         channel, origin, thread, anchor = _make_channel()
         deps = _make_magi_deps(_approve_by_reaction())
-        fp, tools = self._pool_tools() if False else (
-            MagicMock(spawn_eager=AsyncMock(), handles={}),
-            [{"name": "mcp__brave-search__b", "input_schema": {}}],
+        fp, tools = (
+            self._pool_tools()
+            if False
+            else (
+                MagicMock(spawn_eager=AsyncMock(), handles={}),
+                [{"name": "mcp__brave-search__b", "input_schema": {}}],
+            )
         )
         mem_block = "[Mem0 — この人についての長期記憶]\n- 先輩は VI 戦略を作成中\n[End of Mem0 memories]"
         briefings = {}
 
         async def fake_clarify_loop(prompt, channel_id, **kwargs):
             briefings["clarify"] = prompt
-            res = MagicMock(); res.text = "- 期間は？"; res.usage_total = None
+            res = MagicMock()
+            res.text = "- 期間は？"
+            res.usage_total = None
             return res
 
         async def fake(**kw):
-            d = kw["defn"]; st = kw["state"]; b = kw["briefing"]
+            d = kw["defn"]
+            st = kw["state"]
+            b = kw["briefing"]
             at = d.agent_type
             briefings.setdefault(at, b)
             if at == "planner":
-                return SubAgentResult("p", '{"central_question":"CQ","subquestions":["q1"]}', ok=True)
+                return SubAgentResult(
+                    "p", '{"central_question":"CQ","subquestions":["q1"]}', ok=True
+                )
             if at == "searcher":
                 st.register_source(url="https://s.com/1", title="t")
                 return SubAgentResult(b, "findings", ok=True)
@@ -1244,11 +2600,18 @@ class TestMem0InjectionScope:
         with ExitStack() as es:
             for p in _magi_patches(fake, fp, tools):
                 es.enter_context(p)
-            es.enter_context(patch.object(orch, "run_agent_loop", new=fake_clarify_loop))
+            es.enter_context(
+                patch.object(orch, "run_agent_loop", new=fake_clarify_loop)
+            )
             # _recall_user_memories 内の遅延 import を本物経路で動かす（search のみ差し替え）
             from services.mem0 import search as mem_search
-            es.enter_context(patch.object(mem_search, "search_memories_smart", new=fake_recall))
-            await orch.run_deep_research(channel, MagicMock(id=42), "テーマ", deps, skip_clarify=False)
+
+            es.enter_context(
+                patch.object(mem_search, "search_memories_smart", new=fake_recall)
+            )
+            await orch.run_deep_research(
+                channel, MagicMock(id=42), "テーマ", deps, skip_clarify=False
+            )
 
         # 注入される4箇所: clarify / planner / cq_refiner / integrator
         assert "VI 戦略" in briefings["clarify"]
@@ -1261,35 +2624,43 @@ class TestMem0InjectionScope:
         assert "VI 戦略" not in briefings["magi_lead"]
 
     def _pool_tools(self):
-        fp = MagicMock(); fp.spawn_eager = AsyncMock(); fp.handles = {}
+        fp = MagicMock()
+        fp.spawn_eager = AsyncMock()
+        fp.handles = {}
         return fp, [{"name": "mcp__brave-search__b", "input_schema": {}}]
 
 
 class TestKanaePersona:
     def test_integrator_system_routes_through_main_persona_and_keeps_rigor(self):
-        from services.deep_research.prompts import build_integrator_system, INTEGRATOR_SYSTEM
+        from services.deep_research.prompts import (
+            build_integrator_system,
+            INTEGRATOR_SYSTEM,
+        )
+
         s = build_integrator_system("先輩")
-        assert config.SYSTEM_PROMPT in s    # 本ルートの人格（CLAUDE.md）を土台にする
-        assert INTEGRATOR_SYSTEM in s       # その上に integrator 仕様を追加システムで重ねる
-        assert "先輩" in s                  # 呼称が反映される
-        assert "反証条件" in s              # 分析の厳密さは温存
+        assert config.SYSTEM_PROMPT in s  # 本ルートの人格（CLAUDE.md）を土台にする
+        assert INTEGRATOR_SYSTEM in s  # その上に integrator 仕様を追加システムで重ねる
+        assert "先輩" in s  # 呼称が反映される
+        assert "反証条件" in s  # 分析の厳密さは温存
 
     def test_integrator_system_unknown_requester_is_polite(self):
         from services.deep_research.prompts import build_integrator_system
+
         s = build_integrator_system("")
         assert config.SYSTEM_PROMPT in s
-        assert "丁寧語" in s                # 呼称不明時は丁寧語、「先輩」とは呼ばない
+        assert "丁寧語" in s  # 呼称不明時は丁寧語、「先輩」とは呼ばない
 
     def test_integrator_system_enforces_plain_language(self):
         # 出力を「普段の語り口」レベルに噛み砕かせる指示が確実に乗っていること。
         from services.deep_research.prompts import build_integrator_system
+
         s = build_integrator_system("先輩")
         # 強調側（呼びかけ階層）
         assert "普段の会話と同じ語り口で書く" in s
         # 規律側（言語ルール）
         assert "言語の規律" in s
-        assert "1文40字目安" in s          # 文を短く切る指示
-        assert "言い換える" in s            # 専門用語を初出で1度だけ言い換え
+        assert "1文40字目安" in s  # 文を短く切る指示
+        assert "言い換える" in s  # 専門用語を初出で1度だけ言い換え
         # BLUF の構造・厳密さは温存
         assert "テーゼ" in s and "覆る条件" in s
 
@@ -1298,22 +2669,27 @@ class TestKanaePersona:
         # SYSTEM_PROMPT（CLAUDE.md）が支配する。INTEGRATOR_SYSTEM 側で再定義していると
         # 競合・劣化するので、ここでは骨格しか書かない。
         from services.deep_research.prompts import INTEGRATOR_SYSTEM
+
         # 旧版にあった独自の Discord 記法ルールが消えていること（再定義禁止の回帰）
         assert "Discord markdown" not in INTEGRATOR_SYSTEM
         assert "テーブル・水平線は使わない" not in INTEGRATOR_SYSTEM
         # 代わりに「システムプロンプトの Discord 出力ルールに従う」明示があること
         assert "Discord 出力ルール" in INTEGRATOR_SYSTEM
         assert "再定義しない" in INTEGRATOR_SYSTEM
-        # SYSTEM_PROMPT には本物の Discord 出力ルールが入っていることを確認（本ルート土台）
-        assert "Discord出力ルール" in config.SYSTEM_PROMPT
-        assert "インラインコード使用ルール" in config.SYSTEM_PROMPT
-        assert "見出し使用ルール" in config.SYSTEM_PROMPT
+        # RuntimeBootstrap が投入する正本には Discord 出力ルールがあることを確認する。
+        # config.SYSTEM_PROMPT は import 時副作用を避けるため安全な fallback の場合がある。
+        runtime_prompt = config.load_system_prompt()
+        assert "Discord出力ルール" in runtime_prompt
+        assert "インラインコード使用ルール" in runtime_prompt
+        assert "見出し使用ルール" in runtime_prompt
 
     def test_kanae_honorific_resolves_from_env_map(self):
-        with patch.dict(config.SPEAKER_LABELS, {1234: "haroin"}, clear=False), \
-             patch.dict(config.KANAE_HONORIFICS, {"haroin": "先輩"}, clear=False):
+        with (
+            patch.dict(config.SPEAKER_LABELS, {1234: "haroin"}, clear=False),
+            patch.dict(config.KANAE_HONORIFICS, {"haroin": "先輩"}, clear=False),
+        ):
             assert config.kanae_honorific(1234) == "先輩"
-            assert config.kanae_honorific(99999) == ""    # 未知の相手 → 丁寧語
+            assert config.kanae_honorific(99999) == ""  # 未知の相手 → 丁寧語
 
     @pytest.mark.asyncio
     async def test_integrator_uses_persona_system_for_requester(self):
@@ -1328,24 +2704,38 @@ class TestKanaePersona:
         state.register_source(url="https://a.com/1", title="A")
         state.lens_outputs = [LensResult("science", "科学", "S", "本文 [S1]", ok=True)]
         ctx = SimpleNamespace(
-            api_client=MagicMock(), pool=MagicMock(), server_locks={},
-            tools_for_api=[], state=state, thread=SimpleNamespace(id=1),
+            api_client=MagicMock(),
+            pool=MagicMock(),
+            server_locks={},
+            tools_for_api=[],
+            state=state,
+            thread=SimpleNamespace(id=1),
             user=SimpleNamespace(id=1234),
         )
-        with patch.object(magi, "run_subagent", new=fake), \
-             patch.dict(config.SPEAKER_LABELS, {1234: "haroin"}, clear=False), \
-             patch.dict(config.KANAE_HONORIFICS, {"haroin": "先輩"}, clear=False):
+        with (
+            patch.object(magi, "run_subagent", new=fake),
+            patch.dict(config.SPEAKER_LABELS, {1234: "haroin"}, clear=False),
+            patch.dict(config.KANAE_HONORIFICS, {"haroin": "先輩"}, clear=False),
+        ):
             out = await magi.run_integrator(ctx)
-        assert config.SYSTEM_PROMPT in captured["system"]   # 本ルートの人格を通す
+        assert config.SYSTEM_PROMPT in captured["system"]  # 本ルートの人格を通す
         assert "先輩" in captured["system"]
         assert out is not None and "テーゼ" in out
 
 
 def _magi_ctx(tools, state):
     return SimpleNamespace(
-        api_client=MagicMock(), pool=MagicMock(), server_locks={},
-        tools_for_api=tools, state=state, thread=SimpleNamespace(id=777),
-        anchor=None, counter={}, tool_cb=None, user=None, deps=None,
+        api_client=MagicMock(),
+        pool=MagicMock(),
+        server_locks={},
+        tools_for_api=tools,
+        state=state,
+        thread=SimpleNamespace(id=777),
+        anchor=None,
+        counter={},
+        tool_cb=None,
+        user=None,
+        deps=None,
     )
 
 
@@ -1355,7 +2745,9 @@ class _FakeView:
 
     async def waiting(self): ...
     async def working(self, note="作業中…"): ...
-    async def on_tool(self, name, tool_input): self.tools += 1
+    async def on_tool(self, name, tool_input):
+        self.tools += 1
+
     async def finish(self, ok, gist=""): ...
 
 
@@ -1376,15 +2768,19 @@ class TestMagiLensNested:
             if d.agent_type == "magi_worker":
                 return SubAgentResult(kw["briefing"], "メモ [S1]", ok=True)
             if d.agent_type == "magi_lead":
-                return SubAgentResult("l", "STANCE: 私の立場\n【手堅い結論】\n- x [S1]", ok=True)
+                return SubAgentResult(
+                    "l", "STANCE: 私の立場\n【手堅い結論】\n- x [S1]", ok=True
+                )
             return SubAgentResult("?", "", ok=False)
 
         state = ResearchState(query="q", central_question="CQ")
         ctx = _magi_ctx([{"name": "mcp__brave-search__b"}], state)
         view = _FakeView()
         sema = asyncio.Semaphore(2)
-        with patch.object(magi, "run_subagent", new=fake), \
-             patch.object(magi, "DEEP_RESEARCH_MAGI_MAX_WORKERS", 2):
+        with (
+            patch.object(magi, "run_subagent", new=fake),
+            patch.object(magi, "DEEP_RESEARCH_MAGI_MAX_WORKERS", 2),
+        ):
             res = await magi.run_magi_lens(ctx, "science", view, sema)
 
         # 入れ子の順序: 分解 → ワーカー×2 → lead
@@ -1405,14 +2801,16 @@ class TestMagiLensNested:
         async def fake(**kw):
             d = kw["defn"]
             if d.agent_type == "magi_decompose":
-                return SubAgentResult("d", "[]", ok=True)    # no subtasks
+                return SubAgentResult("d", "[]", ok=True)  # no subtasks
             if d.agent_type == "magi_lead":
                 return SubAgentResult("l", "", ok=False, error="429")
             return SubAgentResult("?", "", ok=False)
 
         ctx = _magi_ctx([], ResearchState(query="q", central_question="CQ"))
         with patch.object(magi, "run_subagent", new=fake):
-            res = await magi.run_magi_lens(ctx, "skeptic", _FakeView(), asyncio.Semaphore(2))
+            res = await magi.run_magi_lens(
+                ctx, "skeptic", _FakeView(), asyncio.Semaphore(2)
+            )
         assert res.ok is False
         assert res.lens_key == "skeptic"
 
@@ -1428,20 +2826,24 @@ class TestMagiLensNested:
             if d.agent_type == "magi_worker":
                 live["now"] += 1
                 live["peak"] = max(live["peak"], live["now"])
-                await asyncio.sleep(0.02)        # 重なりを観測できるよう少し滞留
+                await asyncio.sleep(0.02)  # 重なりを観測できるよう少し滞留
                 live["now"] -= 1
                 return SubAgentResult(kw["briefing"], "メモ", ok=True)
             if d.agent_type == "magi_lead":
                 return SubAgentResult("l", "STANCE: ok", ok=True)
             return SubAgentResult("?", "", ok=False)
 
-        ctx = _magi_ctx([{"name": "mcp__brave-search__b"}],
-                        ResearchState(query="q", central_question="CQ"))
-        with patch.object(magi, "run_subagent", new=fake), \
-             patch.object(magi, "DEEP_RESEARCH_MAGI_MAX_WORKERS", 4):
+        ctx = _magi_ctx(
+            [{"name": "mcp__brave-search__b"}],
+            ResearchState(query="q", central_question="CQ"),
+        )
+        with (
+            patch.object(magi, "run_subagent", new=fake),
+            patch.object(magi, "DEEP_RESEARCH_MAGI_MAX_WORKERS", 4),
+        ):
             await magi.run_magi_lens(ctx, "science", _FakeView(), asyncio.Semaphore(2))
-        assert live["peak"] <= 2                  # sema(2) を超えて並走しない
-        assert live["peak"] >= 2                  # かつ実際に並列化されている
+        assert live["peak"] <= 2  # sema(2) を超えて並走しない
+        assert live["peak"] >= 2  # かつ実際に並列化されている
 
 
 # --- フル MAGI パイプライン（orchestrator 経由）---
@@ -1450,8 +2852,10 @@ def _make_magi_deps(wait_for, bot_id=999000):
     bot.wait_for = wait_for
     bot.user = SimpleNamespace(id=bot_id)
     return orch.DeepResearchDeps(
-        bot=bot, send_segmented=AsyncMock(),
-        get_http_session=AsyncMock(), track_task=MagicMock(),
+        bot=bot,
+        send_segmented=AsyncMock(),
+        get_http_session=AsyncMock(),
+        track_task=MagicMock(),
     )
 
 
@@ -1459,7 +2863,8 @@ def _approve_by_reaction():
     async def _wf(event, *, check=None, timeout=None):
         if event == "raw_reaction_add":
             return SimpleNamespace(message_id=1, user_id=1)
-        await asyncio.Event().wait()   # message: never arrives
+        await asyncio.Event().wait()  # message: never arrives
+
     return _wf
 
 
@@ -1482,12 +2887,15 @@ def _magi_patches(fake, fake_pool, tools, extra=None):
 
 class TestMagiPipeline:
     def _pool_tools(self):
-        fp = MagicMock(); fp.spawn_eager = AsyncMock(); fp.handles = {}
+        fp = MagicMock()
+        fp.spawn_eager = AsyncMock()
+        fp.handles = {}
         return fp, [{"name": "mcp__brave-search__b", "input_schema": {}}]
 
     @pytest.mark.asyncio
     async def test_full_pipeline_cost_structure(self):
         from contextlib import ExitStack
+
         channel, origin, thread, anchor = _make_channel()
         deps = _make_magi_deps(_approve_by_reaction())
         fp, tools = self._pool_tools()
@@ -1495,22 +2903,31 @@ class TestMagiPipeline:
         captured = {}
 
         async def fake(**kw):
-            d = kw["defn"]; st = kw["state"]
+            d = kw["defn"]
+            st = kw["state"]
             at = d.agent_type
             calls[at] = calls.get(at, 0) + 1
             if at == "planner":
-                return SubAgentResult("p", '{"central_question":"暫定CQ","subquestions":["q1","q2"]}', ok=True)
+                return SubAgentResult(
+                    "p",
+                    '{"central_question":"暫定CQ","subquestions":["q1","q2"]}',
+                    ok=True,
+                )
             if at == "searcher":
                 st.register_source(url=f"https://s.com/{calls['searcher']}", title="t")
                 return SubAgentResult(kw["briefing"], "findings", ok=True)
             if at == "cq_refiner":
-                return SubAgentResult("r", "中心的問い: 研いだCQ\n核心: 緊張に根ざす", ok=True)
+                return SubAgentResult(
+                    "r", "中心的問い: 研いだCQ\n核心: 緊張に根ざす", ok=True
+                )
             if at == "magi_decompose":
                 return SubAgentResult("d", '["sub1", "sub2"]', ok=True)
             if at == "magi_worker":
                 return SubAgentResult(kw["briefing"], "分析メモ [S1]", ok=True)
             if at == "magi_lead":
-                return SubAgentResult("l", "STANCE: 立場\n【手堅い結論】\n- x [S1]", ok=True)
+                return SubAgentResult(
+                    "l", "STANCE: 立場\n【手堅い結論】\n- x [S1]", ok=True
+                )
             if at == "integrator":
                 captured["briefing"] = kw["briefing"]
                 captured["effort"] = d.effort
@@ -1520,14 +2937,16 @@ class TestMagiPipeline:
         with ExitStack() as es:
             for p in _magi_patches(fake, fp, tools):
                 es.enter_context(p)
-            await orch.run_deep_research(channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True)
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True
+            )
 
         # コスト構造（PoC）: Opus は planner+refine+3 lead+integrator=6、検索/部品は Sonnet。
         assert calls["planner"] == 1
         assert calls["searcher"] == 2
         assert calls["cq_refiner"] == 1
-        assert calls["magi_decompose"] == 3        # 1 per lens
-        assert calls["magi_worker"] == 6           # 2 subtasks × 3 lenses
+        assert calls["magi_decompose"] == 3  # 1 per lens
+        assert calls["magi_worker"] == 6  # 2 subtasks × 3 lenses
         assert calls["magi_lead"] == 3
         assert calls["integrator"] == 1
         # integrator は effort=max、入力は匿名化（視点A/B/C・神名は伏せ）
@@ -1542,6 +2961,7 @@ class TestMagiPipeline:
     async def test_lens_reasoning_not_posted_to_thread(self):
         # 詳細な推論ログは出さない（隠す）。STANCE 本文等が thread に投稿されないこと。
         from contextlib import ExitStack
+
         channel, origin, thread, anchor = _make_channel()
         deps = _make_magi_deps(_approve_by_reaction())
         fp, tools = self._pool_tools()
@@ -1549,10 +2969,13 @@ class TestMagiPipeline:
         stream_cbs = []
 
         async def fake(**kw):
-            d = kw["defn"]; st = kw["state"]
+            d = kw["defn"]
+            st = kw["state"]
             at = d.agent_type
             if at == "planner":
-                return SubAgentResult("p", '{"central_question":"CQ","subquestions":["q1"]}', ok=True)
+                return SubAgentResult(
+                    "p", '{"central_question":"CQ","subquestions":["q1"]}', ok=True
+                )
             if at == "searcher":
                 st.register_source(url="https://s.com/1", title="t")
                 return SubAgentResult(kw["briefing"], "f", ok=True)
@@ -1570,7 +2993,9 @@ class TestMagiPipeline:
         with ExitStack() as es:
             for p in _magi_patches(fake, fp, tools):
                 es.enter_context(p)
-            await orch.run_deep_research(channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True)
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True
+            )
 
         texts = [str(c.args[0]) for c in thread.send.call_args_list]
         # レンズの推論全文（"の推論" 見出しや STANCE 本文）は thread に出さない
@@ -1587,16 +3012,20 @@ class TestMagiPipeline:
     @pytest.mark.asyncio
     async def test_one_lens_fails_integrator_still_runs(self):
         from contextlib import ExitStack
+
         channel, origin, thread, anchor = _make_channel()
         deps = _make_magi_deps(_approve_by_reaction())
         fp, tools = self._pool_tools()
         integ = {"ran": False}
 
         async def fake(**kw):
-            d = kw["defn"]; st = kw["state"]
+            d = kw["defn"]
+            st = kw["state"]
             at = d.agent_type
             if at == "planner":
-                return SubAgentResult("p", '{"central_question":"CQ","subquestions":["q1"]}', ok=True)
+                return SubAgentResult(
+                    "p", '{"central_question":"CQ","subquestions":["q1"]}', ok=True
+                )
             if at == "searcher":
                 st.register_source(url="https://s.com/1", title="t")
                 return SubAgentResult(kw["briefing"], "f", ok=True)
@@ -1617,25 +3046,31 @@ class TestMagiPipeline:
         with ExitStack() as es:
             for p in _magi_patches(fake, fp, tools):
                 es.enter_context(p)
-            await orch.run_deep_research(channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True)
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True
+            )
 
-        assert integ["ran"] is True             # 1レンズ失敗でも統合は走る
+        assert integ["ran"] is True  # 1レンズ失敗でも統合は走る
         _a, sent_text, _f = deps.send_segmented.call_args.args
         assert "統合テーゼ" in sent_text
 
     @pytest.mark.asyncio
     async def test_all_lenses_fail_degrades_to_raw(self):
         from contextlib import ExitStack
+
         channel, origin, thread, anchor = _make_channel()
         deps = _make_magi_deps(_approve_by_reaction())
         fp, tools = self._pool_tools()
         integ = {"ran": False}
 
         async def fake(**kw):
-            d = kw["defn"]; st = kw["state"]
+            d = kw["defn"]
+            st = kw["state"]
             at = d.agent_type
             if at == "planner":
-                return SubAgentResult("p", '{"central_question":"CQ","subquestions":["q1"]}', ok=True)
+                return SubAgentResult(
+                    "p", '{"central_question":"CQ","subquestions":["q1"]}', ok=True
+                )
             if at == "searcher":
                 st.register_source(url="https://s.com/1", title="t")
                 return SubAgentResult(kw["briefing"], "findings ok", ok=True)
@@ -1653,15 +3088,18 @@ class TestMagiPipeline:
         with ExitStack() as es:
             for p in _magi_patches(fake, fp, tools):
                 es.enter_context(p)
-            await orch.run_deep_research(channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True)
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True
+            )
 
-        assert integ["ran"] is False            # 全滅 → integrator を呼ばず degrade
+        assert integ["ran"] is False  # 全滅 → integrator を呼ばず degrade
         _a, sent_text, _f = deps.send_segmented.call_args.args
-        assert "簡易版" in sent_text             # 事実統合フォールバック
+        assert "簡易版" in sent_text  # 事実統合フォールバック
 
     @pytest.mark.asyncio
     async def test_gate_reply_corrects_then_approves(self):
         from contextlib import ExitStack
+
         channel, origin, thread, anchor = _make_channel()
         fp, tools = self._pool_tools()
 
@@ -1689,10 +3127,13 @@ class TestMagiPipeline:
         refines = {"n": 0}
 
         async def fake(**kw):
-            d = kw["defn"]; st = kw["state"]
+            d = kw["defn"]
+            st = kw["state"]
             at = d.agent_type
             if at == "planner":
-                return SubAgentResult("p", '{"central_question":"CQ","subquestions":["q1"]}', ok=True)
+                return SubAgentResult(
+                    "p", '{"central_question":"CQ","subquestions":["q1"]}', ok=True
+                )
             if at == "searcher":
                 st.register_source(url="https://s.com/1", title="t")
                 return SubAgentResult(kw["briefing"], "f", ok=True)
@@ -1710,7 +3151,9 @@ class TestMagiPipeline:
         with ExitStack() as es:
             for p in _magi_patches(fake, fp, tools):
                 es.enter_context(p)
-            await orch.run_deep_research(channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True)
+            await orch.run_deep_research(
+                channel, MagicMock(id=1), "テーマ", deps, skip_clarify=True
+            )
 
         # Stage2 refine（1回）+ 訂正後の再研磨（1回）= 2
         assert refines["n"] == 2
@@ -1721,16 +3164,89 @@ class TestMagiPipeline:
 class TestMagiHelpers:
     def _ctx(self, state, *, deps=None, user=None, thread=None):
         return SimpleNamespace(
-            api_client=MagicMock(), pool=MagicMock(), server_locks={},
-            tools_for_api=[], state=state, thread=thread or SimpleNamespace(id=1),
-            anchor=None, counter={}, tool_cb=None, user=user, deps=deps,
+            api_client=MagicMock(),
+            pool=MagicMock(),
+            server_locks={},
+            tools_for_api=[],
+            state=state,
+            thread=thread or SimpleNamespace(id=1),
+            anchor=None,
+            counter={},
+            tool_cb=None,
+            user=user,
+            deps=deps,
         )
 
     @pytest.mark.asyncio
     async def test_gate_noop_without_bot_or_user(self):
         # deps/user 無し → 承認待ちせず即 return（CI/headless で詰まらない）
-        ctx = self._ctx(ResearchState(query="q", central_question="CQ"), deps=None, user=None)
-        await orch._central_question_gate(ctx)   # should not raise / not hang
+        ctx = self._ctx(
+            ResearchState(query="q", central_question="CQ"), deps=None, user=None
+        )
+        await orch._central_question_gate(ctx)  # should not raise / not hang
+
+    @pytest.mark.asyncio
+    async def test_gate_timeout_proceeds_and_cleans_waiters(self):
+        async def wait_forever(event, *, check=None, timeout=None):
+            await asyncio.Event().wait()
+
+        bot = MagicMock()
+        bot.wait_for = wait_forever
+        bot.user = SimpleNamespace(id=999)
+        thread = MagicMock()
+        thread.id = 42
+        thread.send = AsyncMock(return_value=SimpleNamespace(id=1))
+        state = ResearchState(query="q", central_question="CQ")
+        run = ResearchRun(state=state, run_id="timeout-run")
+        ctx = self._ctx(
+            state,
+            deps=SimpleNamespace(bot=bot),
+            user=SimpleNamespace(id=7),
+            thread=thread,
+        )
+        ctx.run = run
+        with patch.object(orch, "DEEP_RESEARCH_CLARIFY_TIMEOUT_S", 0.01):
+            await asyncio.wait_for(orch._central_question_gate(ctx), timeout=1)
+        sent = [str(call.args[0]) for call in thread.send.await_args_list]
+        assert any("タイムアウト" in text and "続行" in text for text in sent)
+        await asyncio.sleep(0)
+        assert run._tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_cancel_cleans_reaction_and_message_waiters(self):
+        cleaned = 0
+
+        async def wait_forever(event, *, check=None, timeout=None):
+            nonlocal cleaned
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned += 1
+
+        bot = MagicMock()
+        bot.wait_for = wait_forever
+        run = ResearchRun(state=ResearchState(query="q"), run_id="cancel-run")
+        waiter = asyncio.create_task(
+            orch._await_reaction_or_reply(
+                bot,
+                7,
+                42,
+                SimpleNamespace(id=1),
+                timeout_s=30,
+                run=run,
+            )
+        )
+        for _ in range(10):
+            if len(run._tasks) == 2:
+                break
+            await asyncio.sleep(0)
+        assert len(run._tasks) == 2
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        await asyncio.sleep(0)
+        assert cleaned == 2
+        assert run._tasks == set()
 
     @pytest.mark.asyncio
     async def test_await_gate_reply_with_auto_mention_is_correct_not_approve(self):
@@ -1740,7 +3256,7 @@ class TestMagiHelpers:
         bot_user = SimpleNamespace(id=999)
         reply = SimpleNamespace(
             content="ROI でなく機会損失で再フレーミングしてほしい",
-            mentions=[bot_user],   # Reply による auto-mention
+            mentions=[bot_user],  # Reply による auto-mention
             reference=SimpleNamespace(message_id=1),
             channel=SimpleNamespace(id=42),
             author=SimpleNamespace(id=7, bot=False),
@@ -1750,9 +3266,16 @@ class TestMagiHelpers:
             if event == "message":
                 return reply
             await asyncio.Event().wait()
-        bot = MagicMock(); bot.wait_for = _wf; bot.user = bot_user
-        ctx = self._ctx(ResearchState(query="q"), deps=SimpleNamespace(bot=bot),
-                        user=SimpleNamespace(id=7), thread=thread)
+
+        bot = MagicMock()
+        bot.wait_for = _wf
+        bot.user = bot_user
+        ctx = self._ctx(
+            ResearchState(query="q"),
+            deps=SimpleNamespace(bot=bot),
+            user=SimpleNamespace(id=7),
+            thread=thread,
+        )
         decision, text = await orch._await_gate_response(ctx, SimpleNamespace(id=1))
         assert decision == "correct"
         assert "機会損失" in text
@@ -1763,17 +3286,27 @@ class TestMagiHelpers:
         thread = SimpleNamespace(id=42)
         bot_user = SimpleNamespace(id=999)
         msg = SimpleNamespace(
-            content="@bot OKそのまま進めて", mentions=[bot_user], reference=None,
-            channel=SimpleNamespace(id=42), author=SimpleNamespace(id=7, bot=False),
+            content="@bot OKそのまま進めて",
+            mentions=[bot_user],
+            reference=None,
+            channel=SimpleNamespace(id=42),
+            author=SimpleNamespace(id=7, bot=False),
         )
 
         async def _wf(event, *, check=None, timeout=None):
             if event == "message":
                 return msg
             await asyncio.Event().wait()
-        bot = MagicMock(); bot.wait_for = _wf; bot.user = bot_user
-        ctx = self._ctx(ResearchState(query="q"), deps=SimpleNamespace(bot=bot),
-                        user=SimpleNamespace(id=7), thread=thread)
+
+        bot = MagicMock()
+        bot.wait_for = _wf
+        bot.user = bot_user
+        ctx = self._ctx(
+            ResearchState(query="q"),
+            deps=SimpleNamespace(bot=bot),
+            user=SimpleNamespace(id=7),
+            thread=thread,
+        )
         decision, _ = await orch._await_gate_response(ctx, SimpleNamespace(id=1))
         assert decision == "approve"
 
@@ -1781,31 +3314,48 @@ class TestMagiHelpers:
     async def test_await_gate_mention_approves(self):
         thread = SimpleNamespace(id=42)
         msg = SimpleNamespace(
-            content="@bot いいね", mentions=[SimpleNamespace(id=999)],
-            channel=SimpleNamespace(id=42), author=SimpleNamespace(id=7, bot=False),
+            content="@bot いいね",
+            mentions=[SimpleNamespace(id=999)],
+            channel=SimpleNamespace(id=42),
+            author=SimpleNamespace(id=7, bot=False),
         )
 
         async def _wf(event, *, check=None, timeout=None):
             if event == "message":
-                assert check(msg) is True       # _mcheck クロージャを実際に通す
+                assert check(msg) is True  # _mcheck クロージャを実際に通す
                 return msg
             await asyncio.Event().wait()
 
-        bot = MagicMock(); bot.wait_for = _wf; bot.user = SimpleNamespace(id=999)
-        ctx = self._ctx(ResearchState(query="q"), deps=SimpleNamespace(bot=bot),
-                        user=SimpleNamespace(id=7), thread=thread)
+        bot = MagicMock()
+        bot.wait_for = _wf
+        bot.user = SimpleNamespace(id=999)
+        ctx = self._ctx(
+            ResearchState(query="q"),
+            deps=SimpleNamespace(bot=bot),
+            user=SimpleNamespace(id=7),
+            thread=thread,
+        )
         decision, text = await orch._await_gate_response(ctx, SimpleNamespace(id=1))
         assert decision == "approve"
 
     @pytest.mark.asyncio
     async def test_gate_wait_exception_proceeds(self):
-        bot = MagicMock(); bot.wait_for = AsyncMock(); bot.user = SimpleNamespace(id=9)
-        thread = MagicMock(); thread.id = 5
+        bot = MagicMock()
+        bot.wait_for = AsyncMock()
+        bot.user = SimpleNamespace(id=9)
+        thread = MagicMock()
+        thread.id = 5
         thread.send = AsyncMock(return_value=SimpleNamespace(id=1))
-        ctx = self._ctx(ResearchState(query="q", central_question="CQ"),
-                        deps=SimpleNamespace(bot=bot), user=SimpleNamespace(id=7), thread=thread)
-        with patch.object(orch, "_await_gate_response", side_effect=RuntimeError("blew up")):
-            await orch._central_question_gate(ctx)   # 例外は握って続行（詰まらせない）
+        ctx = self._ctx(
+            ResearchState(query="q", central_question="CQ"),
+            deps=SimpleNamespace(bot=bot),
+            user=SimpleNamespace(id=7),
+            thread=thread,
+        )
+        with patch.object(
+            orch, "_await_gate_response", side_effect=RuntimeError("blew up")
+        ):
+            await orch._central_question_gate(ctx)  # 例外は握って続行（詰まらせない）
 
     @pytest.mark.asyncio
     async def test_parse_refined_cq_fallback_first_line(self):
@@ -1816,6 +3366,7 @@ class TestMagiHelpers:
     @pytest.mark.asyncio
     async def test_present_cq_returns_none_on_send_failure(self):
         import discord
+
         thread = MagicMock()
         thread.send = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
         ctx = self._ctx(ResearchState(query="q", central_question="CQ"), thread=thread)
@@ -1824,33 +3375,46 @@ class TestMagiHelpers:
     @pytest.mark.asyncio
     async def test_gate_returns_when_cannot_present(self):
         import discord
+
         thread = MagicMock()
         thread.send = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
-        bot = MagicMock(); bot.wait_for = AsyncMock(); bot.user = SimpleNamespace(id=9)
-        ctx = self._ctx(ResearchState(query="q", central_question="CQ"),
-                        deps=SimpleNamespace(bot=bot), user=SimpleNamespace(id=7), thread=thread)
-        await orch._central_question_gate(ctx)   # present None → return（無限ループしない）
+        bot = MagicMock()
+        bot.wait_for = AsyncMock()
+        bot.user = SimpleNamespace(id=9)
+        ctx = self._ctx(
+            ResearchState(query="q", central_question="CQ"),
+            deps=SimpleNamespace(bot=bot),
+            user=SimpleNamespace(id=7),
+            thread=thread,
+        )
+        await orch._central_question_gate(
+            ctx
+        )  # present None → return（無限ループしない）
         bot.wait_for.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_refine_falls_back_to_clarified_query(self):
         async def fake(**kw):
             return SubAgentResult("r", "", ok=False, error="refiner down")
+
         state = ResearchState(query="q", clarified_query="元テーマ")
         ctx = self._ctx(state)
         with patch.object(orch, "run_subagent", new=fake):
             await orch._refine_central_question(ctx)
-        assert state.central_question == "元テーマ"   # 失敗時はテーマを問いに
+        assert state.central_question == "元テーマ"  # 失敗時はテーマを問いに
 
     @pytest.mark.asyncio
     async def test_refine_extracts_next_line_question_not_label(self):
         # 実バグ回帰: refiner が次行形式で返しても、中心的問いがラベルで埋まらない。
         async def fake(**kw):
             return SubAgentResult(
-                "r", "中心的問い:\nAIブームはバブルか？\n核心:\n過熱の緊張", ok=True,
+                "r",
+                "中心的問い:\nAIブームはバブルか？\n核心:\n過熱の緊張",
+                ok=True,
             )
+
         state = ResearchState(query="q", clarified_query="AIバブル調査")
-        state.central_question = "暫定の問い"   # planner 暫定
+        state.central_question = "暫定の問い"  # planner 暫定
         ctx = self._ctx(state)
         with patch.object(orch, "run_subagent", new=fake):
             await orch._refine_central_question(ctx)
@@ -1863,6 +3427,7 @@ class TestMagiHelpers:
         # 「中心的問い:」のような空欄を lead に渡さない。
         async def fake(**kw):
             return SubAgentResult("r", "中心的問い:\n核心:", ok=True)
+
         state = ResearchState(query="q", clarified_query="AIバブル調査")
         ctx = self._ctx(state)
         with patch.object(orch, "run_subagent", new=fake):
@@ -1878,27 +3443,36 @@ class TestMagiHelpers:
                 return SubAgentResult("d", '["s1", "s2"]', ok=True)
             if d.agent_type == "magi_worker":
                 if "s2" in kw["briefing"]:
-                    raise RuntimeError("worker boom")    # gather(return_exceptions) で握る
+                    raise RuntimeError(
+                        "worker boom"
+                    )  # gather(return_exceptions) で握る
                 return SubAgentResult(kw["briefing"], "メモ [S1]", ok=True)
             if d.agent_type == "magi_lead":
                 return SubAgentResult("l", "STANCE: 生存", ok=True)
             return SubAgentResult("?", "", ok=False)
 
         ctx = SimpleNamespace(
-            api_client=MagicMock(), pool=MagicMock(), server_locks={},
+            api_client=MagicMock(),
+            pool=MagicMock(),
+            server_locks={},
             tools_for_api=[{"name": "mcp__brave-search__b"}],
             state=ResearchState(query="q", central_question="CQ"),
             thread=SimpleNamespace(id=1),
         )
-        with patch.object(magi, "run_subagent", new=fake), \
-             patch.object(magi, "DEEP_RESEARCH_MAGI_MAX_WORKERS", 2):
-            res = await magi.run_magi_lens(ctx, "science", _FakeView(), asyncio.Semaphore(2))
-        assert res.ok and res.stance == "生存"   # 1ワーカー死亡でも lead は完走
+        with (
+            patch.object(magi, "run_subagent", new=fake),
+            patch.object(magi, "DEEP_RESEARCH_MAGI_MAX_WORKERS", 2),
+        ):
+            res = await magi.run_magi_lens(
+                ctx, "science", _FakeView(), asyncio.Semaphore(2)
+            )
+        assert res.ok and res.stance == "生存"  # 1ワーカー死亡でも lead は完走
 
 
 # ---------------------------------------------------------------------------
 # 中心的問いゲート — 訂正回数上限（_research_busy の占有 DoS 対策）
 # ---------------------------------------------------------------------------
+
 
 class TestCqCorrectionCap:
     @pytest.mark.asyncio
@@ -1911,12 +3485,19 @@ class TestCqCorrectionCap:
             thread=SimpleNamespace(id=1),
         )
         refine = AsyncMock()
-        with patch.object(orch, "_present_cq", new=AsyncMock(return_value=SimpleNamespace(id=9))), \
-             patch.object(orch, "_await_gate_response",
-                          new=AsyncMock(return_value=("correct", "もっと具体的に"))), \
-             patch.object(orch, "_refine_central_question", new=refine), \
-             patch.object(orch, "_safe_send", new=AsyncMock()), \
-             patch.object(orch, "DEEP_RESEARCH_MAX_CQ_CORRECTIONS", 2):
+        with (
+            patch.object(
+                orch, "_present_cq", new=AsyncMock(return_value=SimpleNamespace(id=9))
+            ),
+            patch.object(
+                orch,
+                "_await_gate_response",
+                new=AsyncMock(return_value=("correct", "もっと具体的に")),
+            ),
+            patch.object(orch, "_refine_central_question", new=refine),
+            patch.object(orch, "_safe_send", new=AsyncMock()),
+            patch.object(orch, "DEEP_RESEARCH_MAX_CQ_CORRECTIONS", 2),
+        ):
             # 訂正しか返ってこなくても while が有限で終わること
             await asyncio.wait_for(orch._central_question_gate(ctx), timeout=5)
         assert refine.await_count == 2  # cap 回だけ研ぎ直して自動続行
@@ -1932,11 +3513,18 @@ class TestCqCorrectionCap:
             thread=SimpleNamespace(id=1),
         )
         refine = AsyncMock()
-        with patch.object(orch, "_present_cq", new=AsyncMock(return_value=SimpleNamespace(id=9))), \
-             patch.object(orch, "_await_gate_response",
-                          new=AsyncMock(return_value=("approve", ""))), \
-             patch.object(orch, "_refine_central_question", new=refine), \
-             patch.object(orch, "_safe_send", new=AsyncMock()):
+        with (
+            patch.object(
+                orch, "_present_cq", new=AsyncMock(return_value=SimpleNamespace(id=9))
+            ),
+            patch.object(
+                orch,
+                "_await_gate_response",
+                new=AsyncMock(return_value=("approve", "")),
+            ),
+            patch.object(orch, "_refine_central_question", new=refine),
+            patch.object(orch, "_safe_send", new=AsyncMock()),
+        ):
             await asyncio.wait_for(orch._central_question_gate(ctx), timeout=5)
         assert refine.await_count == 0
 
@@ -1945,15 +3533,19 @@ class TestCqCorrectionCap:
 # evidence digest — ソース一覧の上限
 # ---------------------------------------------------------------------------
 
+
 class TestDigestSourceCap:
     def test_source_list_is_capped(self):
         from services.deep_research import prompts as prompts_mod
         from services.deep_research.types import SourceRef
+
         state = ResearchState(query="q")
         for i in range(1, prompts_mod._DIGEST_MAX_SOURCES + 6):
             sid = f"S{i}"
             state.sources[f"u{i}"] = SourceRef(
-                sid=sid, title=f"t{i}", url=f"https://example.com/{i}",
+                sid=sid,
+                title=f"t{i}",
+                url=f"https://example.com/{i}",
             )
         state.results.append(SubAgentResult(subq="q1", summary_md="要約テキスト"))
         digest = prompts_mod.build_evidence_digest(state)
@@ -1969,18 +3561,24 @@ class TestDigestSourceCap:
 # report critic（最終レポートの adversarial verification）
 # ---------------------------------------------------------------------------
 
+
 class TestReportCritic:
     def _ctx(self):
         return SimpleNamespace(
-            api_client=MagicMock(), pool=MagicMock(), server_locks={},
+            api_client=MagicMock(),
+            pool=MagicMock(),
+            server_locks={},
             state=ResearchState(query="q", central_question="CQ"),
             thread=SimpleNamespace(id=1),
         )
 
     def _integ_def(self):
         return ResearchAgentDef(
-            agent_type="integrator", model="m", system_prompt="s",
-            max_tool_turns=1, idle_timeout_s=30,
+            agent_type="integrator",
+            model="m",
+            system_prompt="s",
+            max_tool_turns=1,
+            idle_timeout_s=30,
         )
 
     @pytest.mark.asyncio
@@ -1993,7 +3591,11 @@ class TestReportCritic:
 
         with patch.object(magi, "run_subagent", new=fake):
             out = await magi._critic_pass(
-                self._ctx(), self._integ_def(), "CQ", "元レポート", "DIGEST",
+                self._ctx(),
+                self._integ_def(),
+                "CQ",
+                "元レポート",
+                "DIGEST",
             )
         assert out == "元レポート"
         assert calls == ["report_critic"]  # 修正 integrator は走らない
@@ -2010,7 +3612,11 @@ class TestReportCritic:
 
         with patch.object(magi, "run_subagent", new=fake):
             out = await magi._critic_pass(
-                self._ctx(), self._integ_def(), "CQ", "元レポート", "DIGEST",
+                self._ctx(),
+                self._integ_def(),
+                "CQ",
+                "元レポート",
+                "DIGEST",
             )
         assert out == "修正版レポート"
         assert calls == ["report_critic", "integrator"]
@@ -2024,15 +3630,24 @@ class TestReportCritic:
 
         with patch.object(magi, "run_subagent", new=fake):
             out = await magi._critic_pass(
-                self._ctx(), self._integ_def(), "CQ", "元レポート", "DIGEST",
+                self._ctx(),
+                self._integ_def(),
+                "CQ",
+                "元レポート",
+                "DIGEST",
             )
         assert out == "元レポート"
 
     @pytest.mark.asyncio
     async def test_critic_exception_keeps_original(self):
-        with patch.object(magi, "run_subagent",
-                          new=AsyncMock(side_effect=RuntimeError("boom"))):
+        with patch.object(
+            magi, "run_subagent", new=AsyncMock(side_effect=RuntimeError("boom"))
+        ):
             out = await magi._critic_pass(
-                self._ctx(), self._integ_def(), "CQ", "元レポート", "DIGEST",
+                self._ctx(),
+                self._integ_def(),
+                "CQ",
+                "元レポート",
+                "DIGEST",
             )
         assert out == "元レポート"

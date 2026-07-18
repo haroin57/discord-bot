@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from ..frontmatter import parse_frontmatter, parse_slash_command_tools
+from ..registry import _metadata_catalog, _prompt_command
 from ..runtime import CommandRuntime
 from ..shell import execute_shell_commands_in_prompt
 from ..types import ContentBlock, PromptCommand, text_block
@@ -95,7 +96,7 @@ async def _commit_get_prompt(args: str, rt: CommandRuntime) -> list[ContentBlock
 
 
 def commit() -> PromptCommand:
-    return PromptCommand(
+    return _prompt_command(
         name="commit",
         description="Create a git commit",
         progress_message="creating commit",
@@ -132,7 +133,9 @@ def _commit_push_pr_content(
 ) -> str:
     attribution = rt.attribution_texts()
     commit_attribution = attribution.commit
-    effective_pr_attribution = pr_attribution if pr_attribution is not None else attribution.pr
+    effective_pr_attribution = (
+        pr_attribution if pr_attribution is not None else attribution.pr
+    )
     safe_user = rt.env("SAFEUSER") or ""
     username = rt.env("USER") or ""
 
@@ -147,7 +150,7 @@ def _commit_push_pr_content(
     )
     slack_step = (
         "\n\n5. After creating/updating the PR, check if the user's CLAUDE.md mentions posting to Slack channels. "
-        "If it does, use ToolSearch to search for \"slack send message\" tools. If ToolSearch finds a Slack tool, "
+        'If it does, use ToolSearch to search for "slack send message" tools. If ToolSearch finds a Slack tool, '
         "ask the user if they'd like you to post the PR URL to the relevant Slack channel. Only post if the user confirms. "
         "If ToolSearch returns no results or errors, skip this step silently—do not mention the failure, do not attempt "
         "workarounds, and do not try alternative approaches."
@@ -160,7 +163,9 @@ def _commit_push_pr_content(
         slack_step = ""
 
     commit_attr_clause = (
-        ", ending with the attribution text shown in the example below" if commit_attribution else ""
+        ", ending with the attribution text shown in the example below"
+        if commit_attribution
+        else ""
     )
     commit_attr_line = f"\n\n{commit_attribution}" if commit_attribution else ""
     pr_attr_line = f"\n\n{effective_pr_attribution}" if effective_pr_attribution else ""
@@ -216,7 +221,9 @@ You have the capability to call multiple tools in a single response. You MUST do
 Return the PR URL when you're done, so the user can see it."""
 
 
-async def _commit_push_pr_get_prompt(args: str, rt: CommandRuntime) -> list[ContentBlock]:
+async def _commit_push_pr_get_prompt(
+    args: str, rt: CommandRuntime
+) -> list[ContentBlock]:
     default_branch = await rt.get_default_branch()
     pr_attribution = await rt.get_enhanced_pr_attribution()
     content = _commit_push_pr_content(rt, default_branch, pr_attribution)
@@ -228,7 +235,7 @@ async def _commit_push_pr_get_prompt(args: str, rt: CommandRuntime) -> list[Cont
 
 
 def commit_push_pr() -> PromptCommand:
-    return PromptCommand(
+    return _prompt_command(
         name="commit-push-pr",
         description="Commit, push, and open a PR",
         progress_message="creating commit and PR",
@@ -275,7 +282,7 @@ async def _review_get_prompt(args: str, rt: CommandRuntime) -> list[ContentBlock
 
 
 def review() -> PromptCommand:
-    return PromptCommand(
+    return _prompt_command(
         name="review",
         description="Review a pull request",
         progress_message="reviewing pull request",
@@ -290,7 +297,7 @@ def review() -> PromptCommand:
 # ---------------------------------------------------------------------------
 
 
-def create_moved_to_plugin_command(
+def _create_moved_to_plugin_command(
     *,
     name: str,
     description: str,
@@ -325,7 +332,7 @@ Do not attempt to run the command. Simply inform the user about the plugin insta
             ]
         return await get_prompt_while_marketplace_is_private(args, rt)
 
-    return PromptCommand(
+    return _prompt_command(
         name=name,
         description=description,
         progress_message=progress_message,
@@ -340,7 +347,9 @@ Do not attempt to run the command. Simply inform the user about the plugin insta
 # ---------------------------------------------------------------------------
 
 
-async def _pr_comments_private_prompt(args: str, rt: CommandRuntime) -> list[ContentBlock]:
+async def _pr_comments_private_prompt(
+    args: str, rt: CommandRuntime
+) -> list[ContentBlock]:
     extra = ("Additional user input: " + args) if args else ""
     return [
         text_block(
@@ -383,7 +392,7 @@ Remember:
 
 
 def pr_comments() -> PromptCommand:
-    return create_moved_to_plugin_command(
+    return _create_moved_to_plugin_command(
         name="pr-comments",
         description="Get comments from a GitHub pull request",
         progress_message="fetching PR comments",
@@ -399,7 +408,9 @@ def pr_comments() -> PromptCommand:
 
 
 def _new_init_enabled(rt: CommandRuntime) -> bool:
-    return rt.feature("NEW_INIT") and (rt.is_ant() or rt.env_truthy("CLAUDE_CODE_NEW_INIT"))
+    return rt.feature("NEW_INIT") and (
+        rt.is_ant() or rt.env_truthy("CLAUDE_CODE_NEW_INIT")
+    )
 
 
 async def _init_get_prompt(args: str, rt: CommandRuntime) -> list[ContentBlock]:
@@ -411,7 +422,7 @@ async def _init_get_prompt(args: str, rt: CommandRuntime) -> list[ContentBlock]:
 
 
 def init() -> PromptCommand:
-    return PromptCommand(
+    return _prompt_command(
         name="init",
         description="Initialize a new CLAUDE.md file with codebase documentation",
         description_fn=lambda rt: (
@@ -431,12 +442,14 @@ def init() -> PromptCommand:
 # ---------------------------------------------------------------------------
 
 
-async def _init_verifiers_get_prompt(args: str, rt: CommandRuntime) -> list[ContentBlock]:
+async def _init_verifiers_get_prompt(
+    args: str, rt: CommandRuntime
+) -> list[ContentBlock]:
     return [text_block(_load_prompt("init_verifiers.md"))]
 
 
 def init_verifiers() -> PromptCommand:
-    return PromptCommand(
+    return _prompt_command(
         name="init-verifiers",
         description="Create verifier skill(s) for automated verification of code changes",
         progress_message="analyzing your project and creating verifier skills",
@@ -451,7 +464,9 @@ def init_verifiers() -> PromptCommand:
 # ---------------------------------------------------------------------------
 
 
-async def _security_review_private_prompt(args: str, rt: CommandRuntime) -> list[ContentBlock]:
+async def _security_review_private_prompt(
+    args: str, rt: CommandRuntime
+) -> list[ContentBlock]:
     markdown = _load_prompt("security_review.md")
     frontmatter, content = parse_frontmatter(markdown)
     # allowed tools parsed (used to widen shell permissions upstream); kept for
@@ -462,7 +477,7 @@ async def _security_review_private_prompt(args: str, rt: CommandRuntime) -> list
 
 
 def security_review() -> PromptCommand:
-    return create_moved_to_plugin_command(
+    return _create_moved_to_plugin_command(
         name="security-review",
         description="Complete a security review of the pending changes on the current branch",
         progress_message="analyzing code changes for security risks",
@@ -489,14 +504,14 @@ async def _statusline_get_prompt(args: str, rt: CommandRuntime) -> list[ContentB
 
 
 def statusline() -> PromptCommand:
-    return PromptCommand(
+    return _prompt_command(
         name="statusline",
         description="Set up Claude Code's status line UI",
         progress_message="setting up statusLine",
         allowed_tools=[_AGENT_TOOL_NAME, "Read(~/**)", "Edit(~/.claude/settings.json)"],
         content_length=0,
         source="builtin",
-        disable_non_interactive=True,
+        supports_non_interactive=False,
         get_prompt_fn=_statusline_get_prompt,
     )
 
@@ -546,7 +561,7 @@ Want to dig into any section or try one of the suggestions?
 
 
 def insights() -> PromptCommand:
-    return PromptCommand(
+    return _prompt_command(
         name="insights",
         description="Generate a report analyzing your Claude Code sessions",
         progress_message="analyzing your sessions",
@@ -556,7 +571,7 @@ def insights() -> PromptCommand:
     )
 
 
-COMMANDS = [
+_DEFINITIONS = (
     commit(),
     commit_push_pr(),
     review(),
@@ -566,4 +581,26 @@ COMMANDS = [
     security_review(),
     statusline(),
     insights(),
-]
+)
+
+COMMANDS = _metadata_catalog(_DEFINITIONS)
+
+
+def _metadata_factory(name: str):
+    def factory() -> PromptCommand:
+        return next(command for command in COMMANDS if command.name == name)
+
+    return factory
+
+
+# Preserve the historical factory spellings as metadata-only APIs.
+commit = _metadata_factory("commit")
+commit_push_pr = _metadata_factory("commit-push-pr")
+review = _metadata_factory("review")
+pr_comments = _metadata_factory("pr-comments")
+init = _metadata_factory("init")
+init_verifiers = _metadata_factory("init-verifiers")
+security_review = _metadata_factory("security-review")
+statusline = _metadata_factory("statusline")
+insights = _metadata_factory("insights")
+del _metadata_factory

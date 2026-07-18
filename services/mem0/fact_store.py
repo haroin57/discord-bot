@@ -1,9 +1,7 @@
 """Structured fact layer (Mem0 v5 T8a) — attribute 付き fact の導出インデックス。
 
-gpt-5.5-pro 検算(2026-07-03)の「Chroma=想起、structured layer=truth maintenance」
-方針の最小実装。ただし v2 で棄却した「真実の二重化」を避けるため、**fact 本文の
-正本はあくまで ChromaDB**。この store は「attribute を持つ fact だけの導出
-インデックス」で、壊れたら Chroma から再構築できる(scripts/mem0_backfill_attributes.py)。
+canonical ledgerを唯一の正本とし、このstoreはattribute付きfactだけの導出
+projectionとして扱う。破損時はcanonical ledgerから再構築できる。
 
 役割:
 - 決定的 conflict ルートの照会を mem.get_all(全件+Pythonフィルタ) から
@@ -50,6 +48,10 @@ CREATE INDEX IF NOT EXISTS idx_facts_user_attr
     ON facts(user_id, attribute, status);
 CREATE INDEX IF NOT EXISTS idx_facts_user_valid
     ON facts(user_id, valid_to);
+CREATE TABLE IF NOT EXISTS projection_receipts (
+    event_id      TEXT PRIMARY KEY,
+    processed_at  INTEGER NOT NULL
+);
 """
 
 _db_lock = threading.Lock()
@@ -61,6 +63,12 @@ _db_path: str | None = None
 # dropping derived-index rows (ADR-0007; same fix as history_index). We now
 # apply it exactly once per DB file, serialized under _db_lock.
 _wal_ready_path: str | None = None
+
+
+def _reject_canonical_direct_mutation() -> None:
+    from services.mem0._projection import reject_direct_mutation
+
+    reject_direct_mutation("fact-store")
 
 
 def _resolve_db_path() -> str:
@@ -126,6 +134,7 @@ def record_fact(
     supersedes を渡すと旧 fact 側の superseded_by / status も同時更新する。
     失敗は False（呼び元は best-effort、正本の Chroma insert は既に済んでいる）。
     """
+    _reject_canonical_direct_mutation()
     if not fact_id or not user_id or not attribute:
         return False
     now = int(time.time())
@@ -138,9 +147,20 @@ def record_fact(
                     source_conversation_id, extractor_version,
                     supersedes, superseded_by, created_at)
                    VALUES (?,?,?,?,?,?,?,?,NULL,'active',?,?,?,NULL,?)""",
-                (fact_id, user_id, attribute, value_text[:500], value_json,
-                 condition, scope, now,
-                 source_conversation_id, extractor_version, supersedes, now),
+                (
+                    fact_id,
+                    user_id,
+                    attribute,
+                    value_text[:500],
+                    value_json,
+                    condition,
+                    scope,
+                    now,
+                    source_conversation_id,
+                    extractor_version,
+                    supersedes,
+                    now,
+                ),
             )
             if supersedes:
                 c.execute(
@@ -160,6 +180,7 @@ def supersede_fact(old_fact_id: str, new_fact_id: str | None = None) -> bool:
 
     new_fact_id が None のときは「置き換え先不明の失効」（手動 forget 等）。
     """
+    _reject_canonical_direct_mutation()
     if not old_fact_id:
         return False
     now = int(time.time())
@@ -175,6 +196,72 @@ def supersede_fact(old_fact_id: str, new_fact_id: str | None = None) -> bool:
         return True
     except Exception as exc:  # noqa: BLE001
         log.warning("fact_store supersede failed (non-fatal): %s", exc)
+        return False
+
+
+def apply_projection(
+    event_id: str,
+    operation: str,
+    fact_id: str,
+    user_id: str,
+    attribute: str,
+    *,
+    value_text: str = "",
+    value_json: str | None = None,
+    condition: str = "",
+    scope: str = "",
+    source_conversation_id: str | None = None,
+    merged_into: str | None = None,
+    _capability: object | None = None,
+) -> bool:
+    """Apply an outbox event and its receipt in one fact-store transaction."""
+    from services.mem0._projection import require_internal_projection
+
+    require_internal_projection(_capability, "fact-store")
+    if not event_id or not fact_id:
+        return False
+    now = int(time.time())
+    try:
+        with _conn() as c, _db_lock:
+            if c.execute(
+                "SELECT 1 FROM projection_receipts WHERE event_id=?",
+                (event_id,),
+            ).fetchone():
+                return True
+            if operation in ("archive", "delete"):
+                c.execute(
+                    """UPDATE facts SET status='superseded',valid_to=?,
+                       superseded_by=COALESCE(?,superseded_by) WHERE fact_id=?""",
+                    (now, merged_into, fact_id),
+                )
+            elif attribute:
+                c.execute(
+                    """INSERT OR REPLACE INTO facts
+                       (fact_id,user_id,attribute,value_text,value_json,condition,
+                        scope,valid_from,valid_to,status,source_conversation_id,
+                        extractor_version,supersedes,superseded_by,created_at)
+                       VALUES (?,?,?,?,?,?,?, ?,NULL,'active',?,NULL,NULL,NULL,?)""",
+                    (
+                        fact_id,
+                        user_id,
+                        attribute,
+                        value_text[:500],
+                        value_json,
+                        condition,
+                        scope,
+                        now,
+                        source_conversation_id,
+                        now,
+                    ),
+                )
+            c.execute(
+                "INSERT INTO projection_receipts(event_id,processed_at) VALUES (?,?)",
+                (event_id, now),
+            )
+            c.commit()
+        return True
+    except Exception as exc:
+        log.warning("fact_store projection failed for %s: %s", event_id, exc)
         return False
 
 

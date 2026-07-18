@@ -1,24 +1,15 @@
-"""Command type model — Python port of free-code's ``src/types/command.ts``.
+"""Immutable public command metadata and command result types.
 
-TypeScript models a command as ``CommandBase & (PromptCommand | LocalCommand |
-LocalJSXCommand)`` — a discriminated union on the ``type`` field. Python has no
-structural intersection, so we express the same shape with a :class:`Command`
-base dataclass carrying the shared metadata and three concrete subclasses, one
-per ``type`` discriminator.
-
-The lazy ``load()`` indirection from the TS side (deferring heavy imports until a
-command runs) is dropped: Python module import is cheap and the behaviour lives
-directly on the instance as ``call`` / ``get_prompt_for_command``.
+Executable callbacks and runtime predicates deliberately do not live in this
+module.  They are private implementation details of :mod:`free_code_commands.registry`;
+``CommandRegistry.invoke`` is the only public execution boundary.
 """
 
 from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Optional
-
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    from .runtime import CommandRuntime
+from typing import Any, Optional
 
 
 class CommandType(str, enum.Enum):
@@ -27,6 +18,10 @@ class CommandType(str, enum.Enum):
     LOCAL = "local"
     PROMPT = "prompt"
     LOCAL_JSX = "local-jsx"
+
+
+class CommandExecutionError(RuntimeError):
+    """Compatibility exception for callers migrating to registry invocation."""
 
 
 # --- content blocks -------------------------------------------------------
@@ -83,8 +78,14 @@ class LocalCommandResult:
         return cls(type="skip")
 
     @classmethod
-    def compact(cls, compaction_result: Any, display_text: Optional[str] = None) -> "LocalCommandResult":
-        return cls(type="compact", compaction_result=compaction_result, display_text=display_text)
+    def compact(
+        cls, compaction_result: Any, display_text: Optional[str] = None
+    ) -> "LocalCommandResult":
+        return cls(
+            type="compact",
+            compaction_result=compaction_result,
+            display_text=display_text,
+        )
 
 
 @dataclass(frozen=True)
@@ -107,56 +108,48 @@ class JsxOutcome:
     data: dict[str, Any] = field(default_factory=dict)
 
 
-# --- command base + variants ---------------------------------------------
+# --- public metadata-only command variants -------------------------------
 
 
-@dataclass
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Command:
-    """Shared metadata (``CommandBase`` in TS). Not instantiated directly."""
+    """Frozen, non-executable command metadata.
+
+    The tuple normalization in ``__post_init__`` prevents callers from smuggling
+    mutable lists into an otherwise frozen instance.
+    """
 
     name: str
     description: str
     type: CommandType = CommandType.LOCAL
-    aliases: list[str] = field(default_factory=list)
-    # None => available everywhere; else a subset of {'claude-ai', 'console'}.
-    availability: Optional[list[str]] = None
+    aliases: tuple[str, ...] = ()
+    availability: Optional[tuple[str, ...]] = None
     argument_hint: Optional[str] = None
     when_to_use: Optional[str] = None
     version: Optional[str] = None
-    kind: Optional[str] = None  # 'workflow'
+    kind: Optional[str] = None
     immediate: bool = False
     is_sensitive: bool = False
     is_mcp: bool = False
     disable_model_invocation: bool = False
     user_invocable: bool = True
+    supports_non_interactive: bool = False
     loaded_from: Optional[str] = None
-    # Static hidden flag; dynamic hiding is expressed by overriding ``hidden``.
-    _is_hidden: bool = False
-    # Optional predicates depending on runtime/env. When None the defaults
-    # (enabled=True, hidden=_is_hidden) apply. Faithful to TS isEnabled/isHidden.
-    is_enabled_fn: Optional[Callable[["CommandRuntime"], bool]] = None
-    is_hidden_fn: Optional[Callable[["CommandRuntime"], bool]] = None
-    # Optional dynamic description (TS uses `get description()` for a few).
-    description_fn: Optional[Callable[["CommandRuntime"], str]] = None
+    hidden: bool = False
+    progress_message: Optional[str] = None
+    content_length: Optional[int] = None
+    allowed_tools: tuple[str, ...] = ()
+    arg_names: Optional[tuple[str, ...]] = None
+    model: Optional[str] = None
+    source: Optional[str] = None
 
-    # ---- resolved views (take a runtime, like the TS getters read globals) --
-
-    def enabled(self, rt: "CommandRuntime") -> bool:
-        """Port of ``isCommandEnabled`` — defaults to True."""
-
-        if self.is_enabled_fn is not None:
-            return self.is_enabled_fn(rt)
-        return True
-
-    def hidden(self, rt: "CommandRuntime") -> bool:
-        if self.is_hidden_fn is not None:
-            return self.is_hidden_fn(rt)
-        return self._is_hidden
-
-    def resolved_description(self, rt: "CommandRuntime") -> str:
-        if self.description_fn is not None:
-            return self.description_fn(rt)
-        return self.description
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "aliases", tuple(self.aliases))
+        if self.availability is not None:
+            object.__setattr__(self, "availability", tuple(self.availability))
+        object.__setattr__(self, "allowed_tools", tuple(self.allowed_tools))
+        if self.arg_names is not None:
+            object.__setattr__(self, "arg_names", tuple(self.arg_names))
 
     def user_facing_name(self) -> str:
         """Port of ``getCommandName`` — defaults to ``name``."""
@@ -169,79 +162,24 @@ class Command:
         return token == self.name or token in self.aliases
 
 
-@dataclass
+@dataclass(frozen=True, slots=True, kw_only=True)
 class LocalCommand(Command):
-    """``type: 'local'`` — computes locally and returns a :class:`LocalCommandResult`."""
+    """Metadata for a ``local`` command."""
 
-    supports_non_interactive: bool = False
-    # call(args, runtime) -> LocalCommandResult
-    call_fn: Optional[Callable[[str, "CommandRuntime"], Any]] = None
-
-    def __post_init__(self) -> None:
-        self.type = CommandType.LOCAL
-
-    async def call(self, args: str, rt: "CommandRuntime") -> LocalCommandResult:
-        if self.call_fn is None:
-            raise NotImplementedError(f"local command '{self.name}' has no call implementation")
-        result = self.call_fn(args, rt)
-        return await _maybe_await(result)
+    type: CommandType = field(default=CommandType.LOCAL, init=False)
 
 
-@dataclass
+@dataclass(frozen=True, slots=True, kw_only=True)
 class PromptCommand(Command):
-    """``type: 'prompt'`` — expands into content blocks sent to the model."""
+    """Metadata for a ``prompt`` command."""
 
-    progress_message: str = ""
-    content_length: int = 0
-    allowed_tools: list[str] = field(default_factory=list)
-    arg_names: Optional[list[str]] = None
-    model: Optional[str] = None
-    source: str = "builtin"
-    disable_non_interactive: bool = False
-    # get_prompt_for_command(args, runtime) -> list[ContentBlock]
-    get_prompt_fn: Optional[Callable[[str, "CommandRuntime"], Any]] = None
-
-    def __post_init__(self) -> None:
-        self.type = CommandType.PROMPT
-
-    async def get_prompt_for_command(self, args: str, rt: "CommandRuntime") -> list[ContentBlock]:
-        if self.get_prompt_fn is None:
-            raise NotImplementedError(f"prompt command '{self.name}' has no prompt implementation")
-        result = self.get_prompt_fn(args, rt)
-        return await _maybe_await(result)
+    type: CommandType = field(default=CommandType.PROMPT, init=False)
+    supports_non_interactive: bool = True
+    source: Optional[str] = "builtin"
 
 
-@dataclass
+@dataclass(frozen=True, slots=True, kw_only=True)
 class LocalJsxCommand(Command):
-    """``type: 'local-jsx'`` — interactive/TUI command, ported headlessly.
+    """Metadata for a ``local-jsx`` command."""
 
-    ``call`` performs any non-UI side effect via the runtime and returns a
-    :class:`JsxOutcome` describing what the terminal dialog would have surfaced.
-    """
-
-    # call(args, runtime) -> JsxOutcome
-    call_fn: Optional[Callable[[str, "CommandRuntime"], Any]] = None
-
-    def __post_init__(self) -> None:
-        self.type = CommandType.LOCAL_JSX
-
-    async def call(self, args: str, rt: "CommandRuntime") -> JsxOutcome:
-        if self.call_fn is None:
-            # A pure dialog with no headless action still reports its intent.
-            return JsxOutcome(dialog=self.name)
-        result = self.call_fn(args, rt)
-        return await _maybe_await(result)
-
-
-async def _maybe_await(value: Any) -> Any:
-    """Await ``value`` if it is awaitable, else return it as-is.
-
-    Lets command implementations be plain ``def`` or ``async def`` interchangeably,
-    the way TS command bodies are all async but many do no real awaiting.
-    """
-
-    import inspect
-
-    if inspect.isawaitable(value):
-        return await value
-    return value
+    type: CommandType = field(default=CommandType.LOCAL_JSX, init=False)

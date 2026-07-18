@@ -28,7 +28,19 @@ import os
 
 def _alpha_enabled() -> bool:
     return os.environ.get("MEM0_ALPHA_ENABLED", "0").strip().lower() in (
-        "1", "true", "on", "yes",
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+
+
+if (
+    _alpha_enabled()
+    and os.environ.get("MEM0_INTEGRITY_MODE", "legacy").lower() != "legacy"
+):
+    raise RuntimeError(
+        "MEM0_ALPHA_ENABLED cannot be combined with shadow/canonical integrity mode",
     )
 
 
@@ -43,10 +55,12 @@ if _alpha_enabled():
     import sys
 
     from services.mem0 import _config_bridge
+
     _config_bridge.apply()
 
     from llm_mem0.auth import set_auth_backend
     from services.mem0.auth_backend import BotOAuthBackend
+
     set_auth_backend(BotOAuthBackend())
 
     # 旧 client 実体(services/mem0/client.py)を本来の名前で先にロードして
@@ -54,6 +68,7 @@ if _alpha_enabled():
     # sys.modules を差し替える。
     from services.mem0 import client as _client_orig
     from services.mem0 import client_alpha as _client_facade
+
     _client_facade.bind(_client_orig)
 
     _this = sys.modules[__name__]
@@ -63,11 +78,29 @@ if _alpha_enabled():
     # 実体 llm_mem0.search の名前空間に届く。cli_compat は bot 実体のまま
     # (課金ルーティング — mem0 外の7ファイルも利用)、client はファサード。
     _ALPHA_ALIASES = (
-        "search", "dedup", "conflict", "morpho", "bm25_index",
-        "attribute_registry", "fact_store", "graph", "history_embed",
-        "history_index", "reinforce", "priming", "decay", "replay",
-        "format", "ingest", "extract", "batch",
-        "llm", "settings", "sqlite_store", "atomic_write", "sanitize",
+        "search",
+        "dedup",
+        "conflict",
+        "morpho",
+        "bm25_index",
+        "attribute_registry",
+        "fact_store",
+        "graph",
+        "history_embed",
+        "history_index",
+        "reinforce",
+        "priming",
+        "decay",
+        "replay",
+        "format",
+        "ingest",
+        "extract",
+        "batch",
+        "llm",
+        "settings",
+        "sqlite_store",
+        "atomic_write",
+        "sanitize",
     )
     for _name in _ALPHA_ALIASES:
         _mod = importlib.import_module(f"llm_mem0.{_name}")
@@ -76,6 +109,17 @@ if _alpha_enabled():
 
     sys.modules["services.mem0.client"] = _client_facade
     _this.client = _client_facade
+
+    # Modules in llm_mem0 bind ``_get_mem0`` at import time. Route those
+    # bindings through the facade dynamically so the documented
+    # ``services.mem0.client._get_mem0`` monkeypatch surface remains effective.
+    def _get_mem0_via_facade():
+        return _client_facade._get_mem0()
+
+    for _name in ("ingest", "search", "decay", "replay"):
+        _module = getattr(_this, _name, None)
+        if _module is not None and hasattr(_module, "_get_mem0"):
+            _module._get_mem0 = _get_mem0_via_facade
 
     from llm_mem0 import (
         add_memories,
@@ -119,6 +163,15 @@ else:
         search_memories_smart,
         should_use_memory_llm_mode,
     )
+
+from services.mem0.integrity import (
+    CanonicalRepository,
+    MemoryApplicationService,
+    ensure_projection_consumer,
+    get_application_service,
+    get_repository,
+    shutdown_projection_consumers,
+)
 
 __all__ = [
     "MEM0_RELEVANCE_MAX_DISTANCE",

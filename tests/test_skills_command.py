@@ -31,7 +31,8 @@ def _interaction(*, user_id: int = USER, channel_id: int | None = CHANNEL):
     return SimpleNamespace(
         user=SimpleNamespace(id=user_id, name="user", display_name="user"),
         channel_id=channel_id,
-        response=SimpleNamespace(send_message=AsyncMock()),
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
         original_response=AsyncMock(
             return_value=SimpleNamespace(edit=AsyncMock()),
         ),
@@ -113,7 +114,9 @@ async def test_off_clears_only_callers_selection() -> None:
 
 async def test_default_action_opens_ephemeral_menu(monkeypatch) -> None:
     command, _deps = _register()
-    monkeypatch.setattr(skills_command, "user_invocable_skills", lambda **_kw: _skills())
+    monkeypatch.setattr(
+        skills_command, "user_invocable_skills", lambda **_kw: _skills()
+    )
     interaction = _interaction()
 
     await command(interaction)
@@ -188,4 +191,5 @@ async def test_clear_command_removes_channel_skill_selections(monkeypatch) -> No
     assert (CHANNEL, USER) not in overrides
     assert (CHANNEL, USER + 1) not in overrides
     assert overrides[(CHANNEL + 1, USER)] == SkillSelection("other")
-    assert "active skill 2 件" in interaction.response.send_message.await_args.args[0]
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    assert "active skill 2 件" in interaction.followup.send.await_args.args[0]

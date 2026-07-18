@@ -9,26 +9,35 @@ StartLimitAction=none
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/home/ubuntu/discord-bot
-EnvironmentFile=/home/ubuntu/discord-bot/.env
+User=kanae-intervention
+Group=kanae-intervention
+SupplementaryGroups=kanae-code
+WorkingDirectory=/var/lib/discord-bot-releases/prod/current/src
+EnvironmentFile=/etc/discord-bot/credentials/intervention.env
+Environment=HOME=/var/lib/kanae-intervention
+Environment=BOT_STATE_DIR=/var/lib/kanae-intervention/state
+Environment=PYTHON_DOTENV_DISABLED=1
+StateDirectory=kanae-intervention kanae-intervention/state
+StateDirectoryMode=0700
 # 30分境界・薄商い判定が datetime.now() 依存のため TZ を明示固定
 Environment=TZ=Asia/Tokyo
-ExecStart=/home/ubuntu/discord-bot/.venv/bin/python -m services.intervention_scheduler
+ExecStart=/var/lib/discord-bot-releases/prod/current/venv/bin/python -m services.intervention_scheduler
 Restart=on-failure
 RestartSec=10s
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=intervention-scheduler
+UMask=0007
 
 # Security hardening (vi-signal-scheduler.service を踏襲)
 NoNewPrivileges=yes
 PrivateTmp=no
 ProtectSystem=strict
 ProtectHome=read-only
-# scheduler はリポジトリ配下 (.state/intervention_alert.log への追記) のみ書き込む
-ReadWritePaths=/home/ubuntu/discord-bot
+# Legacy .state paths are redirected inside this mount namespace to the
+# scheduler's private state directory; no other service UID can replace them.
+BindPaths=/var/lib/kanae-intervention/state:/var/lib/discord-bot-releases/prod/current/src/.state
+ReadWritePaths=/var/lib/kanae-intervention
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

@@ -8,23 +8,29 @@ StartLimitAction=none
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
+User=kanae-opencode
+Group=kanae-opencode
+SupplementaryGroups=kanae-code
 WorkingDirectory=/home/ubuntu
 Environment=PATH=/home/ubuntu/.opencode/bin:/home/ubuntu/.volta/bin:/home/ubuntu/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=HOME=/home/ubuntu
-EnvironmentFile=-/home/ubuntu/discord-bot/.env
+Environment=HOME=/var/lib/kanae-opencode
+EnvironmentFile=/etc/discord-bot/credentials/remote-opencode.env
+StateDirectory=kanae-opencode
+StateDirectoryMode=0700
+CacheDirectory=kanae-opencode
+CacheDirectoryMode=0700
 ExecStart=/home/ubuntu/.volta/bin/remote-opencode start
 Restart=always
 RestartSec=10s
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=remote-opencode
+UMask=0077
 
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/ubuntu/.remote-opencode /home/ubuntu/.npm /home/ubuntu/.cache /home/ubuntu/.opencode /home/ubuntu/.local /home/ubuntu/discord-bot /tmp
+ReadWritePaths=/var/lib/kanae-opencode /var/cache/kanae-opencode /tmp
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

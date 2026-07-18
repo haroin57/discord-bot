@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """Entry point — matches free-code entrypoints/ pattern."""
 
-import atexit
-import fcntl
 import logging
 import logging.handlers
 import os
 import queue
-import sys
 
-from config import BOT_DIR, DISCORD_TOKEN, STATE_DIR, validate_discord_token
+from services.runtime_bootstrap import (
+    DiscordTokenError,
+    PidFileLock,
+    RootLifecycle,
+    RuntimeBootstrap,
+    RuntimeSettings,
+)
+
+_runtime_bootstrap = RuntimeBootstrap()
 # cleanup_stale_attachments is now scheduled from bot.on_ready (Phase G/D5);
 # main.py no longer needs the import.
+
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_DIR = os.path.join(BOT_DIR, ".state")
 
 _LOG_LEVEL = os.environ.get("BOT_LOG_LEVEL", "INFO").upper()
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
@@ -22,9 +30,11 @@ _LOG_PATH = os.environ.get("BOT_LOG_PATH") or os.path.join(BOT_DIR, "bot.log")
 # Hold a strong reference to the QueueListener so its background thread
 # isn't GC'd and can be cleanly stopped at process exit.
 _log_listener: logging.handlers.QueueListener | None = None
+_root_lifecycle: RootLifecycle | None = None
+_QUEUE_HANDLER_OWNER = "discord-bot-root-queue-v1"
 
 
-def _setup_logging() -> None:
+def _setup_logging(lifecycle: RootLifecycle | None = None) -> None:
     """Initialize root logger with QueueHandler-based async file output.
 
     IMPORTANT: This must only run when the bot is actually launched, never
@@ -36,9 +46,39 @@ def _setup_logging() -> None:
     indirection also lifts the synchronous disk write off the asyncio event
     loop — log records are handed to a worker thread instead.
     """
-    global _log_listener
+    global _log_listener, _root_lifecycle
+
+    owner = lifecycle or _root_lifecycle
+    if owner is None:
+        owner = RootLifecycle()
+        owner.arm_atexit()
+        _root_lifecycle = owner
 
     root_logger = logging.getLogger()
+    for existing in list(root_logger.handlers):
+        if (
+            getattr(existing, "_discord_bot_logging_owner", None)
+            != _QUEUE_HANDLER_OWNER
+        ):
+            continue
+        listener = getattr(existing, "_discord_bot_listener", None)
+        downstream = getattr(existing, "_discord_bot_downstream", ())
+        if listener is not None and getattr(listener, "_thread", None) is not None:
+            root_logger.setLevel(_LOG_LEVEL)
+            _log_listener = listener
+            owner.own_logging(
+                logger=root_logger,
+                handler=existing,
+                listener=listener,
+                downstream=downstream,
+            )
+            return
+        root_logger.removeHandler(existing)
+        existing.close()
+        for child in downstream:
+            child.close()
+
+    previous_level = root_logger.level
     root_logger.setLevel(_LOG_LEVEL)
     formatter = logging.Formatter(_LOG_FORMAT)
 
@@ -64,71 +104,120 @@ def _setup_logging() -> None:
         log_queue, *real_handlers, respect_handler_level=True
     )
     listener.start()
+    setattr(queue_handler, "_discord_bot_logging_owner", _QUEUE_HANDLER_OWNER)
+    setattr(queue_handler, "_discord_bot_previous_level", previous_level)
+    setattr(queue_handler, "_discord_bot_listener", listener)
+    setattr(queue_handler, "_discord_bot_downstream", tuple(real_handlers))
     _log_listener = listener
-    atexit.register(listener.stop)
+    owner.own_logging(
+        logger=root_logger,
+        handler=queue_handler,
+        listener=listener,
+        downstream=tuple(real_handlers),
+    )
 
 
 PIDFILE = os.path.join(STATE_DIR, "bot.pid")
-_pidfile_handle = None  # keep FD alive so flock persists for the process lifetime
+_pidfile_handle: PidFileLock | None = None
 
 
-def _acquire_pidlock() -> None:
+def _acquire_pidlock(lifecycle: RootLifecycle | None = None) -> None:
     """Prevent duplicate bot processes via flock-based PID file (race-free)."""
-    global _pidfile_handle
-    fh = open(PIDFILE, "a+")
+    global _pidfile_handle, _root_lifecycle
+    lock = PidFileLock(PIDFILE)
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock.acquire()
     except BlockingIOError:
-        fh.seek(0)
-        old_pid = fh.read().strip()
-        print(
-            f"ERROR: Bot already running (PID {old_pid or '?'}). "
-            f"Kill it first or remove {PIDFILE}"
-        )
-        sys.exit(1)
-    # Lock acquired; rewrite our PID.
-    fh.seek(0)
-    fh.truncate()
-    fh.write(str(os.getpid()))
-    fh.flush()
-    _pidfile_handle = fh
+        print(f"ERROR: Bot already running (PID ?). Kill it first or remove {PIDFILE}")
+        raise SystemExit(1) from None
+    _pidfile_handle = lock
 
-    def _release():
-        try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
-        try:
-            fh.close()
-        except Exception:
-            pass
-        try:
-            if os.path.isfile(PIDFILE):
-                os.unlink(PIDFILE)
-        except OSError:
-            pass
+    def _release() -> None:
+        global _pidfile_handle
+        lock.close()
+        if _pidfile_handle is lock:
+            _pidfile_handle = None
 
-    atexit.register(_release)
+    owner = lifecycle or _root_lifecycle
+    if owner is None:
+        owner = RootLifecycle()
+        owner.arm_atexit()
+        _root_lifecycle = owner
+    owner.callback("pidfile", _release)
+
+
+def _configure_runtime_paths(settings: RuntimeSettings) -> None:
+    """Install initialized paths without importing config at module import."""
+    global BOT_DIR, STATE_DIR, PIDFILE, _LOG_PATH
+    BOT_DIR = settings.bot_dir
+    STATE_DIR = settings.state_dir
+    PIDFILE = os.path.join(settings.state_dir, "bot.pid")
+    if not os.environ.get("BOT_LOG_PATH"):
+        _LOG_PATH = os.path.join(settings.bot_dir, "bot.log")
 
 
 def main():
-    _setup_logging()
-
+    global _root_lifecycle
+    lifecycle = RootLifecycle()
+    lifecycle.arm_atexit()
+    _root_lifecycle = lifecycle
     try:
-        validate_discord_token()
-    except RuntimeError as e:
+        runtime_settings = _runtime_bootstrap.initialize()
+    except DiscordTokenError as e:
+        lifecycle.close()
         print(f"ERROR: {e}")
         print("  Create a .env file with: DISCORD_TOKEN=your_discord_bot_token_here")
         raise SystemExit(1) from e
+    except BaseException:
+        try:
+            _runtime_bootstrap.shutdown_sync()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "runtime cleanup failed after initialization error"
+            )
+        lifecycle.close()
+        raise
 
-    _acquire_pidlock()
-    # cleanup_stale_attachments moved into bot.on_ready (Phase G/D5) so the
-    # event loop is available; running it sync here blocked startup on a
-    # large tmpdir.
+    _configure_runtime_paths(runtime_settings)
+    primary_error: BaseException | None = None
+    try:
+        _setup_logging()
+        _acquire_pidlock()
+        # cleanup_stale_attachments moved into bot.on_ready (Phase G/D5) so the
+        # event loop is available; running it sync here blocked startup on a
+        # large tmpdir.
 
-    # Import bot here to trigger setup and event registration
-    from bot import bot
-    bot.run(DISCORD_TOKEN)
+        # Import bot here to trigger setup and event registration.
+        from bot import bot
+
+        bot.run(runtime_settings.discord_token)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        shutdown_error: Exception | None = None
+        try:
+            _runtime_bootstrap.shutdown_sync()
+        except Exception as exc:
+            shutdown_error = exc
+            if primary_error is not None:
+                logging.getLogger(__name__).exception(
+                    "runtime cleanup failed while propagating the primary error"
+                )
+        lifecycle_error: Exception | None = None
+        try:
+            lifecycle.close()
+        except Exception as exc:
+            lifecycle_error = exc
+            if primary_error is not None:
+                logging.getLogger(__name__).exception(
+                    "root lifecycle cleanup failed while propagating the primary error"
+                )
+        if primary_error is None:
+            if shutdown_error is not None:
+                raise shutdown_error
+            if lifecycle_error is not None:
+                raise lifecycle_error
 
 
 if __name__ == "__main__":

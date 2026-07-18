@@ -17,8 +17,9 @@ keeps both and resolves by enablement (see ``CommandRegistry.resolve``).
 
 from __future__ import annotations
 
+from ..registry import _local_jsx_command, _metadata_catalog
 from ..runtime import CommandRuntime
-from ..types import JsxOutcome, LocalJsxCommand
+from ..types import JsxOutcome
 
 # Terminals that natively support CSI u / Kitty keyboard protocol — /terminal-setup
 # hides itself on these (port of NATIVE_CSIU_TERMINALS in terminalSetup/index.ts).
@@ -45,11 +46,11 @@ def _dialog(name: str):
     return _call
 
 
-def _jsx(name: str, description: str, **kw) -> LocalJsxCommand:
+def _jsx(name: str, description: str, **kw):
     """Construct a local-jsx command with the default dialog-opening ``call``."""
 
     kw.setdefault("call_fn", _dialog(name))
-    return LocalJsxCommand(name=name, description=description, **kw)
+    return _local_jsx_command(name=name, description=description, **kw)
 
 
 def _mcp_summary(rows: list[dict]) -> str:
@@ -87,8 +88,10 @@ async def _mcp_call(args: str, rt: CommandRuntime) -> JsxOutcome:
             "Use status, reconnect, tools, enable, or disable."
         )
     if len(parts) != 2:
-        return finish(f"Usage: /mcp {action} <server"
-                      + ("|all>" if action in {"enable", "disable"} else ">"))
+        return finish(
+            f"Usage: /mcp {action} <server"
+            + ("|all>" if action in {"enable", "disable"} else ">")
+        )
 
     target = parts[1]
     try:
@@ -107,7 +110,8 @@ async def _mcp_call(args: str, rt: CommandRuntime) -> JsxOutcome:
             names = rt.mcp_tool_names(target)
             message = (
                 f"{target}: {len(names)} tools"
-                if names else f"{target}: no known tools; run reconnect to probe."
+                if names
+                else f"{target}: no known tools; run reconnect to probe."
             )
             return finish(message, server=target, tools=names)
 
@@ -124,7 +128,7 @@ async def _mcp_call(args: str, rt: CommandRuntime) -> JsxOutcome:
         return finish(f"Unknown MCP server: {target}", server=target)
 
 
-COMMANDS: list[LocalJsxCommand] = [
+_DEFINITIONS = (
     # add-dir/index.ts
     _jsx("add-dir", "Add a new working directory", argument_hint="<path>"),
     # agents/index.ts
@@ -204,7 +208,9 @@ COMMANDS: list[LocalJsxCommand] = [
         argument_hint="[on|off]",
         is_enabled_fn=lambda rt: rt.fast_mode_enabled(),
         is_hidden_fn=lambda rt: not rt.fast_mode_enabled(),
-        description_fn=lambda rt: f"Toggle fast mode ({rt.fast_mode_model_display()} only)",
+        description_fn=lambda rt: (
+            f"Toggle fast mode ({rt.fast_mode_model_display()} only)"
+        ),
     ),
     # feedback/index.ts — aliases ['bug']; disabled on 3P back ends / opt-outs
     _jsx(
@@ -212,14 +218,16 @@ COMMANDS: list[LocalJsxCommand] = [
         "Submit feedback about Claude Code",
         aliases=["bug"],
         argument_hint="[report]",
-        is_enabled_fn=lambda rt: not (
-            rt.env_truthy("CLAUDE_CODE_USE_BEDROCK")
-            or rt.env_truthy("CLAUDE_CODE_USE_VERTEX")
-            or rt.env_truthy("CLAUDE_CODE_USE_FOUNDRY")
-            or rt.env_truthy("DISABLE_FEEDBACK_COMMAND")
-            or rt.env_truthy("DISABLE_BUG_COMMAND")
-            or rt.is_ant()
-            or not rt.policy_allowed("allow_product_feedback")
+        is_enabled_fn=lambda rt: (
+            not (
+                rt.env_truthy("CLAUDE_CODE_USE_BEDROCK")
+                or rt.env_truthy("CLAUDE_CODE_USE_VERTEX")
+                or rt.env_truthy("CLAUDE_CODE_USE_FOUNDRY")
+                or rt.env_truthy("DISABLE_FEEDBACK_COMMAND")
+                or rt.env_truthy("DISABLE_BUG_COMMAND")
+                or rt.is_ant()
+                or not rt.policy_allowed("allow_product_feedback")
+            )
         ),
     ),
     # help/index.ts
@@ -233,7 +241,9 @@ COMMANDS: list[LocalJsxCommand] = [
         "install-github-app",
         "Set up Claude GitHub Actions for a repository",
         availability=["claude-ai", "console"],
-        is_enabled_fn=lambda rt: not rt.env_truthy("DISABLE_INSTALL_GITHUB_APP_COMMAND"),
+        is_enabled_fn=lambda rt: (
+            not rt.env_truthy("DISABLE_INSTALL_GITHUB_APP_COMMAND")
+        ),
     ),
     # mcp/index.ts
     _jsx(
@@ -270,10 +280,13 @@ COMMANDS: list[LocalJsxCommand] = [
     _jsx(
         "remote-env",
         "Configure the default remote environment for teleport sessions",
-        is_enabled_fn=lambda rt: rt.is_claude_ai_subscriber()
-        and rt.policy_allowed("allow_remote_sessions"),
-        is_hidden_fn=lambda rt: not rt.is_claude_ai_subscriber()
-        or not rt.policy_allowed("allow_remote_sessions"),
+        is_enabled_fn=lambda rt: (
+            rt.is_claude_ai_subscriber() and rt.policy_allowed("allow_remote_sessions")
+        ),
+        is_hidden_fn=lambda rt: (
+            not rt.is_claude_ai_subscriber()
+            or not rt.policy_allowed("allow_remote_sessions")
+        ),
     ),
     # plugin/index.tsx
     _jsx(
@@ -335,8 +348,9 @@ COMMANDS: list[LocalJsxCommand] = [
     _jsx(
         "terminal-setup",
         "Install Shift+Enter key binding for newlines",
-        is_hidden_fn=lambda rt: rt.terminal() is not None
-        and rt.terminal() in _NATIVE_CSIU_TERMINALS,
+        is_hidden_fn=lambda rt: (
+            rt.terminal() is not None and rt.terminal() in _NATIVE_CSIU_TERMINALS
+        ),
         description_fn=lambda rt: (
             "Enable Option+Enter key binding for newlines and visual bell"
             if rt.terminal() == "Apple_Terminal"
@@ -348,16 +362,20 @@ COMMANDS: list[LocalJsxCommand] = [
         "upgrade",
         "Upgrade to Max for higher rate limits and more Opus",
         availability=["claude-ai"],
-        is_enabled_fn=lambda rt: not rt.env_truthy("DISABLE_UPGRADE_COMMAND")
-        and rt.subscription_type() != "enterprise",
+        is_enabled_fn=lambda rt: (
+            not rt.env_truthy("DISABLE_UPGRADE_COMMAND")
+            and rt.subscription_type() != "enterprise"
+        ),
     ),
     # extra-usage/index.ts (interactive twin of the local `extra-usage`)
     _jsx(
         "extra-usage",
         "Configure extra usage to keep working when limits are hit",
-        is_enabled_fn=lambda rt: rt.is_overage_provisioning_allowed()
-        and not rt.env_truthy("DISABLE_EXTRA_USAGE_COMMAND")
-        and not rt.is_non_interactive(),
+        is_enabled_fn=lambda rt: (
+            rt.is_overage_provisioning_allowed()
+            and not rt.env_truthy("DISABLE_EXTRA_USAGE_COMMAND")
+            and not rt.is_non_interactive()
+        ),
     ),
     # rate-limit-options/index.ts — internal, hidden
     _jsx(
@@ -411,13 +429,18 @@ COMMANDS: list[LocalJsxCommand] = [
     _jsx(
         "logout",
         "Sign out from your Anthropic account",
-        is_enabled_fn=lambda rt: not rt.env_truthy("DISABLE_LOGOUT_COMMAND"),
+        is_enabled_fn=lambda rt: (
+            not rt.is_using_3p_services()
+            and not rt.env_truthy("DISABLE_LOGOUT_COMMAND")
+        ),
     ),
     # login/index.ts — dynamic description; only registered when not on 3P services
     _jsx(
         "login",
         "Sign in with your Anthropic account",
-        is_enabled_fn=lambda rt: not rt.env_truthy("DISABLE_LOGIN_COMMAND"),
+        is_enabled_fn=lambda rt: (
+            not rt.is_using_3p_services() and not rt.env_truthy("DISABLE_LOGIN_COMMAND")
+        ),
         description_fn=lambda rt: (
             "Switch Anthropic accounts"
             if rt.has_anthropic_api_key_auth()
@@ -437,4 +460,6 @@ COMMANDS: list[LocalJsxCommand] = [
     ),
     # tasks/index.ts
     _jsx("tasks", "List and manage background tasks", aliases=["bashes"]),
-]
+)
+
+COMMANDS = _metadata_catalog(_DEFINITIONS)
