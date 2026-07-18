@@ -18,12 +18,14 @@ import re
 
 from config import (
     ADMIN_USER_IDS,
+    AGENTIC_INBOX_ALLOWED_USER_IDS,
     MCP_SERVERS,
     MCP_SERVERS_BASE,
     MCP_SERVERS_DOCS,
     MCP_SERVERS_HEAVY,
     MCP_SERVERS_INSHI,
     MCP_SERVERS_IOT,
+    MCP_SERVERS_MAIL,
     MCP_SERVERS_MEMORY,
     MCP_SERVERS_PAPER,
     MCP_SERVERS_REALESTATE,
@@ -128,6 +130,13 @@ _INSHI_TRIGGERS = tuple(kw.lower() for kw in (
     "ポンピング", "双対", "シンプレックス", "mle", "採点",
 ))
 
+# MAIL tier — agentic-inbox（haroin 個人の Workers メールサーバ）。メール操作を
+# 語った時だけ、AGENTIC_INBOX_ALLOWED_USER_IDS の user のみ接続（fail-closed）。
+_MAIL_TRIGGERS = tuple(kw.lower() for kw in (
+    "メール", "mail", "inbox", "受信箱", "受信トレイ", "下書き", "draft",
+    "件名", "宛先", "差出人", "返信して", "agentic",
+))
+
 
 def get_mcp_servers_by_keys(keys: list[str]) -> dict:
     """Reconstruct MCP server config dict from a list of server name keys."""
@@ -177,6 +186,14 @@ def pick_mcp_servers(raw_user_text: str, user_id: int | None = None) -> dict:
         and any(kw in text for kw in _IOT_TRIGGERS)
     ):
         servers.update(MCP_SERVERS_IOT)
+    # MAIL は admin 全員ではなく AGENTIC_INBOX_ALLOWED_USER_IDS だけ
+    # （haroin 個人の受信箱。送信系ツールも生えているので二重に絞る）。
+    if (
+        user_id is not None
+        and user_id in AGENTIC_INBOX_ALLOWED_USER_IDS
+        and any(kw in text for kw in _MAIL_TRIGGERS)
+    ):
+        servers.update(MCP_SERVERS_MAIL)
     return filter_enabled_mcp_configs(servers)
 
 

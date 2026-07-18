@@ -1,11 +1,27 @@
 """Configuration and constants — matches free-code constants/ pattern."""
 
 import os
-import tempfile
 
-from dotenv import load_dotenv
 
-load_dotenv()
+def _parse_int_setting(
+    name: str,
+    default: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    """Parse a named integer setting with a stable startup error."""
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if minimum is not None and value < minimum:
+        raise RuntimeError(f"{name} must be at least {minimum}")
+    if maximum is not None and value > maximum:
+        raise RuntimeError(f"{name} must be at most {maximum}")
+    return value
+
 
 # ---------------------------------------------------------------------------
 # Discord
@@ -32,11 +48,16 @@ COOLDOWN_SECONDS = int(os.environ.get("BOT_COOLDOWN", "5"))
 RESTRICTED_COOLDOWN_SECONDS = int(os.environ.get("BOT_RESTRICTED_COOLDOWN", "30"))
 # Per-user daily quota for non-admins (messages-per-24h). 0 disables.
 RESTRICTED_DAILY_QUOTA = int(os.environ.get("BOT_RESTRICTED_DAILY_QUOTA", "30"))
-_raw_keywords = [s.strip() for s in os.environ.get("BOT_KEYWORDS", "かなえ").split(",") if s.strip()]
+_raw_keywords = [
+    s.strip() for s in os.environ.get("BOT_KEYWORDS", "かなえ").split(",") if s.strip()
+]
 BOT_KEYWORDS = [kw for kw in _raw_keywords if len(kw) >= 3]
 if len(BOT_KEYWORDS) < len(_raw_keywords):
     import warnings
-    warnings.warn("BOT_KEYWORDS entries shorter than 3 chars were dropped", stacklevel=2)
+
+    warnings.warn(
+        "BOT_KEYWORDS entries shorter than 3 chars were dropped", stacklevel=2
+    )
 
 # Per-process routing isolation for deployments where multiple bot identities
 # share one guild. A message containing one of these role mentions cannot wake
@@ -54,9 +75,7 @@ if _invalid_ignored_role_ids:
     raise RuntimeError(
         "BOT_IGNORED_ROLE_IDS must contain only comma-separated integer IDs"
     )
-BOT_IGNORED_ROLE_IDS: set[int] = {
-    int(value) for value in _ignored_role_parts
-}
+BOT_IGNORED_ROLE_IDS: set[int] = {int(value) for value in _ignored_role_parts}
 
 ADMIN_USER_IDS: set[int] = set()
 _raw_ids = os.environ.get("ADMIN_USER_IDS", "")
@@ -74,7 +93,9 @@ if _raw_ids:
 # from other channels (b0nchichi DM, server channels) when labelling
 # speakers in history context. Optional.
 _raw_haroin_dm = os.environ.get("HAROIN_DM_CHANNEL_ID", "").strip()
-HAROIN_DM_CHANNEL_ID: int | None = int(_raw_haroin_dm) if _raw_haroin_dm.isdigit() else None
+HAROIN_DM_CHANNEL_ID: int | None = (
+    int(_raw_haroin_dm) if _raw_haroin_dm.isdigit() else None
+)
 
 # Stable per-user speaker labels for resume-history attribution. When two
 # admins share a channel, the JSONL transcript records each user turn's author
@@ -251,17 +272,18 @@ SERVER_SIDE_FALLBACK_ENABLED = os.environ.get(
 # cold-start fallback before a turn reports real token usage (the token trigger
 # below is the real gate). Raised 200K->240K alongside the token bump now that
 # Opus 4.8 (200K context, no Fable-style long-context refusal) is primary.
-HISTORY_COMPACT_ENABLED = os.environ.get(
-    "HISTORY_COMPACT_ENABLED", "1"
-) not in ("0", "false", "False", "")
+HISTORY_COMPACT_ENABLED = os.environ.get("HISTORY_COMPACT_ENABLED", "1") not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
 HISTORY_COMPACT_TRIGGER_CHARS = int(
     os.environ.get("HISTORY_COMPACT_TRIGGER_CHARS", "240000")
 )
 # How much of the newest history to keep verbatim ("Recent messages are
 # preserved verbatim" leg of the official CLI compact).
-HISTORY_COMPACT_KEEP_CHARS = int(
-    os.environ.get("HISTORY_COMPACT_KEEP_CHARS", "0")
-)
+HISTORY_COMPACT_KEEP_CHARS = int(os.environ.get("HISTORY_COMPACT_KEEP_CHARS", "0"))
 # The official CLI summarizes with the main-loop model; we deliberately use
 # the refusal-fallback model instead, because Fable 5 refuses exactly the
 # long contexts compaction exists to shrink.
@@ -287,9 +309,7 @@ HISTORY_COMPACT_EFFORT = os.environ.get("HISTORY_COMPACT_EFFORT", "medium")
 # The response format is now summary-only (no <analysis> scratchpad) and the
 # default effort is "medium", so real usage sits well under this — 48000 is
 # retained as generous headroom, under CLAUDE_MAX_TOKENS_OPUS (64000).
-HISTORY_COMPACT_MAX_TOKENS = int(
-    os.environ.get("HISTORY_COMPACT_MAX_TOKENS", "20000")
-)
+HISTORY_COMPACT_MAX_TOKENS = int(os.environ.get("HISTORY_COMPACT_MAX_TOKENS", "20000"))
 # ADR-0040: graceful checkpoint (ADR-0036) の自動継続。従来は turn 上限・実行
 # 予算・stream 停止で checkpoint すると、ユーザーが手で「続けて」と打つまで
 # 作業が止まっていた（UX 最悪、2026-07-08 指摘）。entry.py が paused_reason を
@@ -302,9 +322,7 @@ HISTORY_COMPACT_MAX_TOKENS = int(
 CHECKPOINT_AUTO_RESUME_ENABLED = os.environ.get(
     "CHECKPOINT_AUTO_RESUME_ENABLED", "1"
 ).lower() not in ("0", "false", "no", "off", "")
-CHECKPOINT_AUTO_RESUME_MAX = int(
-    os.environ.get("CHECKPOINT_AUTO_RESUME_MAX", "2")
-)
+CHECKPOINT_AUTO_RESUME_MAX = int(os.environ.get("CHECKPOINT_AUTO_RESUME_MAX", "2"))
 CHECKPOINT_AUTO_RESUME_BUDGET_MAX = int(
     os.environ.get("CHECKPOINT_AUTO_RESUME_BUDGET_MAX", "1")
 )
@@ -326,9 +344,12 @@ HISTORY_COMPACT_TRIGGER_TOKENS = int(
 # Raised to 500K alongside HISTORY_COMPACT_TRIGGER_TOKENS, gated on the
 # context-1m beta (see that constant). Without the 1M beta (200K window) this
 # MUST drop back to ~180K. 0 disables.
-PROACTIVE_COMPACT_ENABLED = os.environ.get(
-    "PROACTIVE_COMPACT_ENABLED", "1"
-) not in ("0", "false", "False", "")
+PROACTIVE_COMPACT_ENABLED = os.environ.get("PROACTIVE_COMPACT_ENABLED", "1") not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
 PROACTIVE_COMPACT_TRIGGER_TOKENS = int(
     os.environ.get("PROACTIVE_COMPACT_TRIGGER_TOKENS", "500000")
 )
@@ -345,16 +366,22 @@ PROACTIVE_COMPACT_HARD_PCT = int(os.environ.get("PROACTIVE_COMPACT_HARD_PCT", "9
 # MICROCOMPACT_KEEP_RECENT tool_result blocks in the replayed transcript are
 # replaced with a placeholder — a cheap, no-LLM token reclaim that runs before
 # the expensive full compaction. Message structure is preserved.
-MICROCOMPACT_ENABLED = os.environ.get(
-    "MICROCOMPACT_ENABLED", "1"
-) not in ("0", "false", "False", "")
+MICROCOMPACT_ENABLED = os.environ.get("MICROCOMPACT_ENABLED", "1") not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
 MICROCOMPACT_GAP_MIN = float(os.environ.get("MICROCOMPACT_GAP_MIN", "60"))
 MICROCOMPACT_KEEP_RECENT = int(os.environ.get("MICROCOMPACT_KEEP_RECENT", "5"))
 # Whether the context-1m beta is active (mirrors the gate in client.py). Drives
 # the model context window used by the model-window-based compaction threshold.
-CONTEXT_1M_ENABLED = os.environ.get(
-    "CONTEXT_1M_ENABLED", "1"
-) not in ("0", "false", "False", "")
+CONTEXT_1M_ENABLED = os.environ.get("CONTEXT_1M_ENABLED", "1") not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
 # free-code parity (autoCompact.ts:29,61): auto-compact 閾値の予約分。
 # threshold = window − min(model_max_output, RESERVED_SUMMARY_TOKENS) − AUTOCOMPACT_BUFFER_TOKENS
 # 本家は要約出力に 20K を予約し、さらに 13K のバッファを引く（1M窓で実効≈967K）。
@@ -364,7 +391,9 @@ AUTOCOMPACT_BUFFER_TOKENS = int(os.environ.get("AUTOCOMPACT_BUFFER_TOKENS", "130
 # CLI's CLAUDE_AUTOCOMPACT_PCT_OVERRIDE). 0 = use the reserve-based formula
 # (window − output − headroom, ≈ CLI et6). Set e.g. 50 to fire at half-window
 # (the old fixed 500K-on-1M behaviour) if per-turn cost matters more.
-HISTORY_COMPACT_PCT_OVERRIDE = float(os.environ.get("HISTORY_COMPACT_PCT_OVERRIDE", "0"))
+HISTORY_COMPACT_PCT_OVERRIDE = float(
+    os.environ.get("HISTORY_COMPACT_PCT_OVERRIDE", "0")
+)
 # Main-loop effort dial (2026-06-13 audit #4). The CLI default is "high" and
 # env-tunable (CLAUDE_CODE_EFFORT_LEVEL); the bot deliberately defaults to
 # "medium" (haroin's instruction — predictable per-turn latency) but the value
@@ -429,12 +458,18 @@ TOOL_LOOP_READONLY_SLACK = int(os.environ.get("TOOL_LOOP_READONLY_SLACK", "3"))
 # nudge を1回、hard で即 checkpoint 離脱。0 以下なら該当予算を無効化。
 # ウォールクロック (秒)。admin は長時間の自律作業を許容、restricted は厳格。
 REQUEST_WALLCLOCK_BUDGET_S = int(os.environ.get("REQUEST_WALLCLOCK_BUDGET_S", "1800"))
-RESTRICTED_WALLCLOCK_BUDGET_S = int(os.environ.get("RESTRICTED_WALLCLOCK_BUDGET_S", "120"))
+RESTRICTED_WALLCLOCK_BUDGET_S = int(
+    os.environ.get("RESTRICTED_WALLCLOCK_BUDGET_S", "120")
+)
 SUBAGENT_WALLCLOCK_BUDGET_S = int(os.environ.get("SUBAGENT_WALLCLOCK_BUDGET_S", "600"))
 # 累積出力トークン (footprint 上限)。Anthropic はサブスク OAuth 枠なのでドル予算では
 # なく footprint を有界に保つ意味。
-REQUEST_OUTPUT_TOKEN_BUDGET = int(os.environ.get("REQUEST_OUTPUT_TOKEN_BUDGET", "800000"))
-RESTRICTED_OUTPUT_TOKEN_BUDGET = int(os.environ.get("RESTRICTED_OUTPUT_TOKEN_BUDGET", "40000"))
+REQUEST_OUTPUT_TOKEN_BUDGET = int(
+    os.environ.get("REQUEST_OUTPUT_TOKEN_BUDGET", "800000")
+)
+RESTRICTED_OUTPUT_TOKEN_BUDGET = int(
+    os.environ.get("RESTRICTED_OUTPUT_TOKEN_BUDGET", "40000")
+)
 # soft 閾値 = 予算 * この係数。到達で1回だけ wrap-up nudge。
 REQUEST_BUDGET_SOFT_RATIO = float(os.environ.get("REQUEST_BUDGET_SOFT_RATIO", "0.8"))
 
@@ -446,9 +481,12 @@ REQUEST_BUDGET_SOFT_RATIO = float(os.environ.get("REQUEST_BUDGET_SOFT_RATIO", "0
 # ---------------------------------------------------------------------------
 # Master switch for the text-form invoke RESCUE (parse the <invoke> and execute
 # it as a real tool_use). Off → pure corrective re-prompt (legacy behaviour).
-TEXT_INVOKE_RESCUE_ENABLED = os.environ.get(
-    "TEXT_INVOKE_RESCUE_ENABLED", "1"
-) not in ("0", "false", "False", "")
+TEXT_INVOKE_RESCUE_ENABLED = os.environ.get("TEXT_INVOKE_RESCUE_ENABLED", "1") not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
 # Per-loop cap on rescue executions (A). Bounds a model that only ever emits
 # text-form calls; max_turns is the outer backstop.
 MAX_TEXT_INVOKE_RESCUES = int(os.environ.get("MAX_TEXT_INVOKE_RESCUES", "3"))
@@ -489,7 +527,12 @@ from config.paths import (  # noqa: F401,E402
     _ensure_mode_700,
 )
 
-INVEST_KB_ENABLED = os.environ.get("INVEST_KB_ENABLED", "1") not in ("0", "false", "False", "")
+INVEST_KB_ENABLED = os.environ.get("INVEST_KB_ENABLED", "1") not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
 INVEST_KB_LIMIT = int(os.environ.get("INVEST_KB_LIMIT", "3"))
 # auto | always | off — gate that decides whether to fire Haiku rewrite/HyDE/
 # rerank on this turn. "auto" uses services.invest_kb.search.is_investment_query.
@@ -517,6 +560,15 @@ MAX_HISTORY = 50
 # Mem0's job (ingest/recall hardened the same day), not this short-term tail.
 MAX_MESSAGES_PER_CHANNEL = int(os.environ.get("MAX_MESSAGES_PER_CHANNEL", "125"))
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_ATTACHMENT_IMAGE_WIDTH = max(
+    1, int(os.environ.get("MAX_ATTACHMENT_IMAGE_WIDTH", "8192"))
+)
+MAX_ATTACHMENT_IMAGE_HEIGHT = max(
+    1, int(os.environ.get("MAX_ATTACHMENT_IMAGE_HEIGHT", "8192"))
+)
+MAX_ATTACHMENT_IMAGE_PIXELS = max(
+    1, int(os.environ.get("MAX_ATTACHMENT_IMAGE_PIXELS", "16777216"))
+)
 MAX_RESOLVED_LINKS = 5
 MAX_RESPONSE_IMAGES = 10
 MAX_COOLDOWN_ENTRIES = 1000
@@ -526,14 +578,20 @@ ATTACHMENT_DL_CONCURRENCY = int(os.environ.get("ATTACHMENT_DL_CONCURRENCY", "3")
 THREAD_HISTORY_LIMIT = int(os.environ.get("THREAD_HISTORY_LIMIT", "100"))
 THREAD_CONTEXT_CACHE_TTL_S = int(os.environ.get("THREAD_CONTEXT_CACHE_TTL_S", "30"))
 THREAD_CONTEXT_CACHE_MAX = int(os.environ.get("THREAD_CONTEXT_CACHE_MAX", "20"))
-CROSS_THREAD_CONTEXT_MESSAGES = int(os.environ.get("CROSS_THREAD_CONTEXT_MESSAGES", "5"))
+CROSS_THREAD_CONTEXT_MESSAGES = int(
+    os.environ.get("CROSS_THREAD_CONTEXT_MESSAGES", "5")
+)
 MAX_CROSS_THREAD_CONTEXTS = int(os.environ.get("MAX_CROSS_THREAD_CONTEXTS", "3"))
 MAX_CROSS_THREAD_CHARS = int(os.environ.get("MAX_CROSS_THREAD_CHARS", "3000"))
 MEM0_MIN_QUERY_LENGTH = int(os.environ.get("MEM0_MIN_QUERY_LENGTH", "20"))
 
 HISTORY_INJECTION_COUNT = int(os.environ.get("HISTORY_INJECTION_COUNT", "100"))
-HISTORY_INJECTION_CHARS_PER_MSG = int(os.environ.get("HISTORY_INJECTION_CHARS_PER_MSG", "1000"))
-HISTORY_INJECTION_MAX_CHARS = int(os.environ.get("HISTORY_INJECTION_MAX_CHARS", "60000"))
+HISTORY_INJECTION_CHARS_PER_MSG = int(
+    os.environ.get("HISTORY_INJECTION_CHARS_PER_MSG", "1000")
+)
+HISTORY_INJECTION_MAX_CHARS = int(
+    os.environ.get("HISTORY_INJECTION_MAX_CHARS", "60000")
+)
 HISTORY_MAX_AGE_DAYS = int(os.environ.get("HISTORY_MAX_AGE_DAYS", "15"))
 
 # Compact history caps for JSONL replay (token reduction plan, 2026-05-15).
@@ -541,8 +599,12 @@ HISTORY_MAX_AGE_DAYS = int(os.environ.get("HISTORY_MAX_AGE_DAYS", "15"))
 # fully rendered prompt), so replay no longer re-sends Mem0/emotion/wrapper
 # bloat on every API request.
 COMPACT_HISTORY_USER_CHARS = int(os.environ.get("COMPACT_HISTORY_USER_CHARS", "2000"))
-COMPACT_HISTORY_ASSISTANT_CHARS = int(os.environ.get("COMPACT_HISTORY_ASSISTANT_CHARS", "3000"))
-COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS = int(os.environ.get("COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS", "2000"))
+COMPACT_HISTORY_ASSISTANT_CHARS = int(
+    os.environ.get("COMPACT_HISTORY_ASSISTANT_CHARS", "3000")
+)
+COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS = int(
+    os.environ.get("COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS", "2000")
+)
 # Per-tool_result cap inside the structured replay transcript (api_messages).
 # The lossless CLI-style transcript stores tool_use/tool_result blocks verbatim
 # so a resumed turn carries real signed thinking + tool context (matches the
@@ -550,7 +612,9 @@ COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS = int(os.environ.get("COMPACT_HISTORY_CON
 # (Bash dumps, file reads) can be huge, so each tool_result content string is
 # truncated to this many chars on persist; replay is consistent with what was
 # stored. Display (content field) is unaffected.
-COMPACT_HISTORY_TOOL_RESULT_CHARS = int(os.environ.get("COMPACT_HISTORY_TOOL_RESULT_CHARS", "4000"))
+COMPACT_HISTORY_TOOL_RESULT_CHARS = int(
+    os.environ.get("COMPACT_HISTORY_TOOL_RESULT_CHARS", "4000")
+)
 
 # kanae_state timestamp bucket. Floors `now.minute` to this width so the
 # rendered <kanae_state> block stays byte-identical across short bursts,
@@ -560,7 +624,9 @@ KANAE_STATE_TIME_BUCKET_MIN = int(os.environ.get("KANAE_STATE_TIME_BUCKET_MIN", 
 # Mem0 auto-record throttle. The host writes a turn into Mem0 only when
 # enough time has passed since the last write AND the user message is
 # substantial. Explicit "覚えて" / "remember this" bypasses the throttle.
-MEM0_AUTO_RECORD_ENABLED = os.environ.get("MEM0_AUTO_RECORD_ENABLED", "true").lower() == "true"
+MEM0_AUTO_RECORD_ENABLED = (
+    os.environ.get("MEM0_AUTO_RECORD_ENABLED", "true").lower() == "true"
+)
 MEM0_AUTO_RECORD_INTERVAL_S = int(os.environ.get("MEM0_AUTO_RECORD_INTERVAL_S", "50"))
 MEM0_AUTO_RECORD_MIN_CHARS = int(os.environ.get("MEM0_AUTO_RECORD_MIN_CHARS", "23"))
 
@@ -568,7 +634,9 @@ MEM0_AUTO_RECORD_MIN_CHARS = int(os.environ.get("MEM0_AUTO_RECORD_MIN_CHARS", "2
 CLAUDE_MAX_PARALLEL = int(os.environ.get("CLAUDE_MAX_PARALLEL", "2"))
 # Non-admin callers get a separate, tighter concurrency slot so they can
 # never starve the admin pool (H-3 DoS mitigation).
-RESTRICTED_CLAUDE_MAX_PARALLEL = int(os.environ.get("RESTRICTED_CLAUDE_MAX_PARALLEL", "1"))
+RESTRICTED_CLAUDE_MAX_PARALLEL = int(
+    os.environ.get("RESTRICTED_CLAUDE_MAX_PARALLEL", "1")
+)
 
 # ---------------------------------------------------------------------------
 # Cloudflare Browser Rendering (Phase 2-1 — replaces local Puppeteer for the
@@ -584,9 +652,7 @@ RESTRICTED_CLAUDE_MAX_PARALLEL = int(os.environ.get("RESTRICTED_CLAUDE_MAX_PARAL
 # the old "KaTeX/daemon unavailable" path.
 # ---------------------------------------------------------------------------
 CF_BROWSER_RENDERING_TOKEN = os.environ.get("CF_BROWSER_RENDERING_TOKEN", "")
-CF_ACCOUNT_ID = os.environ.get(
-    "CF_ACCOUNT_ID", "8574821c4ec0b24f61d59c5a15dc31f4"
-)
+CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "8574821c4ec0b24f61d59c5a15dc31f4")
 CF_BROWSER_RENDERING_URL = (
     "https://api.cloudflare.com/client/v4/accounts/"
     f"{CF_ACCOUNT_ID}/browser-rendering/screenshot"
@@ -596,9 +662,7 @@ CF_BROWSER_RENDERING_URL = (
 CF_BROWSER_RENDERING_TIMEOUT_S = float(
     os.environ.get("CF_BROWSER_RENDERING_TIMEOUT_S", "30")
 )
-CF_BROWSER_RENDERING_RETRIES = int(
-    os.environ.get("CF_BROWSER_RENDERING_RETRIES", "1")
-)
+CF_BROWSER_RENDERING_RETRIES = int(os.environ.get("CF_BROWSER_RENDERING_RETRIES", "1"))
 # KaTeX is loaded from a pinned jsDelivr CDN inside the remote browser (the old
 # file:// bundle is invisible to Cloudflare's browser). Pin a 0.16.x patch that
 # matches the local install's rendering (local is 0.16.44/45; 0.16.x is
@@ -625,7 +689,9 @@ CLAUDE_CLI_ENV: dict[str, str] = {
 
 # Retry policy — reasonable bounds (was 999/999 which blocked for hours)
 CLAUDE_MAX_ATTEMPTS = int(os.environ.get("CLAUDE_MAX_ATTEMPTS", "5"))
-CLAUDE_TRANSIENT_MAX_ATTEMPTS = int(os.environ.get("CLAUDE_TRANSIENT_MAX_ATTEMPTS", "4"))
+CLAUDE_TRANSIENT_MAX_ATTEMPTS = int(
+    os.environ.get("CLAUDE_TRANSIENT_MAX_ATTEMPTS", "4")
+)
 CLAUDE_MAX_BACKOFF_S = int(os.environ.get("CLAUDE_MAX_BACKOFF_S", "60"))
 
 # Stream quality (free-code: queryModelWithStreaming)
@@ -746,18 +812,14 @@ MCP_TOOL_RESULT_CHARS = int(os.environ.get("MCP_TOOL_RESULT_CHARS", "20000"))
 # (scripts/probe_tool_search.py) で subscriber 経路の対応を確認してから .env で
 # 有効化する（staged rollout）。CLI 経路用の ENABLE_TOOL_SEARCH（CLAUDE_CLI_ENV,
 # 上方）とは別物なので混同しないこと。
-TOOL_SEARCH_ENABLED = (
-    os.environ.get("TOOL_SEARCH_ENABLED", "false").lower() == "true"
-)
+TOOL_SEARCH_ENABLED = os.environ.get("TOOL_SEARCH_ENABLED", "false").lower() == "true"
 # regex: モデルが正規表現で検索（CLI と同系）/ bm25: 自然言語クエリ
 TOOL_SEARCH_VARIANT = os.environ.get("TOOL_SEARCH_VARIANT", "regex").strip().lower()
 
 # tool loop 評価ハーネス（scripts/eval_tool_loop.py）用: 凍結コーパス検索の
 # evalsearch MCP を広告に加える。本番では常に false。
 # docs/2026-07-02-tool-loop-eval-design.md
-EVAL_MCP_ENABLED = (
-    os.environ.get("EVAL_MCP_ENABLED", "false").lower() == "true"
-)
+EVAL_MCP_ENABLED = os.environ.get("EVAL_MCP_ENABLED", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # 熟考パイプライン (DELIB_*) — 全機能 env flag、既定 OFF。restricted には不適用。
@@ -769,28 +831,25 @@ DELIB_EVIDENCE_ENABLED = (
 DELIB_EVIDENCE_TTL_S = int(os.environ.get("DELIB_EVIDENCE_TTL_S", "86400"))
 # これ未満の tool 結果は raw ファイル保存しない（台帳の note だけ持つ）
 DELIB_EVIDENCE_RAW_MIN_CHARS = int(
-    os.environ.get("DELIB_EVIDENCE_RAW_MIN_CHARS", "2000"))
+    os.environ.get("DELIB_EVIDENCE_RAW_MIN_CHARS", "2000")
+)
 # 台帳 note（非蒸留時は原文 head）の上限
-DELIB_EVIDENCE_NOTE_CHARS = int(
-    os.environ.get("DELIB_EVIDENCE_NOTE_CHARS", "700"))
+DELIB_EVIDENCE_NOTE_CHARS = int(os.environ.get("DELIB_EVIDENCE_NOTE_CHARS", "700"))
 
 DELIB_DISTILL_ENABLED = (
     os.environ.get("DELIB_DISTILL_ENABLED", "false").lower() == "true"
 )
-DELIB_DISTILL_MODEL = os.environ.get(
-    "DELIB_DISTILL_MODEL", "claude-haiku-4-5-20251001")
+DELIB_DISTILL_MODEL = os.environ.get("DELIB_DISTILL_MODEL", "claude-haiku-4-5-20251001")
 DELIB_DISTILL_MIN_CHARS = int(os.environ.get("DELIB_DISTILL_MIN_CHARS", "4000"))
 DELIB_DISTILL_MAX_NOTE_CHARS = int(
-    os.environ.get("DELIB_DISTILL_MAX_NOTE_CHARS", "1200"))
+    os.environ.get("DELIB_DISTILL_MAX_NOTE_CHARS", "1200")
+)
 DELIB_DISTILL_INPUT_CAP = int(os.environ.get("DELIB_DISTILL_INPUT_CAP", "24000"))
 DELIB_DISTILL_TIMEOUT_S = int(os.environ.get("DELIB_DISTILL_TIMEOUT_S", "20"))
-DELIB_DISTILL_MAX_PARALLEL = int(
-    os.environ.get("DELIB_DISTILL_MAX_PARALLEL", "3"))
+DELIB_DISTILL_MAX_PARALLEL = int(os.environ.get("DELIB_DISTILL_MAX_PARALLEL", "3"))
 
 # P2: tier router + verifier + judge-lite
-DELIB_ROUTER_ENABLED = (
-    os.environ.get("DELIB_ROUTER_ENABLED", "false").lower() == "true"
-)
+DELIB_ROUTER_ENABLED = os.environ.get("DELIB_ROUTER_ENABLED", "false").lower() == "true"
 DELIB_ROUTER_MODE = os.environ.get("DELIB_ROUTER_MODE", "heuristic").strip().lower()
 DELIB_ROUTER_MIN_CHARS = int(os.environ.get("DELIB_ROUTER_MIN_CHARS", "120"))
 # スコアベースの自動 deliberate 昇格。2026-07-02 に「積極自動」で導入したが、
@@ -803,7 +862,8 @@ DELIB_ROUTER_AUTO_ENABLED = (
 )
 # 自動昇格時の閾値（DELIB_ROUTER_AUTO_ENABLED=true のときのみ意味を持つ）
 DELIB_ROUTER_SCORE_THRESHOLD = float(
-    os.environ.get("DELIB_ROUTER_SCORE_THRESHOLD", "1.0"))
+    os.environ.get("DELIB_ROUTER_SCORE_THRESHOLD", "1.0")
+)
 
 DELIB_VERIFIER_ENABLED = (
     os.environ.get("DELIB_VERIFIER_ENABLED", "false").lower() == "true"
@@ -816,8 +876,7 @@ DELIB_VERIFY_MAX_REVISIONS = int(os.environ.get("DELIB_VERIFY_MAX_REVISIONS", "1
 DELIB_JUDGE_LITE_ENABLED = (
     os.environ.get("DELIB_JUDGE_LITE_ENABLED", "false").lower() == "true"
 )
-DELIB_JUDGE_MODEL = os.environ.get(
-    "DELIB_JUDGE_MODEL", "claude-haiku-4-5-20251001")
+DELIB_JUDGE_MODEL = os.environ.get("DELIB_JUDGE_MODEL", "claude-haiku-4-5-20251001")
 DELIB_JUDGE_MIN_CHARS = int(os.environ.get("DELIB_JUDGE_MIN_CHARS", "400"))
 
 # P3: planner（deliberate tier 冒頭の計画パス）+ scratchpad（作業メモリ tool）
@@ -838,25 +897,22 @@ SCRATCHPAD_STREAM_ENABLED = (
 # モデルの thinking（計画）と verifier（検証）の途中経過を Discord へライブ
 # プレビュー表示するか。ストリーム中は展開、完了で 1 行サブテキストに畳む。
 # 全 tier 対象（deliberate は本文非streamだが thinking 経路は独立）。表示専用トグル。
-PLAN_STREAM_ENABLED = (
-    os.environ.get("PLAN_STREAM_ENABLED", "true").lower() == "true"
-)
+PLAN_STREAM_ENABLED = os.environ.get("PLAN_STREAM_ENABLED", "true").lower() == "true"
 
 # P4: 他社モデルへの相談 tool（GPT-5 + DeepSeek 並列）と Anthropic Advisor tool
 SECOND_OPINION_ENABLED = (
     os.environ.get("SECOND_OPINION_ENABLED", "false").lower() == "true"
 )
-SECOND_OPINION_OPENAI_MODEL = os.environ.get(
-    "SECOND_OPINION_OPENAI_MODEL", "gpt-5")
+SECOND_OPINION_OPENAI_MODEL = os.environ.get("SECOND_OPINION_OPENAI_MODEL", "gpt-5")
 # gpt-5 の reasoning effort。既定 effort は重い相談で 60s を超えて timeout した
 # （2026-07-02）ため low を既定にする（第二意見は即答性優先）。
-SECOND_OPINION_OPENAI_EFFORT = os.environ.get(
-    "SECOND_OPINION_OPENAI_EFFORT", "low")
+SECOND_OPINION_OPENAI_EFFORT = os.environ.get("SECOND_OPINION_OPENAI_EFFORT", "low")
 # GPT 経路: auto=codex(ChatGPTサブスク枠) 利用可なら codex、無ければ
 # API 直課金(gpt-5) / codex=codex 固定 / api=API 直固定。既定 auto。
 # codex は ChatGPT OAuth のサブスク経路を使用する。
-SECOND_OPINION_OPENAI_MODE = os.environ.get(
-    "SECOND_OPINION_OPENAI_MODE", "auto").strip().lower()
+SECOND_OPINION_OPENAI_MODE = (
+    os.environ.get("SECOND_OPINION_OPENAI_MODE", "auto").strip().lower()
+)
 # codex(OpenAI Codex CLI)。ChatGPT ログイン済み（~/.codex/auth.json）が前提。
 # systemd の PATH は対話シェルより狭く、Volta 配下の codex を見つけられない。
 # 実在する絶対パスを既定にして、SSH セッションの PATH に依存させない。
@@ -870,7 +926,8 @@ CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-sol")
 # 第二意見は即答性優先。既定 config は xhigh なので下げる
 CODEX_REASONING_EFFORT = os.environ.get("CODEX_REASONING_EFFORT", "low")
 CODEX_WORKDIR = os.environ.get(
-    "CODEX_WORKDIR", os.path.join(STATE_DIR, "codex_workdir"))
+    "CODEX_WORKDIR", os.path.join(STATE_DIR, "codex_workdir")
+)
 
 # ---------------------------------------------------------------------------
 # Main Discord chat provider routing / Codex app-server
@@ -878,38 +935,66 @@ CODEX_WORKDIR = os.environ.get(
 # Claude remains the rollout-safe default. Admins can switch one
 # (channel,user) pair with /provider; non-admin traffic is always kept on the
 # restricted Claude path because Codex app-server owns native host tools.
-DEFAULT_LLM_PROVIDER = os.environ.get(
-    "DEFAULT_LLM_PROVIDER", "claude",
-).strip().lower()
+DEFAULT_LLM_PROVIDER = (
+    os.environ.get(
+        "DEFAULT_LLM_PROVIDER",
+        "claude",
+    )
+    .strip()
+    .lower()
+)
 CODEX_APP_SERVER_ENABLED = os.environ.get(
-    "CODEX_APP_SERVER_ENABLED", "true",
+    "CODEX_APP_SERVER_ENABLED",
+    "true",
 ).lower() not in ("0", "false", "no", "off", "")
 CODEX_APP_SERVER_MODEL = os.environ.get("CODEX_APP_SERVER_MODEL", CODEX_MODEL)
-CODEX_APP_SERVER_REASONING_EFFORT = os.environ.get(
-    "CODEX_APP_SERVER_REASONING_EFFORT", "xhigh",
-).strip().lower()
-CODEX_APP_SERVER_CWD = os.path.abspath(os.path.expanduser(
-    os.environ.get("CODEX_APP_SERVER_CWD", CWD),
-))
+CODEX_APP_SERVER_REASONING_EFFORT = (
+    os.environ.get(
+        "CODEX_APP_SERVER_REASONING_EFFORT",
+        "xhigh",
+    )
+    .strip()
+    .lower()
+)
+CODEX_APP_SERVER_CWD = os.path.abspath(
+    os.path.expanduser(
+        os.environ.get("CODEX_APP_SERVER_CWD", CWD),
+    )
+)
 CODEX_APP_SERVER_PATH = os.environ.get(
     "CODEX_APP_SERVER_PATH",
-    ":".join((
-        os.path.expanduser("~/.volta/bin"),
-        os.path.expanduser("~/.local/bin"),
-        os.path.expanduser("~/.bun/bin"),
-        "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin",
-        "/sbin", "/bin",
-    )),
+    ":".join(
+        (
+            os.path.expanduser("~/.volta/bin"),
+            os.path.expanduser("~/.local/bin"),
+            os.path.expanduser("~/.bun/bin"),
+            "/usr/local/sbin",
+            "/usr/local/bin",
+            "/usr/sbin",
+            "/usr/bin",
+            "/sbin",
+            "/bin",
+        )
+    ),
 ).strip()
-CODEX_APP_SERVER_TIMEOUT_S = float(os.environ.get(
-    "CODEX_APP_SERVER_TIMEOUT_S", "1800",
-))
-CODEX_APP_SERVER_POST_TOOL_TIMEOUT_S = float(os.environ.get(
-    "CODEX_APP_SERVER_POST_TOOL_TIMEOUT_S", "180",
-))
-CODEX_APP_SERVER_MAX_SESSIONS = int(os.environ.get(
-    "CODEX_APP_SERVER_MAX_SESSIONS", "8",
-))
+CODEX_APP_SERVER_TIMEOUT_S = float(
+    os.environ.get(
+        "CODEX_APP_SERVER_TIMEOUT_S",
+        "1800",
+    )
+)
+CODEX_APP_SERVER_POST_TOOL_TIMEOUT_S = float(
+    os.environ.get(
+        "CODEX_APP_SERVER_POST_TOOL_TIMEOUT_S",
+        "180",
+    )
+)
+CODEX_APP_SERVER_MAX_SESSIONS = int(
+    os.environ.get(
+        "CODEX_APP_SERVER_MAX_SESSIONS",
+        "8",
+    )
+)
 CODEX_APP_SERVER_STATE_PATH = os.environ.get(
     "CODEX_APP_SERVER_STATE_PATH",
     os.path.join(STATE_DIR, "codex_app_server_sessions.json"),
@@ -919,13 +1004,16 @@ CODEX_APP_SERVER_STATE_PATH = os.environ.get(
 # outside Codex's read-only trusted set; those requests pass through the
 # existing Discord permission rules and approval UI.
 CODEX_APP_SERVER_SANDBOX = os.environ.get(
-    "CODEX_APP_SERVER_SANDBOX", "workspace-write",
+    "CODEX_APP_SERVER_SANDBOX",
+    "workspace-write",
 ).strip()
 CODEX_APP_SERVER_APPROVAL_POLICY = os.environ.get(
-    "CODEX_APP_SERVER_APPROVAL_POLICY", "untrusted",
+    "CODEX_APP_SERVER_APPROVAL_POLICY",
+    "untrusted",
 ).strip()
 CODEX_APP_SERVER_DANGEROUSLY_BYPASS_APPROVALS_AND_SANDBOX = os.environ.get(
-    "CODEX_APP_SERVER_DANGEROUSLY_BYPASS_APPROVALS_AND_SANDBOX", "false",
+    "CODEX_APP_SERVER_DANGEROUSLY_BYPASS_APPROVALS_AND_SANDBOX",
+    "false",
 ).lower() not in ("0", "false", "no", "off", "")
 if CODEX_APP_SERVER_DANGEROUSLY_BYPASS_APPROVALS_AND_SANDBOX:
     # Keep the CLI flag and app-server thread/turn contract aligned. The flag
@@ -938,12 +1026,14 @@ if CODEX_APP_SERVER_DANGEROUSLY_BYPASS_APPROVALS_AND_SANDBOX:
 # workspace-write enforcement functional under the systemd hardening profile.
 # Keep this explicit and removable when the host gains bwrap prerequisites.
 CODEX_APP_SERVER_USE_LEGACY_LANDLOCK = os.environ.get(
-    "CODEX_APP_SERVER_USE_LEGACY_LANDLOCK", "true",
+    "CODEX_APP_SERVER_USE_LEGACY_LANDLOCK",
+    "true",
 ).lower() not in ("0", "false", "no", "off", "")
 # Existing shared MCP daemons are attached by URL. No credential is placed in
 # process arguments; each daemon keeps ownership of its own EnvironmentFile.
 CODEX_APP_SERVER_MEM0_MCP_URL = os.environ.get(
-    "CODEX_APP_SERVER_MEM0_MCP_URL", "http://127.0.0.1:8013/mcp",
+    "CODEX_APP_SERVER_MEM0_MCP_URL",
+    "http://127.0.0.1:8013/mcp",
 ).strip()
 # Global Codex MCP configuration is not inherited implicitly by the Discord
 # bot. Operators can opt specific URL-only servers into this process by name;
@@ -952,37 +1042,39 @@ CODEX_APP_SERVER_MEM0_MCP_URL = os.environ.get(
 CODEX_APP_SERVER_INHERIT_MCP_SERVERS: tuple[str, ...] = tuple(
     name.strip()
     for name in os.environ.get(
-        "CODEX_APP_SERVER_INHERIT_MCP_SERVERS", "",
+        "CODEX_APP_SERVER_INHERIT_MCP_SERVERS",
+        "",
     ).split(",")
     if name.strip()
 )
 SECOND_OPINION_DEEPSEEK_MODEL = os.environ.get(
-    "SECOND_OPINION_DEEPSEEK_MODEL", "deepseek/deepseek-chat-v4-flash")
+    "SECOND_OPINION_DEEPSEEK_MODEL", "deepseek/deepseek-chat-v4-flash"
+)
 # Gemini 最上位（Google 直・課金アカウント = GOOGLE_AI_API_KEY を使用、
 # aggregator 非経由 — haroin 指定 2026-07-02）
 SECOND_OPINION_GEMINI_MODEL = os.environ.get(
-    "SECOND_OPINION_GEMINI_MODEL", "gemini-3.1-pro-preview")
+    "SECOND_OPINION_GEMINI_MODEL", "gemini-3.1-pro-preview"
+)
 # Gemini 経路の選択: auto=agy(OAuthサブスク枠) 利用可なら agy、無ければ API 直課金 /
 # agy=agy 固定（不通なら Gemini スキップ）/ api=API 直固定。既定 auto。
 # agy は従量課金ゼロだが print mode で Gemini 3.5 Flash 固定、API 直は最上位可だが課金。
-SECOND_OPINION_GEMINI_MODE = os.environ.get(
-    "SECOND_OPINION_GEMINI_MODE", "auto").strip().lower()
+SECOND_OPINION_GEMINI_MODE = (
+    os.environ.get("SECOND_OPINION_GEMINI_MODE", "auto").strip().lower()
+)
 # agy(Antigravity CLI) バイナリと transcript の場所（実機で確定 → 上書き可）
 # 2026-07-02: v1.0.15 は `install` 実行時に PATH を通すが、systemd 経由では
 # ~/.local/bin が PATH に無いことがあるのでフルパス既定にする。
-AGY_BIN = os.environ.get(
-    "AGY_BIN", os.path.expanduser("~/.local/bin/agy"))
+AGY_BIN = os.environ.get("AGY_BIN", os.path.expanduser("~/.local/bin/agy"))
 # v1.0.15 は --model で最上位まで選べる（旧「3.5 Flash 固定」は解消）。
 # サブスク枠で最上位 Pro を使う。
 AGY_MODEL = os.environ.get("AGY_MODEL", "Gemini 3.1 Pro (High)")
 AGY_TRANSCRIPT_ROOT = os.environ.get(
-    "AGY_TRANSCRIPT_ROOT",
-    os.path.expanduser("~/.gemini/antigravity-cli/brain"))
+    "AGY_TRANSCRIPT_ROOT", os.path.expanduser("~/.gemini/antigravity-cli/brain")
+)
 # agy の作業ディレクトリ。/tmp だと他プロセスのファイルで workspace 検出が
 # 詰まって print mode がハングする（2026-07-02 実測 60s+）ため専用の空 dir を
 # 使う。副作用（自律エージェントのファイル書込み）もここに隔離される。
-AGY_WORKDIR = os.environ.get(
-    "AGY_WORKDIR", os.path.join(STATE_DIR, "agy_workdir"))
+AGY_WORKDIR = os.environ.get("AGY_WORKDIR", os.path.join(STATE_DIR, "agy_workdir"))
 # 両 vendor（GPT / DeepSeek）共通の per-vendor timeout。reasoning モデルの
 # 思考時間を待ち切る（haroin 指定 2026-07-02）。TOOL_CALL_TIMEOUT_S（tool 実行
 # の外壁）より短くないと tool ごと切られるので、外壁 360s とセットで運用する。
@@ -995,18 +1087,13 @@ SECOND_OPINION_TIMEOUT_S = int(os.environ.get("SECOND_OPINION_TIMEOUT_S", "300")
 # - 結果は advisor_redacted_result + encrypted_content（opaque、redacted_thinking
 #   と同系）。_block_to_dict の verbatim echo で次ターン 400 にならないことを確認済み
 # 有効化は .env で ADVISOR_ENABLED=true（beta header は client.py が自動付与）。
-ADVISOR_ENABLED = (
-    os.environ.get("ADVISOR_ENABLED", "false").lower() == "true"
-)
+ADVISOR_ENABLED = os.environ.get("ADVISOR_ENABLED", "false").lower() == "true"
 ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "claude-fable-5")
 
 # P5: MAGI-lite（判断系の問いに3レンズ独立見解 + 合意度キャリブレーション）
-MAGI_LITE_ENABLED = (
-    os.environ.get("MAGI_LITE_ENABLED", "false").lower() == "true"
-)
+MAGI_LITE_ENABLED = os.environ.get("MAGI_LITE_ENABLED", "false").lower() == "true"
 DELIB_MAGI_MODEL = os.environ.get("DELIB_MAGI_MODEL", "")  # ""=実効model継承
-DELIB_MAGI_CONSENSUS_MIN = float(
-    os.environ.get("DELIB_MAGI_CONSENSUS_MIN", "0.6"))
+DELIB_MAGI_CONSENSUS_MIN = float(os.environ.get("DELIB_MAGI_CONSENSUS_MIN", "0.6"))
 DELIB_MAGI_TIMEOUT_S = int(os.environ.get("DELIB_MAGI_TIMEOUT_S", "180"))
 
 # MCP サーバー選択方式（層2）。keyword=従来 / semantic=埋め込みのみ /
@@ -1024,10 +1111,14 @@ MCP_SEMANTIC_TOP_K = int(os.environ.get("MCP_SEMANTIC_TOP_K", "3"))
 # session/JSONL を触らない）。Phase 0 は単一エージェント + 必須明確化で E2E。
 # default OFF（user 向け有効化は堅牢化フェーズ完了後）。
 # ---------------------------------------------------------------------------
-DEEP_RESEARCH_ENABLED = os.environ.get("DEEP_RESEARCH_ENABLED", "false").lower() == "true"
+DEEP_RESEARCH_ENABLED = (
+    os.environ.get("DEEP_RESEARCH_ENABLED", "false").lower() == "true"
+)
 # CLI 式 multi-agent（planner→並列searcher→synthesizer）を使うか。False で Phase 0 の
 # 単一エージェント反復型にフォールバック（低コスト・デバッグ用）。
-DEEP_RESEARCH_MULTI_AGENT = os.environ.get("DEEP_RESEARCH_MULTI_AGENT", "true").lower() == "true"
+DEEP_RESEARCH_MULTI_AGENT = (
+    os.environ.get("DEEP_RESEARCH_MULTI_AGENT", "true").lower() == "true"
+)
 # 並列サブエージェントの実走上限（Phase 1）。subscriber バケット保護のため小さく。
 DEEP_RESEARCH_MAX_PARALLEL = int(os.environ.get("DEEP_RESEARCH_MAX_PARALLEL", "2"))
 # 計画で生成するサブ質問の上限（Phase 1）。
@@ -1037,18 +1128,30 @@ DEEP_RESEARCH_MAX_SUBAGENTS = int(os.environ.get("DEEP_RESEARCH_MAX_SUBAGENTS", 
 # ログに残す。MIN > MAX_PARALLEL のときは並列度が天井になるが、サブ質問自体は MIN 出る。
 DEEP_RESEARCH_MIN_SUBAGENTS = int(os.environ.get("DEEP_RESEARCH_MIN_SUBAGENTS", "5"))
 # 各 searcher の検索ループ turn 上限（Phase 1）。
-DEEP_RESEARCH_MAX_SEARCHES_PER_AGENT = int(os.environ.get("DEEP_RESEARCH_MAX_SEARCHES_PER_AGENT", "4"))
+DEEP_RESEARCH_MAX_SEARCHES_PER_AGENT = int(
+    os.environ.get("DEEP_RESEARCH_MAX_SEARCHES_PER_AGENT", "4")
+)
 # Phase 0 の単一エージェントが回せる tool ループ turn 上限。
-DEEP_RESEARCH_SINGLE_AGENT_MAX_TURNS = int(os.environ.get("DEEP_RESEARCH_SINGLE_AGENT_MAX_TURNS", "12"))
+DEEP_RESEARCH_SINGLE_AGENT_MAX_TURNS = int(
+    os.environ.get("DEEP_RESEARCH_SINGLE_AGENT_MAX_TURNS", "12")
+)
 # 全体時間 / トークン上限（超過で degrade）。MAGI は「質優先・時間上限なし」なので
 # 時間は実質無効化（/abort で制御）、トークンは暴走防止の backstop のみ大きめに置く。
-DEEP_RESEARCH_TOTAL_TIME_BUDGET_S = int(os.environ.get("DEEP_RESEARCH_TOTAL_TIME_BUDGET_S", "86400"))
-DEEP_RESEARCH_TOTAL_TOKEN_BUDGET = int(os.environ.get("DEEP_RESEARCH_TOTAL_TOKEN_BUDGET", "8000000"))
+DEEP_RESEARCH_TOTAL_TIME_BUDGET_S = int(
+    os.environ.get("DEEP_RESEARCH_TOTAL_TIME_BUDGET_S", "86400")
+)
+DEEP_RESEARCH_TOTAL_TOKEN_BUDGET = int(
+    os.environ.get("DEEP_RESEARCH_TOTAL_TOKEN_BUDGET", "8000000")
+)
 # 明確化質問の回答待ち時間。タイムアウトで既定スコープ続行。
-DEEP_RESEARCH_CLARIFY_TIMEOUT_S = int(os.environ.get("DEEP_RESEARCH_CLARIFY_TIMEOUT_S", "180"))
+DEEP_RESEARCH_CLARIFY_TIMEOUT_S = int(
+    os.environ.get("DEEP_RESEARCH_CLARIFY_TIMEOUT_S", "180")
+)
 # 中心的問い承認ゲートの訂正回数上限。到達時は最後の訂正を反映した問いで自動続行
 # する。無上限だと訂正を送り続けるだけで _research_busy を任意時間占有できる。
-DEEP_RESEARCH_MAX_CQ_CORRECTIONS = int(os.environ.get("DEEP_RESEARCH_MAX_CQ_CORRECTIONS", "5"))
+DEEP_RESEARCH_MAX_CQ_CORRECTIONS = int(
+    os.environ.get("DEEP_RESEARCH_MAX_CQ_CORRECTIONS", "5")
+)
 # 最終レポートへの adversarial verification。integrator 出力を critic（Sonnet・
 # ツール無し）が証拠ベースと突き合わせ、指摘があれば integrator を1回だけ再実行。
 # MAGI の懐疑レンズは証拠収集段の独立推論で、レポート本文自体は未検証だった。
@@ -1058,10 +1161,16 @@ DEEP_RESEARCH_REPORT_CRITIC_ENABLED = (
 # モデル: lead/synthesizer は Opus、searcher は Sonnet（Phase 1）。Phase 0 は
 # Haiku の adaptive-thinking HTTP400 を避けるため全工程 LEAD_MODEL を使う。
 DEEP_RESEARCH_LEAD_MODEL = os.environ.get("DEEP_RESEARCH_LEAD_MODEL", CLAUDE_MODEL)
-DEEP_RESEARCH_SEARCHER_MODEL = os.environ.get("DEEP_RESEARCH_SEARCHER_MODEL", "claude-sonnet-4-6")
+DEEP_RESEARCH_SEARCHER_MODEL = os.environ.get(
+    "DEEP_RESEARCH_SEARCHER_MODEL", "claude-sonnet-4-6"
+)
 # フェーズ別 idle timeout（StallWatchdog 誤発火対策）。
-DEEP_RESEARCH_SEARCHER_IDLE_TIMEOUT_S = int(os.environ.get("DEEP_RESEARCH_SEARCHER_IDLE_TIMEOUT_S", "240"))
-DEEP_RESEARCH_SYNTH_IDLE_TIMEOUT_S = int(os.environ.get("DEEP_RESEARCH_SYNTH_IDLE_TIMEOUT_S", "600"))
+DEEP_RESEARCH_SEARCHER_IDLE_TIMEOUT_S = int(
+    os.environ.get("DEEP_RESEARCH_SEARCHER_IDLE_TIMEOUT_S", "240")
+)
+DEEP_RESEARCH_SYNTH_IDLE_TIMEOUT_S = int(
+    os.environ.get("DEEP_RESEARCH_SYNTH_IDLE_TIMEOUT_S", "600")
+)
 # Deep Research が searcher に「横断的に」渡す MCP server key（Web + X + 金融 + 学術）。
 # env DEEP_RESEARCH_MCP_KEYS でカンマ区切り上書き可。playwright(RAM大)/mem0(個人記憶)/
 # realestate(admin専用データ)/google-maps/context7 は既定で除外（env で追加可能）。
@@ -1072,10 +1181,14 @@ _raw_dr_mcp = os.environ.get("DEEP_RESEARCH_MCP_KEYS", "")
 DEEP_RESEARCH_MCP_KEYS: tuple[str, ...] = tuple(
     k.strip() for k in _raw_dr_mcp.split(",") if k.strip()
 ) or (
-    "brave-search", "tavily",                    # 一般 Web
-    "x-scraper",                                  # X / リアルタイム
-    "nikkei-indexes", "yfj-quote", "polymarket", "minkabu-fx",  # 金融・市場
-    "scholarly",                                  # 学術論文
+    "brave-search",
+    "tavily",  # 一般 Web
+    "x-scraper",  # X / リアルタイム
+    "nikkei-indexes",
+    "yfj-quote",
+    "polymarket",
+    "minkabu-fx",  # 金融・市場
+    "scholarly",  # 学術論文
 )
 # 一般 Web 検索の前提条件。これらのいずれかが MCP_SERVERS_WEB に在ることを要求
 # （x-scraper は X 専用なので一般 Web 検索には数えない）。無ければ /research を拒否。
@@ -1090,20 +1203,34 @@ DEEP_RESEARCH_REQUIRED_WEB_KEYS = ("brave-search", "tavily")
 # Opus は 3 lead + integrator の計4回のみ、検索・部品推論はすべて Sonnet に逃がす。
 # ---------------------------------------------------------------------------
 # kill switch（コスト/安全）。false で旧 synthesizer（事実統合のみ）にフォールバック。
-DEEP_RESEARCH_MAGI_ENABLED = os.environ.get("DEEP_RESEARCH_MAGI_ENABLED", "true").lower() == "true"
+DEEP_RESEARCH_MAGI_ENABLED = (
+    os.environ.get("DEEP_RESEARCH_MAGI_ENABLED", "true").lower() == "true"
+)
 # lead(c) と integrator に使う高思考モデル（既定 = LEAD = Opus）と effort。
-DEEP_RESEARCH_MAGI_MODEL = os.environ.get("DEEP_RESEARCH_MAGI_MODEL", DEEP_RESEARCH_LEAD_MODEL)
+DEEP_RESEARCH_MAGI_MODEL = os.environ.get(
+    "DEEP_RESEARCH_MAGI_MODEL", DEEP_RESEARCH_LEAD_MODEL
+)
 DEEP_RESEARCH_MAGI_EFFORT = os.environ.get("DEEP_RESEARCH_MAGI_EFFORT", "max")
 # 分解(a)とワーカー(b)に使う安いモデル（既定 = SEARCHER = Sonnet）。
-DEEP_RESEARCH_MAGI_WORKER_MODEL = os.environ.get("DEEP_RESEARCH_MAGI_WORKER_MODEL", DEEP_RESEARCH_SEARCHER_MODEL)
+DEEP_RESEARCH_MAGI_WORKER_MODEL = os.environ.get(
+    "DEEP_RESEARCH_MAGI_WORKER_MODEL", DEEP_RESEARCH_SEARCHER_MODEL
+)
 # レンズあたりの分解サブタスク上限（= 並列 Sonnet ワーカー数の上限）。
-DEEP_RESEARCH_MAGI_MAX_WORKERS = int(os.environ.get("DEEP_RESEARCH_MAGI_MAX_WORKERS", "4"))
+DEEP_RESEARCH_MAGI_MAX_WORKERS = int(
+    os.environ.get("DEEP_RESEARCH_MAGI_MAX_WORKERS", "4")
+)
 # ワーカー1体の検証検索（アブダクション）の turn 上限。
-DEEP_RESEARCH_MAGI_WORKER_MAX_SEARCHES = int(os.environ.get("DEEP_RESEARCH_MAGI_WORKER_MAX_SEARCHES", "5"))
+DEEP_RESEARCH_MAGI_WORKER_MAX_SEARCHES = int(
+    os.environ.get("DEEP_RESEARCH_MAGI_WORKER_MAX_SEARCHES", "5")
+)
 # lead / integrator は長考するので idle timeout を長めに（StallWatchdog 誤発火対策）。
-DEEP_RESEARCH_MAGI_IDLE_TIMEOUT_S = int(os.environ.get("DEEP_RESEARCH_MAGI_IDLE_TIMEOUT_S", "600"))
+DEEP_RESEARCH_MAGI_IDLE_TIMEOUT_S = int(
+    os.environ.get("DEEP_RESEARCH_MAGI_IDLE_TIMEOUT_S", "600")
+)
 # 中心的問いの承認ゲートのリアクション絵文字（これ以外でも承認扱い。表示用）。
-DEEP_RESEARCH_MAGI_APPROVE_HINT = os.environ.get("DEEP_RESEARCH_MAGI_APPROVE_HINT", "👍")
+DEEP_RESEARCH_MAGI_APPROVE_HINT = os.environ.get(
+    "DEEP_RESEARCH_MAGI_APPROVE_HINT", "👍"
+)
 
 # 1 回の MCP ツール結果をモデルの context に戻す際の上限文字数。通常chatは
 # microcompact / 履歴圧縮で 200k トークン以内に収め続けるが、deep research の
@@ -1128,7 +1255,8 @@ DEEP_RESEARCH_SUBAGENT_INPUT_BUDGET_CHARS = int(
 # subagent に context-1m beta を渡さない（既定 on）。off にすると long-context request
 # として課金されるが 200K 超のリクエストも通る可能性がある。
 DEEP_RESEARCH_SUBAGENT_DISABLE_CONTEXT_1M = (
-    os.environ.get("DEEP_RESEARCH_SUBAGENT_DISABLE_CONTEXT_1M", "true").lower() == "true"
+    os.environ.get("DEEP_RESEARCH_SUBAGENT_DISABLE_CONTEXT_1M", "true").lower()
+    == "true"
 )
 
 # OAuth (free-code: checkAndRefreshOAuthTokenIfNeeded)
@@ -1142,11 +1270,8 @@ TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000
 # render dir. Do NOT add /home/ubuntu here — that would let an attacker
 # trick the model into attaching .env via symlinked path extensions.
 MERMAID_OUTPUT_DIR = os.environ.get("MERMAID_OUTPUT_DIR", "/tmp/mermaid_output")
-os.makedirs(MERMAID_OUTPUT_DIR, exist_ok=True)
 TABLE_RENDERS_DIR = os.environ.get("TABLE_RENDERS_DIR", "/tmp/table_renders")
-os.makedirs(TABLE_RENDERS_DIR, exist_ok=True)
 MATH_RENDERS_DIR = os.environ.get("MATH_RENDERS_DIR", "/tmp/math_renders")
-os.makedirs(MATH_RENDERS_DIR, exist_ok=True)
 
 
 def _parse_math_presentation_mode(value: str | None) -> str:
@@ -1165,13 +1290,21 @@ def _parse_math_presentation_mode(value: str | None) -> str:
 MATH_PRESENTATION_MODE = _parse_math_presentation_mode(
     os.environ.get("MATH_PRESENTATION_MODE")
 )
-ALLOWED_IMAGE_DIRS = (ATTACHMENT_DIR, MERMAID_OUTPUT_DIR, "/tmp/discord_bot_attachments", TABLE_RENDERS_DIR, MATH_RENDERS_DIR)
+ALLOWED_IMAGE_DIRS = (
+    ATTACHMENT_DIR,
+    MERMAID_OUTPUT_DIR,
+    "/tmp/discord_bot_attachments",
+    TABLE_RENDERS_DIR,
+    MATH_RENDERS_DIR,
+)
 
 # Only these hosts are allowed as attachment download sources.
-ALLOWED_ATTACHMENT_HOSTS = frozenset({
-    "cdn.discordapp.com",
-    "media.discordapp.net",
-})
+ALLOWED_ATTACHMENT_HOSTS = frozenset(
+    {
+        "cdn.discordapp.com",
+        "media.discordapp.net",
+    }
+)
 
 # Hard cap on the final synthesised prompt length (chars) handed to Claude,
 # to bound cost and context usage attacks.
@@ -1182,14 +1315,38 @@ MAX_USER_MESSAGE_CHARS = int(os.environ.get("MAX_USER_MESSAGE_CHARS", "8000"))
 
 # Tool-use trigger keywords (matched against user's raw message only)
 TOOL_KEYWORDS = [
-    "ファイル", "実行して", "コマンド", "インストール", "作成して", "編集して", "削除して",
-    "書いて", "書き換えて", "修正して", "デプロイ", "ビルドして",
-    "mermaid", "Mermaid", "画像生成", "スクリーンショット",
-    "git ", "npm ", "pip ", "sudo ", "apt ", "docker ",
-    "再起動して", "systemctl", "systemd",
-    "調べて", "検索して", "ググって", "ブラウズ",
+    "ファイル",
+    "実行して",
+    "コマンド",
+    "インストール",
+    "作成して",
+    "編集して",
+    "削除して",
+    "書いて",
+    "書き換えて",
+    "修正して",
+    "デプロイ",
+    "ビルドして",
+    "mermaid",
+    "Mermaid",
+    "画像生成",
+    "スクリーンショット",
+    "git ",
+    "npm ",
+    "pip ",
+    "sudo ",
+    "apt ",
+    "docker ",
+    "再起動して",
+    "systemctl",
+    "systemd",
+    "調べて",
+    "検索して",
+    "ググって",
+    "ブラウズ",
 ]
 import re as _re
+
 TOOL_KEYWORDS_RE = _re.compile("|".join(_re.escape(kw) for kw in TOOL_KEYWORDS))
 
 
@@ -1197,10 +1354,11 @@ def needs_tools(text: str) -> bool:
     """Check if text contains tool-use trigger keywords."""
     return bool(TOOL_KEYWORDS_RE.search(text))
 
+
 # ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
-def load_system_prompt() -> str:
+def load_system_prompt(*, bot_dir: str | None = None) -> str:
     """Concatenate ~/.claude/CLAUDE.md (global) and discord-bot/CLAUDE.md.
 
     The global file is the source of truth for the "佐藤かなえ" persona
@@ -1214,18 +1372,16 @@ def load_system_prompt() -> str:
             with open(global_md, encoding="utf-8") as f:
                 parts.append(
                     "# Contents of ~/.claude/CLAUDE.md "
-                    "(global instructions, the persona lives here)\n\n"
-                    + f.read()
+                    "(global instructions, the persona lives here)\n\n" + f.read()
                 )
         except OSError:
             pass
-    claude_md = os.path.join(BOT_DIR, "CLAUDE.md")
+    claude_md = os.path.join(bot_dir or BOT_DIR, "CLAUDE.md")
     if os.path.isfile(claude_md):
         with open(claude_md, encoding="utf-8") as f:
             parts.append(
                 "# Contents of CLAUDE.md "
-                "(project instructions; Discord-specific adjustments)\n\n"
-                + f.read()
+                "(project instructions; Discord-specific adjustments)\n\n" + f.read()
             )
     if parts:
         return "\n\n---\n\n".join(parts)
@@ -1255,12 +1411,21 @@ def _with_math_presentation_guidance(prompt: str) -> str:
     return prompt.rstrip() + "\n\n" + MATH_PRESENTATION_GUIDANCE
 
 
-# H-7: refuse environment-variable override of the system prompt. If an
-# attacker escapes any sandbox and can mutate the bot's env (e.g. DGM
-# process), they must not be able to swap the system prompt between
-# restarts. The prompt is always loaded from CLAUDE.md on disk, whose
-# integrity is governed by filesystem permissions.
-SYSTEM_PROMPT = _with_math_presentation_guidance(load_system_prompt())
+# H-7: refuse environment-variable override of the system prompt. Runtime
+# filesystem loading is owned by RuntimeBootstrap; direct config imports stay
+# side-effect free and expose a safe non-empty fallback for library callers.
+SYSTEM_PROMPT = _with_math_presentation_guidance(
+    "You are a helpful assistant running as a Discord bot. Answer concisely."
+)
+
+
+def _install_runtime_system_prompt(value: str) -> None:
+    """Install the prompt loaded by RuntimeBootstrap before service imports."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("runtime system prompt must be a non-empty string")
+    global SYSTEM_PROMPT
+    SYSTEM_PROMPT = value
+
 
 # Restricted (non-admin) system prompt. This must NOT include host-specific
 # file paths, secrets locations, or admin-identity cues. It explicitly tells
@@ -1327,11 +1492,11 @@ MCP_SERVERS_BASE: dict = {}
 # would execute arbitrary code in MCP subprocess context). Versions captured
 # 2026-05-13 from npm registry; review and bump quarterly.
 _MCP_NPX_PINS = {
-    "context7": "2.2.5",       # @upstash/context7-mcp
+    "context7": "2.2.5",  # @upstash/context7-mcp
     "brave-search": "2.0.80",  # @brave/brave-search-mcp-server
-    "tavily": "0.2.19",        # tavily-mcp
-    "playwright": "0.0.75",    # @playwright/mcp
-    "google-maps": "0.6.2",    # @modelcontextprotocol/server-google-maps (deprecated upstream 2025; last published 0.6.2)
+    "tavily": "0.2.19",  # tavily-mcp
+    "playwright": "0.0.75",  # @playwright/mcp
+    "google-maps": "0.6.2",  # @modelcontextprotocol/server-google-maps (deprecated upstream 2025; last published 0.6.2)
 }
 
 
@@ -1437,7 +1602,10 @@ elif _brave_key:
     # Direct stdio (bot-owned, self-reaping) — see x-scraper note / ADR-0022.
     MCP_SERVERS_WEB["brave-search"] = {
         "command": "npx",
-        "args": ["-y", f"@brave/brave-search-mcp-server@{_MCP_NPX_PINS['brave-search']}"],
+        "args": [
+            "-y",
+            f"@brave/brave-search-mcp-server@{_MCP_NPX_PINS['brave-search']}",
+        ],
         "env": {"BRAVE_API_KEY": _brave_key},
     }
 
@@ -1457,7 +1625,10 @@ if _google_maps_key:
     # Direct stdio (bot-owned, self-reaping) — ADR-0022.
     MCP_SERVERS_WEB["google-maps"] = {
         "command": "npx",
-        "args": ["-y", f"@modelcontextprotocol/server-google-maps@{_MCP_NPX_PINS['google-maps']}"],
+        "args": [
+            "-y",
+            f"@modelcontextprotocol/server-google-maps@{_MCP_NPX_PINS['google-maps']}",
+        ],
         "env": {"GOOGLE_MAPS_API_KEY": _google_maps_key},
     }
 
@@ -1524,6 +1695,33 @@ MCP_SERVERS_IOT: dict = {
 }
 
 
+# MAIL tier — agentic-inbox (haroin の Cloudflare Workers メールサーバ) MCP。
+# Cloudflare Access Service Token 認証の streamable HTTP (remote)。ツールに
+# sendReply / sendEmail の送信系が含まれるため、IOT と同じ個人ゲート方式:
+# AGENTIC_INBOX_ALLOWED_USER_IDS に載る user だけが接続できる（env が空なら
+# fail-closed で誰も繋がらない）。トークン実体は .env 側に隔離。
+_raw_inbox_ids = os.environ.get("AGENTIC_INBOX_ALLOWED_USER_IDS", "")
+AGENTIC_INBOX_ALLOWED_USER_IDS: set[int] = set()
+for _s in _raw_inbox_ids.split(","):
+    _s = _s.strip()
+    if _s.isdigit():
+        AGENTIC_INBOX_ALLOWED_USER_IDS.add(int(_s))
+
+_agentic_inbox_url = os.environ.get("AGENTIC_INBOX_MCP_URL")
+_agentic_inbox_cid = os.environ.get("AGENTIC_INBOX_CF_CLIENT_ID")
+_agentic_inbox_sec = os.environ.get("AGENTIC_INBOX_CF_CLIENT_SECRET")
+MCP_SERVERS_MAIL: dict = {}
+if _agentic_inbox_url and _agentic_inbox_cid and _agentic_inbox_sec:
+    MCP_SERVERS_MAIL["agentic-inbox"] = {
+        "type": "http",
+        "url": _agentic_inbox_url,
+        "headers": {
+            "CF-Access-Client-Id": _agentic_inbox_cid,
+            "CF-Access-Client-Secret": _agentic_inbox_sec,
+        },
+    }
+
+
 # INSHI tier — 院試誤答DB (inshi-vault) MCP。常駐 streamable-HTTP daemon
 # (mcp-inshi-vault-shared :8017) へ接続。誤答の検索・出題・登録・正答参照。
 # データの正は /home/ubuntu/inshi-vault（git bare 経由で Mac クローンと同期）。
@@ -1545,6 +1743,7 @@ MCP_SERVERS: dict = {
     **MCP_SERVERS_DOCS,
     **MCP_SERVERS_REALESTATE,
     **MCP_SERVERS_IOT,
+    **MCP_SERVERS_MAIL,
     **MCP_SERVERS_INSHI,
 }
 
@@ -1553,10 +1752,15 @@ MCP_SERVERS: dict = {
 if EVAL_MCP_ENABLED:
     MCP_SERVERS["evalsearch"] = {
         "command": os.path.join(BOT_DIR, ".venv", "bin", "python"),
-        "args": [os.path.join(
-            BOT_DIR, "tests", "fixtures", "tool_loop_eval",
-            "evalsearch_server.py",
-        )],
+        "args": [
+            os.path.join(
+                BOT_DIR,
+                "tests",
+                "fixtures",
+                "tool_loop_eval",
+                "evalsearch_server.py",
+            )
+        ],
         "env": {},
     }
 
@@ -1570,11 +1774,34 @@ if EVAL_MCP_ENABLED:
 # uptime Worker). The old Socket.IO Web API was removed in Phase 1; the port
 # env vars are reused by services/health_server.py.
 # ---------------------------------------------------------------------------
-WEB_API_PORT = int(os.environ.get("WEB_API_PORT", "3002"))
+WEB_API_PORT = _parse_int_setting(
+    "WEB_API_PORT",
+    3002,
+    minimum=1,
+    maximum=65535,
+)
 # Default to localhost so a fresh `main_async.py` start does not expose the
 # health endpoint to the public internet. Override with WEB_API_HOST=0.0.0.0
 # when fronting it with an authenticated reverse proxy or tunnel.
 WEB_API_HOST = os.environ.get("WEB_API_HOST", "127.0.0.1")
+
+# A systemd restart first stops accepting new Discord turns, then lets every
+# already accepted turn finish before provider/browser resources are closed.
+# Match the longest provider request deadline so a deployment does not turn a
+# normal in-flight request into a false /abort.
+SHUTDOWN_DRAIN_TIMEOUT_S = _parse_int_setting(
+    "SHUTDOWN_DRAIN_TIMEOUT_S",
+    1800,
+    minimum=0,
+    maximum=1800,
+)
+SHUTDOWN_FORCE_CLEANUP_TIMEOUT_S = _parse_int_setting(
+    "SHUTDOWN_FORCE_CLEANUP_TIMEOUT_S",
+    60,
+    minimum=1,
+    maximum=60,
+)
+
 
 # Mem0 quality-improvement flags (added 2026-05-12, see plans/partitioned-wibbling-sifakis.md)
 def _bool_env(name: str, default: bool) -> bool:
@@ -1582,6 +1809,7 @@ def _bool_env(name: str, default: bool) -> bool:
     if v is None:
         return default
     return v.lower() in ("1", "true", "yes", "on")
+
 
 # Cloudflare R2 searchable archive.  Conversation writes are always committed
 # locally first; R2 delivery uses a durable .state/r2_archive spool and is
@@ -1594,9 +1822,7 @@ R2_ARCHIVE_PREFIX = os.environ.get("R2_ARCHIVE_PREFIX", "discord-bot/v1")
 R2_ARCHIVE_WRANGLER_BIN = os.environ.get(
     "R2_ARCHIVE_WRANGLER_BIN", os.path.expanduser("~/.volta/bin/wrangler")
 )
-R2_ARCHIVE_FLUSH_INTERVAL_S = float(
-    os.environ.get("R2_ARCHIVE_FLUSH_INTERVAL_S", "5")
-)
+R2_ARCHIVE_FLUSH_INTERVAL_S = float(os.environ.get("R2_ARCHIVE_FLUSH_INTERVAL_S", "5"))
 R2_ARCHIVE_FLUSH_BATCH = int(os.environ.get("R2_ARCHIVE_FLUSH_BATCH", "20"))
 R2_ARCHIVE_STATE_INTERVAL_S = float(
     os.environ.get("R2_ARCHIVE_STATE_INTERVAL_S", "3600")
@@ -1605,8 +1831,12 @@ R2_ARCHIVE_COMMAND_TIMEOUT_S = float(
     os.environ.get("R2_ARCHIVE_COMMAND_TIMEOUT_S", "300")
 )
 
-MEM0_LEGACY_CONTEXT = _bool_env("MEM0_LEGACY_CONTEXT", False)             # P1: True で旧 channel-history 流入挙動に戻す
-MEM0_GATE_ENABLED = _bool_env("MEM0_GATE_ENABLED", True)                   # P2: False で Mem0 標準抽出にフォールバック
+MEM0_LEGACY_CONTEXT = _bool_env(
+    "MEM0_LEGACY_CONTEXT", False
+)  # P1: True で旧 channel-history 流入挙動に戻す
+MEM0_GATE_ENABLED = _bool_env(
+    "MEM0_GATE_ENABLED", True
+)  # P2: False で Mem0 標準抽出にフォールバック
 MEM0_GATE_MIN_IMPORTANCE = int(os.environ.get("MEM0_GATE_MIN_IMPORTANCE", "2"))
 MEM0_GATE_MODEL = os.environ.get("MEM0_GATE_MODEL", "claude-haiku-4-5-20251001")
 # Output budget for the single-call fact+relation extractor. 4000 was too
@@ -1620,12 +1850,18 @@ MEM0_EXTRACT_MAX_TOKENS = int(os.environ.get("MEM0_EXTRACT_MAX_TOKENS", "12000")
 # "ニッスイ株をホールド…"). Wider caps preserve more; tune down to cut cost.
 MEM0_BATCH_TURN_CHARS = int(os.environ.get("MEM0_BATCH_TURN_CHARS", "600"))
 MEM0_EXTRACT_INPUT_CHARS = int(os.environ.get("MEM0_EXTRACT_INPUT_CHARS", "6000"))
-MEM0_CLIENT_DEDUP_ENABLED = _bool_env("MEM0_CLIENT_DEDUP_ENABLED", True)   # P2.5
-MEM0_CLIENT_DEDUP_THRESHOLD = float(os.environ.get("MEM0_CLIENT_DEDUP_THRESHOLD", "0.85"))
-MEM0_DEDUP_TWO_STAGE = _bool_env("MEM0_DEDUP_TWO_STAGE", True)            # P4: 2段階dedup (LLM判定)
+MEM0_CLIENT_DEDUP_ENABLED = _bool_env("MEM0_CLIENT_DEDUP_ENABLED", True)  # P2.5
+MEM0_CLIENT_DEDUP_THRESHOLD = float(
+    os.environ.get("MEM0_CLIENT_DEDUP_THRESHOLD", "0.85")
+)
+MEM0_DEDUP_TWO_STAGE = _bool_env(
+    "MEM0_DEDUP_TWO_STAGE", True
+)  # P4: 2段階dedup (LLM判定)
 MEM0_DEDUP_SEARCH_LIMIT = int(os.environ.get("MEM0_DEDUP_SEARCH_LIMIT", "5"))
-MEM0_DEDUP_DRY_RUN = _bool_env("MEM0_DEDUP_DRY_RUN", False)               # P4: dry-run (dropせずログのみ)
-MEM0_SMART_SEARCH = _bool_env("MEM0_SMART_SEARCH", True)                   # P3
+MEM0_DEDUP_DRY_RUN = _bool_env(
+    "MEM0_DEDUP_DRY_RUN", False
+)  # P4: dry-run (dropせずログのみ)
+MEM0_SMART_SEARCH = _bool_env("MEM0_SMART_SEARCH", True)  # P3
 # Per-turn auto-recall fan-out. 5 was too thin against ~5k stored memories: a
 # topic spread over several facts (e.g. the日経VI strategy ≈ 6 memories) lost
 # the race for the 5 slots. Admins get a wider window; non-admins stay narrow.
@@ -1641,15 +1877,20 @@ MEM0_CORE_CACHE_TTL_S = int(os.environ.get("MEM0_CORE_CACHE_TTL_S", "300"))
 # lines that Mem0 curation/keyword-FTS miss. OFF by default — it adds a
 # per-turn embedding call (cost); flip on (+ run scripts/backfill_history_embed.py)
 # to enable, then it augments history_index keyword recall with vector hits.
-MEM0_HISTORY_EMBED_ENABLED = os.environ.get(
-    "MEM0_HISTORY_EMBED_ENABLED", "0"
-) not in ("0", "false", "False", "")
+MEM0_HISTORY_EMBED_ENABLED = os.environ.get("MEM0_HISTORY_EMBED_ENABLED", "0") not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
 MEM0_HISTORY_EMBED_LIMIT = int(os.environ.get("MEM0_HISTORY_EMBED_LIMIT", "5"))
 # Per-line char cap before embedding. text-embedding-3-small rejects inputs
 # over 8192 tokens; a long line (big code block, long reply) blows past that.
 # 4000 chars stays safely under the limit even for kanji-dense text (~1.5
 # tok/char) while keeping enough head for semantic topic matching.
-MEM0_HISTORY_EMBED_MAX_CHARS = int(os.environ.get("MEM0_HISTORY_EMBED_MAX_CHARS", "4000"))
+MEM0_HISTORY_EMBED_MAX_CHARS = int(
+    os.environ.get("MEM0_HISTORY_EMBED_MAX_CHARS", "4000")
+)
 
 # Offline cluster consolidation (ADR-0016, 2026-06-15). scripts/mem0_consolidate.py
 # finds clusters of related-but-separately-stored facts (which ingest-time
@@ -1659,7 +1900,9 @@ MEM0_HISTORY_EMBED_MAX_CHARS = int(os.environ.get("MEM0_HISTORY_EMBED_MAX_CHARS"
 MEM0_CONSOLIDATE_SIM = float(os.environ.get("MEM0_CONSOLIDATE_SIM", "0.83"))
 MEM0_CONSOLIDATE_DRY_RUN = _bool_env("MEM0_CONSOLIDATE_DRY_RUN", True)
 MEM0_CONSOLIDATE_MAX_CLUSTER = int(os.environ.get("MEM0_CONSOLIDATE_MAX_CLUSTER", "8"))
-MEM0_CONSOLIDATE_MAX_CLUSTERS = int(os.environ.get("MEM0_CONSOLIDATE_MAX_CLUSTERS", "50"))
+MEM0_CONSOLIDATE_MAX_CLUSTERS = int(
+    os.environ.get("MEM0_CONSOLIDATE_MAX_CLUSTERS", "50")
+)
 # P3 over-merge gate (ADR-0017): split each vector cluster into pairwise
 # judge_fact_relation-mergeable sub-clusters before synthesizing, so distinct
 # aspects accidentally co-clustered are never fused. synthesize_cluster alone
