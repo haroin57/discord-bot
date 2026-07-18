@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from free_code_commands.commands import jsx_commands
+from free_code_commands import build_registry
 from free_code_commands.runtime import RecordingRuntime
 
 
-def _command():
-    return next(command for command in jsx_commands.COMMANDS if command.name == "mcp")
+async def _invoke(args, runtime):
+    text = f"/mcp {args}".rstrip()
+    invocation = await build_registry().invoke(text, runtime)
+    assert invocation is not None
+    return invocation.result
 
 
 def _runtime():
@@ -44,7 +47,7 @@ def _runtime():
 
 
 async def test_empty_args_returns_structured_status():
-    outcome = await _command().call("", _runtime())
+    outcome = await _invoke("", _runtime())
     assert outcome.dialog == "mcp"
     assert outcome.data["action"] == "status"
     assert len(outcome.data["servers"]) == 2
@@ -53,34 +56,34 @@ async def test_empty_args_returns_structured_status():
 
 async def test_enable_disable_and_idempotence():
     runtime = _runtime()
-    disabled = await _command().call("disable alpha", runtime)
+    disabled = await _invoke("disable alpha", runtime)
     assert disabled.data["mutation"]["changed_keys"] == ("alpha",)
-    again = await _command().call("disable alpha", runtime)
+    again = await _invoke("disable alpha", runtime)
     assert "already disabled" in (again.message or "")
-    enabled = await _command().call("enable alpha", runtime)
+    enabled = await _invoke("enable alpha", runtime)
     assert enabled.data["mutation"]["changed_keys"] == ("alpha",)
 
 
 async def test_all_and_missing_target():
     runtime = _runtime()
-    outcome = await _command().call("disable all", runtime)
+    outcome = await _invoke("disable all", runtime)
     assert outcome.data["mutation"]["changed_keys"] == ("alpha", "beta")
-    missing = await _command().call("enable", runtime)
+    missing = await _invoke("enable", runtime)
     assert "Usage:" in (missing.message or "")
 
 
 async def test_unknown_server_and_action():
     runtime = _runtime()
-    missing = await _command().call("reconnect missing", runtime)
+    missing = await _invoke("reconnect missing", runtime)
     assert "Unknown MCP server" in (missing.message or "")
-    unknown = await _command().call("oauth alpha", runtime)
+    unknown = await _invoke("oauth alpha", runtime)
     assert "Unknown MCP action" in (unknown.message or "")
 
 
 async def test_reconnect_is_temporary_probe_and_tools_action():
     runtime = _runtime()
-    probe = await _command().call("reconnect alpha", runtime)
+    probe = await _invoke("reconnect alpha", runtime)
     assert probe.data["probe"]["status"] == "reachable"
     assert "2 tools" in (probe.message or "")
-    tools = await _command().call("tools alpha", runtime)
+    tools = await _invoke("tools alpha", runtime)
     assert tools.data["tools"] == ["a", "b"]

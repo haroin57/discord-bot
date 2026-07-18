@@ -24,9 +24,9 @@ any Discord-bot internals — so it can be tested, embedded, or driven headlessl
 - `commands/local_commands.py` — **19** `local` commands (cost, version, clear,
   compact, context, vim, advisor, bridge-kick, …).
 - `commands/jsx_commands.py` — **51** `local-jsx` (interactive) commands, ported
-  headlessly: metadata + a `call` that records which dialog would open.
-- `commands/feature_gated.py` — **12** flag-gated commands (`is_enabled_fn` gated on
-  `rt.feature('FLAG')`), conditionally registered in `commands.ts`.
+  headlessly with registry-private implementations that record opened dialogs.
+- `commands/feature_gated.py` — **12** commands gated internally on runtime feature
+  flags, corresponding to conditional registration in `commands.ts`.
 - `commands/internal_commands.py` — **21** ant-only `INTERNAL_ONLY_COMMANDS`.
 
 ## Fidelity notes (honest gaps)
@@ -52,12 +52,18 @@ from free_code_commands import build_registry
 from free_code_commands.runtime import CommandRuntime  # subclass to wire real services
 
 reg = build_registry()
-cmd, args = reg.parse("/commit")          # or reg.find("commit") / reg.resolve("commit", rt)
-# prompt commands:
-blocks = await cmd.get_prompt_for_command(args, rt)   # list[ContentBlock]
-# local commands:
-result = await cmd.call(args, rt)                     # LocalCommandResult
+rt = CommandRuntime()
+metadata = reg.get("commit")              # immutable, non-executable metadata
+invocation = await reg.invoke("/commit", rt)
+blocks = invocation.result                 # list[ContentBlock]
 ```
+
+`find` / `get` / `has` are metadata introspection APIs and intentionally do not
+apply feature, availability, or invocation gates. `active`, `dispatch`, and `resolve`
+also return metadata only. `invoke(text, rt)` is the sole execution boundary and
+atomically applies user, feature, availability, and non-interactive gates.
+Module-level `COMMANDS`, `all_commands()`, and historical command factories also
+return only frozen metadata. They never expose callbacks or runtime predicates.
 
 See `PORTING_NOTES.md` for the per-command construction contract, and
 `tests/test_free_code_commands_*.py` (92 PoC tests) for behavioural parity coverage.

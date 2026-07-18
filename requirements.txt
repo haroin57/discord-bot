@@ -8,15 +8,16 @@ discord.py>=2.7,<3.0
 python-dotenv>=1.0,<2.0
 claude-code-sdk==0.0.25            # SRE-H7: exact pin; bypassPermissions is SDK-internal
 anthropic>=0.88.0,<1.0             # SRE-H7: surface the transitive dep so upgrades are visible
-mcp==1.26.0                        # PR4 of claude-api-unify: direct pin so deleting
+mcp==1.28.1                        # PR4 of claude-api-unify: direct pin so deleting
                                    # claude-code-sdk in PR9 does not drop the MCP SDK.
                                    # Review quarterly; pre-1.0 minor releases can rename
                                    # fields like Tool.inputSchema (see test_tool_schema_shape).
-aiohttp>=3.9,<4.0
+aiohttp>=3.14.1,<4.0
+xxhash>=3.7,<4.0
 mem0ai>=1.0,<2.0                 # TODO: bump to >=2.0 once stable lands (fixes CVE-2026-7597, currently only in 2.0.0b2)
 chromadb>=1.0,<2.0
 psutil>=5.9,<8.0
-bleach>=6.1,<7.0                 # HTML sanitization for table_renderer
+bleach>=6.4,<7.0                 # HTML sanitization for table_renderer
 matplotlib>=3.10,<4.0            # Emotion timeseries graph (scripts/emotion_graph.py only)
 pandas>=2.2,<4.0                 # JSONL→DataFrame for graph generation
 janome>=0.5,<0.6                 # Pure-Python morphological analyzer.
@@ -37,9 +38,9 @@ nbformat>=5.10,<6.0
 
 # Transitive dependency floors required to pull in CVE fixes.
 # These would otherwise resolve to a vulnerable older version.
-cryptography>=46.0.7,<47.0      # CVE-2026-39892
+cryptography>=48.0.1,<49.0      # GHSA-537c-gmf6-5ccf
 urllib3>=2.7.0,<3.0              # CVE-2026-44431, CVE-2026-44432
-python-multipart>=0.0.27,<0.1    # CVE-2026-40347, CVE-2026-42561
+python-multipart>=0.0.31,<0.1    # PYSEC-2026-3036, PYSEC-2026-3037, PYSEC-2026-3040
 
 # Test packages live in requirements-dev.txt now so prod installs do not
 # pull pytest / pytest-asyncio / pytest-cov / pytest-xdist needlessly.

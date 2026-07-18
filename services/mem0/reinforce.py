@@ -42,7 +42,9 @@ MAX_REINFORCED_HISTORY = 10
 # Phase A-2 (mem0-recall-hybrid-hyde-kg): age decay defaults. Read once at
 # import so the boost calculation stays a hot-path no-cost lookup.
 _DEFAULT_ALPHA_AGE = float(os.environ.get("MEM0_BOOST_ALPHA_AGE", "0.03"))
-_DEFAULT_AGE_HALF_LIFE_DAYS = float(os.environ.get("MEM0_BOOST_AGE_HALF_LIFE_DAYS", "90"))
+_DEFAULT_AGE_HALF_LIFE_DAYS = float(
+    os.environ.get("MEM0_BOOST_AGE_HALF_LIFE_DAYS", "90")
+)
 
 
 def reinforce_existing_sync(mem, memory_id: str) -> bool:
@@ -61,41 +63,15 @@ def reinforce_existing_sync(mem, memory_id: str) -> bool:
     if not memory_id:
         return False
     try:
-        existing = mem.get(memory_id)
+        from services.mem0.integrity import get_application_service
+
+        return get_application_service().reinforce(
+            mem,
+            memory_id,
+            channel="mention",
+        )
     except Exception as exc:
-        log.warning("reinforce: get(%s) failed: %s", memory_id, exc)
-        return False
-    if not isinstance(existing, dict):
-        return False
-
-    existing_meta = existing.get("metadata") or {}
-    existing_text = existing.get("memory") or existing.get("text") or ""
-    if not existing_text:
-        return False
-
-    now = int(time.time())
-    history = list(existing_meta.get("reinforced_at") or [])
-    history.append(now)
-    history = history[-MAX_REINFORCED_HISTORY:]
-    try:
-        cur_mention = int(existing_meta.get("mention_count", 1))
-    except (TypeError, ValueError):
-        cur_mention = 1
-
-    # Only specify the fields we're changing — Mem0 preserves the rest.
-    # importance is intentionally absent: see the module docstring for why
-    # frequency must not feed back into the LLM-assigned importance score.
-    partial = {
-        "mention_count": cur_mention + 1,
-        "reinforced_at": history,
-        "last_reinforced_at": now,
-    }
-
-    try:
-        mem.update(memory_id=memory_id, data=existing_text, metadata=partial)
-        return True
-    except Exception as exc:
-        log.warning("reinforce: update(%s) failed: %s", memory_id, exc)
+        log.warning("reinforce: application service failed for %s: %s", memory_id, exc)
         return False
 
 
@@ -103,6 +79,7 @@ async def reinforce_existing(mem, memory_id: str) -> bool:
     """Async wrapper around the sync helper, for ingest call sites that
     already live in an event loop."""
     import asyncio
+
     return await asyncio.to_thread(reinforce_existing_sync, mem, memory_id)
 
 
@@ -146,61 +123,39 @@ def reinforce_on_recall_sync(mem, memory_id: str) -> bool:
     if not memory_id:
         return False
     try:
-        existing = mem.get(memory_id)
+        from services.mem0.integrity import get_application_service
+
+        return get_application_service().reinforce(
+            mem,
+            memory_id,
+            channel="recall",
+            min_interval=RECALL_REINFORCE_MIN_INTERVAL_SEC,
+        )
     except Exception as exc:
-        log.warning("recall-reinforce: get(%s) failed: %s", memory_id, exc)
-        return False
-    if not isinstance(existing, dict):
-        return False
-    existing_meta = existing.get("metadata") or {}
-    existing_text = existing.get("memory") or existing.get("text") or ""
-    if not existing_text:
-        return False
-
-    now = int(time.time())
-    try:
-        last_recalled = int(existing_meta.get("last_recalled_at") or 0)
-    except (TypeError, ValueError):
-        last_recalled = 0
-    if last_recalled and (now - last_recalled) < RECALL_REINFORCE_MIN_INTERVAL_SEC:
-        return False
-
-    history = list(existing_meta.get("reinforced_at") or [])
-    history.append(now)
-    history = history[-MAX_REINFORCED_HISTORY:]
-    try:
-        cur_recall = int(existing_meta.get("recall_count", 0))
-    except (TypeError, ValueError):
-        cur_recall = 0
-
-    # importance is never touched here either — see reinforce_existing_sync /
-    # the module docstring.
-    partial = {
-        "recall_count": cur_recall + 1,
-        "reinforced_at": history,
-        "last_reinforced_at": now,
-        "last_recalled_at": now,
-    }
-    try:
-        mem.update(memory_id=memory_id, data=existing_text, metadata=partial)
-        return True
-    except Exception as exc:
-        log.warning("recall-reinforce: update(%s) failed: %s", memory_id, exc)
+        log.warning(
+            "recall-reinforce: application service failed for %s: %s",
+            memory_id,
+            exc,
+        )
         return False
 
 
 async def reinforce_on_recall(mem, memory_id: str) -> bool:
     """Async wrapper around reinforce_on_recall_sync."""
     import asyncio
+
     return await asyncio.to_thread(reinforce_on_recall_sync, mem, memory_id)
 
 
-def _legacy_reinforcement_boost(metadata: dict, *,
-                                alpha_mention: float,
-                                alpha_recency: float,
-                                recency_half_life_days: float,
-                                alpha_age: float | None,
-                                age_half_life_days: float | None) -> float:
+def _legacy_reinforcement_boost(
+    metadata: dict,
+    *,
+    alpha_mention: float,
+    alpha_recency: float,
+    recency_half_life_days: float,
+    alpha_age: float | None,
+    age_half_life_days: float | None,
+) -> float:
     """Original hand-tuned three-term boost (frequency + recency + age).
 
     Combines three components:
@@ -238,10 +193,16 @@ def _legacy_reinforcement_boost(metadata: dict, *,
     # created_at_unix as an alias for any future caller that writes it
     # under that name.
     aa = _DEFAULT_ALPHA_AGE if alpha_age is None else alpha_age
-    ah = _DEFAULT_AGE_HALF_LIFE_DAYS if age_half_life_days is None else age_half_life_days
+    ah = (
+        _DEFAULT_AGE_HALF_LIFE_DAYS
+        if age_half_life_days is None
+        else age_half_life_days
+    )
     if aa and ah > 0:
         try:
-            created = int(metadata.get("created_at_unix") or metadata.get("timestamp") or 0)
+            created = int(
+                metadata.get("created_at_unix") or metadata.get("timestamp") or 0
+            )
         except (TypeError, ValueError):
             created = 0
         if created:
@@ -272,7 +233,9 @@ _ACTR_DECAY_D = float(os.environ.get("MEM0_ACTR_DECAY_D", "0.5"))
 # realistic activation range, matching decay.py's Hot cutoff) spreads the
 # boost meaningfully across facts a corpus actually contains.
 _ACTR_BOOST_ALPHA = float(os.environ.get("MEM0_ACTR_BOOST_ALPHA", "0.2"))
-_ACTR_RETRIEVAL_THRESHOLD = float(os.environ.get("MEM0_ACTR_RETRIEVAL_THRESHOLD", "-7.5"))
+_ACTR_RETRIEVAL_THRESHOLD = float(
+    os.environ.get("MEM0_ACTR_RETRIEVAL_THRESHOLD", "-7.5")
+)
 _ACTR_NOISE_S = float(os.environ.get("MEM0_ACTR_NOISE_S", "1.0"))
 # Floor on (now - t) before exponentiating — guards against a zero/negative
 # delta (clock skew, or a reinforcement landing in the same wall-clock second
@@ -281,8 +244,13 @@ _ACTR_MIN_DT_SEC = 1.0
 
 
 def _actr_activation(
-    created_at: int, reinforced_at: list, mention_count: int, recall_count: int,
-    *, now: float, d: float = 0.5,
+    created_at: int,
+    reinforced_at: list,
+    mention_count: int,
+    recall_count: int,
+    *,
+    now: float,
+    d: float = 0.5,
 ) -> float:
     """ACT-R base-level activation: ``B = ln( Σ_j (now - t_j)^-d )``.
 
@@ -300,7 +268,9 @@ def _actr_activation(
     Returns ``-inf`` for a fact with zero valid presentation timestamps
     (should not happen in practice — creation always stamps ``timestamp``).
     """
-    known = sorted(t for t in (reinforced_at or []) if isinstance(t, (int, float)) and t > 0)
+    known = sorted(
+        t for t in (reinforced_at or []) if isinstance(t, (int, float)) and t > 0
+    )
     times = ([created_at] if created_at else []) + known
     times = sorted(t for t in times if t > 0)
     if not times:
@@ -325,6 +295,7 @@ def _actr_activation(
             integral = (dt0 ** (1 - d) - dt1 ** (1 - d)) / (1 - d)
         else:
             import math as _math
+
             integral = _math.log(dt0) - _math.log(dt1)
         total += missing * max(integral / span, 0.0)
     elif missing > 0:
@@ -336,6 +307,7 @@ def _actr_activation(
     if total <= 0:
         return float("-inf")
     import math as _math
+
     return _math.log(total)
 
 
@@ -358,21 +330,30 @@ def _actr_reinforcement_boost(metadata: dict) -> float:
     reinforced_at = metadata.get("reinforced_at") or []
 
     activation = _actr_activation(
-        created, reinforced_at, mention, recall,
-        now=time.time(), d=_ACTR_DECAY_D,
+        created,
+        reinforced_at,
+        mention,
+        recall,
+        now=time.time(),
+        d=_ACTR_DECAY_D,
     )
     if activation == float("-inf"):
         return 0.0
-    p_recall = 1.0 / (1.0 + math.exp(-(activation - _ACTR_RETRIEVAL_THRESHOLD) / _ACTR_NOISE_S))
+    p_recall = 1.0 / (
+        1.0 + math.exp(-(activation - _ACTR_RETRIEVAL_THRESHOLD) / _ACTR_NOISE_S)
+    )
     return _ACTR_BOOST_ALPHA * p_recall
 
 
-def reinforcement_boost(metadata: dict | None, *,
-                        alpha_mention: float = 0.10,
-                        alpha_recency: float = 0.05,
-                        recency_half_life_days: float = 30.0,
-                        alpha_age: float | None = None,
-                        age_half_life_days: float | None = None) -> float:
+def reinforcement_boost(
+    metadata: dict | None,
+    *,
+    alpha_mention: float = 0.10,
+    alpha_recency: float = 0.05,
+    recency_half_life_days: float = 30.0,
+    alpha_age: float | None = None,
+    age_half_life_days: float | None = None,
+) -> float:
     """Return the additive score boost for a memory.
 
     Dispatches on ``MEM0_BOOST_MODE`` (env, default ``legacy``):

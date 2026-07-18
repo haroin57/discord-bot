@@ -43,7 +43,8 @@ def wired(monkeypatch):
     captured: dict = {}
 
     monkeypatch.setattr(
-        sq, "load_api_replay_channel",
+        sq,
+        "load_api_replay_channel",
         lambda cid: (captured.get("prior", []), "", ""),
     )
     monkeypatch.setattr(sq, "StallWatchdog", _FakeWatchdog)
@@ -158,6 +159,7 @@ class _FakeTree:
         def deco(fn):
             self.cmds[name] = fn
             return fn
+
         return deco
 
 
@@ -169,16 +171,26 @@ def _make_interaction(*, channel_id=CHANNEL, uid=573489206240870410):
     followup = SimpleNamespace(send=AsyncMock())
     user = SimpleNamespace(id=uid, display_name="先輩", name="haroin")
     return SimpleNamespace(
-        response=resp, followup=followup, user=user, channel_id=channel_id,
+        response=resp,
+        followup=followup,
+        user=user,
+        channel_id=channel_id,
     )
 
 
-def _register(is_admin=True):
+def _register(
+    is_admin=True,
+    *,
+    provider_overrides=None,
+    model_overrides=None,
+    effort_overrides=None,
+):
     tree = _FakeTree()
     deps = SimpleNamespace(
         is_admin=lambda u: is_admin,
-        model_overrides={},
-        effort_overrides={},
+        provider_overrides=provider_overrides or {},
+        model_overrides=model_overrides or {},
+        effort_overrides=effort_overrides or {},
     )
     btw.register(tree, deps)
     return tree.cmds["btw"]
@@ -195,13 +207,15 @@ class TestBtwCommand:
     async def test_non_admin_blocked(self, monkeypatch):
         spy = AsyncMock()
         monkeypatch.setattr(
-            "services.claude_api.side_question.answer_side_question", spy,
+            "services.claude_api.side_question.answer_side_question",
+            spy,
         )
         cmd = _register(is_admin=False)
         interaction = _make_interaction()
         await cmd(interaction, "質問")
         interaction.response.send_message.assert_awaited_once_with(
-            "admin only", ephemeral=True,
+            "admin only",
+            ephemeral=True,
         )
         spy.assert_not_called()
 
@@ -227,10 +241,16 @@ class TestBtwCommand:
         )
         monkeypatch.setattr(
             "services.claude_api.side_question.answer_side_question",
-            AsyncMock(return_value=sq.SideQuestionResult(
-                answer="答えです", input_tokens=13, output_tokens=5,
-                duration_ms=1200, prior_turns=2, paused_reason=None,
-            )),
+            AsyncMock(
+                return_value=sq.SideQuestionResult(
+                    answer="答えです",
+                    input_tokens=13,
+                    output_tokens=5,
+                    duration_ms=1200,
+                    prior_turns=2,
+                    paused_reason=None,
+                )
+            ),
         )
         cmd = _register()
         interaction = _make_interaction()
@@ -247,10 +267,16 @@ class TestBtwCommand:
         )
         monkeypatch.setattr(
             "services.claude_api.side_question.answer_side_question",
-            AsyncMock(return_value=sq.SideQuestionResult(
-                answer="答え", input_tokens=1, output_tokens=1,
-                duration_ms=100, prior_turns=0, paused_reason=None,
-            )),
+            AsyncMock(
+                return_value=sq.SideQuestionResult(
+                    answer="答え",
+                    input_tokens=1,
+                    output_tokens=1,
+                    duration_ms=100,
+                    prior_turns=0,
+                    paused_reason=None,
+                )
+            ),
         )
         cmd = _register()
         # first call → "+0 earlier", second → "+1 earlier"
@@ -267,16 +293,56 @@ class TestBtwCommand:
         )
         monkeypatch.setattr(
             "services.claude_api.side_question.answer_side_question",
-            AsyncMock(return_value=sq.SideQuestionResult(
-                answer="   ", input_tokens=1, output_tokens=0,
-                duration_ms=100, prior_turns=0, paused_reason=None,
-            )),
+            AsyncMock(
+                return_value=sq.SideQuestionResult(
+                    answer="   ",
+                    input_tokens=1,
+                    output_tokens=0,
+                    duration_ms=100,
+                    prior_turns=0,
+                    paused_reason=None,
+                )
+            ),
         )
         cmd = _register()
         interaction = _make_interaction()
         await cmd(interaction, "q")
         last_text = interaction.followup.send.await_args_list[-1].args[0]
         assert "応答が空" in last_text
+
+    async def test_codex_override_is_not_forwarded_to_claude_provider(
+        self,
+        monkeypatch,
+    ):
+        key = (CHANNEL, 573489206240870410)
+        answer = AsyncMock(
+            return_value=sq.SideQuestionResult(
+                answer="答え",
+                input_tokens=1,
+                output_tokens=1,
+                duration_ms=100,
+                prior_turns=0,
+                paused_reason=None,
+            )
+        )
+        monkeypatch.setattr(
+            "services.claude_api.client_factory.make_api_client",
+            AsyncMock(return_value=object()),
+        )
+        monkeypatch.setattr(
+            "services.claude_api.side_question.answer_side_question",
+            answer,
+        )
+        cmd = _register(
+            provider_overrides={key: "codex"},
+            model_overrides={key: "gpt-5.6-sol"},
+            effort_overrides={key: "ultra"},
+        )
+
+        await cmd(_make_interaction(), "質問")
+
+        assert answer.await_args.kwargs["model"] is None
+        assert answer.await_args.kwargs["effort"] is None
 
 
 # --------------------------------------------------------------------------- #

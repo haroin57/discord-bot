@@ -1,0 +1,256 @@
+name: trusted-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Full SHA of the release candidate to test and verify.
+        required: true
+        type: string
+      reviewed_base_sha:
+        description: Full SHA of the explicitly reviewed diff base.
+        required: false
+        type: string
+      previous_release_sha:
+        description: Full SHA of the immediately preceding release.
+        required: false
+        type: string
+      staging_health_url:
+        description: Allowlisted HTTPS staging health endpoint.
+        required: true
+        type: string
+      observed_error_rate_pct:
+        description: Observed staging error rate percentage.
+        required: true
+        default: "0"
+        type: string
+      rollback_threshold_pct:
+        description: Error rate percentage that forces rollback.
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trusted-release
+  cancel-in-progress: true
+
+env:
+  DISCORD_TOKEN: dummy_test_token
+  ADMIN_USER_IDS: "1234567890"
+  ANTHROPIC_API_KEY: ci-dummy
+  OPENAI_API_KEY: ci-dummy
+  GOOGLE_AI_API_KEY: ci-dummy
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  trust-controller:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Validate manual release identity
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          CONTROLLER_REF: ${{ github.ref }}
+          CONTROLLER_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "${CONTROLLER_REF}" = "refs/heads/${DEFAULT_BRANCH}"
+          test "${WORKFLOW_SHA}" = "${CONTROLLER_SHA}"
+          if ! [[ "${CANDIDATE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "candidate_sha must be a full lowercase SHA" >&2
+            exit 2
+          fi
+      - name: Check out candidate graph for trust validation
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          path: trust-candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate reviewed candidate range
+        working-directory: trust-candidate
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          PREVIOUS_RELEASE_SHA: ${{ inputs.previous_release_sha }}
+          REVIEWED_BASE_SHA: ${{ inputs.reviewed_base_sha }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${REVIEWED_BASE_SHA}" && -n "${PREVIOUS_RELEASE_SHA}" ]]; then
+            echo "provide exactly one reviewed release base" >&2
+            exit 2
+          fi
+          base_sha="${REVIEWED_BASE_SHA:-${PREVIOUS_RELEASE_SHA}}"
+          if ! [[ "${base_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "reviewed release base must be a full lowercase SHA" >&2
+            exit 2
+          fi
+          test "$(git rev-parse HEAD)" = "${CANDIDATE_SHA}"
+          git cat-file -e "${base_sha}^{commit}"
+          git merge-base --is-ancestor "${base_sha}" "${CANDIDATE_SHA}"
+
+  collection-contract:
+    needs: trust-controller
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tests
+      - name: Reject collection-time test pollution
+        run: python scripts/check_test_isolation.py
+      - name: Collect all tests and run contracts
+        run: python scripts/run_test_lane.py collection-contract --workers auto
+
+  unit-fast:
+    needs: trust-controller
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tests
+      - name: Run isolated unit lane
+        run: python scripts/run_test_lane.py unit-fast --workers auto
+
+  characterization:
+    needs: trust-controller
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tests
+      - name: Run characterization lane
+        run: python scripts/run_test_lane.py characterization --workers auto
+
+  integration:
+    needs: trust-controller
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tests
+      - name: Run integration lane
+        run: python scripts/run_test_lane.py integration --workers auto
+
+  offline-eval:
+    needs: trust-controller
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tests
+      - name: Run deterministic offline evaluations
+        run: python scripts/run_test_lane.py offline-eval --workers auto
+
+  security:
+    needs: trust-controller
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security.yml
+    with:
+      candidate_sha: ${{ inputs.candidate_sha }}
+
+  release-gate:
+    if: ${{ always() && !cancelled() && needs.trust-controller.result == 'success' }}
+    needs:
+      - trust-controller
+      - collection-contract
+      - unit-fast
+      - characterization
+      - integration
+      - offline-eval
+      - security
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify trusted controller identity
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          CONTROLLER_REF: ${{ github.ref }}
+          CONTROLLER_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "${CONTROLLER_REF}" = "refs/heads/${DEFAULT_BRANCH}"
+          test "${WORKFLOW_SHA}" = "${CONTROLLER_SHA}"
+          if ! [[ "${CANDIDATE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "candidate_sha must be a full lowercase SHA" >&2
+            exit 2
+          fi
+      - name: Check out trusted controller
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: controller
+          persist-credentials: false
+      - name: Check out candidate as data
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Enforce trusted release prerequisites
+        working-directory: controller
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+          REVIEWED_BASE_SHA: ${{ inputs.reviewed_base_sha }}
+          PREVIOUS_RELEASE_SHA: ${{ inputs.previous_release_sha }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          RELEASE_MANIFEST: ${{ runner.temp }}/phase4-release-manifest.json
+          RELEASE_MANIFEST_B64: ${{ vars.RELEASE_MANIFEST_B64 }}
+          RELEASE_MANIFEST_DIGEST: ${{ vars.RELEASE_MANIFEST_SHA256 }}
+          STAGING_HEALTH_URL: ${{ inputs.staging_health_url }}
+          STAGING_ALLOWED_HOSTS: ${{ vars.STAGING_HEALTH_ALLOWED_HOSTS }}
+          OBSERVED_ERROR_RATE: ${{ inputs.observed_error_rate_pct }}
+          ROLLBACK_THRESHOLD: ${{ inputs.rollback_threshold_pct }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${REVIEWED_BASE_SHA}" && -n "${PREVIOUS_RELEASE_SHA}" ]]; then
+            echo "provide exactly one reviewed release base" >&2
+            exit 2
+          fi
+          base_sha="${REVIEWED_BASE_SHA:-${PREVIOUS_RELEASE_SHA}}"
+          if ! [[ "${base_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "reviewed_base_sha or previous_release_sha must be a full lowercase SHA" >&2
+            exit 2
+          fi
+          if [[ -z "${RELEASE_MANIFEST_DIGEST}" || -z "${RELEASE_MANIFEST_B64}" ]]; then
+            echo "RELEASE_MANIFEST_SHA256 and RELEASE_MANIFEST_B64 repository variables are required" >&2
+            exit 2
+          fi
+          umask 077
+          printf '%s' "${RELEASE_MANIFEST_B64}" | base64 --decode > "${RELEASE_MANIFEST}"
+          args=(
+            --job-results "${JOB_RESULTS}"
+            --repo "${GITHUB_WORKSPACE}/candidate"
+            --base-sha "${base_sha}"
+            --candidate-sha "${CANDIDATE_SHA}"
+            --release-manifest "${RELEASE_MANIFEST}"
+            --release-manifest-digest "${RELEASE_MANIFEST_DIGEST}"
+            --staging-health-url "${STAGING_HEALTH_URL}"
+            --staging-allowed-host "${STAGING_ALLOWED_HOSTS}"
+            --require-staging
+            --observed-error-rate "${OBSERVED_ERROR_RATE}"
+            --rollback-threshold "${ROLLBACK_THRESHOLD}"
+          )
+          python scripts/check_release_gate.py "${args[@]}"

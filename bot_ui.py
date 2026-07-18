@@ -12,6 +12,7 @@ content, and this class owns everything about the status message.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 
@@ -53,6 +54,9 @@ class StatusController:
         # Status updater (latest-wins, 2s rate limit).
         self._last_status_update = 0.0
         self._pending_status: dict = {"text": None, "task": None}
+        self._write_lock = asyncio.Lock()
+        self._revision = 0
+        self._terminal = False
 
         # Claude-Code-CLI-style animated spinner. CADENCE = 1 char / second —
         # a HARD Discord limit (per-message edit bucket ~5/5s ≈ 1/s sustained);
@@ -60,7 +64,7 @@ class StatusController:
         # empirical freezes at faster cadences. Continuous motion comes from
         # SPINNER_EMOJI (animated application emoji, free).
         self._spinner = ProgressSpinner()
-        self.prog: dict = {"tokens": 0}   # live output-token count (set by tool_loop)
+        self.prog: dict = {"tokens": 0}  # live output-token count (set by tool_loop)
         self.spin: dict = {"on": False, "action": "", "start": 0.0}
         # Vestigial guard, kept False: status_msg is the spinner only — the
         # response is always a fresh reply now (in-place-repurpose removed
@@ -68,9 +72,24 @@ class StatusController:
         # the reply in the wrong timeline slot).
         self.consumed = {"v": False}
         self._animator_task: "asyncio.Task | None" = None
+        self._owned_tasks: set[asyncio.Task] = set()
+        self._closed = False
+
+    def _spawn(self, coro, *, name: str) -> asyncio.Task | None:
+        if self._closed:
+            close = getattr(coro, "close", None)
+            if close is not None:
+                close()
+            return None
+        task = self._track_task(coro, name=name)
+        self._owned_tasks.add(task)
+        task.add_done_callback(self._owned_tasks.discard)
+        return task
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def initial_reply(self, *, was_queued: bool, wait_pos: int = 1) -> None:
+        if self._closed:
+            return
         try:
             if was_queued:
                 self.status_msg = await self.message.reply(f"⏳ 待機中({wait_pos}番目)")
@@ -81,17 +100,18 @@ class StatusController:
 
     def spin_start(self, *, mode: str) -> None:
         """Start the animator; it owns status_msg until spin_stop()."""
+        if self._closed or self._terminal:
+            return
         self.spin["on"] = True
         self.spin["start"] = time.monotonic()
         coro = self._animate_gif() if mode == "gif" else self._animate()
-        self._animator_task = self._track_task(coro, name="status_spinner")
+        self._animator_task = self._spawn(coro, name="status_spinner")
 
     def spin_stop(self) -> None:
         """Hand status_msg back to the normal (throttled) flow."""
         self.spin["on"] = False
         if self._animator_task is not None:
             self._animator_task.cancel()
-            self._animator_task = None
 
     async def reposition(self) -> None:
         """Keep the spinner pinned at the BOTTOM of the reply while generating.
@@ -103,27 +123,54 @@ class StatusController:
         the HTTPException guards). No-op once generation ends or if the
         spinner is gone.
         """
-        if not self.spin["on"] or self.status_msg is None:
+        if (
+            self._closed
+            or self._terminal
+            or not self.spin["on"]
+            or self.status_msg is None
+        ):
             return
-        old = self.status_msg
-        try:
-            new = await self.message.channel.send(self._spin_body())
-        except discord.errors.HTTPException:
-            return
-        self.status_msg = new
-        try:
-            await old.delete()
-        except discord.errors.HTTPException:
-            pass
+        async with self._write_lock:
+            if (
+                self._closed
+                or self._terminal
+                or not self.spin["on"]
+                or self.status_msg is None
+            ):
+                return
+            old = self.status_msg
+            try:
+                new = await self.message.channel.send(self._spin_body())
+            except discord.errors.HTTPException:
+                return
+            # edit_final() establishes its terminal fence before waiting for
+            # this lock.  If that happened during channel.send(), never swap a
+            # fresh spinner in after the terminal message was selected.
+            if self._closed or self._terminal or not self.spin["on"]:
+                try:
+                    await new.delete()
+                except discord.errors.HTTPException:
+                    pass
+                return
+            self.status_msg = new
+            try:
+                await old.delete()
+            except discord.errors.HTTPException:
+                pass
 
     async def edit_final(self, text: str) -> None:
-        """Terminal edit (abort/error paths). No-op when no status message."""
-        if self.status_msg is None:
+        """Commit one terminal edit after fencing every older status writer."""
+        if self._closed or self._terminal:
             return
-        try:
-            await self.status_msg.edit(content=text)
-        except discord.errors.HTTPException:
-            pass
+        # Establish the fence before any await.  Existing edits that already
+        # hold _write_lock finish first; queued/delayed/spinner edits observe
+        # _terminal after they acquire it and are discarded.  The terminal
+        # edit therefore always lands last.
+        self._terminal = True
+        self._revision += 1
+        self.cancel_pending()
+        self.spin_stop()
+        await self._write_status(content=text, terminal=True)
 
     def cancel_pending(self) -> None:
         """Cancel any pending delayed status edit (success path, pre-delete)."""
@@ -134,11 +181,42 @@ class StatusController:
 
     async def delete_if_alive(self) -> None:
         """Success path: remove the status message (unless repurposed)."""
-        if self.status_msg is not None and not self.consumed["v"]:
+        if self._closed or self._terminal:
+            return
+        self._terminal = True
+        self._revision += 1
+        self.cancel_pending()
+        self.spin_stop()
+        async with self._write_lock:
+            status_message = self.status_msg
+            if status_message is None or self.consumed["v"]:
+                return
+            self.status_msg = None
             try:
-                await self.status_msg.delete()
+                await status_message.delete()
             except discord.errors.HTTPException:
                 pass
+
+    async def close(self) -> None:
+        """Fence late edits and cancel/await every status-owned task once."""
+        if self._closed:
+            return
+        self._closed = True
+        self._terminal = True
+        self._revision += 1
+        self.spin["on"] = False
+        tasks = list(self._owned_tasks)
+        pending = self._pending_status.get("task")
+        if pending is not None and pending not in tasks:
+            tasks.append(pending)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._owned_tasks.clear()
+        self._pending_status["task"] = None
+        self._animator_task = None
 
     # ── status text (latest-wins, throttled) ───────────────────────────────
     async def update(self, text: str) -> None:
@@ -148,8 +226,12 @@ class StatusController:
         schedule a delayed edit (cancelling any previously pending one).
         Discord message limit is 2000 chars — truncate to stay safe.
         """
+        if self._closed or self._terminal:
+            return
         if len(text) > 1990:
             text = text[:1990] + "…"
+        self._revision += 1
+        revision = self._revision
         # While the animator owns status_msg, route phase/tool labels into its
         # transient "action" line instead of editing directly (avoids two
         # writers fighting over one message). Plain thinking/generating
@@ -166,35 +248,58 @@ class StatusController:
                 self._pending_status["task"] = None
             self._last_status_update = now_mono
             # Fire-and-forget so the streaming loop isn't blocked on Discord I/O.
-            self._track_task(self._do_edit(text), name="status_edit")
+            self._spawn(self._do_edit(text, revision), name="status_edit")
             return
         # Too soon: remember latest text, schedule a single delayed edit.
         self._pending_status["text"] = text
         pending = self._pending_status.get("task")
         if pending and not pending.done():
             pending.cancel()
-        self._pending_status["task"] = self._track_task(
-            self._delayed_edit(text, STATUS_INTERVAL_S - elapsed),
+        self._pending_status["task"] = self._spawn(
+            self._delayed_edit(text, STATUS_INTERVAL_S - elapsed, revision),
             name="status_delayed_edit",
         )
 
-    async def _do_edit(self, text: str) -> None:
-        if self.status_msg is None or self.consumed["v"]:
-            # status_msg was repurposed as the response body — don't clobber it.
-            return
-        try:
-            await self.status_msg.edit(content=text)
-        except discord.errors.HTTPException:
-            pass
+    async def _write_status(
+        self,
+        *,
+        content: str,
+        attachments=None,
+        revision: int | None = None,
+        terminal: bool = False,
+    ) -> bool:
+        """Serialize edits and reject stale/non-terminal writes after a fence."""
+        kwargs = {"content": content}
+        if attachments is not None:
+            kwargs["attachments"] = attachments
+        async with self._write_lock:
+            if (
+                self._closed
+                or self.status_msg is None
+                or self.consumed["v"]
+                or (self._terminal and not terminal)
+                or (revision is not None and revision != self._revision)
+            ):
+                return False
+            try:
+                await self.status_msg.edit(**kwargs)
+            except discord.errors.HTTPException:
+                return False
+        return True
 
-    async def _delayed_edit(self, text: str, delay: float) -> None:
+    async def _do_edit(self, text: str, revision: int) -> None:
+        # status_msg was repurposed as the response body, terminally edited, or
+        # superseded by a newer revision — do not clobber it.
+        await self._write_status(content=text, revision=revision)
+
+    async def _delayed_edit(self, text: str, delay: float, revision: int) -> None:
         try:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return
         self._last_status_update = time.monotonic()
         self._pending_status["task"] = None
-        await self._do_edit(text)
+        await self._do_edit(text, revision)
 
     # ── spinner rendering ───────────────────────────────────────────────────
     def _spin_body(self) -> str:
@@ -207,15 +312,13 @@ class StatusController:
                 body += f" · ↑ {_fmt_tokens(self.prog['tokens'])} tokens"
             return body + ")"
         return self._spinner.render(
-            elapsed_s=elapsed, tokens=self.prog["tokens"], interrupt_hint="/abort で中断",
+            elapsed_s=elapsed,
+            tokens=self.prog["tokens"],
+            interrupt_hint="/abort で中断",
         )
 
     async def _spin_edit(self, text: str) -> None:
-        try:
-            if self.status_msg is not None:
-                await self.status_msg.edit(content=text)
-        except discord.errors.HTTPException:
-            pass
+        await self._write_status(content=text)
 
     async def _animate(self) -> None:
         next_frame = time.monotonic()
@@ -256,6 +359,7 @@ class StatusController:
         import os as _os
         from services.claude_api.progress import pick_word
         from services.claude_api.spinner_gif import render_status_gif, _CACHE_DIR
+
         REFRESH_S = 1.0
         gif_path = _os.path.join(_CACHE_DIR, f"status_{self.message.channel.id}.gif")
         state = {"mode": None, "action": None, "last_refresh": 0.0}
@@ -272,19 +376,23 @@ class StatusController:
         async def _refresh_gif(meta: str) -> None:
             try:
                 path = await asyncio.to_thread(
-                    render_status_gif, pick_word(), meta, gif_path,
+                    render_status_gif,
+                    pick_word(),
+                    meta,
+                    gif_path,
                 )
             except Exception as exc:
-                log.warning("[rid=%s] status gif render failed: %s",
-                            get_request_id(), exc)
-                await self.status_msg.edit(content=f"⏳ {meta}")
-                state["mode"] = "text"
+                log.warning(
+                    "[rid=%s] status gif render failed: %s", get_request_id(), exc
+                )
+                if await self._write_status(content=f"⏳ {meta}"):
+                    state["mode"] = "text"
                 return
             f = discord.File(path)
             try:
-                await self.status_msg.edit(content="", attachments=[f])
-                state["mode"] = "gif"
-                state["last_refresh"] = time.monotonic()
+                if await self._write_status(content="", attachments=[f]):
+                    state["mode"] = "gif"
+                    state["last_refresh"] = time.monotonic()
             finally:
                 f.close()
 
@@ -296,16 +404,23 @@ class StatusController:
                     if action:
                         # tool running → plain text line, drop the gif
                         changed = state["mode"] != "action" or state["action"] != action
-                        if changed or time.monotonic() - state["last_refresh"] >= REFRESH_S:
+                        if (
+                            changed
+                            or time.monotonic() - state["last_refresh"] >= REFRESH_S
+                        ):
                             if state["mode"] == "gif":
                                 # clear the gif attachment when leaving gif mode
-                                await self.status_msg.edit(content=f"{action}  {meta}",
-                                                           attachments=[])
+                                edited = await self._write_status(
+                                    content=f"{action}  {meta}", attachments=[]
+                                )
                             else:
-                                await self.status_msg.edit(content=f"{action}  {meta}")
-                            state["mode"] = "action"
-                            state["action"] = action
-                            state["last_refresh"] = time.monotonic()
+                                edited = await self._write_status(
+                                    content=f"{action}  {meta}"
+                                )
+                            if edited:
+                                state["mode"] = "action"
+                                state["action"] = action
+                                state["last_refresh"] = time.monotonic()
                     else:
                         state["action"] = None
                         # Refresh every tick (~1s): new sweep + ticking counters.
@@ -364,6 +479,7 @@ class LiveRenderer:
         job,
         split_message,
         math_presentation_mode: str = "legacy",
+        delivery_callback=None,
     ) -> None:
         self.message = message
         self._status = status
@@ -371,16 +487,18 @@ class LiveRenderer:
         self._job = job
         self._split_message = split_message
         self._adaptive_math = math_presentation_mode == "adaptive"
+        self._delivery_callback = delivery_callback
 
         # ── shared streaming state (was nonlocal / dict cells in on_message) ──
         self._live_sent_any = {"v": False}
-        self._acc = {"committed": "", "last_edit": 0.0}   # raw prose across all turns
-        self._emitted = {"upto": 0}                        # raw offset finalized (immutable)
-        self._draft_msgs: list["discord.Message"] = []     # editable live-tail prose msgs
-        self._placeholder: dict = {"msg": None}            # held open-block placeholder
-        self._rendered_images: list[str] = []              # temp image paths to clean up
+        self._acc = {"committed": "", "last_edit": 0.0}  # raw prose across all turns
+        self._emitted = {"upto": 0}  # raw offset finalized (immutable)
+        self._draft_msgs: list["discord.Message"] = []  # editable live-tail prose msgs
+        self._placeholder: dict = {"msg": None}  # held open-block placeholder
+        self._rendered_images: list[str] = []  # temp image paths to clean up
         self._rendered_image_message_ids: dict[str, int] = {}
-        self._first_reply = {"done": False}                # first content msg replies to user
+        self._delivery_message_ids: list[int] = []
+        self._first_reply = {"done": False}  # first content msg replies to user
         self._render_lock = asyncio.Lock()
 
         # ── parallel tool-call notice state ──────────────────────────────────
@@ -391,7 +509,10 @@ class LiveRenderer:
         # throttled like stream_preview. On block close it collapses into a
         # 1-line subtext summary instead of leaving the full draft behind.
         self._scratch_state: dict = {
-            "msg": None, "last_edit": 0.0, "section": None, "summary": [],
+            "msg": None,
+            "last_edit": 0.0,
+            "section": None,
+            "summary": [],
         }
 
         # ── Plan/Verify live-preview state ───────────────────────────────────
@@ -400,7 +521,10 @@ class LiveRenderer:
         # into 1-line subtext summaries (capped) instead of leaving raw
         # reasoning behind.
         self._plan_state: dict = {
-            "msg": None, "last_edit": 0.0, "kind": None, "summary": [],
+            "msg": None,
+            "last_edit": 0.0,
+            "kind": None,
+            "summary": [],
         }
 
     # ── public read-only accessors (bot.py reads these after the turn) ───────
@@ -419,6 +543,10 @@ class LiveRenderer:
     @property
     def rendered_image_message_ids(self) -> dict[str, int]:
         return self._rendered_image_message_ids
+
+    @property
+    def delivery_message_ids(self) -> list[int]:
+        return list(self._delivery_message_ids)
 
     @property
     def tool_notice_task(self):
@@ -446,15 +574,28 @@ class LiveRenderer:
         try:
             if not self._first_reply["done"]:
                 self._first_reply["done"] = True
-                m = await (self.message.reply(file=file) if file is not None
-                           else self.message.reply(text))
+                m = await (
+                    self.message.reply(file=file)
+                    if file is not None
+                    else self.message.reply(text)
+                )
             else:
-                m = await (self.message.channel.send(file=file) if file is not None
-                           else self.message.channel.send(text))
+                m = await (
+                    self.message.channel.send(file=file)
+                    if file is not None
+                    else self.message.channel.send(text)
+                )
         except discord.errors.HTTPException as exc:
             log.warning("[rid=%s] content send failed: %s", get_request_id(), exc)
             return None
         self._live_sent_any["v"] = True
+        message_id = getattr(m, "id", None)
+        if message_id is not None and message_id not in self._delivery_message_ids:
+            self._delivery_message_ids.append(message_id)
+        if self._delivery_callback is not None:
+            result = self._delivery_callback(m)
+            if inspect.isawaitable(result):
+                await result
         await self._status.reposition()
         return m
 
@@ -467,7 +608,7 @@ class LiveRenderer:
     def _disp(self, text: str) -> str:
         """Apply the final per-message Discord hard cap."""
         if len(text) > self.DISCORD_HARD_CAP:
-            text = text[:self.DISCORD_HARD_CAP - 1] + "…"
+            text = text[: self.DISCORD_HARD_CAP - 1] + "…"
         return text
 
     async def _draft_live(self, prose: str) -> None:
@@ -476,11 +617,12 @@ class LiveRenderer:
         prose = (prose or "").strip("\n")
         presented = self._present_prose(prose)
         chunks = await asyncio.to_thread(
-            self._split_message, presented, self.LIVE_DRAFT_LIMIT, numbered=False,
+            self._split_message,
+            presented,
+            self.LIVE_DRAFT_LIMIT,
+            numbered=False,
         )
-        display_chunks = [
-            self._disp(chunk) for chunk in chunks if chunk.strip()
-        ]
+        display_chunks = [self._disp(chunk) for chunk in chunks if chunk.strip()]
         for i, disp in enumerate(display_chunks):
             if i < len(self._draft_msgs):
                 existing = self._draft_msgs[i]
@@ -496,14 +638,14 @@ class LiveRenderer:
                     return
                 self._draft_msgs.append(sent)
 
-        stale = self._draft_msgs[len(display_chunks):]
+        stale = self._draft_msgs[len(display_chunks) :]
         for message in stale:
             try:
                 await message.delete()
             except discord.errors.HTTPException:
                 pass
         if stale:
-            del self._draft_msgs[len(display_chunks):]
+            del self._draft_msgs[len(display_chunks) :]
 
     async def _finalize_text(self, prose: str) -> None:
         """Freeze the live-tail prose as immutable messages: render it once
@@ -514,7 +656,11 @@ class LiveRenderer:
 
     async def _show_placeholder(self) -> None:
         if self._placeholder.get("msg") is None:
-            self._placeholder["msg"] = await self._send_content("📊 描画中…")
+            try:
+                self._placeholder["msg"] = await self.message.channel.send("📊 描画中…")
+                await self._status.reposition()
+            except discord.errors.HTTPException:
+                self._placeholder["msg"] = None
 
     async def _hide_placeholder(self) -> None:
         ph = self._placeholder.get("msg")
@@ -533,7 +679,9 @@ class LiveRenderer:
             if isinstance(seg, TableSegment):
                 img_path = await render_table_image(seg.markdown, caption=seg.caption)
             elif isinstance(seg, MathSegment):
-                img_path = await render_math_image(seg.latex, display_mode=seg.display_mode)
+                img_path = await render_math_image(
+                    seg.latex, display_mode=seg.display_mode
+                )
         except Exception as exc:
             log.warning("[rid=%s] block render failed: %s", get_request_id(), exc)
             img_path = None
@@ -559,20 +707,28 @@ class LiveRenderer:
         if isinstance(seg, TableSegment):
             fallback = seg.markdown
         else:
-            fallback = (f"```\n{seg.latex}\n```" if seg.display_mode
-                        else f"`{seg.latex}`")
+            fallback = (
+                f"```\n{seg.latex}\n```" if seg.display_mode else f"`{seg.latex}`"
+            )
         for chunk in await asyncio.to_thread(
-            self._split_message, fallback, self.LIVE_DRAFT_LIMIT, numbered=False,
+            self._split_message,
+            fallback,
+            self.LIVE_DRAFT_LIMIT,
+            numbered=False,
         ):
             await self._send_content(self._disp(chunk))
 
-    async def render_incremental(self, full_text: str, *, final: bool = False,
-                                 force: bool = False) -> None:
+    async def render_incremental(
+        self, full_text: str, *, final: bool = False, force: bool = False
+    ) -> None:
         full_text = full_text or ""
         async with self._render_lock:
             now_mono = time.monotonic()
-            if not final and not force and \
-                    (now_mono - self._acc["last_edit"]) < self.STREAM_EDIT_INTERVAL_S:
+            if (
+                not final
+                and not force
+                and (now_mono - self._acc["last_edit"]) < self.STREAM_EDIT_INTERVAL_S
+            ):
                 return
             self._acc["last_edit"] = now_mono
 
@@ -595,7 +751,7 @@ class LiveRenderer:
             _guard = 0
             while _guard < 500:
                 _guard += 1
-                region = full_text[self._emitted["upto"]:settled_end]
+                region = full_text[self._emitted["upto"] : settled_end]
                 span = first_block_span(
                     region,
                     adaptive_math=self._adaptive_math,
@@ -615,7 +771,7 @@ class LiveRenderer:
 
             # Trailing region after the last emitted block.
             if final:
-                tail = full_text[self._emitted["upto"]:]
+                tail = full_text[self._emitted["upto"] :]
                 if tail.strip():
                     await self._finalize_text(tail)
                 await self._hide_placeholder()
@@ -623,11 +779,11 @@ class LiveRenderer:
             if is_open:
                 # Prose before the open block (settled) is shown live; the
                 # open block is held behind the placeholder until it closes.
-                await self._draft_live(full_text[self._emitted["upto"]:settled_end])
+                await self._draft_live(full_text[self._emitted["upto"] : settled_end])
                 await self._show_placeholder()
             else:
                 await self._hide_placeholder()
-                await self._draft_live(full_text[self._emitted["upto"]:])
+                await self._draft_live(full_text[self._emitted["upto"] :])
 
     async def stream_preview(self, partial_turn_text: str) -> None:
         # In-progress text of the CURRENT turn appended to everything
@@ -646,7 +802,9 @@ class LiveRenderer:
         self._acc["committed"] = self._acc["committed"] + sep + text
         log.info(
             "[rid=%s] live commit: +%d chars committed=%d",
-            get_request_id(), len(text), len(self._acc["committed"]),
+            get_request_id(),
+            len(text),
+            len(self._acc["committed"]),
         )
         await self.render_incremental(self._acc["committed"], force=True)
 
@@ -656,7 +814,7 @@ class LiveRenderer:
         if not lines:
             return
         self._tool_notice_state["lines"] = []
-        shown = lines[:self.TOOL_NOTICE_MAX_LINES]
+        shown = lines[: self.TOOL_NOTICE_MAX_LINES]
         extra = len(lines) - len(shown)
         payload = "\n".join(shown)
         if extra > 0:
@@ -666,13 +824,17 @@ class LiveRenderer:
         existing = self._tool_notice_state.get("msg")
         try:
             if existing is None:
-                self._tool_notice_state["msg"] = await self.message.channel.send(payload)
+                self._tool_notice_state["msg"] = await self.message.channel.send(
+                    payload
+                )
                 await self._status.reposition()
                 return
             await existing.edit(content=payload)
         except discord.errors.NotFound:
             try:
-                self._tool_notice_state["msg"] = await self.message.channel.send(payload)
+                self._tool_notice_state["msg"] = await self.message.channel.send(
+                    payload
+                )
                 await self._status.reposition()
             except Exception as exc:
                 log.warning("tool notice re-post failed: %s", exc)
@@ -683,6 +845,7 @@ class LiveRenderer:
         self._job.phase = JobPhase.TOOL_RUNNING
         try:
             from services.claude_api.status import tool_oneline
+
             line = tool_oneline(tool_name, tool_input)
         except Exception as exc:
             log.warning("tool notice format failed: %s", exc)
@@ -718,7 +881,7 @@ class LiveRenderer:
             return
         self._scratch_state["last_edit"] = now_mono
         self._scratch_state["section"] = section
-        tail = (content or "")[-self.SCRATCH_PREVIEW_TAIL_CHARS:]
+        tail = (content or "")[-self.SCRATCH_PREVIEW_TAIL_CHARS :]
         quoted = "\n".join(f"> {line}" for line in tail.splitlines()) or "> …"
         payload = self._disp(f"-# 💭 メモ「{section}」を記述中…\n{quoted}")
         existing = self._scratch_state.get("msg")
@@ -767,7 +930,7 @@ class LiveRenderer:
         self._plan_state["last_edit"] = now_mono
         self._plan_state["kind"] = kind
         emoji = "🔎" if kind == "検証" else "🧠"
-        tail = (text or "")[-self.SCRATCH_PREVIEW_TAIL_CHARS:]
+        tail = (text or "")[-self.SCRATCH_PREVIEW_TAIL_CHARS :]
         quoted = "\n".join(f"> {line}" for line in tail.splitlines()) or "> …"
         payload = self._disp(f"-# {emoji} {kind}中…\n{quoted}")
         existing = self._plan_state.get("msg")

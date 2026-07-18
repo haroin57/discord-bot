@@ -4,9 +4,9 @@
 #
 # なぜラッパーが要るか:
 #  - CLI から spawn される MCP は最小 PATH になり得る → volta の node bin を PATH に足す
-#  - API キーを .mcp.json に直書きすると git に乗る → .env から実行時に注入する
+#  - API キーを .mcp.json に直書きせず、呼び出し元の専用 env から継承する
 #
-# 認証: OPENAI_API_KEY(必須, gpt系) / GOOGLE_AI_API_KEY(任意, gemini系) を .env から。
+# 認証: OPENAI_API_KEY(必須) / GOOGLE_AI_API_KEY(任意) は呼び出し元が注入する。
 # ChatGPT browser 自動化モードは使わない前提（Responses API 直＝規約クリーン）。
 set -euo pipefail
 # ADR-0037: ジョブコントロールを明示 off。非対話ではデフォルト off だが、
@@ -15,12 +15,7 @@ set -euo pipefail
 set +m
 
 export PATH="$HOME/.volta/bin:$PATH"
-ENV_FILE="/home/ubuntu/discord-bot/.env"
-
-for k in OPENAI_API_KEY GOOGLE_AI_API_KEY; do
-  v="$(grep -E "^${k}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)"
-  if [ -n "${v}" ]; then export "${k}=${v}"; fi
-done
+: "${OPENAI_API_KEY:?OPENAI_API_KEY must be injected by the Oracle service environment}"
 
 # oracle は Gemini に GEMINI_API_KEY を見る。GOOGLE_AI_API_KEY を写経。
 if [ -n "${GOOGLE_AI_API_KEY:-}" ]; then export GEMINI_API_KEY="${GOOGLE_AI_API_KEY}"; fi
@@ -45,8 +40,5 @@ export ORACLE_DEFAULT_SEARCH="${ORACLE_DEFAULT_SEARCH:-off}"
 # ローカルパッチの自己修復（npm update で剥がれても次のスポーンで再適用）。
 # 正本: infra/oracle-patches/<version>/files/、手順: docs/oracle_mcp.md
 "$(dirname "${BASH_SOURCE[0]}")/oracle_apply_patches.sh" || true
-# supergateway の unhandled-rejection クラッシュパッチも同時に自己修復。
-# 正本: infra/supergateway-patches/<version>/files/、手順: docs/oracle_mcp.md
-"$(dirname "${BASH_SOURCE[0]}")/supergateway_apply_patches.sh" || true
 
 exec oracle-mcp "$@"

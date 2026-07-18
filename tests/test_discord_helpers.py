@@ -9,6 +9,7 @@ import discord
 import pytest
 
 from config import ADMIN_USER_IDS, BOT_IGNORED_ROLE_IDS, BOT_ROLE_IDS
+from utils.context_gateway import ResolvedMessageLinks
 from utils.discord_helpers import (
     _cache_get,
     _cache_set,
@@ -94,9 +95,7 @@ class TestSplitMessage:
             body = c.split("\n-# (")[0]
             assert body.count("```") % 2 == 0, f"unbalanced fence in: {body[-80:]}"
         # continuation chunks reopen with the language tag
-        assert any(
-            c.split("\n-# (")[0].startswith("```python") for c in chunks[1:]
-        )
+        assert any(c.split("\n-# (")[0].startswith("```python") for c in chunks[1:])
 
     def test_fence_language_preserved_across_splits(self):
         long_line_code = "\n".join("x = " + "1" * 60 for _ in range(60))
@@ -239,6 +238,24 @@ class TestDiscordMsgUrlRegex:
         url = "https://discordapp.com/channels/111/222/333"
         assert DISCORD_MSG_URL_RE.search(url)
 
+    def test_matches_dm_url(self):
+        url = "https://discord.com/channels/@me/1489297911895294042/1527125169381048350"
+        match = DISCORD_MSG_URL_RE.search(url)
+        assert match
+        assert match.groups() == (
+            "@me",
+            "1489297911895294042",
+            "1527125169381048350",
+        )
+
+    @pytest.mark.parametrize(
+        "suffix",
+        ("abc", "/extra", "%2Fextra"),
+    )
+    def test_rejects_invalid_message_id_suffix(self, suffix):
+        url = f"https://discord.com/channels/@me/222/333{suffix}"
+        assert DISCORD_MSG_URL_RE.search(url) is None
+
     def test_no_match_on_random_text(self):
         assert DISCORD_MSG_URL_RE.search("hello world") is None
 
@@ -259,9 +276,8 @@ class TestResolveMessageLinks:
         mock_msg.embeds = []
         mock_msg.attachments = []
         mock_channel.name = "general"
-        # guild=None avoids the guild-id equality check; requester=None
-        # skips the confused-deputy read-permission check.
-        mock_channel.guild = None
+        mock_channel.guild = MagicMock()
+        mock_channel.guild.id = 111
 
         mock_client.get_channel = MagicMock(return_value=mock_channel)
         mock_channel.fetch_message = AsyncMock(return_value=mock_msg)
@@ -281,24 +297,166 @@ class TestResolveMessageLinks:
         result = await resolve_message_links(mock_client, text)
         assert "discord.com/channels/111/222/333" in result
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("error_type", "status"),
+        ((discord.NotFound, 404), (discord.Forbidden, 403)),
+    )
+    async def test_discord_api_failure_keeps_url(self, error_type, status):
+        channel = MagicMock()
+        channel.guild = MagicMock()
+        channel.guild.id = 111
+        response = MagicMock(status=status, reason="Unavailable")
+        channel.fetch_message = AsyncMock(
+            side_effect=error_type(response, "unavailable")
+        )
+
+        client = MagicMock()
+        client.get_channel = MagicMock(return_value=channel)
+
+        url = "https://discord.com/channels/111/222/333"
+        result = await resolve_message_links(client, url, caller_is_admin=True)
+
+        assert result == url
+
+    @pytest.mark.asyncio
+    async def test_resolves_dm_link_for_recipient(self):
+        requester = MagicMock()
+        requester.id = 42
+
+        channel = MagicMock()
+        channel.guild = None
+        channel.name = "Direct Message"
+        channel.recipient = requester
+        del channel.recipients
+
+        target = MagicMock()
+        target.author.display_name = "LinkedUser"
+        target.content = "linked DM content"
+        target.embeds = []
+        target.attachments = []
+        channel.fetch_message = AsyncMock(return_value=target)
+
+        client = MagicMock()
+        client.get_channel = MagicMock(return_value=channel)
+
+        url = "https://discord.com/channels/@me/222/333"
+        result = await resolve_message_links(client, url, requester=requester)
+
+        assert isinstance(result, ResolvedMessageLinks)
+        assert result.original_text == url
+        assert "LinkedUser" in result
+        assert "linked DM content" in result
+        channel.fetch_message.assert_awaited_once_with(333)
+
+    @pytest.mark.asyncio
+    async def test_dm_link_for_other_recipient_is_not_resolved(self):
+        requester = MagicMock()
+        requester.id = 42
+
+        recipient = MagicMock()
+        recipient.id = 99
+        channel = MagicMock()
+        channel.guild = None
+        channel.recipient = recipient
+        del channel.recipients
+        channel.fetch_message = AsyncMock()
+
+        client = MagicMock()
+        client.get_channel = MagicMock(return_value=channel)
+
+        url = "https://discord.com/channels/@me/222/333"
+        result = await resolve_message_links(
+            client,
+            url,
+            requester=requester,
+            caller_is_admin=True,
+        )
+
+        assert result == url
+        channel.fetch_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dm_link_without_requester_is_not_resolved(self):
+        channel = MagicMock()
+        channel.guild = None
+        channel.fetch_message = AsyncMock()
+
+        client = MagicMock()
+        client.get_channel = MagicMock(return_value=channel)
+
+        url = "https://discord.com/channels/@me/222/333"
+        result = await resolve_message_links(client, url, caller_is_admin=True)
+
+        assert result == url
+        channel.fetch_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dm_link_cannot_resolve_a_guild_channel(self):
+        channel = MagicMock()
+        channel.guild = MagicMock()
+        channel.guild.id = 111
+        channel.fetch_message = AsyncMock()
+
+        client = MagicMock()
+        client.get_channel = MagicMock(return_value=channel)
+
+        url = "https://discord.com/channels/@me/222/333"
+        result = await resolve_message_links(client, url, caller_is_admin=True)
+
+        assert result == url
+        channel.fetch_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_guild_link_cannot_resolve_a_dm_channel(self):
+        requester = MagicMock()
+        requester.id = 42
+        channel = MagicMock()
+        channel.guild = None
+        channel.recipient = requester
+        del channel.recipients
+        channel.fetch_message = AsyncMock()
+
+        client = MagicMock()
+        client.get_channel = MagicMock(return_value=channel)
+
+        url = "https://discord.com/channels/111/222/333"
+        result = await resolve_message_links(
+            client,
+            url,
+            requester=requester,
+            caller_is_admin=True,
+        )
+
+        assert result == url
+        channel.fetch_message.assert_not_awaited()
+
 
 class TestContextConstants:
     """Verify widened context constants are set correctly."""
 
     def test_layer1_count(self):
         from utils.discord_helpers import LAYER1_COUNT
+
         assert LAYER1_COUNT == 25
 
     def test_layer2_count(self):
         from utils.discord_helpers import LAYER2_COUNT
+
         assert LAYER2_COUNT == 15
 
     def test_max_context_chars(self):
         from utils.discord_helpers import MAX_CONTEXT_CHARS
+
         assert MAX_CONTEXT_CHARS == 20000
 
     def test_channel_context_limit_derived(self):
-        from utils.discord_helpers import LAYER1_COUNT, LAYER2_COUNT, CHANNEL_CONTEXT_LIMIT
+        from utils.discord_helpers import (
+            LAYER1_COUNT,
+            LAYER2_COUNT,
+            CHANNEL_CONTEXT_LIMIT,
+        )
+
         assert CHANNEL_CONTEXT_LIMIT == LAYER1_COUNT + LAYER2_COUNT
 
 
@@ -307,6 +465,7 @@ class TestBuildLayeredLines:
 
     def test_all_layer1_when_few_messages(self):
         from utils.discord_helpers import _build_layered_lines, LAYER1_COUNT
+
         messages = [(f"user{i}", f"message {i}") for i in range(5)]
         lines, _ = _build_layered_lines(messages)
         # All 5 should be full text (within LAYER1_COUNT=25)
@@ -314,7 +473,12 @@ class TestBuildLayeredLines:
         assert all("message" in line for line in lines)
 
     def test_layer2_summarized_when_many_messages(self):
-        from utils.discord_helpers import _build_layered_lines, LAYER1_COUNT, LAYER2_COUNT
+        from utils.discord_helpers import (
+            _build_layered_lines,
+            LAYER1_COUNT,
+            LAYER2_COUNT,
+        )
+
         total = LAYER1_COUNT + LAYER2_COUNT  # 40
         messages = [(f"user{i}", f"{'x' * 300} msg{i}") for i in range(total)]
         lines, _ = _build_layered_lines(messages)
@@ -327,6 +491,7 @@ class TestCacheGetSet:
     def setup_method(self):
         # Clear cache before each test
         import utils.discord_helpers as dh
+
         dh._thread_context_cache.clear()
 
     def test_cache_miss_returns_none(self):
@@ -340,12 +505,14 @@ class TestCacheGetSet:
         import utils.discord_helpers as dh
         import utils.cache as cache_mod
         from config import THREAD_CONTEXT_CACHE_TTL_S
+
         key = (3, 4, False)
         # Insert via the normal API, then jump the clock past TTL.
         _cache_set(key, "expired")
         original = cache_mod.time.monotonic
         monkeypatch.setattr(
-            cache_mod.time, "monotonic",
+            cache_mod.time,
+            "monotonic",
             lambda: original() + THREAD_CONTEXT_CACHE_TTL_S + 1.0,
         )
         assert _cache_get(key) is None
@@ -354,6 +521,7 @@ class TestCacheGetSet:
     def test_cache_evicts_lru_when_full(self):
         import utils.discord_helpers as dh
         from config import THREAD_CONTEXT_CACHE_MAX
+
         # Fill cache to max
         for i in range(THREAD_CONTEXT_CACHE_MAX):
             _cache_set((i, i, False), f"val{i}")
@@ -464,12 +632,24 @@ class TestParseAndVerifyUrl:
         result = _parse_and_verify_url("https://discordapp.com/channels/1/2/3")
         assert result == (1, 2, 3)
 
+    def test_valid_dm_url(self):
+        result = _parse_and_verify_url(
+            "https://discord.com/channels/@me/1489297911895294042/1527125169381048350"
+        )
+        assert result == (
+            "@me",
+            1489297911895294042,
+            1527125169381048350,
+        )
+
     def test_invalid_host_returns_none(self):
         assert _parse_and_verify_url("https://evil.com/channels/1/2/3") is None
 
     def test_userinfo_spoofing_returns_none(self):
         # Classic SSRF spoof attempt
-        assert _parse_and_verify_url("https://discord.com@evil.com/channels/1/2/3") is None
+        assert (
+            _parse_and_verify_url("https://discord.com@evil.com/channels/1/2/3") is None
+        )
 
     def test_non_channels_path_returns_none(self):
         assert _parse_and_verify_url("https://discord.com/api/1/2/3") is None
@@ -482,6 +662,14 @@ class TestParseAndVerifyUrl:
 
     def test_too_few_path_parts_returns_none(self):
         assert _parse_and_verify_url("https://discord.com/channels/1/2") is None
+
+    def test_extra_path_parts_returns_none(self):
+        assert (
+            _parse_and_verify_url(
+                "https://discord.com/channels/@me/222/333/extra"
+            )
+            is None
+        )
 
 
 class TestRequesterCanRead:
@@ -564,6 +752,7 @@ class TestFetchThreadContext:
     @pytest.mark.asyncio
     async def test_returns_cached_result(self):
         import utils.discord_helpers as dh
+
         dh._thread_context_cache.clear()
 
         thread = MagicMock(spec=discord.Thread)
@@ -581,6 +770,7 @@ class TestFetchThreadContext:
     @pytest.mark.asyncio
     async def test_empty_history_returns_empty_string(self):
         import utils.discord_helpers as dh
+
         dh._thread_context_cache.clear()
 
         thread = MagicMock(spec=discord.Thread)
@@ -601,6 +791,7 @@ class TestFetchThreadContext:
     @pytest.mark.asyncio
     async def test_admin_sees_admin_messages(self):
         import utils.discord_helpers as dh
+
         dh._thread_context_cache.clear()
         ADMIN_USER_IDS.clear()
         ADMIN_USER_IDS.add(777)
@@ -630,6 +821,7 @@ class TestFetchThreadContext:
     @pytest.mark.asyncio
     async def test_non_admin_filters_admin_messages(self):
         import utils.discord_helpers as dh
+
         dh._thread_context_cache.clear()
         ADMIN_USER_IDS.clear()
         ADMIN_USER_IDS.add(777)
@@ -659,6 +851,7 @@ class TestFetchThreadContext:
     @pytest.mark.asyncio
     async def test_thread_context_cache_partition_by_admin_flag(self):
         import utils.discord_helpers as dh
+
         dh._thread_context_cache.clear()
 
         thread = MagicMock(spec=discord.Thread)
@@ -671,8 +864,12 @@ class TestFetchThreadContext:
         dh._thread_context_cache.set((104, 204, True), "admin-context")
         dh._thread_context_cache.set((104, 204, False), "nonadmin-context")
 
-        admin_result = await fetch_thread_context(thread, before_msg, caller_is_admin=True)
-        nonadmin_result = await fetch_thread_context(thread, before_msg, caller_is_admin=False)
+        admin_result = await fetch_thread_context(
+            thread, before_msg, caller_is_admin=True
+        )
+        nonadmin_result = await fetch_thread_context(
+            thread, before_msg, caller_is_admin=False
+        )
 
         assert admin_result == "admin-context"
         assert nonadmin_result == "nonadmin-context"
@@ -682,6 +879,7 @@ class TestFetchChannelContext:
     @pytest.mark.asyncio
     async def test_returns_cached_result(self):
         import utils.discord_helpers as dh
+
         dh._thread_context_cache.clear()
 
         channel = MagicMock()
@@ -696,6 +894,7 @@ class TestFetchChannelContext:
     @pytest.mark.asyncio
     async def test_empty_history_returns_empty(self):
         import utils.discord_helpers as dh
+
         dh._thread_context_cache.clear()
 
         channel = MagicMock()
@@ -714,6 +913,7 @@ class TestFetchChannelContext:
     @pytest.mark.asyncio
     async def test_channel_context_non_admin_filters_admin(self):
         import utils.discord_helpers as dh
+
         dh._thread_context_cache.clear()
         ADMIN_USER_IDS.clear()
         ADMIN_USER_IDS.add(888)
@@ -741,6 +941,7 @@ class TestFetchChannelContext:
     @pytest.mark.asyncio
     async def test_channel_context_with_messages(self):
         import utils.discord_helpers as dh
+
         dh._thread_context_cache.clear()
         ADMIN_USER_IDS.clear()
 
@@ -777,6 +978,7 @@ class TestResolveOneLink:
     @pytest.mark.asyncio
     async def test_admin_bypasses_permission_check(self):
         import utils.discord_helpers as dh
+
         dh._thread_context_cache.clear()
 
         channel = MagicMock()
@@ -798,12 +1000,18 @@ class TestResolveOneLink:
         client.get_channel = MagicMock(return_value=channel)
 
         match = MagicMock()
-        match.group = MagicMock(side_effect=lambda i: {
-            0: "https://discord.com/channels/1/222/333",
-            1: "1", 2: "222", 3: "333"
-        }[i])
+        match.group = MagicMock(
+            side_effect=lambda i: {
+                0: "https://discord.com/channels/1/222/333",
+                1: "1",
+                2: "222",
+                3: "333",
+            }[i]
+        )
 
-        _, result = await _resolve_one_link(client, match, requester=MagicMock(id=99), caller_is_admin=True)
+        _, result = await _resolve_one_link(
+            client, match, requester=MagicMock(id=99), caller_is_admin=True
+        )
         assert result is not None
         assert "admin content" in result
 
@@ -827,12 +1035,18 @@ class TestResolveOneLink:
         requester.id = 55
 
         match = MagicMock()
-        match.group = MagicMock(side_effect=lambda i: {
-            0: "https://discord.com/channels/1/222/333",
-            1: "1", 2: "222", 3: "333"
-        }[i])
+        match.group = MagicMock(
+            side_effect=lambda i: {
+                0: "https://discord.com/channels/1/222/333",
+                1: "1",
+                2: "222",
+                3: "333",
+            }[i]
+        )
 
-        _, result = await _resolve_one_link(client, match, requester=requester, caller_is_admin=False)
+        _, result = await _resolve_one_link(
+            client, match, requester=requester, caller_is_admin=False
+        )
         assert result is None
 
     @pytest.mark.asyncio
@@ -845,12 +1059,18 @@ class TestResolveOneLink:
         client.get_channel = MagicMock(return_value=channel)
 
         match = MagicMock()
-        match.group = MagicMock(side_effect=lambda i: {
-            0: "https://discord.com/channels/1/222/333",
-            1: "1", 2: "222", 3: "333"
-        }[i])
+        match.group = MagicMock(
+            side_effect=lambda i: {
+                0: "https://discord.com/channels/1/222/333",
+                1: "1",
+                2: "222",
+                3: "333",
+            }[i]
+        )
 
-        _, result = await _resolve_one_link(client, match, requester=None, caller_is_admin=False)
+        _, result = await _resolve_one_link(
+            client, match, requester=None, caller_is_admin=False
+        )
         assert result is None
 
     @pytest.mark.asyncio
@@ -860,18 +1080,25 @@ class TestResolveOneLink:
         client.fetch_channel = AsyncMock(return_value=None)
 
         match = MagicMock()
-        match.group = MagicMock(side_effect=lambda i: {
-            0: "https://discord.com/channels/1/222/333",
-            1: "1", 2: "222", 3: "333"
-        }[i])
+        match.group = MagicMock(
+            side_effect=lambda i: {
+                0: "https://discord.com/channels/1/222/333",
+                1: "1",
+                2: "222",
+                3: "333",
+            }[i]
+        )
 
-        _, result = await _resolve_one_link(client, match, requester=None, caller_is_admin=False)
+        _, result = await _resolve_one_link(
+            client, match, requester=None, caller_is_admin=False
+        )
         assert result is None
 
     @pytest.mark.asyncio
     async def test_thread_context_fetched_on_thread_channel(self):
         channel = MagicMock(spec=discord.Thread)
-        channel.guild = None
+        channel.guild = MagicMock()
+        channel.guild.id = 1
         channel.name = "my-thread"
         channel.id = 222
 
@@ -893,12 +1120,18 @@ class TestResolveOneLink:
         client.get_channel = MagicMock(return_value=channel)
 
         match = MagicMock()
-        match.group = MagicMock(side_effect=lambda i: {
-            0: "https://discord.com/channels/1/222/333",
-            1: "1", 2: "222", 3: "333"
-        }[i])
+        match.group = MagicMock(
+            side_effect=lambda i: {
+                0: "https://discord.com/channels/1/222/333",
+                1: "1",
+                2: "222",
+                3: "333",
+            }[i]
+        )
 
-        _, result = await _resolve_one_link(client, match, requester=None, caller_is_admin=True)
+        _, result = await _resolve_one_link(
+            client, match, requester=None, caller_is_admin=True
+        )
         assert result is not None
         assert "thread content" in result
 
@@ -908,7 +1141,8 @@ class TestResolveMessageLinksExtended:
     async def test_admin_can_resolve_links(self):
         mock_client = MagicMock()
         channel = MagicMock()
-        channel.guild = None
+        channel.guild = MagicMock()
+        channel.guild.id = 1
         channel.name = "admin-ch"
 
         msg = MagicMock()
@@ -921,12 +1155,15 @@ class TestResolveMessageLinksExtended:
         channel.fetch_message = AsyncMock(return_value=msg)
 
         text = "See: https://discord.com/channels/1/2/3"
-        result = await resolve_message_links(mock_client, text, requester=None, caller_is_admin=True)
+        result = await resolve_message_links(
+            mock_client, text, requester=None, caller_is_admin=True
+        )
         assert "privileged content" in result
 
     @pytest.mark.asyncio
     async def test_max_resolved_links_capped(self):
         from config import MAX_RESOLVED_LINKS
+
         mock_client = MagicMock()
         mock_client.get_channel = MagicMock(return_value=None)
         mock_client.fetch_channel = AsyncMock(return_value=None)
@@ -996,6 +1233,7 @@ class TestResolveChannelMentionContexts:
     @pytest.mark.asyncio
     async def test_thread_context_returned(self):
         import utils.discord_helpers as dh
+
         ADMIN_USER_IDS.clear()
 
         channel = MagicMock(spec=discord.Thread)
@@ -1072,15 +1310,20 @@ class TestResolveLinkAttachments:
 
     def _make_match(self):
         match = MagicMock()
-        match.group = MagicMock(side_effect=lambda i: {
-            0: "https://discord.com/channels/1/222/333",
-            1: "1", 2: "222", 3: "333"
-        }[i])
+        match.group = MagicMock(
+            side_effect=lambda i: {
+                0: "https://discord.com/channels/1/222/333",
+                1: "1",
+                2: "222",
+                3: "333",
+            }[i]
+        )
         return match
 
     def _make_channel(self):
         channel = MagicMock()
-        channel.guild = None
+        channel.guild = MagicMock()
+        channel.guild.id = 1
         channel.name = "test-ch"
         return channel
 
@@ -1103,7 +1346,9 @@ class TestResolveLinkAttachments:
         client = MagicMock()
         client.get_channel = MagicMock(return_value=channel)
 
-        _, result = await _resolve_one_link(client, self._make_match(), requester=None, caller_is_admin=True)
+        _, result = await _resolve_one_link(
+            client, self._make_match(), requester=None, caller_is_admin=True
+        )
         assert "[Attachment: image.png]" in result
 
     @pytest.mark.asyncio
@@ -1125,7 +1370,9 @@ class TestResolveLinkAttachments:
         client = MagicMock()
         client.get_channel = MagicMock(return_value=channel)
 
-        _, result = await _resolve_one_link(client, self._make_match(), requester=None, caller_is_admin=True)
+        _, result = await _resolve_one_link(
+            client, self._make_match(), requester=None, caller_is_admin=True
+        )
         # Should fall through to bare attachment listing
         assert "[Attachment: data.txt]" in result
         # Content should not be inlined
@@ -1168,7 +1415,9 @@ class TestResolveLinkAttachments:
         mock_sess.__aexit__ = AsyncMock(return_value=False)
 
         with patch("aiohttp.ClientSession", return_value=mock_sess):
-            _, result = await _resolve_one_link(client, self._make_match(), requester=None, caller_is_admin=True)
+            _, result = await _resolve_one_link(
+                client, self._make_match(), requester=None, caller_is_admin=True
+            )
 
         assert "[Attachment: notes.txt]" in result
         assert "file content here" in result
@@ -1176,6 +1425,7 @@ class TestResolveLinkAttachments:
     @pytest.mark.asyncio
     async def test_inline_attachment_content_length_exceeded(self):
         from utils.discord_helpers import _MAX_LINK_TEXT_BYTES
+
         channel = self._make_channel()
         att = MagicMock()
         att.filename = "big.txt"
@@ -1205,7 +1455,9 @@ class TestResolveLinkAttachments:
         mock_sess.__aexit__ = AsyncMock(return_value=False)
 
         with patch("aiohttp.ClientSession", return_value=mock_sess):
-            _, result = await _resolve_one_link(client, self._make_match(), requester=None, caller_is_admin=True)
+            _, result = await _resolve_one_link(
+                client, self._make_match(), requester=None, caller_is_admin=True
+            )
 
         assert "[Attachment: big.txt]" in result
 
@@ -1228,7 +1480,9 @@ class TestResolveLinkAttachments:
         client = MagicMock()
         client.get_channel = MagicMock(return_value=channel)
 
-        _, result = await _resolve_one_link(client, self._make_match(), requester=None, caller_is_admin=True)
+        _, result = await _resolve_one_link(
+            client, self._make_match(), requester=None, caller_is_admin=True
+        )
         assert "EmbedTitle" in result
         assert "EmbedDesc" in result
 
@@ -1239,10 +1493,14 @@ class TestResolveLinkAttachments:
         client.fetch_channel = AsyncMock(side_effect=Exception("network error"))
 
         match = MagicMock()
-        match.group = MagicMock(side_effect=lambda i: {
-            0: "https://discord.com/channels/1/222/333",
-            1: "1", 2: "222", 3: "333"
-        }[i])
+        match.group = MagicMock(
+            side_effect=lambda i: {
+                0: "https://discord.com/channels/1/222/333",
+                1: "1",
+                2: "222",
+                3: "333",
+            }[i]
+        )
 
         _, result = await _resolve_one_link(client, match, requester=None)
         assert result is None
@@ -1250,7 +1508,13 @@ class TestResolveLinkAttachments:
 
 class TestBuildLayeredLinesExtended:
     def test_layer2_truncated_when_exceeds_max_chars(self):
-        from utils.discord_helpers import _build_layered_lines, LAYER1_COUNT, LAYER2_COUNT, MAX_CONTEXT_CHARS
+        from utils.discord_helpers import (
+            _build_layered_lines,
+            LAYER1_COUNT,
+            LAYER2_COUNT,
+            MAX_CONTEXT_CHARS,
+        )
+
         # Create many messages that together exceed MAX_CONTEXT_CHARS
         big_body = "z" * 2000
         total = LAYER1_COUNT + LAYER2_COUNT
@@ -1260,7 +1524,12 @@ class TestBuildLayeredLinesExtended:
         assert total_chars <= MAX_CONTEXT_CHARS or any("truncated" in l for l in lines)
 
     def test_layer1_truncated_when_exceeds_max_chars(self):
-        from utils.discord_helpers import _build_layered_lines, LAYER1_COUNT, MAX_CONTEXT_CHARS
+        from utils.discord_helpers import (
+            _build_layered_lines,
+            LAYER1_COUNT,
+            MAX_CONTEXT_CHARS,
+        )
+
         # Only layer1 messages, each very large
         big_body = "a" * (MAX_CONTEXT_CHARS // 2)
         messages = [(f"user{i}", big_body) for i in range(LAYER1_COUNT)]
@@ -1269,13 +1538,19 @@ class TestBuildLayeredLinesExtended:
 
     def test_empty_body_skipped(self):
         from utils.discord_helpers import _build_layered_lines
+
         messages = [("user1", ""), ("user2", "real content"), ("user3", "")]
         lines, _ = _build_layered_lines(messages)
         assert len(lines) == 1
         assert "real content" in lines[0]
 
     def test_layer3_messages_skipped(self):
-        from utils.discord_helpers import _build_layered_lines, LAYER1_COUNT, LAYER2_COUNT
+        from utils.discord_helpers import (
+            _build_layered_lines,
+            LAYER1_COUNT,
+            LAYER2_COUNT,
+        )
+
         # Messages beyond L1+L2 total go to layer3 (index < layer2_start) → skipped
         total = LAYER1_COUNT + LAYER2_COUNT + 5
         messages = [(f"user{i}", f"msg{i}") for i in range(total)]
@@ -1340,13 +1615,46 @@ class TestAfterMsgsPermissionFilter:
         channel.fetch_message = AsyncMock(return_value=ref_msg)
 
         match = MagicMock()
-        match.group = MagicMock(side_effect=lambda i: {0: "https://discord.com/channels/1/222/333", 1: "1", 2: "222", 3: "333"}[i])
+        match.group = MagicMock(
+            side_effect=lambda i: {
+                0: "https://discord.com/channels/1/222/333",
+                1: "1",
+                2: "222",
+                3: "333",
+            }[i]
+        )
 
         client = MagicMock()
         client.get_channel = MagicMock(return_value=channel)
 
-        _, result = await _resolve_one_link(client, match, requester=requester, caller_is_admin=False)
+        _, result = await _resolve_one_link(
+            client, match, requester=requester, caller_is_admin=False
+        )
 
         # The after_msg content must not appear in the resolved context
         if result is not None:
             assert "secret after content" not in result
+
+
+@pytest.mark.asyncio
+async def test_context_gateway_cancels_and_awaits_fanout():
+    from utils.context_gateway import _gather_owned
+
+    started = [asyncio.Event(), asyncio.Event()]
+    finalized = [asyncio.Event(), asyncio.Event()]
+
+    async def child(index: int):
+        started[index].set()
+        try:
+            await asyncio.Future()
+        finally:
+            finalized[index].set()
+
+    owner = asyncio.create_task(_gather_owned([child(0), child(1)]))
+    await asyncio.gather(*(event.wait() for event in started))
+    owner.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+
+    assert all(event.is_set() for event in finalized)

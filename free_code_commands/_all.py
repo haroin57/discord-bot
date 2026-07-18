@@ -1,6 +1,6 @@
-"""Registry assembly — Python analogue of ``commands.ts``'s ``COMMANDS`` list.
+"""Registry assembly for private definitions and public metadata catalogs.
 
-Gathers every ported command module's ``COMMANDS`` into one
+Gathers every ported command module's private immutable definitions into one
 :class:`~free_code_commands.registry.CommandRegistry`. Import order mirrors
 ``commands.ts`` loosely (prompt → local → local-jsx → feature-gated → internal),
 which is all that matters since the registry resolves by name/alias, not position.
@@ -20,8 +20,7 @@ from .commands import (
     local_commands,
     prompt_commands,
 )
-from .registry import CommandRegistry
-from .types import Command
+from .registry import CommandMetadata, CommandRegistry
 
 # Order mirrors commands.ts groupings. Duplicates-by-name (twins) are intentional.
 _MODULES = (
@@ -33,19 +32,22 @@ _MODULES = (
 )
 
 
-def all_commands() -> list[Command]:
-    """Every ported command instance, in module order."""
+def all_commands() -> tuple[CommandMetadata, ...]:
+    """Every ported command as immutable, non-executable metadata."""
 
-    out: list[Command] = []
-    for mod in _MODULES:
-        out.extend(mod.COMMANDS)
-    return out
+    return tuple(command for module in _MODULES for command in module.COMMANDS)
+
+
+def _all_definitions():
+    return tuple(
+        definition for module in _MODULES for definition in module._DEFINITIONS
+    )
 
 
 def build_registry() -> CommandRegistry:
     """Build the full :class:`CommandRegistry` of ported commands."""
 
-    return CommandRegistry(all_commands())
+    return CommandRegistry._from_definitions(_all_definitions())
 
 
 # Convenience: names grouped by module, handy for tests and introspection.

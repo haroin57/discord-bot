@@ -80,6 +80,19 @@ def live_jobs(channel_id: int) -> list[JobState]:
     return [j for j in chan.values() if j.phase in _LIVE_PHASES]
 
 
+def live_job_tasks() -> list[asyncio.Task]:
+    """Return each active job task once for composition-root shutdown."""
+    tasks: list[asyncio.Task] = []
+    seen: set[int] = set()
+    for channel_id in list(_jobs):
+        for job in live_jobs(channel_id):
+            if job.task is None or id(job.task) in seen:
+                continue
+            seen.add(id(job.task))
+            tasks.append(job.task)
+    return tasks
+
+
 def cancel_channel_jobs(channel_id: int) -> int:
     """Cancel every live job (queued AND running) in the channel.
 
@@ -88,6 +101,6 @@ def cancel_channel_jobs(channel_id: int) -> int:
     cancelled = 0
     for job in live_jobs(channel_id):
         if job.task is not None and not job.task.done():
-            job.task.cancel()
+            job.task.cancel("user abort")
             cancelled += 1
     return cancelled

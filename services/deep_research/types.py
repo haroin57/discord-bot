@@ -28,8 +28,10 @@ class SourceRef:
     sid: str
     title: str
     url: str
-    source_type: str = "web"   # "web" | "news" | "x" | "other"
+    source_type: str = "web"  # "web" | "news" | "x" | "other"
     snippet: str = ""
+    # EvidenceRegistry が支持判定に使う、検索結果から機械抽出した根拠断片。
+    evidence: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -51,10 +53,10 @@ class LensResult:
     その STANCE 行を軽くパースしたもの（integrator の見出し用）。失敗時は ok=False。
     """
 
-    lens_key: str            # "science" | "intuition" | "skeptic"
-    lens_label: str          # "科学（メルキオール）" など表示名
-    stance: str              # STANCE: 行（無ければ body 冒頭）
-    body: str                # lead の全文（統合役に渡す素材）
+    lens_key: str  # "science" | "intuition" | "skeptic"
+    lens_label: str  # "科学（メルキオール）" など表示名
+    stance: str  # STANCE: 行（無ければ body 冒頭）
+    body: str  # lead の全文（統合役に渡す素材）
     ok: bool = True
     error: str | None = None
 
@@ -83,7 +85,12 @@ class ResearchState:
     user_memories: str = ""
 
     def register_source(
-        self, *, url: str, title: str = "", source_type: str = "web", snippet: str = "",
+        self,
+        *,
+        url: str,
+        title: str = "",
+        source_type: str = "web",
+        snippet: str = "",
     ) -> SourceRef | None:
         """URL を sid 付きで登録（既出なら既存を返す）。無効 URL は None。"""
         norm = normalize_url(url)
@@ -108,8 +115,10 @@ class ResearchState:
         if not usage:
             return
         for k in (
-            "input_tokens", "output_tokens",
-            "cache_read_input_tokens", "cache_creation_input_tokens",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
         ):
             try:
                 self.tokens_used += int(usage.get(k, 0) or 0)

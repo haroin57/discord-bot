@@ -20,18 +20,14 @@ Notes:
 """
 
 import asyncio
-import inspect
 import logging
-import re
 import time
 import uuid
-from dataclasses import dataclass
 
 import anthropic
 import httpx
 
 from config import (
-    CLAUDE_MAX_TOKENS,
     DELIB_DISTILL_ENABLED,
     MAX_CONSECUTIVE_EMPTY_TURNS,
     MAX_FINAL_EMPTY_NUDGES,
@@ -58,16 +54,6 @@ from services.claude_api.loop_guard import (  # ADR-0036
     ToolLoopDetector,
 )
 
-from services.claude_api.client import (
-    CLAUDE_MAX_TOKENS_OPUS,
-    CLI_DEFAULT_SYSTEM_PROMPT,
-    CLI_IDENTITY_TEXT,
-    CONTEXT_MANAGEMENT_CONFIG,
-    OUTPUT_CONFIG,
-    THINKING_CONFIG,
-    get_attribution_header_value,
-    get_metadata,
-)
 from services.claude_api.errors import (
     classify_anthropic_error,
     coerce_tool_input,
@@ -78,74 +64,81 @@ from services.claude_api.errors import (
     strip_degraded_opener_token,
 )
 from services.claude_api.mcp_client import kill_orphan_mcp_processes
+from services.claude_api.message_codec import (
+    _EMPTY_CONTENT_PLACEHOLDER,
+    _SERVER_TOOL_RESULT_TYPES,
+    _TOOL_SEARCH_BLOCK_TYPES,
+    _block_to_dict,
+    _has_unpaired_server_tool_use,
+    _join_final_text,
+    _normalize_history_for_api,
+    _response_blocks_to_dict,
+    _sanitize_content_blocks,
+    _serialize_search_result_content,
+    strip_tool_search_blocks,
+)
+from services.claude_api.loop_contracts import (
+    AUTO_RESUME_DIRECTIVE,
+    AgentLoopResult,
+    _AUTO_RESUME_NOTE,
+    _CHECKPOINT_NOTE,
+    _build_checkpoint_result,
+    _fallback_alert,
+    _model_display,
+)
+from services.claude_api.loop_observability import (
+    _HALLUC_MAX_DISTANCE,
+    _HALLUC_PATH_RE,
+    _HALLUC_VERBS,
+    _HALLUC_VERB_RE,
+    _HALLUC_WRITE_TOOLS,
+    _USAGE_FIELDS,
+    _context_tokens,
+    _detect_write_hallucination,
+    _last_context_tokens,
+    _log_total_usage,
+    _log_turn_usage,
+    _observe_response_headers,
+    _usage_number,
+    get_last_context_tokens,
+)
 from services.claude_api.ratelimit import (
     maybe_wait_before_request,
-    observe as observe_ratelimit,
     should_block,
+)
+from services.claude_api.request_shape import (
+    CLAUDE_MAX_TOKENS,
+    CLAUDE_MAX_TOKENS_OPUS,
+    CLI_DEFAULT_SYSTEM_PROMPT,
+    CLI_IDENTITY_TEXT,
+    CONTEXT_MANAGEMENT_CONFIG,
+    OUTPUT_CONFIG,
+    REFUSAL_FALLBACK_HEADER,
+    THINKING_CONFIG,
+    _build_cached_system,
+    _build_stream_kwargs_impl,
+    _inject_cache_breakpoints,
+    _mark_cache_breakpoint,
+    get_attribution_header_value,
+    get_metadata,
 )
 from services.claude_api.stall import StallWatchdog
 from services.claude_api.status import _safe_status, _tool_input_hint
+from services.claude_api.tool_display import (
+    _TOOL_DETAIL_FIELD_CAP,
+    _TOOL_DETAIL_INLINE_CAP,
+    _cap_inline,
+    _format_tool_invocation_for_display,
+)
+from services.claude_api.tool_execution import (
+    _cap_mcp_result_content,
+    _RescuedToolUse,
+    _run_one_tool_inner as _run_one_tool_inner_impl,
+    _truncate_head_tail,
+    _validate_tool_input,
+)
 
 log = logging.getLogger(__name__)
-
-
-@dataclass
-class AgentLoopResult:
-    text: str
-    synthetic_session_id: str | None
-    active_mcp_keys: list[str]
-    # Set to the fallback model id (e.g. "claude-opus-4-8") when the primary
-    # model (Fable 5) returned stop_reason=refusal and the loop retried the
-    # request on the fallback. None when no fallback happened.
-    fallback_model: str | None = None
-    # Number of leading ``history`` entries that belong to the PRIOR
-    # transcript after the loop finished. Equal to the caller's
-    # ``prior_turns`` unless an in-loop proactive compaction replaced the
-    # prior window mid-request (audit #3) — entry.py slices new turns for
-    # JSONL persistence at this index, not at len(prior_history).
-    prior_len: int | None = None
-    # 機能6: per-turn aggregated usage (input/cache_read/cache_creation/output
-    # tokens). Surfaced to bot.py via SessionInfo.last_usage so /context can
-    # show "how much room is left before the 500K compaction trigger".
-    usage_total: dict | None = None
-    # ADR-0036: set when the loop stopped at a resource guard rather than a
-    # natural end_turn — one of "turn_ceiling" / "wallclock" / "output_tokens"
-    # / "tool_loop". None on clean completion. The reply text and session are
-    # still preserved (graceful checkpoint), so "続けて" resumes seamlessly.
-    paused_reason: str | None = None
-
-
-# Header the official CLI sets on every API request once a refusal fallback
-# has occurred in the session (claude.exe fetch wrapper, gated on
-# hasRefusalFallbackOccurred), so the API can tell fallback-leg traffic apart.
-# Same semantics here: set on the in-turn retry leg (fallback_used below) and
-# on every turn of a sticky-pinned session (entry.py passes it through
-# extra_headers). ADR-0010.
-REFUSAL_FALLBACK_HEADER = "x-is-refusal-fallback"
-
-
-def _model_display(m: str) -> str:
-    """Short human label for a model id, for the user-facing fallback note."""
-    ml = (m or "").lower()
-    if "opus-4-8" in ml:
-        return "Opus 4.8"
-    if "opus" in ml:
-        return "Opus"
-    if "fable" in ml:
-        return "Fable 5"
-    return m or "?"
-
-
-def _fallback_alert(model: str) -> str:
-    """The user-facing alert pushed to Discord when a refusal fell back.
-
-    A blockquote + warning so it reads as a system alert, visually distinct
-    from かなえ's reply. Single source of truth — used both for the live note
-    (streaming) and the text prepend (non-streaming)."""
-    return (
-        f"> ⚠️ **Fable 5 が応答を拒否したため {_model_display(model)} に"
-        "フォールバックしました**"
-    )
 
 
 # MAX_TEXT_INVOKE_CORRECTIONS / MAX_TEXT_INVOKE_RESCUES / the nudge caps now
@@ -180,81 +173,6 @@ _TOOL_LOOP_WARN_NUDGE = (
     "⚠️ 同じツールを同じ引数で繰り返しているようです。進んでいないので、"
     "別のアプローチに切り替えるか、ここまでで分かったことを整理してください。"
 )
-# ADR-0036: subtext note appended to a graceful checkpoint reply so the user
-# knows work was saved and can resume. NOT a NON_PERSISTABLE sentinel — the
-# reply carries real prose + full tool context, so it persists and resumes.
-_CHECKPOINT_NOTE = (
-    "-# ⏸️ 作業が長くなったのでここまでを保存しました。「続けて」で同じ文脈から再開できます。"
-)
-# ADR-0040: variant of the checkpoint note used when entry.py's policy
-# (``should_auto_resume``) says this request is about to be auto-resumed —
-# the user sees a "continuing…" line instead of being asked to type
-# 「続けて」 themselves.
-_AUTO_RESUME_NOTE = (
-    "-# ⏳ 作業が長くなったので一旦区切りました。続きを自動で実行します…"
-)
-# ADR-0040: synthetic user turn entry.py injects to continue a checkpointed
-# request. Worded as a user instruction because it IS one — it rides the same
-# persisted history the manual 「続けて」 would, so resume semantics are
-# byte-identical to the manual path.
-AUTO_RESUME_DIRECTIVE = (
-    "（自動継続）直前の応答は長さ上限で一旦区切られました。保存済みの文脈から"
-    "作業をそのまま続けてください。挨拶・状況の再説明・完了済み作業のやり直しは"
-    "不要です。残りを終えたら通常どおり結果をまとめてください。"
-)
-
-
-def _build_checkpoint_result(
-    *,
-    text_across_turns: list[str],
-    last_text: str,
-    fallback_used: bool,
-    fallback_note_sent_live: bool,
-    current_model: str,
-    active_mcp_keys: list[str],
-    prior_len: int | None,
-    usage_totals: dict,
-    paused_reason: str,
-    auto_resume_planned: bool = False,
-) -> "AgentLoopResult":
-    """Graceful checkpoint (ADR-0036): preserve work instead of discarding it.
-
-    Unlike the pre-ADR-0036 max_turns path (synthetic_session_id=None + a
-    NON_PERSISTABLE sentinel, which threw away the whole transcript), this
-    returns a REAL session id and a non-sentinel reply. entry.py's existing
-    persistence (set_session + JSONL slice) then saves the full structured
-    transcript verbatim, so "続けて" resumes with all tool context intact.
-
-    ``auto_resume_planned`` (ADR-0040): entry.py's policy already committed to
-    continuing this request automatically — swap the 「続けて」 ask for a
-    "continuing…" note so the user is not prompted for an action that is about
-    to happen on its own.
-    """
-    accumulated = "\n\n".join(t for t in text_across_turns if t)
-    body = accumulated or last_text
-    if body:
-        note = _AUTO_RESUME_NOTE if auto_resume_planned else _CHECKPOINT_NOTE
-        text = body + "\n\n" + note
-    else:
-        # Model ran tools but emitted no prose — still give the user a handle.
-        text = (
-            "⏳ 作業をここまで保存しました。続きを自動で実行します…"
-            if auto_resume_planned
-            else "⏸️ 作業をここまで保存しました。「続けて」で同じ文脈から再開できます。"
-        )
-    if fallback_used and not fallback_note_sent_live and body:
-        text = _fallback_alert(current_model) + "\n\n" + text
-    return AgentLoopResult(
-        text=text,
-        synthetic_session_id=uuid.uuid4().hex,
-        active_mcp_keys=active_mcp_keys,
-        fallback_model=current_model if fallback_used else None,
-        prior_len=prior_len,
-        usage_total=dict(usage_totals),
-        paused_reason=paused_reason,
-    )
-
-
 # Read-only tools whose repeated identical calls are less alarming (status
 # checks, re-reads). Loop detector gives these extra slack. Distinct from
 # CONCURRENCY_SAFE_TOOLS (which includes Agent — repeated identical subagent
@@ -285,598 +203,6 @@ async def _idle_guarded(stream, idle_s: float):
         yield event
 
 
-def _observe_response_headers(source) -> None:
-    """Feed rate-limit headers from a response-carrying object (stream or
-    SDK exception) into the shared pacing state. Best-effort: never raises.
-    Single idiom for both the success and the error path (P1-a)."""
-    try:
-        resp = getattr(source, "response", None)
-        if resp is not None and getattr(resp, "headers", None) is not None:
-            observe_ratelimit(resp.headers)
-    except Exception as exc:
-        log.debug("ratelimit observe failed: %s", exc)
-
-
-def _build_cached_system(system_prompt: str, messages: list[dict]) -> list[dict]:
-    """Build the 4-block system prompt the CLI sends on /v1/messages.
-
-    Captured from real claude-cli 2.1.92 (mitmproxy, 2026-05-13):
-
-        system[0] = attribution header value (no cache)
-        system[1] = "You are Claude Code, Anthropic's official CLI for
-                     Claude." (no cache)
-        system[2] = CLI's 11700-char default agent system prompt
-                    (cache_control={"type":"ephemeral","scope":"global"})
-        system[3] = caller-supplied prompt — for us this is the
-                    concatenation of ~/.claude/CLAUDE.md (global persona)
-                    + discord-bot/CLAUDE.md (Discord-specific override).
-                    No cache; this block changes per session.
-
-    The CLI default prompt at system[2] is what subscriber-tier gating
-    appears to inspect; the caller's persona prompt at system[3] is the
-    behavior override that wins on conflicts (Anthropic prompts give
-    later system text more weight when they contradict).
-    """
-    attribution = get_attribution_header_value(messages)
-    return [
-        {"type": "text", "text": attribution},
-        {"type": "text", "text": CLI_IDENTITY_TEXT},
-        # ttl:1h matches the real CLI (mitm capture: system[2] carries
-        # {ephemeral, ttl:1h, scope:global}). Without ttl the block falls
-        # back to the 5-minute default and the cached prefix expires between
-        # turns, forcing a full re-write (observed as cache_read=0).
-        {"type": "text", "text": CLI_DEFAULT_SYSTEM_PROMPT,
-         "cache_control": {"type": "ephemeral", "ttl": "1h", "scope": "global"}},
-        # The CLI also caches system[3] (the persona prompt) with ttl:1h.
-        {"type": "text", "text": system_prompt,
-         "cache_control": {"type": "ephemeral", "ttl": "1h"}},
-    ]
-
-
-def _mark_cache_breakpoint(msg: dict) -> dict:
-    """Return a copy of ``msg`` with a ttl:1h breakpoint on its last block."""
-    msg = dict(msg)
-    content = msg["content"]
-    if isinstance(content, str):
-        msg["content"] = [
-            {"type": "text", "text": content,
-             "cache_control": {"type": "ephemeral", "ttl": "1h"}},
-        ]
-    elif isinstance(content, list) and content:
-        content = list(content)
-        last_block = dict(content[-1])
-        last_block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-        content[-1] = last_block
-        msg["content"] = content
-    return msg
-
-
-def _inject_cache_breakpoints(messages: list[dict]) -> list[dict]:
-    """Mirrors the helper in __init__.py (see _build_cached_system above).
-
-    PLACEMENT (CLI parity, binary fn Def — audit #8): breakpoints go on BOTH
-    the last and the second-to-last user message. [-2] caches the stable
-    prefix (system + all prior turns). [-1] additionally writes the newest
-    user turn, so the NEXT request's read window covers this turn's reply +
-    tool results instead of stopping at the previous turn — without it, every
-    resume re-pays the latest exchange as cache_creation (one leg of the
-    ADR-0010 cache_read=0 cascade). Budget: 2 system blocks + these 2 = the
-    API's 4-breakpoint maximum.
-
-    TTL: the breakpoint carries ttl:1h, matching the ttl:1h value the real
-    claude-cli uses on its message breakpoint (mitm capture cli_resume.json) and
-    the ttl:1h on system[2]/[3] in _build_cached_system. The default 5-minute
-    TTL is wrong for this workload: Discord turns are routinely spaced >5 min
-    apart, so a 5-min breakpoint expires between user turns and the entire
-    replayed conversation history is re-written to cache every resume (observed
-    as cache_read pinned to system-block size while cache_creation re-pays the
-    full history — up to ~227k tokens — on each turn). ttl:1h keeps the history
-    prefix warm across the gap so the next turn reads it at ~0.1x instead.
-    Requires the extended-cache-ttl beta, which MODEL_BETAS already sends.
-    """
-    user_indices = [i for i, m in enumerate(messages) if m["role"] == "user"]
-    if not user_indices:
-        return messages
-    messages = list(messages)
-    targets = {user_indices[-1]}
-    if len(user_indices) >= 2:
-        targets.add(user_indices[-2])
-    for target_idx in targets:
-        messages[target_idx] = _mark_cache_breakpoint(messages[target_idx])
-    return messages
-
-
-def _block_to_dict(block) -> dict | None:
-    """Convert an anthropic content block (Pydantic model) to a serializable dict.
-
-    Returns ``None`` for blocks that MUST NOT be echoed back to the API on the
-    next turn (server-side response metadata that would cause a 400 on replay).
-    Callers must ``filter(None, ...)`` before persisting to history.
-    """
-    btype = getattr(block, "type", None)
-    if btype == "fallback":
-        # Server-side refusal fallback (ADR-0015): Anthropic includes a
-        # ``fallback`` metadata block in the response when it silently switched
-        # models mid-stream (Fable 5 refusal → Opus 4.8). This block carries
-        # {to:{model:...}, citations:[...]} — response-only metadata that the
-        # Messages API refuses on the way back ("messages.N.content.M.fallback
-        # .citations: Extra inputs are not permitted", HTTP 400). Drop it so
-        # the next turn's history replay doesn't poison the request.
-        # rid 0679af30 / haroin 2026-07-02: regression.
-        return None
-    if btype == "text":
-        return {"type": "text", "text": getattr(block, "text", "")}
-    if btype == "tool_use":
-        out = {
-            "type": "tool_use",
-            "id": getattr(block, "id", ""),
-            "name": getattr(block, "name", ""),
-            "input": getattr(block, "input", None) or {},
-        }
-        # CLI capture (mitmproxy 2026-05-13) showed tool_use blocks
-        # round-tripping with a "caller" field present. Preserve it if
-        # the SDK exposed it so 2nd-turn requests are byte-shape-equal
-        # to what the CLI emits.
-        caller = getattr(block, "caller", None)
-        if caller is not None:
-            # caller may be a Pydantic model with .model_dump
-            if hasattr(caller, "model_dump"):
-                out["caller"] = caller.model_dump()
-            else:
-                out["caller"] = caller
-        return out
-    if btype == "thinking":
-        # Anthropic round-trips thinking content; the API REQUIRES the
-        # signature field on the way back, or it returns HTTP 400
-        # "thinking.signature: Field required" on the next turn.
-        out = {
-            "type": "thinking",
-            "thinking": getattr(block, "thinking", ""),
-        }
-        sig = getattr(block, "signature", None)
-        if sig is not None:
-            out["signature"] = sig
-        return out
-    if btype == "redacted_thinking":
-        # Same story for redacted_thinking blocks — keep the data field
-        # so we can echo it back next turn.
-        out = {"type": "redacted_thinking"}
-        data = getattr(block, "data", None)
-        if data is not None:
-            out["data"] = data
-        return out
-    if btype == "server_tool_use":
-        # Tool Search Tool（等の server-side tool）の呼び出しブロック。echo 必須
-        # だが SDK の model_dump() は `caller: None` を含み、fallback.citations
-        # 400（rid 0679af30）と同型の「レスポンス専用フィールド echo で 400」を
-        # 踏むため明示的に最小 dict へ直列化する。
-        out = {
-            "type": "server_tool_use",
-            "id": getattr(block, "id", ""),
-            "name": getattr(block, "name", ""),
-            "input": getattr(block, "input", None) or {},
-        }
-        caller = getattr(block, "caller", None)
-        if caller is not None:
-            out["caller"] = (
-                caller.model_dump() if hasattr(caller, "model_dump") else caller
-            )
-        return out
-    if btype in ("tool_search_tool_result", "advisor_tool_result"):
-        # server-side tool の result ブロック（tool search / advisor）。
-        # SDK model_dump の余剰フィールド 400 を避けて最小 dict へ。
-        return {
-            "type": btype,
-            "tool_use_id": getattr(block, "tool_use_id", ""),
-            "content": _serialize_search_result_content(
-                getattr(block, "content", None)
-            ),
-        }
-    # Unknown / future block type — best effort.
-    if hasattr(block, "model_dump"):
-        return block.model_dump()
-    return {"type": btype or "unknown"}
-
-
-def _serialize_search_result_content(content) -> "list[dict] | dict":
-    """tool_search_tool_result.content を echo 可能な最小 dict へ直列化する。
-
-    成功時は tool_reference のリスト、エラー時は error オブジェクト。SDK の
-    model_dump に頼らず必要フィールドだけ残す（余剰フィールド 400 防止）。
-    """
-    if content is None:
-        return []
-    # エラー型（BetaToolSearchToolResultError 等）は list ではなく単一オブジェクト
-    if not isinstance(content, (list, tuple)):
-        err_code = getattr(content, "error_code", None)
-        if err_code is not None:
-            return {"type": "tool_search_tool_result_error", "error_code": err_code}
-        if isinstance(content, dict):
-            return content
-        return []
-    out: list[dict] = []
-    for item in content:
-        itype = getattr(item, "type", None) or (
-            item.get("type") if isinstance(item, dict) else None
-        )
-        if itype == "tool_reference":
-            name = getattr(item, "tool_name", None) or (
-                item.get("tool_name") if isinstance(item, dict) else ""
-            )
-            out.append({"type": "tool_reference", "tool_name": name or ""})
-        elif itype == "text":
-            text = getattr(item, "text", None) or (
-                item.get("text") if isinstance(item, dict) else ""
-            )
-            out.append({"type": "text", "text": text or ""})
-        elif isinstance(item, dict):
-            out.append(item)
-    return out
-
-
-def _join_final_text(final_message) -> str:
-    parts = []
-    for block in getattr(final_message, "content", None) or []:
-        if getattr(block, "type", None) == "text":
-            parts.append(getattr(block, "text", "") or "")
-    return "".join(parts).strip()
-
-
-# Cap on the inline body of any tool-invocation notice. Discord caps each
-# message at 2000 chars; we hold ~100 chars of headroom for the wrapper
-# (header, code fences, "truncated" marker). Anything bigger is sliced —
-# the user sees the head of a long Bash pipeline or Write payload, and
-# the model still operates on the full input.
-_TOOL_DETAIL_INLINE_CAP = 1900
-_TOOL_DETAIL_FIELD_CAP = 700  # for Edit's old/new pair (two fields share the budget)
-
-
-# Hallucination detection: when assistant prose claims a file was written /
-# saved / created (and names a plausible file path) but no Write or Edit
-# tool_use block fired in that turn, log a WARN so we can audit. Kept as a
-# pure observation hook for now — no auto-retry, no synthetic correction
-# message. False positives are tolerated; the trace is meant to surface
-# patterns that warrant prompt tweaks.
-_HALLUC_VERBS = (
-    "書きました", "書き出しました", "書き込みました", "保存しました",
-    "作成しました", "作りました", "出力しました", "残しました", "記録しました",
-    "wrote to", "wrote out", "saved to", "saved as", "created file",
-    "written to",
-)
-_HALLUC_VERB_RE = re.compile(
-    r"(?P<verb>" + "|".join(re.escape(v) for v in _HALLUC_VERBS) + r")",
-    re.IGNORECASE,
-)
-_HALLUC_PATH_RE = re.compile(
-    r"(?P<path>[\w./\\~-]+\."
-    r"(?:md|py|txt|json|yaml|yml|toml|sh|rst|csv|tsv|html|css|js|ts|tsx|jsx|"
-    r"go|rs|java|kt|swift|c|cpp|h|hpp|sql|env|ini|cfg|log))\b"
-)
-# Max distance (chars) between the claim verb and the cited file path. The
-# two may appear in either order ("wrote to foo.md" en / "foo.md に書きました"
-# jp), so we check both directions.
-_HALLUC_MAX_DISTANCE = 160
-_HALLUC_WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
-
-
-def _detect_write_hallucination(
-    turn_text: str,
-    fired_tools: set[str],
-    *,
-    channel_id: int,
-    turn: int,
-) -> None:
-    """Log a WARN if prose claims file writing without a Write/Edit fire."""
-    if not turn_text:
-        return
-    if fired_tools & _HALLUC_WRITE_TOOLS:
-        return
-    verbs = list(_HALLUC_VERB_RE.finditer(turn_text))
-    if not verbs:
-        return
-    paths = list(_HALLUC_PATH_RE.finditer(turn_text))
-    if not paths:
-        return
-    # Pair the closest verb / path within _HALLUC_MAX_DISTANCE chars (either
-    # order). Word order varies by language: "wrote to foo.md" (en) puts the
-    # verb first; "foo.md に書きました" (jp) puts the path first.
-    best: tuple[int, "re.Match", "re.Match"] | None = None
-    for v in verbs:
-        for p in paths:
-            dist = max(v.start(), p.start()) - min(v.end(), p.end())
-            if dist < 0:
-                dist = 0
-            if dist > _HALLUC_MAX_DISTANCE:
-                continue
-            if best is None or dist < best[0]:
-                best = (dist, v, p)
-    if best is None:
-        return
-    _, v, p = best
-    lo = min(v.start(), p.start())
-    hi = max(v.end(), p.end())
-    snippet = turn_text[lo:hi]
-    if len(snippet) > 200:
-        snippet = snippet[:200] + "..."
-    log.warning(
-        "hallucination_suspect ch=%d turn=%d verb=%r path=%r snippet=%r "
-        "fired_tools=%s",
-        channel_id, turn + 1,
-        v.group("verb"), p.group("path"), snippet,
-        sorted(fired_tools),
-    )
-
-
-def _cap_inline(text: str, cap: int) -> str:
-    if len(text) <= cap:
-        return text
-    return text[:cap] + "\n...(truncated)"
-
-
-def _truncate_head_tail(text: str, cap: int) -> str:
-    """Middle-out truncation: keep the head and tail, drop the middle.
-
-    MCP 検索結果は先頭（上位ヒット）と末尾（ページネーション情報等）に価値が
-    寄りやすいので、head-only の ``_cap_inline`` ではなく中抜きにする。
-    """
-    if cap <= 0 or len(text) <= cap:
-        return text
-    half = max(1, cap // 2)
-    omitted = len(text) - cap
-    return (
-        text[:half]
-        + f"\n...[{omitted} chars omitted by MCP_TOOL_RESULT_CHARS cap]...\n"
-        + text[-half:]
-    )
-
-
-def _cap_mcp_result_content(
-    content: "str | list[dict]", cap: int,
-) -> "str | list[dict]":
-    """Apply the MCP result char cap to a tool_result content payload.
-
-    str はそのまま中抜き。list（text+image ブロック）は text ブロックにだけ
-    総量 cap を按分して適用する（image ブロックは対象外）。
-    """
-    if cap <= 0:
-        return content
-    if isinstance(content, str):
-        return _truncate_head_tail(content, cap)
-    if isinstance(content, list):
-        def _is_text(b: object) -> bool:
-            return (
-                isinstance(b, dict) and b.get("type") == "text"
-                and isinstance(b.get("text"), str)
-            )
-
-        n_text = sum(1 for b in content if _is_text(b))
-        total = sum(len(b["text"]) for b in content if _is_text(b))
-        if not n_text or total <= cap:
-            return content
-        per_block = max(1, cap // n_text)
-        return [
-            {**b, "text": _truncate_head_tail(b["text"], per_block)}
-            if _is_text(b) else b
-            for b in content
-        ]
-    return content
-
-
-def _format_tool_invocation_for_display(tool_name: str, tool_input: dict) -> str | None:
-    """Build a Discord-friendly notice of an about-to-execute tool call.
-
-    Returns ``None`` when there is nothing meaningful to render (empty
-    input). The string is meant to be posted as-is via
-    ``incremental_text_callback``.
-    """
-    tool_input = tool_input or {}
-
-    if tool_name == "Bash":
-        cmd = str(tool_input.get("command", "")).rstrip()
-        if not cmd:
-            return None
-        timeout_hint = tool_input.get("timeout")
-        header = "🔧 **Bash 実行**"
-        if timeout_hint:
-            header += f" (timeout={timeout_hint}s)"
-        return f"{header}\n```bash\n{_cap_inline(cmd, _TOOL_DETAIL_INLINE_CAP)}\n```"
-
-    if tool_name == "Read":
-        fp = tool_input.get("file_path", "")
-        if not fp:
-            return None
-        return f"🔧 **Read** `{fp}`"
-
-    if tool_name == "Write":
-        fp = tool_input.get("file_path", "")
-        content = str(tool_input.get("content", ""))
-        if not fp:
-            return None
-        return (
-            f"🔧 **Write** `{fp}`\n"
-            f"```\n{_cap_inline(content, _TOOL_DETAIL_INLINE_CAP)}\n```"
-        )
-
-    if tool_name == "Edit":
-        fp = tool_input.get("file_path", "")
-        old = str(tool_input.get("old_string", ""))
-        new = str(tool_input.get("new_string", ""))
-        if not fp:
-            return None
-        old_p = _cap_inline(old, _TOOL_DETAIL_FIELD_CAP)
-        new_p = _cap_inline(new, _TOOL_DETAIL_FIELD_CAP)
-        # Prefix each line so multi-line old/new still reads as a diff in
-        # Discord's code-block syntax-highlighter.
-        old_lines = "\n".join("- " + ln for ln in old_p.splitlines() or [""])
-        new_lines = "\n".join("+ " + ln for ln in new_p.splitlines() or [""])
-        replace_all = " (replace_all)" if tool_input.get("replace_all") else ""
-        return (
-            f"🔧 **Edit** `{fp}`{replace_all}\n"
-            f"```diff\n{old_lines}\n{new_lines}\n```"
-        )
-
-    if tool_name == "Glob":
-        pat = tool_input.get("pattern", "")
-        if not pat:
-            return None
-        return f"🔧 **Glob** `{pat}`"
-
-    if tool_name == "Grep":
-        pat = tool_input.get("pattern", "")
-        glob_filter = tool_input.get("glob")
-        if not pat:
-            return None
-        if glob_filter:
-            return f"🔧 **Grep** `{pat}` (in `{glob_filter}`)"
-        return f"🔧 **Grep** `{pat}`"
-
-    if tool_name == "TodoWrite":
-        todos = tool_input.get("todos") or []
-        if not isinstance(todos, list):
-            return None
-        # CLI-aligned "Update Todos" block — mirrors Claude Code's terminal UI:
-        #   ☐ pending  /  ☐ **in-progress** (emphasized)  /  ☒ ~~completed~~
-        # The ☐/☒ glyphs are the exact ones the CLI binary uses; the checkbox
-        # column conveys progress at a glance, so no numbering / count summary
-        # (the CLI shows neither). For in-progress, prefer activeForm (the CLI
-        # surfaces the present-tense form for the active item). Cap to the inline
-        # budget so the Discord status message stays under 2000 chars.
-        lines = ["📝 **Update Todos**"]
-        for t in todos:
-            if not isinstance(t, dict):
-                continue
-            status = t.get("status")
-            if status == "completed":
-                lines.append(f"  ☒ ~~{str(t.get('content', ''))}~~")
-            elif status == "in_progress":
-                active = t.get("activeForm") or t.get("content", "")
-                lines.append(f"  ☐ **{str(active)}**")
-            else:  # pending / unknown
-                lines.append(f"  ☐ {str(t.get('content', ''))}")
-        body = "\n".join(lines)
-        return _cap_inline(body, _TOOL_DETAIL_INLINE_CAP)
-
-    # MCP / unknown tools: render the input as JSON so the user can see
-    # what's being passed. Useful for mem0_add, x-scraper, etc.
-    if tool_input:
-        import json as _json
-        try:
-            args_str = _json.dumps(tool_input, ensure_ascii=False)
-        except (TypeError, ValueError):
-            args_str = str(tool_input)
-        return (
-            f"🔧 **{tool_name}**\n"
-            f"```json\n{_cap_inline(args_str, _TOOL_DETAIL_INLINE_CAP)}\n```"
-        )
-    return f"🔧 **{tool_name}**"
-
-
-# Placeholder substituted for empty message content. The Messages API
-# rejects messages with empty content (400 'must have non-empty content').
-# Empty content arises from a thinking-only pause turn (tool_results==[]) or
-# from resumed JSONL history that captured such a turn from an older run.
-_EMPTY_CONTENT_PLACEHOLDER = [{"type": "text", "text": "(続けてください)"}]
-
-# MAX_CONSECUTIVE_EMPTY_TURNS (max consecutive thinking-only "pause turns"
-# before the loop stops nudging) is imported from config.py above. It bounds a
-# model that keeps thinking without acting; the empty-content 400 guard relies
-# on it. Re-exported via this module so callers/tests can import it from here.
-
-
-def _sanitize_content_blocks(content):
-    """Drop content blocks that the Messages API rejects on replay.
-
-    ``fallback`` blocks are server-side response metadata (ADR-0015 refusal
-    fallback); the API returns them in responses but refuses them on the way
-    back with ``messages.N.content.M.fallback.citations: Extra inputs are not
-    permitted`` (HTTP 400). This is the single choke-point for both fresh
-    in-loop turns and JSONL-resumed history — anything that reaches the API
-    passes through ``_normalize_history_for_api``. Non-list content (a plain
-    string user turn) is returned unchanged.
-    rid 0679af30 / haroin 2026-07-02: regression.
-    """
-    if not isinstance(content, list):
-        return content
-    return [b for b in content if not (isinstance(b, dict) and b.get("type") == "fallback")]
-
-
-# server-side tool のブロック type（tool search / advisor）。無効時の replay
-# strip と未対ペア判定の両方で使う。
-_TOOL_SEARCH_BLOCK_TYPES = (
-    "server_tool_use", "tool_search_tool_result", "advisor_tool_result",
-)
-_SERVER_TOOL_RESULT_TYPES = ("tool_search_tool_result", "advisor_tool_result")
-
-
-def strip_tool_search_blocks(content):
-    """Tool Search 関連ブロックを content から除去する（純関数）。
-
-    Tool Search 無効時（フラグ OFF / ランタイム auto-off 後）、過去ターンの
-    JSONL に残った ``server_tool_use`` / ``tool_search_tool_result`` を tools
-    配列に tool search が無いリクエストへ echo すると 400 になり得るため、
-    replay 前に落とす。有効時は呼ばない（echo は resume に必要）。
-    """
-    if not isinstance(content, list):
-        return content
-    return [
-        b for b in content
-        if not (isinstance(b, dict) and b.get("type") in _TOOL_SEARCH_BLOCK_TYPES)
-    ]
-
-
-def _has_unpaired_server_tool_use(content) -> bool:
-    """content 内に result 未対の server_tool_use があるか。
-
-    Tool Search の検索発行ターンでは assistant content に server_tool_use が
-    載り、対応する tool_search_tool_result が同一 content に無いまま
-    stop_reason=tool_use / pause_turn で止まることがある。この状態で user
-    ターンを挟むと server 側の resume 検出（trailing server_tool_use）が壊れる。
-    """
-    server_ids: set[str] = set()
-    result_ids: set[str] = set()
-    for b in content or []:
-        btype = getattr(b, "type", None) or (
-            b.get("type") if isinstance(b, dict) else None
-        )
-        if btype == "server_tool_use":
-            bid = getattr(b, "id", None) or (
-                b.get("id") if isinstance(b, dict) else None
-            )
-            if bid:
-                server_ids.add(bid)
-        elif btype in _SERVER_TOOL_RESULT_TYPES:
-            rid = getattr(b, "tool_use_id", None) or (
-                b.get("tool_use_id") if isinstance(b, dict) else None
-            )
-            if rid:
-                result_ids.add(rid)
-    return bool(server_ids - result_ids)
-
-
-def _normalize_history_for_api(
-    history: list[dict], *, strip_tool_search: bool = False,
-) -> list[dict]:
-    """Strip extra fields, leaving only {role, content} for the API.
-
-    Also guards against empty content (``""`` or ``[]``), which the Messages
-    API rejects with 400 invalid_request. Empty content is REPLACED (not
-    dropped) with a placeholder so tool_use/tool_result pairing stays intact.
-    Both the in-loop path and the JSONL resume path funnel through here, so
-    this is the single structural defense against the empty-content 400.
-    Strict ``== ""`` / ``== []`` comparison (not a falsy check) so a future
-    ``0``/``False`` content is left untouched.
-    """
-    out: list[dict] = []
-    for h in history:
-        content = _sanitize_content_blocks(h["content"])
-        if strip_tool_search:
-            content = strip_tool_search_blocks(content)
-        if content == "" or content == []:
-            content = _EMPTY_CONTENT_PLACEHOLDER
-        out.append({"role": h["role"], "content": content})
-    return out
-
-
 # Tools that only read state and can safely run concurrently (CLI
 # isConcurrencySafe, audit #12). When a turn's tool_use blocks are ALL in
 # this set they are dispatched via asyncio.gather; anything else (writes,
@@ -889,146 +215,6 @@ def _normalize_history_for_api(
 # in one turn. Per-process throttling lives in agent_tool._subagent_sema
 # (SUBAGENT_MAX_PARALLEL), not here.
 CONCURRENCY_SAFE_TOOLS = frozenset({"Read", "Glob", "Grep", "Agent"})
-
-
-def _validate_tool_input(schema, args: dict) -> str | None:
-    """Validate ``args`` against an input_schema; return an error string or None.
-
-    Mirrors the CLI's pre-dispatch zod validation (audit #11): a malformed
-    call comes back as a ``<tool_use_error>InputValidationError: …</tool_use_error>``
-    tool_result naming the offending field, so the model can self-correct in
-    one turn instead of decoding an arbitrary handler traceback. Soft
-    dependency — when jsonschema is unavailable or the schema itself is
-    broken, validation is skipped (the handlers keep their own guards).
-    """
-    if not isinstance(schema, dict) or not schema:
-        return None
-    try:
-        import jsonschema
-    except ImportError:
-        return None
-    try:
-        jsonschema.validate(args, schema)
-    except jsonschema.ValidationError as e:
-        path = ".".join(str(p) for p in e.absolute_path)
-        loc = f" at '{path}'" if path else ""
-        return f"{e.message}{loc}"
-    except jsonschema.SchemaError:
-        return None  # broken schema is our bug; never block the tool on it
-    return None
-
-
-_USAGE_FIELDS = (
-    "input_tokens",
-    "cache_read_input_tokens",
-    "cache_creation_input_tokens",
-    "output_tokens",
-)
-
-
-def _usage_number(usage, field: str) -> int:
-    if usage is None:
-        return 0
-    if isinstance(usage, dict):
-        value = usage.get(field, 0)
-    else:
-        value = getattr(usage, field, 0)
-    return value if isinstance(value, int) else 0
-
-
-# Last observed per-channel context footprint (input + cache_read +
-# cache_creation of the most recent turn). entry.py reads this for the
-# token-based boundary compaction trigger (audit #7) — real tokens, not the
-# 2-4x-noisy char estimate.
-_last_context_tokens: dict[int, int] = {}
-
-
-def get_last_context_tokens(channel_id: int) -> int:
-    """Most recent context-size observation for a channel, 0 if none yet."""
-    return _last_context_tokens.get(channel_id, 0)
-
-
-def _context_tokens(values: dict[str, int]) -> int:
-    return (
-        values["input_tokens"]
-        + values["cache_read_input_tokens"]
-        + values["cache_creation_input_tokens"]
-    )
-
-
-def _log_turn_usage(
-    channel_id: int,
-    turn: int,
-    final_msg,
-    totals: dict[str, int],
-    *,
-    model: str = "",
-    request_id: str = "",
-    duration_ms: int | None = None,
-    ttft_ms: int | None = None,
-    message_count: int = 0,
-) -> None:
-    """Emit per-turn usage if the SDK message exposes it.
-
-    Stays silent for mocks / responses without ``usage`` so the agent loop
-    keeps running. Bumps ``totals`` so a later call to ``_log_total_usage``
-    can summarize multi-turn (tool_use) requests.
-
-    ``request_id`` / ``duration_ms`` / ``ttft_ms`` / ``message_count`` mirror
-    the CLI's tengu_api_success payload (audit #17) — request-id especially,
-    since without it a refusal/error can never be correlated server-side.
-    """
-    usage = getattr(final_msg, "usage", None)
-    if usage is None:
-        return
-    values = {field: _usage_number(usage, field) for field in _USAGE_FIELDS}
-    for field, value in values.items():
-        totals[field] += value
-    totals["turns"] += 1
-    _last_context_tokens[channel_id] = _context_tokens(values)
-    stop_reason = getattr(final_msg, "stop_reason", None)
-    log.info(
-        "claude_api_usage channel=%d turn=%d model=%s input_tokens=%d "
-        "cache_read_input_tokens=%d cache_creation_input_tokens=%d "
-        "output_tokens=%d stop_reason=%s request_id=%s duration_ms=%s "
-        "ttft_ms=%s message_count=%d",
-        channel_id, turn + 1,
-        model or "-",
-        values["input_tokens"],
-        values["cache_read_input_tokens"],
-        values["cache_creation_input_tokens"],
-        values["output_tokens"],
-        stop_reason,
-        request_id or "-",
-        duration_ms if duration_ms is not None else "-",
-        ttft_ms if ttft_ms is not None else "-",
-        message_count,
-    )
-    # On a model refusal, surface stop_details (category: cyber|bio|None +
-    # explanation) so refusals are diagnosable instead of silently becoming
-    # "(no response)" (ADR-0008). The bot was previously blind to WHY fable-5
-    # refused. getattr-guarded so older SDKs / mocks without the field are safe.
-    if stop_reason == "refusal":
-        sd = getattr(final_msg, "stop_details", None)
-        log.warning(
-            "claude_api_refusal channel=%d turn=%d category=%s explanation=%r",
-            channel_id, turn + 1,
-            getattr(sd, "category", None),
-            getattr(sd, "explanation", None),
-        )
-
-
-def _log_total_usage(channel_id: int, totals: dict[str, int]) -> None:
-    """Emit a tool-loop-wide summary when the request spanned >=2 turns."""
-    if totals.get("turns", 0) <= 1:
-        return
-    log.info(
-        "claude_api_usage_total channel=%d turns=%d input_tokens=%d "
-        "cache_read_input_tokens=%d cache_creation_input_tokens=%d output_tokens=%d",
-        channel_id, totals["turns"], totals["input_tokens"],
-        totals["cache_read_input_tokens"], totals["cache_creation_input_tokens"],
-        totals["output_tokens"],
-    )
 
 
 # --- DIAGNOSTIC (temporary): capture the exact request that produced a refusal.
@@ -1091,17 +277,6 @@ def _capture_refusal_request(channel_id, turn, model, cached_system, messages,
         log.debug("refusal capture failed: %s", exc)
 
 
-@dataclass
-class _RescuedToolUse:
-    """A lightweight stand-in for an anthropic tool_use block, minted when a
-    text-form ``<invoke>`` is rescued. ``_run_one_tool`` reads id/name/input via
-    getattr, so this duck-types as the real block on the execution path."""
-    id: str
-    name: str
-    input: dict
-    type: str = "tool_use"
-
-
 def _build_stream_kwargs(
     *,
     current_model: str,
@@ -1114,52 +289,43 @@ def _build_stream_kwargs(
     extra_headers,
     fallback_used: bool,
 ) -> dict:
-    """Assemble the per-turn ``messages.stream`` kwargs (P3-b extraction).
-
-    Body fields the CLI pairs with its betas (mitm capture 2026-05-15,
-    docs/captures/A_one_shot/): output_config + context_management ride as
-    top-level body fields.
-
-    - output_config MUST be a direct kwarg, NOT nested in extra_body: the
-      anthropic SDK 0.88.0 beta streaming path silently drops it from
-      extra_body (verified by mitmproxy — effort never reached the wire),
-      which made the server see a contradictory request and return
-      stop_reason=refusal (ADR-0009). /effort override (機能6) takes
-      precedence per request; falls through to env-driven OUTPUT_CONFIG.
-    - Server-side model fallback (ADR-0015): when a refusal fallback model
-      is in play, declare it via the ``fallbacks`` body field so the server
-      switches mid-stream on a Fable refusal — no client-side second
-      request. SDK doesn't model ``fallbacks``, so it rides extra_body.
-    """
-    max_tokens = (
-        CLAUDE_MAX_TOKENS_OPUS if "opus" in (current_model or "").lower()
-        else CLAUDE_MAX_TOKENS
-    )
-    stream_kwargs = dict(
-        model=current_model,
-        max_tokens=max_tokens,
-        system=cached_system,
+    """Compatibility wrapper preserving ``tool_loop`` config patch points."""
+    return _build_stream_kwargs_impl(
+        current_model=current_model,
+        cached_system=cached_system,
         messages=messages,
-        betas=extra_betas,
-        metadata=get_metadata(),
-        thinking=THINKING_CONFIG,
-        output_config=output_config_override or OUTPUT_CONFIG,
-        extra_body={
-            "context_management": CONTEXT_MANAGEMENT_CONFIG,
-        },
+        extra_betas=extra_betas,
+        output_config_override=output_config_override,
+        refusal_fallback_model=refusal_fallback_model,
+        tools_for_api=tools_for_api,
+        extra_headers=extra_headers,
+        fallback_used=fallback_used,
+        server_side_fallback_enabled=SERVER_SIDE_FALLBACK_ENABLED,
+        refusal_fallback_header=REFUSAL_FALLBACK_HEADER,
     )
-    if SERVER_SIDE_FALLBACK_ENABLED and refusal_fallback_model:
-        stream_kwargs["extra_body"]["fallbacks"] = [
-            {"model": refusal_fallback_model}
-        ]
-    if tools_for_api:
-        stream_kwargs["tools"] = tools_for_api
-    merged_headers = dict(extra_headers or {})
-    if fallback_used:
-        merged_headers[REFUSAL_FALLBACK_HEADER] = "true"
-    if merged_headers:
-        stream_kwargs["extra_headers"] = merged_headers
-    return stream_kwargs
+
+
+async def _run_one_tool_inner(
+    block,
+    *,
+    can_use_tool,
+    execute_tool,
+    tool_schemas: dict,
+    status_callback,
+    tool_invocation_callback,
+    turn: int,
+) -> dict:
+    """Compatibility wrapper preserving the tool-loop timeout patch point."""
+    return await _run_one_tool_inner_impl(
+        block,
+        can_use_tool=can_use_tool,
+        execute_tool=execute_tool,
+        tool_schemas=tool_schemas,
+        status_callback=status_callback,
+        tool_invocation_callback=tool_invocation_callback,
+        turn=turn,
+        _tool_call_timeout_s=TOOL_CALL_TIMEOUT_S,
+    )
 
 
 async def _run_one_tool(
@@ -1229,131 +395,6 @@ async def _run_one_tool(
             result = dict(result)
             result["content"] = capped
     return result
-
-
-async def _run_one_tool_inner(
-    block,
-    *,
-    can_use_tool,
-    execute_tool,
-    tool_schemas: dict,
-    status_callback,
-    tool_invocation_callback,
-    turn: int,
-) -> dict:
-    """Execute one tool_use block → a tool_result dict.
-
-    Shared by the normal tool-execution path and the text-form rescue path so
-    pre-dispatch validation, can_use_tool gating, the timeout cap, and error
-    shaping are identical for both. Was a nested closure in run_agent_loop;
-    hoisted to module scope (2026-06-21) so the rescue helper can reuse it.
-    """
-    tool_id = getattr(block, "id", "")
-    tool_name = getattr(block, "name", "")
-    tool_input = getattr(block, "input", None) or {}
-
-    # Notify the caller that a tool is about to run. bot.py renders this as a
-    # single edit-overwriting status message so the transcript stays clean.
-    if tool_invocation_callback is not None:
-        try:
-            await tool_invocation_callback(tool_name, tool_input)
-        except Exception as exc:
-            log.warning(
-                "tool_invocation_callback failed (tool=%s turn=%d): %s",
-                tool_name, turn, exc,
-            )
-
-    # Pre-dispatch schema validation (audit #11): a malformed call is answered
-    # in the CLI's <tool_use_error> shape, naming the field, so the model can
-    # fix it in one turn.
-    validation_error = _validate_tool_input(
-        tool_schemas.get(tool_name), tool_input,
-    )
-    if validation_error is not None:
-        log.info(
-            "tool %s input validation failed: %s",
-            tool_name, validation_error,
-        )
-        await _safe_status(status_callback, "❌ ツール入力エラー")
-        return {
-            "type": "tool_result",
-            "tool_use_id": tool_id,
-            "content": (
-                "<tool_use_error>InputValidationError: "
-                f"{validation_error}</tool_use_error>"
-            ),
-            "is_error": True,
-        }
-
-    _gate_res = can_use_tool(tool_name, tool_input)
-    if inspect.isawaitable(_gate_res):
-        # permission ask（free-code移植）: ask ルールは Discord リアクション承認を
-        # await する。同期 gate（従来の restricted 等）はそのまま通る。
-        _gate_res = await _gate_res
-    allowed, reason = _gate_res
-    if not allowed:
-        await _safe_status(status_callback, "❌ ツール拒否")
-        return {
-            "type": "tool_result",
-            "tool_use_id": tool_id,
-            "content": f"Tool {tool_name} denied: {reason}",
-            "is_error": True,
-        }
-
-    try:
-        t0 = time.monotonic()
-        # Hard cap so a hung tool/MCP call can't wedge the turn (and the whole
-        # channel) forever. On timeout we return an is_error tool_result, so the
-        # loop can continue or wind down cleanly.
-        output = await asyncio.wait_for(
-            execute_tool(tool_name, tool_input),
-            timeout=TOOL_CALL_TIMEOUT_S,
-        )
-        dt = time.monotonic() - t0
-        # Anthropic tool_result content accepts either a string or a list of
-        # content blocks (text + image). The Read tool's image branch returns
-        # the latter; everything else returns a plain string. Anything weird
-        # falls back to str() so we never wedge the API call.
-        if isinstance(output, list):
-            result_content: "str | list[dict]" = output
-        elif isinstance(output, str):
-            result_content = output
-        else:
-            result_content = str(output)
-        # NOTE: MCP 結果の文字数 cap は wrapper（_run_one_tool）側で、蒸留の
-        # 後に適用する（蒸留は原文に対して行いたいため）。
-        await _safe_status(
-            status_callback,
-            f"📨 結果を受信 ({dt:.1f}s)",
-        )
-        return {
-            "type": "tool_result",
-            "tool_use_id": tool_id,
-            "content": result_content,
-        }
-    except (asyncio.TimeoutError, TimeoutError):
-        log.warning(
-            "tool %s timed out after %ds", tool_name, TOOL_CALL_TIMEOUT_S,
-        )
-        await _safe_status(status_callback, "⏰ ツールがタイムアウト")
-        return {
-            "type": "tool_result",
-            "tool_use_id": tool_id,
-            "content": (
-                f"<tool_use_error>Tool {tool_name} timed out after "
-                f"{TOOL_CALL_TIMEOUT_S}s and was aborted.</tool_use_error>"
-            ),
-            "is_error": True,
-        }
-    except Exception as exc:
-        log.warning("tool %s failed: %s", tool_name, exc)
-        await _safe_status(status_callback, "❌ ツールエラー")
-        return {
-            "type": "tool_result",
-            "tool_use_id": tool_id,
-            "content": f"<tool_use_error>{exc}</tool_use_error>",
-            "is_error": True,
-        }
 
 
 async def _attempt_text_invoke_rescue(
@@ -1971,6 +1012,14 @@ async def run_agent_loop(
                     if detected:
                         fallback_used = True
                         current_model = detected
+                        # Clear the fallback target now that we've pinned it as
+                        # the answering model. Otherwise the next tool-loop turn
+                        # rebuilds stream_kwargs with current_model=<fallback> AND
+                        # fallbacks=[<fallback>] still attached — and the fallback
+                        # model (Opus 4.8) rejects the `fallbacks` body field with
+                        # 400 invalid_request, hanging the turn at "整形中"
+                        # (2026-07-14: Fable 5 server-side fallback → tool_use).
+                        refusal_fallback_model = None
                         log.warning(
                             "[ch=%d] turn=%d server-side fallback confirmed "
                             "(answering model=%s)",
@@ -2138,12 +1187,9 @@ async def run_agent_loop(
             # Caller (entry.py) owns retry/backoff; surface the exception.
             raise
 
-        # Persist the assistant turn (in-memory only; disk write is caller's job)
-        # filter(None, ...): _block_to_dict returns None for server-only
-        # metadata blocks (e.g. ``fallback``) that would cause a 400 on replay.
-        assistant_blocks = [
-            d for d in (_block_to_dict(b) for b in (final_msg.content or [])) if d is not None
-        ]
+        # Preserve the fallback boundary while removing only the pre-boundary
+        # blocks the continuation schema forbids.
+        assistant_blocks = _response_blocks_to_dict(final_msg.content)
         history.append({"role": "assistant", "content": assistant_blocks})
 
         # Capture any prose this turn emitted before deciding how to exit.
@@ -2280,6 +1326,10 @@ async def run_agent_loop(
                 history.pop()
             fallback_used = True
             current_model = refusal_fallback_model
+            # Same reason as the server-side path above: once current_model IS
+            # the fallback model, stop declaring `fallbacks` on subsequent turns
+            # or the fallback model 400s on the unsupported body field.
+            refusal_fallback_model = None
             consecutive_empty = 0
             log.warning(
                 "[ch=%d] turn=%d Fable refusal → fallback to %s",

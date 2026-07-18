@@ -2,24 +2,21 @@
 testpaths = ["tests"]
 asyncio_mode = "auto"
 
-# Custom markers. Tests marked `integration` spawn real subprocesses,
-# touch the network, or otherwise have significantly higher cost than
-# unit tests. They are skipped by default; opt in with
-#   pytest -m integration
-# or
-#   pytest -m ""
-# (the empty filter disables exclusion).
+# Phase 4 primary test taxonomy. Every collected test receives exactly one
+# primary marker from its classification directory or tests/taxonomy.toml.
 markers = [
-    "integration: real subprocess / network test, skipped by default",
-    "legacy: superseded mock-coupled test kept for reference; excluded from the default run (P0.5-d governance: count must not grow, replacement test link required, deleted only via review)",
+    "unit: deterministic isolated test with no external service dependency",
+    "contract: stable public API, facade, import, or serialization contract",
+    "characterization: observable legacy behavior frozen for refactoring",
+    "integration: multi-component, real subprocess, or explicitly provisioned service test",
+    "eval: deterministic offline quality evaluation; network access is forbidden",
+    "legacy: superseded test retained temporarily with a documented replacement",
+    "process_state_mutation: test intentionally verifies an environment or cwd lifecycle mutation",
 ]
 
-# Default to excluding `integration`-marked tests. The bot's test suite is
-# otherwise mock-heavy and runs in ~1-2 s; integration-marked tests
-# add ~10-25 s when included. `legacy` marks tests broken by refactor phases
-# that have a replacement characterization/contract test — they still run in
-# the nightly full suite (workflow: test.yml nightly-full job).
-addopts = "-m 'not integration and not legacy'"
+# Keep local pytest deterministic and isolated. CI executes each fixed lane
+# independently through scripts/run_test_lane.py.
+addopts = "--strict-markers -m unit"
 
 [tool.coverage.run]
 branch = true

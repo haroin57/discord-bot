@@ -11,20 +11,30 @@ from discord import app_commands
 from services.session import clear_channel_context, get_session
 
 from bot_commands._deps import CommandDeps
+from bot_commands.guards import require_admin_channel
+from bot_commands.responses import InteractionResponse
+from bot_commands.state import state_from_deps
 
 log = logging.getLogger(__name__)
 
 
 def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
-    @tree.command(name="compact", description="このチャンネルの会話履歴を手動で圧縮する (admin only)")
-    @app_commands.describe(focus="要約で特に残したい観点（任意・free-codeの /compact <指示> と同じ）")
+    @tree.command(
+        name="compact",
+        description="このチャンネルの会話履歴を手動で圧縮する (admin only)",
+    )
+    @app_commands.describe(
+        focus="要約で特に残したい観点（任意・free-codeの /compact <指示> と同じ）"
+    )
     async def compact_cmd(interaction: discord.Interaction, focus: str | None = None):
         if not deps.is_admin(interaction.user):
             await interaction.response.send_message("admin only", ephemeral=True)
             return
         channel_id = interaction.channel_id
         if channel_id is None:
-            await interaction.response.send_message("チャンネル外では使えません", ephemeral=True)
+            await interaction.response.send_message(
+                "チャンネル外では使えません", ephemeral=True
+            )
             return
         await interaction.response.defer(ephemeral=True)
         try:
@@ -44,15 +54,21 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
                     + int(_usage.get("cache_creation_input_tokens", 0) or 0)
                 )
             result = await compact_channel_history(
-                channel_id, api_client, force=True,
-                custom_instructions=focus,      # free-code: focus instructions
-                auto_continue=False,            # 手動は自己継続文言を付けない
+                channel_id,
+                api_client,
+                force=True,
+                custom_instructions=focus,  # free-code: focus instructions
+                auto_continue=False,  # 手動は自己継続文言を付けない
             )
         except Exception as exc:
-            await interaction.followup.send(f"圧縮に失敗しました: {exc}", ephemeral=True)
+            await interaction.followup.send(
+                f"圧縮に失敗しました: {exc}", ephemeral=True
+            )
             return
         if result:
-            tok_line = f"- 圧縮前の直近文脈: ~{before_tok:,} tok\n" if before_tok else ""
+            tok_line = (
+                f"- 圧縮前の直近文脈: ~{before_tok:,} tok\n" if before_tok else ""
+            )
             await interaction.followup.send(
                 "🗜️ **会話履歴を圧縮しました**（次ターンから反映）\n"
                 f"{tok_line}"
@@ -74,25 +90,24 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
         description="このチャンネルの会話履歴とセッションをクリアする (admin only)",
     )
     async def clear_cmd(interaction: discord.Interaction):
-        if not deps.is_admin(interaction.user):
-            await interaction.response.send_message("admin only", ephemeral=True)
+        response = InteractionResponse(interaction)
+        context = await require_admin_channel(response, interaction, deps.is_admin)
+        if context is None:
             return
-        channel_id = interaction.channel_id
-        if channel_id is None:
-            await interaction.response.send_message("チャンネル外では使えません", ephemeral=True)
-            return
+        await response.defer(ephemeral=True)
         try:
-            report = clear_channel_context(channel_id)
+            report = clear_channel_context(context.channel_id)
             from services.codex_app_server.manager import clear_codex_channel
-            codex_dropped = await clear_codex_channel(channel_id)
-            skill_overrides = getattr(deps, "skill_overrides", {})
-            skill_keys = [key for key in skill_overrides if key[0] == channel_id]
-            for key in skill_keys:
-                skill_overrides.pop(key, None)
+
+            codex_dropped = await clear_codex_channel(context.channel_id)
+            skills_dropped = state_from_deps(deps).clear_channel_skills(
+                context.channel_id
+            )
         except Exception as exc:
-            log.exception("/clear failed for ch=%s", channel_id)
-            await interaction.response.send_message(
-                f"クリアに失敗しました: {exc}", ephemeral=True,
+            log.exception("/clear failed for ch=%s", context.channel_id)
+            await response.send(
+                f"クリアに失敗しました: {exc}",
+                ephemeral=True,
             )
             return
         parts = ["✅ このチャンネルの会話コンテキストをクリアしました。"]
@@ -105,11 +120,14 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
             parts.append("-# 履歴ファイルは無かったのでスキップ")
         parts.append(f"-# in-memory session {report['sessions_dropped']} 件を破棄")
         parts.append(f"-# Codex thread mapping {codex_dropped} 件を破棄")
-        parts.append(f"-# active skill {len(skill_keys)} 件を解除")
+        parts.append(f"-# active skill {skills_dropped} 件を解除")
         parts.append("-# 次のメッセージから完全にフレッシュな会話が始まります。")
-        await interaction.response.send_message("\n".join(parts), ephemeral=True)
+        await response.send("\n".join(parts), ephemeral=True)
 
-    @tree.command(name="context", description="このチャンネルでの直近トークン使用量と圧縮余裕を表示する (admin only)")
+    @tree.command(
+        name="context",
+        description="このチャンネルでの直近トークン使用量と圧縮余裕を表示する (admin only)",
+    )
     async def context_cmd(interaction: discord.Interaction):
         if not deps.is_admin(interaction.user):
             await interaction.response.send_message("admin only", ephemeral=True)
@@ -120,10 +138,10 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
             from services.provider_router import PROVIDER_CODEX, resolve_provider
 
             key = (cid, uid)
-            provider_overrides = getattr(deps, "provider_overrides", {})
+            state = state_from_deps(deps)
             provider = resolve_provider(
-                explicit=provider_overrides.get(key),
-                model=deps.model_overrides.get(key),
+                explicit=state.provider(key),
+                model=state.model(key),
                 restricted=False,
             )
             if provider == PROVIDER_CODEX:
@@ -149,7 +167,9 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
 
                 inp = _number(usage, "inputTokens", "input_tokens")
                 cached = _number(
-                    usage, "cachedInputTokens", "cached_input_tokens",
+                    usage,
+                    "cachedInputTokens",
+                    "cached_input_tokens",
                     "cache_read_input_tokens",
                 )
                 out = _number(usage, "outputTokens", "output_tokens")
@@ -182,6 +202,7 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
         total_in = inp + cr + cc
         # 500K の圧縮トリガーまでの余裕。env override されてれば追従する。
         from config import HISTORY_COMPACT_TRIGGER_TOKENS
+
         head = max(0, HISTORY_COMPACT_TRIGGER_TOKENS - total_in)
         msg = (
             f"**直近ターンの usage**\n"

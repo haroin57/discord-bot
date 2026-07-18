@@ -1,10 +1,11 @@
 # free_code_commands — porting contract
 
 Python port of free-code's slash-command system (`/home/ubuntu/free-code/src/commands`).
-Every ported command is constructed against the framework in `types.py` + `runtime.py`
-and registered in `_all.py`. This file is the contract each command module follows.
+Every ported command is defined with registry-private builders and registered in
+`_all.py`. Public values from `types.py`, module `COMMANDS`, and registry lookup are
+frozen metadata only. This file is the contract each command module follows.
 
-## Framework API (import from `..types` / `..runtime`)
+## Framework API
 
 ```python
 from ..types import (
@@ -12,23 +13,27 @@ from ..types import (
     LocalCommand, PromptCommand, LocalJsxCommand,
     LocalCommandResult, JsxOutcome,
 )
+from ..registry import _local_command, _prompt_command, _local_jsx_command
 from ..runtime import CommandRuntime, ShellResult, Attribution
 from ..shell import execute_shell_commands_in_prompt, substitute_arguments
 ```
 
 ### Command variants
 
-* **local** → `LocalCommand(name, description, supports_non_interactive=<bool>, call_fn=<fn>)`
+The underscored registry builders are restricted to built-in command definition
+modules. Public consumers use `build_registry()` and metadata APIs.
+
+* **local** → `_local_command(name, description, supports_non_interactive=<bool>, call_fn=<fn>)`
   where `call_fn(args: str, rt: CommandRuntime) -> LocalCommandResult` (may be `async`).
   Return `LocalCommandResult.text(value)` / `.skip()` / `.compact(result, display_text)`.
 
-* **prompt** → `PromptCommand(name, description, progress_message=..., content_length=...,`
-  `allowed_tools=[...], source='builtin', get_prompt_fn=<fn>)`
+* **prompt** → `_prompt_command(name, description, progress_message=..., content_length=...,`
+  `allowed_tools=[...], source='builtin', supports_non_interactive=<bool>, get_prompt_fn=<fn>)`
   where `get_prompt_fn(args: str, rt: CommandRuntime) -> list[ContentBlock]` (may be `async`).
   Use `text_block(text)` for `{type:'text', text}`. Expand embedded `` !`cmd` `` via
   `await execute_shell_commands_in_prompt(text, rt, '/name')`.
 
-* **local-jsx** → `LocalJsxCommand(name, description, call_fn=<fn>)` where
+* **local-jsx** → `_local_jsx_command(name, description, supports_non_interactive=<bool>, call_fn=<fn>)` where
   `call_fn(args, rt) -> JsxOutcome`. Interactive TUI is headless here: perform any non-UI
   effect through `rt` (e.g. `rt.open_dialog('theme')`) and return
   `JsxOutcome(dialog='theme', message=..., data={...})`. A pure dialog with no headless
@@ -38,7 +43,13 @@ from ..shell import execute_shell_commands_in_prompt, substitute_arguments
 
 `aliases=[...]`, `availability=['claude-ai'|'console']`, `argument_hint='<...>'`,
 `immediate=True`, `is_sensitive=True`, `when_to_use='...'`, `_is_hidden=True` (static hidden),
-`user_invocable=False`, `disable_model_invocation=True`, `loaded_from='...'`.
+`user_invocable=False`, `disable_model_invocation=True`, `supports_non_interactive=True`,
+`loaded_from='...'`.
+
+Command implementations are not public execution APIs. Consumers inspect immutable
+metadata through `find` / `get` / `active` and execute only through
+`await registry.invoke(text, runtime)`.
+Module `COMMANDS` tuples and `all_commands()` contain no callback or predicate.
 
 ### Conditional enablement / hiding / dynamic description
 
@@ -92,7 +103,7 @@ def _cost_call(args, rt):
         return LocalCommandResult.text(value)
     return LocalCommandResult.text(rt.format_total_cost())
 
-cost = LocalCommand(
+cost = _local_command(
     name='cost',
     description='Show the total cost and duration of the current session',
     supports_non_interactive=True,
@@ -116,7 +127,7 @@ async def _commit_prompt(args, rt):
     final = await execute_shell_commands_in_prompt(text, rt, '/commit')
     return [text_block(final)]
 
-commit = PromptCommand(name='commit', description='Create a git commit',
+commit = _prompt_command(name='commit', description='Create a git commit',
     allowed_tools=_ALLOWED, content_length=0, progress_message='creating commit',
     source='builtin', get_prompt_fn=_commit_prompt)
 ```

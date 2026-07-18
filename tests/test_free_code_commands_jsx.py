@@ -1,6 +1,6 @@
 """PoC: local-jsx (interactive) commands + feature-gated commands.
 
-The TUI is headless here, so each command's ``call`` must record which dialog it
+The TUI is headless here, so registry invocation must record which dialog it
 would open and return a :class:`JsxOutcome`. Also verifies dynamic descriptions,
 per-runtime enablement/hiding gates, and that feature-gated commands stay dark
 until their flag is set — matching the conditional registration in ``commands.ts``.
@@ -8,18 +8,13 @@ until their flag is set — matching the conditional registration in ``commands.
 
 from __future__ import annotations
 
-from free_code_commands.commands import feature_gated as fg
-from free_code_commands.commands import jsx_commands as jc
+from free_code_commands import build_registry
 from free_code_commands.runtime import RecordingRuntime
-from free_code_commands.types import JsxOutcome
+from free_code_commands.types import CommandType, JsxOutcome
 
 
-def _jsx(name):
-    return next(c for c in jc.COMMANDS if c.name == name)
-
-
-def _gated(name):
-    return next(c for c in fg.COMMANDS if c.name == name)
+def _resolved(name, runtime):
+    return build_registry().resolve(name, runtime)
 
 
 # --------------------------------------------------------------------------
@@ -28,12 +23,21 @@ def _gated(name):
 
 
 async def test_every_jsx_command_opens_its_dialog():
-    for cmd in jc.COMMANDS:
+    registry = build_registry()
+    catalog_runtime = RecordingRuntime()
+    active = [
+        command
+        for command in registry.active(catalog_runtime)
+        if command.type is CommandType.LOCAL_JSX
+    ]
+    for command in active:
         rt = RecordingRuntime()
-        out = await cmd.call("some args", rt)
+        invocation = await registry.invoke(f"/{command.name} some args", rt)
+        assert invocation is not None
+        out = invocation.result
         assert isinstance(out, JsxOutcome)
-        assert out.dialog == cmd.name
-        assert rt.opened_dialogs and rt.opened_dialogs[0][0] == cmd.name
+        assert out.dialog == command.name
+        assert rt.opened_dialogs and rt.opened_dialogs[0][0] == command.name
         # args are threaded into the recorded dialog payload
         assert rt.opened_dialogs[0][1].get("args") == "some args"
 
@@ -44,7 +48,10 @@ async def test_every_jsx_command_opens_its_dialog():
 
 
 def test_model_description_shows_current_model():
-    desc = _jsx("model").resolved_description(RecordingRuntime(main_loop_model="opus-4.8"))
+    desc = _resolved(
+        "model",
+        RecordingRuntime(main_loop_model="opus-4.8"),
+    ).description
     assert "currently opus-4.8" in desc
 
 
@@ -53,25 +60,36 @@ def test_fast_description_shows_fast_model():
         def fast_mode_model_display(self):
             return "Haiku"
 
-    assert "Haiku only" in _jsx("fast").resolved_description(FastRt())
+    assert (
+        "Haiku only"
+        in _resolved(
+            "fast",
+            FastRt(fast_mode=True, claude_ai=True),
+        ).description
+    )
 
 
 def test_login_description_switches_on_auth():
-    signin = _jsx("login").resolved_description(RecordingRuntime())
-    switch = _jsx("login").resolved_description(RecordingRuntime(api_key_auth=True))
+    signin = _resolved("login", RecordingRuntime()).description
+    switch = _resolved("login", RecordingRuntime(api_key_auth=True)).description
     assert signin == "Sign in with your Anthropic account"
     assert switch == "Switch Anthropic accounts"
 
 
 def test_terminal_setup_description_and_hiding():
-    ts = _jsx("terminal-setup")
-    apple = ts.resolved_description(RecordingRuntime(terminal="Apple_Terminal"))
-    other = ts.resolved_description(RecordingRuntime(terminal="xterm"))
+    apple = _resolved(
+        "terminal-setup",
+        RecordingRuntime(terminal="Apple_Terminal"),
+    ).description
+    other = _resolved(
+        "terminal-setup",
+        RecordingRuntime(terminal="xterm"),
+    ).description
     assert "Option+Enter" in apple
     assert "Shift+Enter" in other
     # hidden on native CSI-u terminals
-    assert ts.hidden(RecordingRuntime(terminal="kitty")) is True
-    assert ts.hidden(RecordingRuntime(terminal="xterm")) is False
+    assert _resolved("terminal-setup", RecordingRuntime(terminal="kitty")).hidden
+    assert not _resolved("terminal-setup", RecordingRuntime(terminal="xterm")).hidden
 
 
 def test_sandbox_description_is_dynamic():
@@ -79,7 +97,7 @@ def test_sandbox_description_is_dynamic():
         def sandbox_status(self):
             return "sandbox enabled (auto-allow)"
 
-    assert "auto-allow" in _jsx("sandbox").resolved_description(SandRt())
+    assert "auto-allow" in _resolved("sandbox", SandRt()).description
 
 
 # --------------------------------------------------------------------------
@@ -88,34 +106,69 @@ def test_sandbox_description_is_dynamic():
 
 
 def test_tag_is_ant_only():
-    assert _jsx("tag").enabled(RecordingRuntime(user_type="ant")) is True
-    assert _jsx("tag").enabled(RecordingRuntime()) is False
+    assert _resolved("tag", RecordingRuntime(user_type="ant")) is not None
+    assert _resolved("tag", RecordingRuntime()) is None
 
 
 def test_session_gated_on_remote_mode():
-    assert _jsx("session").enabled(RecordingRuntime(remote_mode=True)) is True
-    assert _jsx("session").enabled(RecordingRuntime()) is False
-    assert _jsx("session").hidden(RecordingRuntime()) is True
+    assert _resolved("session", RecordingRuntime(remote_mode=True)) is not None
+    assert _resolved("session", RecordingRuntime()) is None
 
 
 def test_desktop_gated_on_platform():
-    assert _jsx("desktop").enabled(RecordingRuntime(platform="darwin")) is True
-    assert _jsx("desktop").enabled(RecordingRuntime(platform="linux")) is False
+    assert (
+        _resolved(
+            "desktop",
+            RecordingRuntime(platform="darwin", claude_ai=True),
+        )
+        is not None
+    )
+    assert (
+        _resolved(
+            "desktop",
+            RecordingRuntime(platform="linux", claude_ai=True),
+        )
+        is None
+    )
 
 
 def test_fast_gated_on_fast_mode():
-    assert _jsx("fast").enabled(RecordingRuntime(fast_mode=True)) is True
-    assert _jsx("fast").enabled(RecordingRuntime()) is False
+    assert (
+        _resolved(
+            "fast",
+            RecordingRuntime(fast_mode=True, claude_ai=True),
+        )
+        is not None
+    )
+    assert _resolved("fast", RecordingRuntime(claude_ai=True)) is None
 
 
 def test_chrome_gated_on_interactive():
-    assert _jsx("chrome").enabled(RecordingRuntime(non_interactive=False)) is True
-    assert _jsx("chrome").enabled(RecordingRuntime(non_interactive=True)) is False
+    assert (
+        _resolved(
+            "chrome",
+            RecordingRuntime(non_interactive=False, claude_ai=True),
+        )
+        is not None
+    )
+    assert (
+        _resolved(
+            "chrome",
+            RecordingRuntime(non_interactive=True, claude_ai=True),
+        )
+        is None
+    )
 
 
 def test_doctor_disabled_by_env():
-    assert _jsx("doctor").enabled(RecordingRuntime()) is True
-    assert _jsx("doctor").enabled(RecordingRuntime(env={"DISABLE_DOCTOR_COMMAND": "1"})) is False
+    assert _resolved("doctor", RecordingRuntime()) is not None
+    assert (
+        _resolved(
+            "doctor",
+            RecordingRuntime(env={"DISABLE_DOCTOR_COMMAND": "1"}),
+        )
+        is None
+    )
 
 
 def test_ultrareview_gated():
@@ -123,17 +176,29 @@ def test_ultrareview_gated():
         def ultrareview_enabled(self):
             return True
 
-    assert _jsx("ultrareview").enabled(UrRt()) is True
-    assert _jsx("ultrareview").enabled(RecordingRuntime()) is False
+    assert _resolved("ultrareview", UrRt()) is not None
+    assert _resolved("ultrareview", RecordingRuntime()) is None
 
 
 def test_upgrade_hidden_for_enterprise():
-    assert _jsx("upgrade").enabled(RecordingRuntime(subscription="pro")) is True
-    assert _jsx("upgrade").enabled(RecordingRuntime(subscription="enterprise")) is False
+    assert (
+        _resolved(
+            "upgrade",
+            RecordingRuntime(subscription="pro", claude_ai=True),
+        )
+        is not None
+    )
+    assert (
+        _resolved(
+            "upgrade",
+            RecordingRuntime(subscription="enterprise", claude_ai=True),
+        )
+        is None
+    )
 
 
 def test_output_style_is_hidden():
-    assert _jsx("output-style").hidden(RecordingRuntime()) is True
+    assert _resolved("output-style", RecordingRuntime()).hidden is True
 
 
 # --------------------------------------------------------------------------
@@ -143,11 +208,14 @@ def test_output_style_is_hidden():
 
 def test_feature_gated_dark_by_default():
     for name in ("fork", "buddy", "peers", "workflows", "torch", "brief", "ultraplan"):
-        assert _gated(name).enabled(RecordingRuntime()) is False, name
+        resolved = _resolved(name, RecordingRuntime())
+        assert resolved is None or resolved.name != name, name
 
 
 def test_fork_enabled_by_flag():
-    assert _gated("fork").enabled(RecordingRuntime(features={"FORK_SUBAGENT"})) is True
+    assert (
+        _resolved("fork", RecordingRuntime(features={"FORK_SUBAGENT"})).name == "fork"
+    )
 
 
 def test_remote_control_needs_flag_and_bridge():
@@ -156,24 +224,32 @@ def test_remote_control_needs_flag_and_bridge():
             return True
 
     on = BridgeRt(features={"BRIDGE_MODE"})
-    assert _gated("remote-control").enabled(on) is True
+    assert _resolved("remote-control", on) is not None
     # flag without bridge enabled → still dark
-    assert _gated("remote-control").enabled(RecordingRuntime(features={"BRIDGE_MODE"})) is False
+    assert (
+        _resolved(
+            "remote-control",
+            RecordingRuntime(features={"BRIDGE_MODE"}),
+        )
+        is None
+    )
 
 
 def test_remote_control_server_needs_two_flags():
     one = RecordingRuntime(features={"DAEMON"})
     both = RecordingRuntime(features={"DAEMON", "BRIDGE_MODE"})
-    assert _gated("remote-control-server").enabled(one) is False
-    assert _gated("remote-control-server").enabled(both) is True
+    assert _resolved("remote-control-server", one) is None
+    assert _resolved("remote-control-server", both) is not None
 
 
 def test_brief_enabled_by_either_kairos_flag():
-    assert _gated("brief").enabled(RecordingRuntime(features={"KAIROS"})) is True
-    assert _gated("brief").enabled(RecordingRuntime(features={"KAIROS_BRIEF"})) is True
+    assert _resolved("brief", RecordingRuntime(features={"KAIROS"})) is not None
+    assert _resolved("brief", RecordingRuntime(features={"KAIROS_BRIEF"})) is not None
 
 
 async def test_feature_gated_still_dispatch_headlessly():
     rt = RecordingRuntime(features={"FORK_SUBAGENT"})
-    out = await _gated("fork").call("do it", rt)
+    invocation = await build_registry().invoke("/fork do it", rt)
+    assert invocation is not None
+    out = invocation.result
     assert out.dialog == "fork"

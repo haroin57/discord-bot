@@ -45,7 +45,7 @@ from .prompts import (
     build_magi_worker_system,
     build_report_critic_briefing,
 )
-from .registry import ResearchAgentDef, extract_plan, run_subagent
+from .agent_runner import ResearchAgentDef, extract_plan, run_subagent
 from .sources import build_final_report
 from .types import LensResult
 
@@ -71,7 +71,9 @@ def parse_lens_output(text: str) -> str:
     return (text.strip().splitlines() or [""])[0][:200]
 
 
-async def run_magi_lens(ctx, lens_key: str, view, sema: asyncio.Semaphore) -> LensResult:
+async def run_magi_lens(
+    ctx, lens_key: str, view, sema: asyncio.Semaphore
+) -> LensResult:
     """1 レンズ（科学/直観/懐疑）を入れ子構成で実行し LensResult を返す。
 
     例外は握って ok=False の LensResult に変換する（1レンズ失敗でも他レンズ・integrator は
@@ -85,27 +87,41 @@ async def run_magi_lens(ctx, lens_key: str, view, sema: asyncio.Semaphore) -> Le
         # (a) 分解（Sonnet, tools 無し）: レンズ観点の簡単な分析サブタスクへ。
         await view.working("分析を分解中…")
         decompose_def = ResearchAgentDef(
-            agent_type="magi_decompose", model=DEEP_RESEARCH_MAGI_WORKER_MODEL,
-            system_prompt=MAGI_DECOMPOSE_SYSTEM, max_tool_turns=1,
+            agent_type="magi_decompose",
+            model=DEEP_RESEARCH_MAGI_WORKER_MODEL,
+            system_prompt=MAGI_DECOMPOSE_SYSTEM,
+            max_tool_turns=1,
             idle_timeout_s=DEEP_RESEARCH_SEARCHER_IDLE_TIMEOUT_S,
         )
         async with sema:
             dres = await run_subagent(
-                api_client=ctx.api_client, pool=ctx.pool, server_locks=ctx.server_locks,
+                api_client=ctx.api_client,
+                pool=ctx.pool,
+                server_locks=ctx.server_locks,
                 defn=decompose_def,
                 briefing=build_decompose_briefing(
-                    lens_label, cq, digest, DEEP_RESEARCH_MAGI_MAX_WORKERS,
+                    lens_label,
+                    cq,
+                    digest,
+                    DEEP_RESEARCH_MAGI_MAX_WORKERS,
                 ),
-                tools_for_api=[], state=ctx.state, channel_id=ctx.thread.id,
+                tools_for_api=[],
+                state=ctx.state,
+                channel_id=ctx.thread.id,
             )
-        subtasks = extract_plan(dres.summary_md, DEEP_RESEARCH_MAGI_MAX_WORKERS) if dres.ok else []
+        subtasks = (
+            extract_plan(dres.summary_md, DEEP_RESEARCH_MAGI_MAX_WORKERS)
+            if dres.ok
+            else []
+        )
 
         # (b) ワーカー（Sonnet, 並列, 検証検索）: 各サブタスクを裏取りして分析部品に。
         worker_parts = ""
         if subtasks:
             await view.working(f"検証検索中…（{len(subtasks)} サブタスク）")
             worker_def = ResearchAgentDef(
-                agent_type="magi_worker", model=DEEP_RESEARCH_MAGI_WORKER_MODEL,
+                agent_type="magi_worker",
+                model=DEEP_RESEARCH_MAGI_WORKER_MODEL,
                 system_prompt=build_magi_worker_system(ctx.tools_for_api),
                 max_tool_turns=DEEP_RESEARCH_MAGI_WORKER_MAX_SEARCHES,
                 idle_timeout_s=DEEP_RESEARCH_SEARCHER_IDLE_TIMEOUT_S,
@@ -114,14 +130,20 @@ async def run_magi_lens(ctx, lens_key: str, view, sema: asyncio.Semaphore) -> Le
             async def _worker(subtask: str):
                 async with sema:
                     return await run_subagent(
-                        api_client=ctx.api_client, pool=ctx.pool, server_locks=ctx.server_locks,
+                        api_client=ctx.api_client,
+                        pool=ctx.pool,
+                        server_locks=ctx.server_locks,
                         defn=worker_def,
                         briefing=build_magi_worker_briefing(lens_label, subtask, cq),
-                        tools_for_api=ctx.tools_for_api, state=ctx.state, channel_id=ctx.thread.id,
+                        tools_for_api=ctx.tools_for_api,
+                        state=ctx.state,
+                        channel_id=ctx.thread.id,
                         tool_invocation_callback=view.on_tool,
                     )
 
-            raw = await asyncio.gather(*[_worker(s) for s in subtasks], return_exceptions=True)
+            raw = await asyncio.gather(
+                *[_worker(s) for s in subtasks], return_exceptions=True
+            )
             chunks: list[str] = []
             for i, (st, r) in enumerate(zip(subtasks, raw), 1):
                 if hasattr(r, "ok") and r.ok and r.summary_md.strip():
@@ -131,32 +153,53 @@ async def run_magi_lens(ctx, lens_key: str, view, sema: asyncio.Semaphore) -> Le
         # (c) lead 統合（Opus, effort=max, tools 無し）: 難所の推論。
         await view.working("統合推論中…（Opus）")
         lead_def = ResearchAgentDef(
-            agent_type="magi_lead", model=DEEP_RESEARCH_MAGI_MODEL,
-            system_prompt=build_lens_system(lens_key), max_tool_turns=1,
+            agent_type="magi_lead",
+            model=DEEP_RESEARCH_MAGI_MODEL,
+            system_prompt=build_lens_system(lens_key),
+            max_tool_turns=1,
             idle_timeout_s=DEEP_RESEARCH_MAGI_IDLE_TIMEOUT_S,
             effort=DEEP_RESEARCH_MAGI_EFFORT,
         )
         async with sema:
             lres = await run_subagent(
-                api_client=ctx.api_client, pool=ctx.pool, server_locks=ctx.server_locks,
+                api_client=ctx.api_client,
+                pool=ctx.pool,
+                server_locks=ctx.server_locks,
                 defn=lead_def,
                 briefing=build_magi_lead_briefing(lens_label, cq, digest, worker_parts),
-                tools_for_api=[], state=ctx.state, channel_id=ctx.thread.id,
+                tools_for_api=[],
+                state=ctx.state,
+                channel_id=ctx.thread.id,
             )
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - 1レンズの失敗で全体を止めない
         log.exception("magi lens %s failed", lens_key)
-        return LensResult(lens_key=lens_key, lens_label=lens_label, stance="", body="",
-                          ok=False, error=f"{type(exc).__name__}: {exc}")
+        return LensResult(
+            lens_key=lens_key,
+            lens_label=lens_label,
+            stance="",
+            body="",
+            ok=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )
 
     if not (lres.ok and lres.summary_md.strip()):
-        return LensResult(lens_key=lens_key, lens_label=lens_label, stance="", body="",
-                          ok=False, error=lres.error or "empty lead output")
+        return LensResult(
+            lens_key=lens_key,
+            lens_label=lens_label,
+            stance="",
+            body="",
+            ok=False,
+            error=lres.error or "empty lead output",
+        )
     body = lres.summary_md.strip()
     return LensResult(
-        lens_key=lens_key, lens_label=lens_label,
-        stance=parse_lens_output(body), body=body, ok=True,
+        lens_key=lens_key,
+        lens_label=lens_label,
+        stance=parse_lens_output(body),
+        body=body,
+        ok=True,
     )
 
 
@@ -189,18 +232,27 @@ async def run_integrator(ctx) -> str | None:
     # 最終回答だけ「佐藤かなえ」の人格・口調を乗せる（3視点の推論コアは厳密・中立のまま）。
     honorific = kanae_honorific(getattr(getattr(ctx, "user", None), "id", None))
     integ_def = ResearchAgentDef(
-        agent_type="integrator", model=DEEP_RESEARCH_MAGI_MODEL,
-        system_prompt=build_integrator_system(honorific), max_tool_turns=1,
+        agent_type="integrator",
+        model=DEEP_RESEARCH_MAGI_MODEL,
+        system_prompt=build_integrator_system(honorific),
+        max_tool_turns=1,
         idle_timeout_s=DEEP_RESEARCH_MAGI_IDLE_TIMEOUT_S,
         effort=DEEP_RESEARCH_MAGI_EFFORT,
     )
     res = await run_subagent(
-        api_client=ctx.api_client, pool=ctx.pool, server_locks=ctx.server_locks,
+        api_client=ctx.api_client,
+        pool=ctx.pool,
+        server_locks=ctx.server_locks,
         defn=integ_def,
         briefing=build_integrator_briefing(
-            cq, anonymized, digest, ctx.state.user_memories,
+            cq,
+            anonymized,
+            digest,
+            ctx.state.user_memories,
         ),
-        tools_for_api=[], state=ctx.state, channel_id=ctx.thread.id,
+        tools_for_api=[],
+        state=ctx.state,
+        channel_id=ctx.thread.id,
     )
     if not (res.ok and res.summary_md.strip()):
         return None
@@ -221,15 +273,21 @@ async def _critic_pass(ctx, integ_def, cq: str, report: str, digest: str) -> str
     """
     try:
         critic_def = ResearchAgentDef(
-            agent_type="report_critic", model=DEEP_RESEARCH_MAGI_WORKER_MODEL,
-            system_prompt=REPORT_CRITIC_SYSTEM, max_tool_turns=1,
+            agent_type="report_critic",
+            model=DEEP_RESEARCH_MAGI_WORKER_MODEL,
+            system_prompt=REPORT_CRITIC_SYSTEM,
+            max_tool_turns=1,
             idle_timeout_s=DEEP_RESEARCH_SEARCHER_IDLE_TIMEOUT_S,
         )
         cres = await run_subagent(
-            api_client=ctx.api_client, pool=ctx.pool, server_locks=ctx.server_locks,
+            api_client=ctx.api_client,
+            pool=ctx.pool,
+            server_locks=ctx.server_locks,
             defn=critic_def,
             briefing=build_report_critic_briefing(report, digest),
-            tools_for_api=[], state=ctx.state, channel_id=ctx.thread.id,
+            tools_for_api=[],
+            state=ctx.state,
+            channel_id=ctx.thread.id,
         )
         critique = (cres.summary_md or "").strip() if cres.ok else ""
         if not critique or critique.upper().startswith("PASS"):
@@ -237,10 +295,14 @@ async def _critic_pass(ctx, integ_def, cq: str, report: str, digest: str) -> str
             return report
         log.info("report critic: %d chars of findings; revising once", len(critique))
         rres = await run_subagent(
-            api_client=ctx.api_client, pool=ctx.pool, server_locks=ctx.server_locks,
+            api_client=ctx.api_client,
+            pool=ctx.pool,
+            server_locks=ctx.server_locks,
             defn=integ_def,
             briefing=build_integrator_revision_briefing(cq, report, critique),
-            tools_for_api=[], state=ctx.state, channel_id=ctx.thread.id,
+            tools_for_api=[],
+            state=ctx.state,
+            channel_id=ctx.thread.id,
         )
         if rres.ok and rres.summary_md.strip():
             return rres.summary_md

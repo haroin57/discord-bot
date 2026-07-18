@@ -28,6 +28,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from typing import Iterable
 
@@ -42,6 +43,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
     text,
     tokenize = 'unicode61 remove_diacritics 1'
 );
+CREATE TABLE IF NOT EXISTS projection_receipts (
+    event_id      TEXT PRIMARY KEY,
+    processed_at  INTEGER NOT NULL
+);
 """
 
 
@@ -55,6 +60,12 @@ _db_path: str | None = None
 # apply it exactly once per DB file, serialized under _db_lock. Keyed on path
 # so a test tempfile swap or a reindex_all wipe re-initialises automatically.
 _wal_ready_path: str | None = None
+
+
+def _reject_canonical_direct_mutation() -> None:
+    from services.mem0._projection import reject_direct_mutation
+
+    reject_direct_mutation("BM25")
 
 
 def _resolve_db_path() -> str:
@@ -114,20 +125,24 @@ def index_fact(fact_id: str, text: str, user_id: str) -> bool:
     Callers MUST pass the original fact sentence here, never a pre-tokenized
     string — otherwise ``orig_text`` would hold tokenized garbage too.
     """
+    _reject_canonical_direct_mutation()
     if not fact_id or not text or not user_id:
         return False
     try:
         from services.mem0 import morpho
+
         tokenized = morpho.tokenize_for_index(text)
     except Exception as exc:
         log.warning(
-            "bm25 morpho tokenize_for_index failed, falling back to raw: %s", exc,
+            "bm25 morpho tokenize_for_index failed, falling back to raw: %s",
+            exc,
         )
         tokenized = text
     try:
         with _conn() as c, _db_lock:
             c.execute(
-                "DELETE FROM facts_fts WHERE fact_id = ?", (fact_id,),
+                "DELETE FROM facts_fts WHERE fact_id = ?",
+                (fact_id,),
             )
             c.execute(
                 "INSERT INTO facts_fts(fact_id, user_id, orig_text, text) "
@@ -143,12 +158,14 @@ def index_fact(fact_id: str, text: str, user_id: str) -> bool:
 
 def remove_fact(fact_id: str) -> int:
     """Drop a fact from the FTS5 index. Returns rowcount removed."""
+    _reject_canonical_direct_mutation()
     if not fact_id:
         return 0
     try:
         with _conn() as c, _db_lock:
             cur = c.execute(
-                "DELETE FROM facts_fts WHERE fact_id = ?", (fact_id,),
+                "DELETE FROM facts_fts WHERE fact_id = ?",
+                (fact_id,),
             )
             c.commit()
             return cur.rowcount or 0
@@ -157,7 +174,61 @@ def remove_fact(fact_id: str) -> int:
         return 0
 
 
-def search_bm25(query: str, user_id: str, limit: int = 20) -> list[dict]:
+def apply_projection(
+    event_id: str,
+    operation: str,
+    fact_id: str,
+    text: str,
+    user_id: str,
+    *,
+    _capability: object | None = None,
+) -> bool:
+    """Apply an idempotent outbox event to the BM25 projection."""
+    from services.mem0._projection import require_internal_projection
+
+    require_internal_projection(_capability, "BM25")
+    if not event_id or not fact_id:
+        return False
+    tokenized = text
+    if operation not in ("archive", "delete"):
+        try:
+            from services.mem0 import morpho
+
+            tokenized = morpho.tokenize_for_index(text)
+        except Exception as exc:
+            log.warning("bm25 projection tokenization fallback: %s", exc)
+    try:
+        with _conn() as c, _db_lock:
+            if c.execute(
+                "SELECT 1 FROM projection_receipts WHERE event_id=?",
+                (event_id,),
+            ).fetchone():
+                return True
+            c.execute("DELETE FROM facts_fts WHERE fact_id=?", (fact_id,))
+            if operation not in ("archive", "delete"):
+                c.execute(
+                    """INSERT INTO facts_fts(fact_id,user_id,orig_text,text)
+                       VALUES (?,?,?,?)""",
+                    (fact_id, user_id, text, tokenized),
+                )
+            c.execute(
+                "INSERT INTO projection_receipts(event_id,processed_at) VALUES (?,?)",
+                (event_id, int(time.time())),
+            )
+            c.commit()
+        return True
+    except Exception as exc:
+        log.warning("bm25 apply_projection(%s) failed: %s", event_id, exc)
+        return False
+
+
+def search_bm25(
+    query: str,
+    user_id: str,
+    limit: int = 20,
+    *,
+    current_channel_id: str | None = None,
+) -> list[dict]:
     """BM25 keyword search scoped to ``user_id``.
 
     Returns ``[{"id": fact_id, "rank": int, "bm25_score": float, "memory": text}, ...]``
@@ -185,6 +256,7 @@ def search_bm25(query: str, user_id: str, limit: int = 20) -> list[dict]:
     # 1-char noise are stripped upstream by morpho.tokenize_keywords.
     try:
         from services.mem0 import morpho
+
         tokens = morpho.tokenize_keywords(q)
     except Exception as exc:
         log.warning("bm25 morpho tokenize failed, falling back: %s", exc)
@@ -193,6 +265,7 @@ def search_bm25(query: str, user_id: str, limit: int = 20) -> list[dict]:
     # Japanese punctuation, drop FTS5 syntax chars, keep tokens >=2 chars.
     if not tokens:
         import re as _re
+
         cleaned = _re.sub(r'["\(\)\*\^:]', " ", q)
         sub_phrases = _re.split(r"[\s、。？！,.?!:;~〜\-—]+", cleaned)
         tokens = [t.strip() for t in sub_phrases if len(t.strip()) >= 2]
@@ -201,6 +274,7 @@ def search_bm25(query: str, user_id: str, limit: int = 20) -> list[dict]:
     # Strip FTS5 syntax inside each token in case the morpho layer let
     # one through (e.g. embedded paren in an English token).
     import re as _re
+
     safe_tokens = [_re.sub(r'["\(\)\*\^:]', "", t) for t in tokens[:10]]
     safe_tokens = [t for t in safe_tokens if t]
     if not safe_tokens:
@@ -227,16 +301,30 @@ def search_bm25(query: str, user_id: str, limit: int = 20) -> list[dict]:
         log.warning("bm25 search failed: %s", exc)
         return []
     out: list[dict] = []
+    from services.mem0.integrity import canonical_fact_visible, get_repository
+
+    managed = os.environ.get("MEM0_INTEGRITY_MODE", "legacy").lower() != "legacy"
+    repository = get_repository() if managed else None
     for i, r in enumerate(rows):
-        out.append({
-            "id": r["fact_id"],
-            # Return the original sentence (orig_text), never the tokenized
-            # `text` column — the latter is for FTS5 matching only and would
-            # surface as keyword-soup to the prompt and the LLM reranker.
-            "memory": r["orig_text"],
-            "rank": i + 1,
-            "bm25_score": float(r["score"]),
-        })
+        if managed and repository.get_fact(r["fact_id"]) is None:
+            continue
+        if not canonical_fact_visible(
+            r["fact_id"],
+            user_id,
+            current_channel_id=current_channel_id,
+        ):
+            continue
+        out.append(
+            {
+                "id": r["fact_id"],
+                # Return the original sentence (orig_text), never the tokenized
+                # `text` column — the latter is for FTS5 matching only and would
+                # surface as keyword-soup to the prompt and the LLM reranker.
+                "memory": r["orig_text"],
+                "rank": i + 1,
+                "bm25_score": float(r["score"]),
+            }
+        )
     return out
 
 
@@ -266,7 +354,8 @@ def rrf_merge(
     fused: dict[str, dict] = {}
 
     def _bump(item: dict, rrf_rank: int) -> None:
-        fid = item.get("id") or item.get("memory") or ""
+        metadata = item.get("metadata") or {}
+        fid = metadata.get("canonical_id") or item.get("id") or item.get("memory") or ""
         if not fid:
             return
         score_inc = 1.0 / (k + rrf_rank)
@@ -304,7 +393,11 @@ def rrf_merge(
     return merged[: max(int(limit), 1)]
 
 
-def reindex_all(facts: Iterable[tuple[str, str, str]]) -> int:
+def reindex_all(
+    facts: Iterable[tuple[str, str, str]],
+    *,
+    _capability: object | None = None,
+) -> int:
     """Wipe-and-rebuild the FTS5 index from an iterable of (fact_id, text, user_id).
 
     Used by ``scripts/build_mem0_bm25_index.py`` after dumping every Mem0 fact
@@ -317,18 +410,23 @@ def reindex_all(facts: Iterable[tuple[str, str, str]]) -> int:
     rows. We unlink the sqlite + WAL/SHM siblings so the next _conn()
     call recreates everything from the current _SCHEMA.
     """
+    from services.mem0._projection import require_internal_projection
+
+    require_internal_projection(_capability, "BM25")
     global _wal_ready_path
     path = _resolve_db_path()
     with _db_lock:
         import os as _os
+
         for suffix in ("", "-wal", "-shm"):
             try:
                 _os.unlink(path + suffix)
             except FileNotFoundError:
                 pass
             except OSError as exc:
-                log.warning("bm25 reindex_all: unlink %s%s failed: %s",
-                            path, suffix, exc)
+                log.warning(
+                    "bm25 reindex_all: unlink %s%s failed: %s", path, suffix, exc
+                )
         _wal_ready_path = None  # DB wiped → next _conn() recreates WAL + schema
 
     count = 0
@@ -338,6 +436,7 @@ def reindex_all(facts: Iterable[tuple[str, str, str]]) -> int:
         with _conn() as c, _db_lock:
             try:
                 from services.mem0 import morpho
+
                 _tokenize = morpho.tokenize_for_index
             except Exception:
                 _tokenize = lambda s: s  # noqa: E731

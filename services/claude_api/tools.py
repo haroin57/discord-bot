@@ -28,6 +28,7 @@ import asyncio
 import logging
 import os
 import re
+import signal
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,6 +47,7 @@ log = logging.getLogger(__name__)
 # globally is the same default the live Claude CLI ships with.
 try:
     from PIL import ImageFile as _PILImageFile
+
     _PILImageFile.LOAD_TRUNCATED_IMAGES = True
 except ImportError:
     pass
@@ -70,17 +72,17 @@ IMAGE_TARGET_MAX_DIM = 1568
 # through to the UTF-8 decode path so .svg / .html stay readable as code.
 _IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 _IMAGE_MEDIA_TYPES = {
-    ".png":  "image/png",
-    ".jpg":  "image/jpeg",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
-    ".gif":  "image/gif",
+    ".gif": "image/gif",
 }
 # Pillow save kwargs per format. PNG is lossless so just request optimize;
 # JPEG/WebP take a quality setting. GIF we never re-encode (animation
 # would break).
 _IMAGE_SAVE_KWARGS = {
-    "image/png":  {"format": "PNG",  "optimize": True},
+    "image/png": {"format": "PNG", "optimize": True},
     "image/jpeg": {"format": "JPEG", "quality": 85, "optimize": True},
     "image/webp": {"format": "WEBP", "quality": 85},
 }
@@ -95,6 +97,13 @@ GREP_MAX_RESULTS = 1000
 # status line displayed the requested value — a contract lie (audit #1).
 BASH_DEFAULT_TIMEOUT_S = float(os.environ.get("CLAUDE_BASH_TIMEOUT_S", "120"))
 BASH_MAX_TIMEOUT_S = float(os.environ.get("CLAUDE_BASH_MAX_TIMEOUT_S", "600"))
+# Grace period for a stopped Bash process group to exit after SIGTERM before
+# SIGKILL is used. This is deliberately short: the caller has already
+# abandoned the tool call, but a cooperative process still gets a chance to
+# clean up before forced termination.
+_BASH_CANCEL_GRACE_S = 0.25
+_BASH_KILL_GRACE_S = 1.0
+_BASH_GROUP_POLL_S = 0.01
 # Per-stream output cap. The CLI defaults to ~30KB; the old 100KB×2 was a
 # token sink (audit #13). Truncation is middle-cut (head+tail preserved) so
 # the FAILED/traceback tail of a test run is never hidden from the model.
@@ -193,7 +202,7 @@ def _read_file_sync(path: str, offset: int = 0, limit: int | None = None) -> str
     if total and start >= total:
         raise ValueError(f"offset {start} is beyond end of file ({total} lines)")
     win = min(int(limit), READ_MAX_LINES) if limit else READ_MAX_LINES
-    window = lines[start:start + win]
+    window = lines[start : start + win]
     out = "".join(window)
     end = start + len(window)
     if end < total:
@@ -317,7 +326,9 @@ def _read_image_sync(path: str) -> list[dict]:
 
 
 def _maybe_resize_image(
-    data: bytes, media_type: str, path_for_log: str,
+    data: bytes,
+    media_type: str,
+    path_for_log: str,
 ) -> tuple[bytes, str]:
     """Return ``(bytes, media_type)`` shrunk to ≤ IMAGE_TARGET_MAX_DIM
     and (when safe) re-encoded as JPEG.
@@ -338,6 +349,7 @@ def _maybe_resize_image(
     the model would have seen.
     """
     from io import BytesIO
+
     try:
         from PIL import Image
     except ImportError:
@@ -352,9 +364,8 @@ def _maybe_resize_image(
             # Detect transparency. Pillow exposes it either via the mode
             # (RGBA / LA / PA) or via the info dict (P-mode PNGs that
             # carry a tRNS chunk).
-            has_alpha = (
-                img.mode in ("RGBA", "LA", "PA")
-                or (img.mode == "P" and "transparency" in img.info)
+            has_alpha = img.mode in ("RGBA", "LA", "PA") or (
+                img.mode == "P" and "transparency" in img.info
             )
 
             # Pick the output format. Alpha-bearing images stay in their
@@ -391,8 +402,14 @@ def _maybe_resize_image(
             log.info(
                 "Read image: %s %dx%d %s (%d B) → %dx%d %s (%d B)",
                 os.path.basename(path_for_log),
-                w, h, media_type, len(data),
-                img_copy.size[0], img_copy.size[1], out_media, len(resized),
+                w,
+                h,
+                media_type,
+                len(data),
+                img_copy.size[0],
+                img_copy.size[1],
+                out_media,
+                len(resized),
             )
             return resized, out_media
     except Exception as exc:
@@ -405,7 +422,8 @@ def _maybe_resize_image(
         log.warning(
             "Read image: Pillow failed for %s (%s); cannot verify dimensions, "
             "refusing pass-through",
-            path_for_log, exc,
+            path_for_log,
+            exc,
         )
         raise ValueError(
             f"image decode failed and dimensions cannot be verified: {exc}",
@@ -425,7 +443,8 @@ async def _tool_read(args: dict, ctx: ToolContext) -> "str | list[dict]":
     if ext in _IMAGE_EXTENSIONS:
         return await asyncio.to_thread(_read_image_sync, path)
     result = await asyncio.to_thread(
-        _read_file_sync, path,
+        _read_file_sync,
+        path,
         int(args.get("offset") or 0),
         int(args.get("limit") or 0) or None,
     )
@@ -577,9 +596,14 @@ async def _tool_scratchpad(args: dict, ctx: ToolContext) -> str:
             f"section too large: {len(content)} > {_SCRATCHPAD_MAX_SECTION_CHARS} "
             "chars — 要点に圧縮するか別 section に分割すること"
         )
-    if section not in ctx.scratchpad and len(ctx.scratchpad) >= _SCRATCHPAD_MAX_SECTIONS:
+    if (
+        section not in ctx.scratchpad
+        and len(ctx.scratchpad) >= _SCRATCHPAD_MAX_SECTIONS
+    ):
         raise ValueError(f"too many sections (max {_SCRATCHPAD_MAX_SECTIONS})")
-    total = sum(len(v) for k, v in ctx.scratchpad.items() if k != section) + len(content)
+    total = sum(len(v) for k, v in ctx.scratchpad.items() if k != section) + len(
+        content
+    )
     if total > _SCRATCHPAD_MAX_TOTAL_CHARS:
         raise ValueError(
             f"scratchpad total too large: {total} > {_SCRATCHPAD_MAX_TOTAL_CHARS}"
@@ -591,11 +615,13 @@ async def _tool_scratchpad(args: dict, ctx: ToolContext) -> str:
 # 熟考 P4: 他社モデルへの第二意見（GPT-5 + DeepSeek 並列）。admin 専用。
 async def _tool_second_opinion(args: dict, ctx: ToolContext) -> str:
     from services.claude_api.second_opinion import get_second_opinions
+
     question = str(args.get("question") or "").strip()
     if not question:
         raise ValueError("question is required")
     return await get_second_opinions(
-        question, context=str(args.get("context") or ""),
+        question,
+        context=str(args.get("context") or ""),
     )
 
 
@@ -639,7 +665,9 @@ async def _tool_todo_write(args: dict, ctx: ToolContext) -> str:
         f"{counts['completed']} completed)"
     ]
     for i, t in enumerate(validated, 1):
-        marker = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}[t["status"]]
+        marker = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}[
+            t["status"]
+        ]
         lines.append(f"  {i}. {marker} {t['content']}")
     return "\n".join(lines)
 
@@ -675,7 +703,7 @@ class _StreamCapture:
         if chunk:
             self.tail.extend(chunk)
             if len(self.tail) > self.cap:
-                del self.tail[:len(self.tail) - self.cap]
+                del self.tail[: len(self.tail) - self.cap]
 
     def render(self) -> str:
         """Decoded output, middle-cut when over budget (audit #13)."""
@@ -696,6 +724,102 @@ async def _drain_stream(stream, capture: _StreamCapture) -> None:
         capture.feed(chunk)
 
 
+def _bash_process_group_exists(pgid: int) -> bool:
+    """Return whether any process remains in ``pgid``."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # The group exists but cannot currently be signalled. Treat it as live
+        # so cleanup still escalates instead of silently abandoning it.
+        return True
+    return True
+
+
+async def _wait_for_bash_process_group_exit(pgid: int, timeout: float) -> bool:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while _bash_process_group_exists(pgid):
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(_BASH_GROUP_POLL_S, remaining))
+    return True
+
+
+async def _terminate_bash_process_group(proc, pgid: int) -> None:
+    """Terminate all of ``pgid`` and reap its original process leader."""
+    wait_task = asyncio.create_task(
+        proc.wait(),
+        name=f"claude-bash-wait-{pgid}",
+    )
+    try:
+        # Always address the fixed process group. The shell leader may already
+        # have exited while one of its descendants remains alive in the group.
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            pass
+
+        group_exited = await _wait_for_bash_process_group_exit(
+            pgid,
+            _BASH_CANCEL_GRACE_S,
+        )
+        if not group_exited:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+            group_exited = await _wait_for_bash_process_group_exit(
+                pgid,
+                _BASH_KILL_GRACE_S,
+            )
+        if not group_exited:
+            raise RuntimeError(f"Bash process group {pgid} survived SIGKILL")
+    finally:
+        await wait_task
+
+
+async def _cleanup_bash_process_group(proc, pgid: int, drain) -> None:
+    """Stop stream readers, terminate the process group, and reap its leader."""
+    drain.cancel()
+    try:
+        await drain
+    except (asyncio.CancelledError, Exception):
+        pass
+    await _terminate_bash_process_group(proc, pgid)
+
+
+async def _wait_for_bash_cleanup(cleanup_task, initial_cancel=None) -> None:
+    """Wait through repeated caller cancellation until cleanup finishes."""
+    cancellation = initial_cancel
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except BaseException:
+            break
+
+    try:
+        cleanup_task.result()
+    except BaseException as cleanup_exc:
+        if cancellation is None:
+            raise
+        log.error(
+            "Bash process-group cleanup failed while cancellation was pending",
+            exc_info=(
+                type(cleanup_exc),
+                cleanup_exc,
+                cleanup_exc.__traceback__,
+            ),
+        )
+
+    if cancellation is not None:
+        raise cancellation
+
+
 async def _tool_bash(args: dict, ctx: ToolContext) -> str:
     cmd = args.get("command")
     if not cmd or not isinstance(cmd, str):
@@ -711,13 +835,16 @@ async def _tool_bash(args: dict, ctx: ToolContext) -> str:
     timeout_s = max(1.0, min(timeout_s, BASH_MAX_TIMEOUT_S))
 
     proc = await asyncio.create_subprocess_exec(
-        "/bin/bash", "-c", cmd,
+        "/bin/bash",
+        "-c",
+        cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=ctx.cwd,
         env=_bash_env(),
         start_new_session=True,  # isolate process group for clean termination
     )
+    pgid = proc.pid
     # Incremental drain instead of communicate(): on timeout the buffered
     # partial output is returned to the model (audit #10) instead of being
     # discarded with a bare TimeoutError — `npm test` / `pip install` runs
@@ -732,18 +859,30 @@ async def _tool_bash(args: dict, ctx: ToolContext) -> str:
     try:
         await asyncio.wait_for(drain, timeout=timeout_s)
         await proc.wait()
+    except asyncio.CancelledError as exc:
+        cleanup_task = asyncio.create_task(
+            _cleanup_bash_process_group(proc, pgid, drain),
+            name=f"claude-bash-cleanup-{pgid}",
+        )
+        await _wait_for_bash_cleanup(cleanup_task, initial_cancel=exc)
     except asyncio.TimeoutError:
         timed_out = True
-        drain.cancel()
-        try:
-            await drain
-        except (asyncio.CancelledError, Exception):
-            pass
-        # Kill the whole process group
-        try:
-            os.killpg(os.getpgid(proc.pid), 9)
-        except (OSError, ProcessLookupError):
-            pass
+        cleanup_task = asyncio.create_task(
+            _cleanup_bash_process_group(proc, pgid, drain),
+            name=f"claude-bash-cleanup-{pgid}",
+        )
+        await _wait_for_bash_cleanup(cleanup_task)
+
+    # A successful shell leader may have daemonized a descendant that closed
+    # its inherited stdio. The drain and leader wait then both complete while
+    # the owned process group remains live, so normal completion must enforce
+    # the same group teardown contract as timeout and cancellation.
+    if _bash_process_group_exists(pgid):
+        cleanup_task = asyncio.create_task(
+            _cleanup_bash_process_group(proc, pgid, drain),
+            name=f"claude-bash-cleanup-{pgid}",
+        )
+        await _wait_for_bash_cleanup(cleanup_task)
 
     out = out_cap.render()
     err = err_cap.render()
@@ -754,8 +893,7 @@ async def _tool_bash(args: dict, ctx: ToolContext) -> str:
         pieces.append(f"--- stderr ---\n{err}")
     if timed_out:
         pieces.append(
-            f"--- command timed out after {timeout_s:.0f}s; "
-            "partial output above ---"
+            f"--- command timed out after {timeout_s:.0f}s; partial output above ---"
         )
     else:
         pieces.append(f"--- exit code: {proc.returncode} ---")
@@ -780,6 +918,7 @@ def _glob_sync(cwd: str, pattern: str, restricted: bool) -> list[str]:
                 f"absolute pattern not allowed in restricted mode: {pattern!r}",
             )
         import glob as _glob  # local: stdlib name shadows our module-level Glob
+
         matches = _glob.glob(pattern, recursive=True)
         return matches[:GLOB_MAX_RESULTS]
 
@@ -797,7 +936,10 @@ async def _tool_glob(args: dict, ctx: ToolContext) -> str:
     if not pattern:
         raise ValueError("pattern is required")
     results = await asyncio.to_thread(
-        _glob_sync, ctx.cwd, pattern, ctx.restricted,
+        _glob_sync,
+        ctx.cwd,
+        pattern,
+        ctx.restricted,
     )
     if not results:
         return f"(no matches for {pattern!r})"
@@ -808,8 +950,12 @@ async def _tool_glob(args: dict, ctx: ToolContext) -> str:
 # Grep
 # ---------------------------------------------------------------------------
 async def _grep_via_rg(
-    cwd: str, pattern: str, glob: str | None,
-    mode: str = "content", context: int = 0, case_insensitive: bool = False,
+    cwd: str,
+    pattern: str,
+    glob: str | None,
+    mode: str = "content",
+    context: int = 0,
+    case_insensitive: bool = False,
 ) -> str:
     cmd = ["rg", "--no-heading", "--color=never"]
     if mode == "files_with_matches":
@@ -835,13 +981,18 @@ async def _grep_via_rg(
     out = (stdout or b"").decode("utf-8", errors="replace")
     lines = out.splitlines()
     if len(lines) > GREP_MAX_RESULTS:
-        lines = lines[:GREP_MAX_RESULTS] + [f"[truncated at {GREP_MAX_RESULTS} matches]"]
+        lines = lines[:GREP_MAX_RESULTS] + [
+            f"[truncated at {GREP_MAX_RESULTS} matches]"
+        ]
     return "\n".join(lines) if lines else "(no matches)"
 
 
 def _grep_python(
-    cwd: str, pattern: str, glob: str | None,
-    mode: str = "content", case_insensitive: bool = False,
+    cwd: str,
+    pattern: str,
+    glob: str | None,
+    mode: str = "content",
+    case_insensitive: bool = False,
 ) -> str:
     rx = re.compile(pattern, re.IGNORECASE if case_insensitive else 0)
     results: list[str] = []
@@ -856,7 +1007,10 @@ def _grep_python(
                     if rx.search(line):
                         results.append(f"{p}:{lineno}:{line.rstrip()}")
                         if len(results) >= GREP_MAX_RESULTS:
-                            return "\n".join(results) + f"\n[truncated at {GREP_MAX_RESULTS}]"
+                            return (
+                                "\n".join(results)
+                                + f"\n[truncated at {GREP_MAX_RESULTS}]"
+                            )
         except OSError:
             continue
     return "\n".join(results) if results else "(no matches)"
@@ -1125,7 +1279,10 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
             "type": "object",
             "properties": {
                 "op": {"type": "string", "enum": ["write", "append", "read"]},
-                "section": {"type": "string", "description": "セクション名（例: 進捗, 発見, 決定事項）"},
+                "section": {
+                    "type": "string",
+                    "description": "セクション名（例: 進捗, 発見, 決定事項）",
+                },
                 "content": {"type": "string"},
             },
             "required": ["op"],
@@ -1144,12 +1301,12 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
             "When users ask you to perform tasks, check if any of the "
             "available skills match. Skills provide specialized capabilities "
             "and domain knowledge.\n\n"
-            "When users reference a \"slash command\" or \"/<something>\", "
+            'When users reference a "slash command" or "/<something>", '
             "they are referring to a skill. Use this tool to invoke it.\n\n"
             "How to invoke:\n"
             "- Use this tool with the skill name and optional arguments\n"
-            "- Examples: skill: \"inshi-coach\" / "
-            "skill: \"inshi-coach\", args: \"今日のログ\"\n\n"
+            '- Examples: skill: "inshi-coach" / '
+            'skill: "inshi-coach", args: "今日のログ"\n\n'
             "Important:\n"
             "- Available skills are listed below\n"
             "- When a skill matches the user's request, this is a BLOCKING "
@@ -1166,7 +1323,7 @@ BUILTIN_TOOLS: dict[str, ToolDef] = {
             "properties": {
                 "skill": {
                     "type": "string",
-                    "description": "The skill name. E.g., \"inshi-coach\"",
+                    "description": 'The skill name. E.g., "inshi-coach"',
                 },
                 "args": {
                     "type": "string",
@@ -1192,24 +1349,24 @@ BUILTIN_TOOL_ALIASES = {
     "skill": "Skill",
     "invoke_skill": "Skill",
     "use_skill": "Skill",
-    "read":       "Read",
-    "read_file":  "Read",
-    "file_read":  "Read",
-    "write":      "Write",
+    "read": "Read",
+    "read_file": "Read",
+    "file_read": "Read",
+    "write": "Write",
     "write_file": "Write",
     "file_write": "Write",
-    "edit":       "Edit",
-    "edit_file":  "Edit",
-    "file_edit":  "Edit",
-    "bash":       "Bash",
-    "shell":      "Bash",
-    "glob":       "Glob",
-    "grep":       "Grep",
+    "edit": "Edit",
+    "edit_file": "Edit",
+    "file_edit": "Edit",
+    "bash": "Bash",
+    "shell": "Bash",
+    "glob": "Glob",
+    "grep": "Grep",
     "todo_write": "TodoWrite",
-    "todowrite":  "TodoWrite",
+    "todowrite": "TodoWrite",
     "TaskCreate": "TodoWrite",
     "task_create": "TodoWrite",
-    "TodoList":   "TodoWrite",
+    "TodoList": "TodoWrite",
 }
 
 
@@ -1224,6 +1381,7 @@ def builtin_tools_for_api(restricted: bool) -> list[dict]:
     if restricted:
         return []
     from config import DELIB_SCRATCHPAD_ENABLED, SECOND_OPINION_ENABLED
+
     skip: set[str] = set()
     # フラグ OFF の tool は広告しない（tools 配列は prompt cache prefix なので、
     # tier ではなくフラグ単位で安定させる — 有効化時の 1 回だけ cache miss）。
@@ -1244,11 +1402,13 @@ def builtin_tools_for_api(restricted: bool) -> list[dict]:
             marker = "Available skills:\n"
             prefix = description.split(marker, 1)[0] + marker
             description = prefix + _skill_format_listing()
-        result.append({
-            "name": td.name,
-            "description": description,
-            "input_schema": td.input_schema,
-        })
+        result.append(
+            {
+                "name": td.name,
+                "description": description,
+                "input_schema": td.input_schema,
+            }
+        )
     return result
 
 
@@ -1280,22 +1440,24 @@ BUILTIN_TOOLS["Read"].description += (
     " Supports offset/limit to read large files in windows; truncated reads "
     "tell you the offset to continue from."
 )
-BUILTIN_TOOLS["Grep"].input_schema["properties"].update({
-    "output_mode": {
-        "type": "string",
-        "enum": ["content", "files_with_matches", "count"],
-        "description": "既定 files_with_matches（本家CLIと同じ）",
-    },
-    "head_limit": {
-        "type": "integer",
-        "description": "出力を先頭N行に制限（既定250、0=無制限）",
-    },
-    "context": {
-        "type": "integer",
-        "description": "マッチ前後の行数（-C相当。output_mode=contentのみ）",
-    },
-    "case_insensitive": {"type": "boolean", "description": "-i相当"},
-})
+BUILTIN_TOOLS["Grep"].input_schema["properties"].update(
+    {
+        "output_mode": {
+            "type": "string",
+            "enum": ["content", "files_with_matches", "count"],
+            "description": "既定 files_with_matches（本家CLIと同じ）",
+        },
+        "head_limit": {
+            "type": "integer",
+            "description": "出力を先頭N行に制限（既定250、0=無制限）",
+        },
+        "context": {
+            "type": "integer",
+            "description": "マッチ前後の行数（-C相当。output_mode=contentのみ）",
+        },
+        "case_insensitive": {"type": "boolean", "description": "-i相当"},
+    }
+)
 BUILTIN_TOOLS["Grep"].description += (
     " Defaults to output_mode=files_with_matches, head_limit=250. Use "
     "output_mode=content with context=N to see matching lines."

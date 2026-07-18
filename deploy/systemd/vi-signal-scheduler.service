@@ -9,27 +9,34 @@ StartLimitAction=none
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/home/ubuntu/discord-bot
-EnvironmentFile=/home/ubuntu/discord-bot/.env
+User=kanae-vi-signal
+Group=kanae-vi-signal
+SupplementaryGroups=kanae-code
+WorkingDirectory=/var/lib/discord-bot-releases/prod/current/src
+EnvironmentFile=/etc/discord-bot/credentials/vi-signal.env
+Environment=HOME=/var/lib/kanae-vi-signal
+Environment=BOT_STATE_DIR=/var/lib/kanae-vi-signal/state
+Environment=PYTHON_DOTENV_DISABLED=1
+StateDirectory=kanae-vi-signal kanae-vi-signal/state
+StateDirectoryMode=0700
 # 営業日・時刻判定が datetime.now() に依存するため TZ を明示固定する (機能8)
 Environment=TZ=Asia/Tokyo
-ExecStart=/home/ubuntu/discord-bot/.venv/bin/python -m services.vi_signal_scheduler
+ExecStart=/var/lib/discord-bot-releases/prod/current/venv/bin/python -m services.vi_signal_scheduler
 Restart=on-failure
 RestartSec=10s
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=vi-signal-scheduler
+UMask=0007
 
 # Security hardening (discord-bot.service の H11 セットを踏襲、軽量化)
 NoNewPrivileges=yes
 PrivateTmp=no
 ProtectSystem=strict
 ProtectHome=read-only
-# scheduler はリポジトリ配下 (.state/vi_signal_alert.log への追記) のみ書き込む。
-# vi_signal_alert.py が市場データ取得で外部 HTTP を叩くだけなので /tmp や .npm は不要。
-ReadWritePaths=/home/ubuntu/discord-bot
+# Redirect legacy .state log paths to this UID's private state directory.
+BindPaths=/var/lib/kanae-vi-signal/state:/var/lib/discord-bot-releases/prod/current/src/.state
+ReadWritePaths=/var/lib/kanae-vi-signal
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

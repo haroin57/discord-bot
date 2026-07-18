@@ -67,8 +67,14 @@ def test_live_jobs_excludes_terminal():
 
 @pytest.mark.asyncio
 async def test_cancel_channel_jobs_cancels_live_tasks():
+    reasons = []
+
     async def _sleep():
-        await asyncio.sleep(100)
+        try:
+            await asyncio.sleep(100)
+        except asyncio.CancelledError as exc:
+            reasons.append(exc.args)
+            raise
 
     t1 = asyncio.create_task(_sleep())
     t2 = asyncio.create_task(_sleep())
@@ -88,6 +94,7 @@ async def test_cancel_channel_jobs_cancels_live_tasks():
     assert n == 2  # only the two live jobs
     await asyncio.sleep(0)
     assert t1.cancelled() and t2.cancelled()
+    assert reasons == [("user abort",), ("user abort",)]
     # the DONE job's task was left alone
     done.task.cancel()  # cleanup
 

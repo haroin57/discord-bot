@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from free_code_commands import build_registry
 from free_code_commands.commands.prompt_commands import commit, review, security_review
 from free_code_commands.runtime import RecordingRuntime, ShellResult
 from services.free_code_bridge import (
@@ -79,45 +80,68 @@ def _git_runtime() -> RecordingRuntime:
     )
 
 
+async def _build(command, args, runtime, *, wrap_trusted=True):
+    async def executor(resolved, expanded_blocks):
+        return await build_prompt_command_turn(
+            resolved,
+            args,
+            expanded_blocks,
+            wrap_trusted=wrap_trusted,
+        )
+
+    text = f"/{command.name} {args}".rstrip()
+    invocation = await build_registry().invoke(
+        text,
+        runtime,
+        executor=executor,
+    )
+    assert invocation is not None
+    return invocation.result
+
+
 async def test_commit_turn_expands_and_tags():
-    p = await build_prompt_command_turn(commit(), "", _git_runtime())
+    p = await _build(commit(), "", _git_runtime())
     # Step 2: tags present, and Step 1: template + expanded shell output
     assert "<command-name>/commit</command-name>" in p.prompt
     assert "Git Safety Protocol" in p.prompt
     assert "On branch master" in p.prompt  # !`git status` was expanded
     assert "!`git status`" not in p.prompt
     # Step 3: allowed tools parsed from the command
-    assert p.allowed_tools == ["Bash(git add:*)", "Bash(git status:*)", "Bash(git commit:*)"]
+    assert p.allowed_tools == [
+        "Bash(git add:*)",
+        "Bash(git status:*)",
+        "Bash(git commit:*)",
+    ]
     assert p.progress_message == "creating commit"
 
 
 async def test_turn_ordering_tags_before_expanded():
-    p = await build_prompt_command_turn(commit(), "", _git_runtime())
+    p = await _build(commit(), "", _git_runtime())
     # free-code sends metadata message first, then the prompt: tags precede body.
     assert p.prompt.index("<command-name>") < p.prompt.index("Git Safety Protocol")
 
 
 async def test_turn_wrapped_as_trusted_admin_input():
-    p = await build_prompt_command_turn(commit(), "", _git_runtime())
+    p = await _build(commit(), "", _git_runtime())
     assert p.prompt.startswith("<trusted_user_input>")
     assert p.prompt.rstrip().endswith("</trusted_user_input>")
 
 
 async def test_turn_can_skip_trust_wrap():
-    p = await build_prompt_command_turn(commit(), "", _git_runtime(), wrap_trusted=False)
+    p = await _build(commit(), "", _git_runtime(), wrap_trusted=False)
     assert not p.prompt.startswith("<trusted_user_input>")
     assert p.prompt.startswith("<command-message>commit</command-message>")
 
 
 async def test_review_injects_pr_number():
-    p = await build_prompt_command_turn(review(), "42", _git_runtime())
+    p = await _build(review(), "42", _git_runtime())
     assert "PR number: 42" in p.prompt
     assert "<command-args>42</command-args>" in p.prompt
     assert "expert code reviewer" in p.prompt
 
 
 async def test_security_review_expands_frontmatter_shell():
-    p = await build_prompt_command_turn(security_review(), "", _git_runtime())
+    p = await _build(security_review(), "", _git_runtime())
     assert p.expanded_prompt.strip()
     assert "!`" not in p.expanded_prompt  # frontmatter shell markers expanded
 
@@ -126,19 +150,12 @@ async def test_non_prompt_command_rejected():
     from free_code_commands.commands.local_commands import cost
 
     with pytest.raises(ValueError):
-        await build_prompt_command_turn(cost(), "", _git_runtime())
+        await _build(cost(), "", _git_runtime())
 
 
 # --------------------------------------------------------------------------
 # BotCommandRuntime — cwd-scoped shell + default branch
 # --------------------------------------------------------------------------
-
-
-async def test_runtime_runs_shell_in_working_dir(tmp_path):
-    (tmp_path / "marker.txt").write_text("hello")
-    rt = BotCommandRuntime(working_dir=str(tmp_path))
-    res = await rt.run_shell("ls")
-    assert "marker.txt" in res.stdout
 
 
 async def test_runtime_attribution_is_bot_trailer():

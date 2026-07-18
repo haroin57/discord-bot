@@ -19,6 +19,7 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_message(
     *,
     author_id=12345,
@@ -68,6 +69,7 @@ class TestIsAdmin:
     def test_admin_user(self, monkeypatch):
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {111, 222})
         from bot import is_admin
+
         user = MagicMock()
         user.id = 111
         assert is_admin(user) is True
@@ -75,6 +77,7 @@ class TestIsAdmin:
     def test_non_admin_user(self, monkeypatch):
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {111, 222})
         from bot import is_admin
+
         user = MagicMock()
         user.id = 999
         assert is_admin(user) is False
@@ -82,6 +85,7 @@ class TestIsAdmin:
     def test_empty_admin_set(self, monkeypatch):
         monkeypatch.setattr("bot.ADMIN_USER_IDS", set())
         from bot import is_admin
+
         user = MagicMock()
         user.id = 1
         assert is_admin(user) is False
@@ -93,6 +97,7 @@ class TestGetHttpSession:
     @pytest.mark.asyncio
     async def test_creates_new_session_when_none(self):
         import bot
+
         bot._http_session = None
         with patch("bot.aiohttp.ClientSession") as MockSession:
             mock_instance = MagicMock()
@@ -107,6 +112,7 @@ class TestGetHttpSession:
     @pytest.mark.asyncio
     async def test_reuses_existing_open_session(self):
         import bot
+
         mock_session = MagicMock()
         mock_session.closed = False
         bot._http_session = mock_session
@@ -119,6 +125,7 @@ class TestGetHttpSession:
     @pytest.mark.asyncio
     async def test_creates_new_when_closed(self):
         import bot
+
         closed_session = MagicMock()
         closed_session.closed = True
         bot._http_session = closed_session
@@ -144,6 +151,7 @@ class TestOnMessage:
     def _reset_bot_state(self, monkeypatch):
         """Clean state before each test."""
         import bot
+
         bot._channel_semas.clear()
         bot._SKILL_OVERRIDES.clear()
         monkeypatch.setattr("bot.COOLDOWN_SECONDS", 5)
@@ -158,7 +166,10 @@ class TestOnMessage:
         self._mock_bot_user = MagicMock()
         self._mock_bot_user.id = 99900
         self._user_patcher = patch.object(
-            type(bot.bot), "user", new_callable=PropertyMock, return_value=self._mock_bot_user
+            type(bot.bot),
+            "user",
+            new_callable=PropertyMock,
+            return_value=self._mock_bot_user,
         )
         self._user_patcher.start()
         yield
@@ -168,12 +179,14 @@ class TestOnMessage:
     async def _dispatch(self, message):
         """Invoke on_message handler directly."""
         import bot
+
         coro = bot.bot.on_message(message)
         await coro
 
     @pytest.mark.asyncio
     async def test_ignores_own_messages(self):
         import bot
+
         msg = _make_message(author_id=99900)
         msg.author.__eq__ = lambda self, other: True  # author == bot.user
         msg.author.bot = False
@@ -205,21 +218,34 @@ class TestOnMessage:
     @pytest.mark.asyncio
     async def test_guild_keyword_triggers(self, monkeypatch):
         import bot
+
         monkeypatch.setattr("bot.BOT_KEYWORDS", ["かなえ"])
 
         msg = _make_message(content="かなえ hello", author_id=12345)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("response text", "sess-1", False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["response text"]), \
-             patch("bot.update_session"), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("response text", "sess-1", False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["response text"]),
+            patch("bot.update_session"),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             msg.reply.assert_called()  # at least the status + final response
@@ -227,21 +253,34 @@ class TestOnMessage:
     @pytest.mark.asyncio
     async def test_guild_mention_triggers(self, monkeypatch):
         import bot
+
         mock_bot_user = bot.bot.user
 
         msg = _make_message(content="<@99900> hello", author_id=12345)
         msg.mentions = [mock_bot_user]
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             msg.reply.assert_called()
@@ -268,16 +307,28 @@ class TestOnMessage:
             reference=reference,
         )
 
-        with patch("bot.strip_mention", return_value="続きを説明して"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)) as model_call, \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="続きを説明して"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="続きを説明して"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", None, False),
+            ) as model_call,
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="続きを説明して",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
         model_call.assert_awaited_once()
@@ -286,6 +337,7 @@ class TestOnMessage:
     @pytest.mark.asyncio
     async def test_role_mention_triggers(self, monkeypatch):
         import bot
+
         monkeypatch.setattr("bot.BOT_ROLE_IDS", {7777})
 
         role_mock = MagicMock()
@@ -294,26 +346,38 @@ class TestOnMessage:
         msg = _make_message(content="hey", author_id=12345)
         msg.role_mentions = [role_mock]
 
-        with patch("bot.strip_mention", return_value="hey"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hey"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hey"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links", new_callable=AsyncMock, return_value="hey"
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             msg.reply.assert_called()
 
     @pytest.mark.asyncio
     async def test_other_bot_role_does_not_trigger_from_expanded_mentions(
-        self, monkeypatch,
+        self,
+        monkeypatch,
     ):
         """A role-expanded mentions payload is not a direct bot mention."""
         import bot
+
         old_bot_role_id = 222222222222222222
         monkeypatch.setattr("bot.BOT_IGNORED_ROLE_IDS", {old_bot_role_id})
         monkeypatch.setattr("bot.BOT_ROLE_IDS", {7777})
@@ -352,6 +416,7 @@ class TestOnMessage:
 
     def test_direct_mention_takes_precedence_over_ignored_role(self, monkeypatch):
         import bot
+
         old_bot_role_id = 222222222222222222
         monkeypatch.setattr("bot.BOT_IGNORED_ROLE_IDS", {old_bot_role_id})
         msg = _make_message(
@@ -363,6 +428,7 @@ class TestOnMessage:
 
     def test_ignored_role_wins_if_accidentally_assigned_to_bot(self, monkeypatch):
         import bot
+
         old_bot_role_id = 222222222222222222
         monkeypatch.setattr("bot.BOT_IGNORED_ROLE_IDS", {old_bot_role_id})
         monkeypatch.setattr("bot.BOT_ROLE_IDS", {old_bot_role_id})
@@ -429,7 +495,8 @@ class TestOnMessage:
         assert bot._guild_message_addresses_bot(msg) is False
 
     def test_reply_to_other_author_does_not_revive_role_expansion(
-        self, monkeypatch,
+        self,
+        monkeypatch,
     ):
         import bot
 
@@ -455,6 +522,7 @@ class TestOnMessage:
     @pytest.mark.asyncio
     async def test_rate_limiting(self, monkeypatch):
         import bot
+
         # Cooldown applies to NON-admins only (admins skip it so their rapid
         # messages queue instead of being bounced — 2026-06-22). Use a non-admin
         # author (12345 is the fixture's admin) to exercise the cooldown reply.
@@ -462,6 +530,7 @@ class TestOnMessage:
 
         # Simulate a recent cooldown for the non-admin sender (shared ledger)
         from services import rate_limit as _rl
+
         _rl.check_cooldown("88888", False)
 
         msg = _make_message(content="かなえ hello", author_id=88888)
@@ -482,16 +551,28 @@ class TestOnMessage:
         sema = bot._get_channel_sema(888)
         await sema.acquire()
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             task = asyncio.create_task(self._dispatch(msg))
             for _ in range(20):
                 if msg.reply.await_count:
@@ -508,8 +589,104 @@ class TestOnMessage:
             assert sema.locked() is False
 
     @pytest.mark.asyncio
+    async def test_cancelled_queued_job_is_unregistered(self):
+        import bot
+        from services.job_state import live_jobs
+
+        msg = _make_message(
+            content="かなえ hello",
+            author_id=12345,
+            channel_id=889,
+        )
+        sema = bot._get_channel_sema(889)
+        await sema.acquire()
+        with patch.object(bot._turn_outbox, "stage_request") as stage_request:
+            task = asyncio.create_task(self._dispatch(msg))
+            try:
+                for _ in range(50):
+                    if live_jobs(889):
+                        break
+                    await asyncio.sleep(0)
+                assert live_jobs(889)
+                task.cancel()
+                await task
+                assert live_jobs(889) == []
+                stage_request.assert_not_called()
+            finally:
+                if sema.locked():
+                    sema.release()
+
+    @pytest.mark.asyncio
+    async def test_initial_status_failure_unregisters_job(self):
+        import bot
+        from services.job_state import live_jobs
+
+        msg = _make_message(
+            content="かなえ hello",
+            author_id=12345,
+            channel_id=890,
+        )
+        with (
+            patch.object(
+                bot.bot_ui.StatusController,
+                "initial_reply",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("initial status failed"),
+            ),
+            patch.object(bot._turn_outbox, "stage_request") as stage_request,
+        ):
+            with pytest.raises(RuntimeError, match="initial status failed"):
+                await self._dispatch(msg)
+
+        stage_request.assert_not_called()
+        assert live_jobs(890) == []
+        assert not bot._get_channel_sema(890).locked()
+
+    @pytest.mark.asyncio
+    async def test_status_constructor_failure_unregisters_job_and_ticket(self):
+        import bot
+        from services.job_state import live_jobs
+
+        msg = _make_message(
+            content="かなえ hello",
+            author_id=12345,
+            channel_id=892,
+        )
+        with (
+            patch(
+                "bot.bot_ui.StatusController",
+                side_effect=RuntimeError("status constructor failed"),
+            ),
+            patch.object(bot._turn_outbox, "stage_request") as stage_request,
+        ):
+            with pytest.raises(RuntimeError, match="status constructor failed"):
+                await self._dispatch(msg)
+
+        stage_request.assert_not_called()
+        assert live_jobs(892) == []
+        assert not bot._get_channel_sema(892).locked()
+
+    @pytest.mark.asyncio
+    async def test_reaction_failure_unregisters_job(self):
+        import bot
+        from services.job_state import live_jobs
+
+        msg = _make_message(
+            content="かなえ hello",
+            author_id=12345,
+            channel_id=891,
+        )
+        msg.add_reaction = AsyncMock(side_effect=RuntimeError("reaction failed"))
+        with pytest.raises(RuntimeError, match="reaction failed"):
+            await self._dispatch(msg)
+
+        assert live_jobs(891) == []
+        assert not bot._get_channel_sema(891).locked()
+
+    @pytest.mark.asyncio
     async def test_empty_prompt_dm(self, monkeypatch):
         import bot
+
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345})
 
         msg = _make_message(content="", is_dm=True, author_id=12345)
@@ -541,15 +718,27 @@ class TestOnMessage:
         long_text = "x" * 9000
         msg = _make_message(content="かなえ hello", author_id=12345)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=(long_text, None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=(long_text, None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             calls = msg.reply.call_args_list
@@ -563,16 +752,28 @@ class TestOnMessage:
 
         msg = _make_message(content="かなえ hello", author_id=12345)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("chunk1", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["chunk1"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("chunk1", None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["chunk1"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             # Final reply should contain the response text
@@ -594,20 +795,36 @@ class TestOnMessage:
         latex = r"B=\begin{pmatrix}1&0\\0&1\end{pmatrix}"
         response = rf"\[{latex}\]"
 
-        with patch("bot.strip_mention", return_value="行列を説明して"), \
-             patch("bot.resolve_provider", return_value=bot.PROVIDER_CODEX), \
-             patch("services.codex_app_server.manager.get_manager") as manager, \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=(response, None, False)) as model_call, \
-             patch("bot.render_math_image", new_callable=AsyncMock, return_value=str(image_path)) as render_call, \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="行列を説明して"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.r2_archive.archive_images", return_value=[]), \
-             patch("bot.r2_archive.bind_response_message"):
+        with (
+            patch("bot.strip_mention", return_value="行列を説明して"),
+            patch("bot.resolve_provider", return_value=bot.PROVIDER_CODEX),
+            patch("services.codex_app_server.manager.get_manager") as manager,
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=(response, None, False),
+            ) as model_call,
+            patch(
+                "bot.render_math_image",
+                new_callable=AsyncMock,
+                return_value=str(image_path),
+            ) as render_call,
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="行列を説明して",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.r2_archive.archive_images", return_value=[]),
+            patch("bot.r2_archive.bind_response_message"),
+        ):
             manager.return_value.has_thread.return_value = False
             await self._dispatch(msg)
 
@@ -621,16 +838,28 @@ class TestOnMessage:
 
         msg = _make_message(content="かなえ hello", author_id=12345)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("c1c2", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["c1", "c2"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("c1c2", None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["c1", "c2"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             # Second chunk should be sent via channel.send
@@ -646,15 +875,27 @@ class TestOnMessage:
         status_msg = AsyncMock()
         msg.reply = AsyncMock(return_value=status_msg)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=RuntimeError("boom")), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("boom"),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             # Error surfaces as an edit of the status message (P0: errors keep
@@ -669,16 +910,28 @@ class TestOnMessage:
 
         msg = _make_message(content="かなえ hello", author_id=12345, channel_id=555)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             # After processing, semaphore for channel 555 must be released (not locked)
@@ -691,15 +944,27 @@ class TestOnMessage:
 
         msg = _make_message(content="かなえ hello", author_id=12345, channel_id=666)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=RuntimeError("fail")), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("fail"),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             # After error, semaphore for channel 666 must be released (not locked)
@@ -712,19 +977,32 @@ class TestOnMessage:
 
         msg = _make_message(content="かなえ hello", author_id=77777)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             from services import rate_limit as _rl
+
             assert "77777" in _rl._cooldowns
 
     async def test_session_updated_when_returned(self, monkeypatch):
@@ -732,17 +1010,29 @@ class TestOnMessage:
 
         msg = _make_message(content="かなえ hello", author_id=12345)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", "new-sess-id", True)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.update_session") as mock_update, \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", "new-sess-id", True),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.update_session") as mock_update,
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             mock_update.assert_called_once()
@@ -753,36 +1043,195 @@ class TestOnMessage:
 
         msg = _make_message(content="かなえ hello", author_id=12345)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.update_session") as mock_update, \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.update_session") as mock_update,
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             mock_update.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_nonstream_session_and_turn_commit_after_publish(self):
+        import bot
+
+        events = []
+        msg = _make_message(content="かなえ hello", author_id=12345)
+
+        async def publish_success(*, delivery_state, **_kwargs):
+            events.append("publish")
+            delivery_state.body_delivered = True
+            return delivery_state
+
+        def update(*_args, **_kwargs):
+            events.append("session")
+
+        async def record_turn(**_kwargs):
+            events.append("record")
+
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", "new-session", False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.update_session", side_effect=update),
+            patch("bot.bot_record_stage.record_admin_turn", side_effect=record_turn),
+            patch("bot.bot_publish.publish_response", side_effect=publish_success),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
+            await self._dispatch(msg)
+
+        assert events == ["publish", "session", "record"]
+
+    @pytest.mark.asyncio
+    async def test_nonstream_publish_failure_does_not_commit_session_or_turn(self):
+        import bot
+
+        msg = _make_message(content="かなえ hello", author_id=12345)
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", "unpublished-session", False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.update_session") as update,
+            patch(
+                "bot.bot_record_stage.record_admin_turn", new_callable=AsyncMock
+            ) as record_turn,
+            patch(
+                "bot.bot_publish.publish_response",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("send failed"),
+            ),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
+            await self._dispatch(msg)
+
+        update.assert_not_called()
+        record_turn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_streamed_empty_provider_text_commits_session_on_archive_failure(
+        self,
+    ):
+        import bot
+
+        msg = _make_message(content="かなえ hello", author_id=12345)
+
+        async def streamed_call(_prompt, *_args, **kwargs):
+            await kwargs["incremental_text_callback"]("delivered stream body")
+            return "", "stream-session", False
+
+        async def archive_failure(*, delivery_state, **_kwargs):
+            assert delivery_state.streamed is True
+            assert delivery_state.body_delivered is True
+            raise RuntimeError("archive failed")
+
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools", new_callable=AsyncMock, side_effect=streamed_call
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.update_session") as update,
+            patch(
+                "bot.bot_record_stage.record_admin_turn", new_callable=AsyncMock
+            ) as record_turn,
+            patch("bot.bot_publish.publish_response", side_effect=archive_failure),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
+            await self._dispatch(msg)
+
+        update.assert_called_once()
+        assert update.call_args.args[2] == "stream-session"
+        record_turn.assert_awaited_once()
+        assert record_turn.await_args.kwargs["response_text"] == "delivered stream body"
+
+    @pytest.mark.asyncio
     async def test_dm_admin_proceeds(self, monkeypatch):
         import bot
+
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345})
 
         msg = _make_message(content="hello", is_dm=True, author_id=12345)
 
-        with patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("hi", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["hi"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("hi", None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["hi"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             # Should have called call_with_tools (got past the guard)
@@ -793,18 +1242,32 @@ class TestOnMessage:
         import bot
 
         msg = _make_message(content="かなえ hello", author_id=12345)
-        msg.add_reaction = AsyncMock(side_effect=discord.errors.Forbidden(MagicMock(), "no perms"))
+        msg.add_reaction = AsyncMock(
+            side_effect=discord.errors.Forbidden(MagicMock(), "no perms")
+        )
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             # Should not raise despite Forbidden on add_reaction
             await self._dispatch(msg)
             msg.reply.assert_called()
@@ -812,6 +1275,7 @@ class TestOnMessage:
     @pytest.mark.asyncio
     async def test_non_admin_prompt_has_security_prefix(self, monkeypatch):
         import bot
+
         monkeypatch.setattr("bot.ADMIN_USER_IDS", set())  # no one is admin
 
         msg = _make_message(content="かなえ hello", author_id=12345)
@@ -823,16 +1287,28 @@ class TestOnMessage:
             captured_prompt = prompt
             return ("ok", None, False)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call_with_tools), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                side_effect=capture_call_with_tools,
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             assert captured_prompt is not None
@@ -843,6 +1319,7 @@ class TestOnMessage:
     @pytest.mark.asyncio
     async def test_admin_prompt_has_senpai_prefix(self, monkeypatch):
         import bot
+
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345})
 
         msg = _make_message(content="かなえ hello", author_id=12345)
@@ -854,16 +1331,28 @@ class TestOnMessage:
             captured_prompt = prompt
             return ("ok", None, False)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call_with_tools), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                side_effect=capture_call_with_tools,
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             assert captured_prompt is not None
@@ -886,17 +1375,29 @@ class TestOnMessage:
             captured["kwargs"] = kwargs
             return ("ok", None, False)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.render_active_skill_prompt", return_value="ACTIVE_INSHI"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call_with_tools), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch("bot.render_active_skill_prompt", return_value="ACTIVE_INSHI"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                side_effect=capture_call_with_tools,
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
         assert captured["kwargs"]["active_skill_prompt"] == "ACTIVE_INSHI"
@@ -910,6 +1411,7 @@ class TestOnMessage:
         # declares the current speaker.
         import bot
         from services.session import SessionInfo
+
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345})
 
         cid = 99999
@@ -931,16 +1433,36 @@ class TestOnMessage:
             return ("ok", None, True)
 
         try:
-            with patch("bot.strip_mention", return_value="hello"), \
-                 patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call_with_tools), \
-                 patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-                 patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-                 patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-                 patch("bot.extract_image_paths", return_value=[]), \
-                 patch("bot.split_message", return_value=["ok"]), \
-                 patch("bot.cleanup_attachments"), \
-                 patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-                 patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            with (
+                patch("bot.strip_mention", return_value="hello"),
+                patch(
+                    "bot.call_with_tools",
+                    new_callable=AsyncMock,
+                    side_effect=capture_call_with_tools,
+                ),
+                patch(
+                    "bot.get_http_session",
+                    new_callable=AsyncMock,
+                    return_value=MagicMock(),
+                ),
+                patch(
+                    "bot.download_attachments", new_callable=AsyncMock, return_value=[]
+                ),
+                patch(
+                    "bot.resolve_message_links",
+                    new_callable=AsyncMock,
+                    return_value="hello",
+                ),
+                patch("bot.extract_image_paths", return_value=[]),
+                patch("bot.split_message", return_value=["ok"]),
+                patch("bot.cleanup_attachments"),
+                patch(
+                    "bot.fetch_channel_context", new_callable=AsyncMock, return_value=""
+                ),
+                patch(
+                    "bot.fetch_thread_context", new_callable=AsyncMock, return_value=""
+                ),
+            ):
                 await self._dispatch(msg)
 
             assert captured_prompt is not None
@@ -976,34 +1498,44 @@ class TestOnMessage:
             captured_prompt = prompt
             return ("ok", None, False)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             assert captured_prompt is not None
             # Implementation wraps reply context in <replied_to_message> XML tag
             assert "replied_to_message" in captured_prompt
             assert "ReplyAuthor" in captured_prompt
-            # An external (untrusted) reply must sit OUTSIDE the admin caller's
-            # <trusted_user_input> wrapper — its untrusted text must never land
-            # inside a first-party trusted block.
-            # Match the real wrapper opening (the admin header text also
-            # mentions the literal "<trusted_user_input>", so anchor on the
-            # newline that only the actual wrapper has).
-            wrapper_open = captured_prompt.index("<trusted_user_input>\n")
+            # External reply text is placed inside its own untrusted block,
+            # after the administrator's trusted input block.
+            trusted_close = captured_prompt.index("</trusted_user_input>")
+            untrusted_open = captured_prompt.index("<untrusted_user_input>\n")
+            untrusted_close = captured_prompt.index("</untrusted_user_input>")
             tag_pos = captured_prompt.index("<replied_to_message")
-            assert tag_pos < wrapper_open
+            assert trusted_close < untrusted_open < tag_pos < untrusted_close
 
     @pytest.mark.asyncio
-    async def test_admin_reply_to_bot_uses_trusted_tag_outside_wrapper(self, monkeypatch):
+    async def test_admin_reply_to_bot_uses_trusted_tag_outside_wrapper(
+        self, monkeypatch
+    ):
         """admin が bot 自身のメッセージにリプライ → trusted扱い (<replied_to_trusted_message>)."""
         import bot
 
@@ -1029,16 +1561,26 @@ class TestOnMessage:
             captured_prompt = prompt
             return ("ok", None, False)
 
-        with patch("bot.strip_mention", return_value="followup"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="followup"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="followup"),
+            patch(
+                "bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="followup",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             assert captured_prompt is not None
@@ -1057,6 +1599,7 @@ class TestOnMessage:
     async def test_admin_reply_to_admin_uses_trusted_tag(self, monkeypatch):
         """admin が他のadmin authoredメッセージにリプライ → trusted扱い."""
         import bot
+
         # Add a second admin (b0nchichi-like)
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345, 22222})
 
@@ -1081,16 +1624,26 @@ class TestOnMessage:
             captured_prompt = prompt
             return ("ok", None, False)
 
-        with patch("bot.strip_mention", return_value="check this"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="check this"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="check this"),
+            patch(
+                "bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="check this",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             assert captured_prompt is not None
@@ -1116,7 +1669,8 @@ class TestOnMessage:
         ref_msg = AsyncMock()
         ref_msg.author = MagicMock()
         ref_msg.author.id = 88888  # not in ADMIN_USER_IDS, not bot.user.id
-        ref_msg.author.display_name = "ExternalUser"
+        # Display names are attacker-controlled and must not confer admin trust.
+        ref_msg.author.display_name = "b0nchichi"
         ref_msg.content = "外部ユーザーの発言"
         ref_msg.attachments = []
 
@@ -1130,30 +1684,36 @@ class TestOnMessage:
             captured_prompt = prompt
             return ("ok", None, False)
 
-        with patch("bot.strip_mention", return_value="hi"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hi"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hi"),
+            patch(
+                "bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links", new_callable=AsyncMock, return_value="hi"
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             assert captured_prompt is not None
-            # External author keeps the non-trusted tag AND sits OUTSIDE the
-            # admin caller's trusted wrapper — untrusted reply text must never
-            # be embedded inside <trusted_user_input>.
+            # External author keeps the non-trusted tag inside a separately
+            # fenced untrusted block after the trusted caller input.
             assert "<replied_to_message" in captured_prompt
             assert "<replied_to_trusted_message" not in captured_prompt
             tag_pos = captured_prompt.index("<replied_to_message")
-            # Match the real wrapper opening (the admin header text also
-            # mentions the literal "<trusted_user_input>", so anchor on the
-            # newline that only the actual wrapper has).
-            wrapper_open = captured_prompt.index("<trusted_user_input>\n")
-            assert tag_pos < wrapper_open
+            trusted_close = captured_prompt.index("</trusted_user_input>")
+            untrusted_open = captured_prompt.index("<untrusted_user_input>\n")
+            untrusted_close = captured_prompt.index("</untrusted_user_input>")
+            assert trusted_close < untrusted_open < tag_pos < untrusted_close
 
     @pytest.mark.asyncio
     async def test_history_search_injected_for_admin(self, monkeypatch):
@@ -1164,10 +1724,18 @@ class TestOnMessage:
         long_text = "東洋水産の株について前に話したのを覚えてる？教えて"
         monkeypatch.setattr("bot.MEM0_HISTORY_SEARCH_ENABLED", True)
         monkeypatch.setattr(
-            history_index, "search_history",
-            MagicMock(return_value=[
-                {"role": "user", "memory": "東洋水産の株を買った", "ts": "t", "rank": 1},
-            ]),
+            history_index,
+            "search_history",
+            MagicMock(
+                return_value=[
+                    {
+                        "role": "user",
+                        "memory": "東洋水産の株を買った",
+                        "ts": "t",
+                        "rank": 1,
+                    },
+                ]
+            ),
         )
 
         msg = _make_message(content=f"かなえ {long_text}", author_id=12345)
@@ -1178,17 +1746,27 @@ class TestOnMessage:
             captured_prompt = prompt
             return ("ok", None, False)
 
-        with patch("bot.strip_mention", return_value=long_text), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value=long_text), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.search_memories_smart", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value=long_text),
+            patch(
+                "bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value=long_text,
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.search_memories_smart", new_callable=AsyncMock, return_value=[]),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             assert captured_prompt is not None
@@ -1208,17 +1786,29 @@ class TestOnMessage:
 
         msg = _make_message(content=f"かなえ {long_text}", author_id=12345)
 
-        with patch("bot.strip_mention", return_value=long_text), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value=long_text), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.search_memories_smart", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value=long_text),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value=long_text,
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.search_memories_smart", new_callable=AsyncMock, return_value=[]),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
             spy.assert_not_called()
 
@@ -1227,6 +1817,7 @@ class TestOnMessage:
         """A guild message that doesn't address the bot is persisted+indexed
         as role="channel" (for later history_search), and gets no reply."""
         import bot
+
         monkeypatch.setattr("bot.MEM0_HISTORY_SEARCH_ENABLED", True)
 
         captured = {}
@@ -1239,8 +1830,10 @@ class TestOnMessage:
         msg = _make_message(content="東洋水産の決算きた", author_id=55555)
         msg.author.display_name = "b0nchichi"
 
-        with patch("services.session.append_jsonl", side_effect=fake_append), \
-             patch("bot.call_with_tools", new_callable=AsyncMock) as mock_cwt:
+        with (
+            patch("services.session.append_jsonl", side_effect=fake_append),
+            patch("bot.call_with_tools", new_callable=AsyncMock) as mock_cwt,
+        ):
             await self._dispatch(msg)
             # Let the fire-and-forget _track_task run.
             await asyncio.sleep(0.05)
@@ -1268,17 +1861,29 @@ class TestOnMessage:
 
         msg = _make_message(content=f"かなえ {long_text}", author_id=12345)
 
-        with patch("bot.strip_mention", return_value=long_text), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value=long_text), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.search_memories_smart", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value=long_text),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value=long_text,
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.search_memories_smart", new_callable=AsyncMock, return_value=[]),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
             spy.assert_not_called()
 
@@ -1295,16 +1900,36 @@ class TestOnMessage:
         try:
             msg = _make_message(content="かなえ hello", author_id=12345)
 
-            with patch("bot.strip_mention", return_value="hello"), \
-                 patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("check " + tmp_path, None, False)), \
-                 patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-                 patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-                 patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-                 patch("bot.extract_image_paths", return_value=[tmp_path]), \
-                 patch("bot.split_message", return_value=["check " + tmp_path]), \
-                 patch("bot.cleanup_attachments"), \
-                 patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-                 patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            with (
+                patch("bot.strip_mention", return_value="hello"),
+                patch(
+                    "bot.call_with_tools",
+                    new_callable=AsyncMock,
+                    return_value=("check " + tmp_path, None, False),
+                ),
+                patch(
+                    "bot.get_http_session",
+                    new_callable=AsyncMock,
+                    return_value=MagicMock(),
+                ),
+                patch(
+                    "bot.download_attachments", new_callable=AsyncMock, return_value=[]
+                ),
+                patch(
+                    "bot.resolve_message_links",
+                    new_callable=AsyncMock,
+                    return_value="hello",
+                ),
+                patch("bot.extract_image_paths", return_value=[tmp_path]),
+                patch("bot.split_message", return_value=["check " + tmp_path]),
+                patch("bot.cleanup_attachments"),
+                patch(
+                    "bot.fetch_channel_context", new_callable=AsyncMock, return_value=""
+                ),
+                patch(
+                    "bot.fetch_thread_context", new_callable=AsyncMock, return_value=""
+                ),
+            ):
                 await self._dispatch(msg)
 
                 # The reply should include files
@@ -1322,16 +1947,28 @@ class TestOnMessage:
         status_msg = AsyncMock()
         msg.reply = AsyncMock(return_value=status_msg)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("ok", None, False)), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
             status_msg.delete.assert_called_once()
@@ -1353,16 +1990,30 @@ class TestOnMessage:
             captured_prompt = prompt
             return ("ok", None, False)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value="thread-context-sentinel"):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch(
+                "bot.fetch_thread_context",
+                new_callable=AsyncMock,
+                return_value="thread-context-sentinel",
+            ),
+        ):
             await self._dispatch(msg)
 
             assert captured_prompt is not None
@@ -1391,12 +2042,13 @@ class TestAdaptiveSegmentedMath:
         msg.channel.send.return_value = sent
         monkeypatch.setattr(bot, "MATH_PRESENTATION_MODE", "adaptive")
 
-        with patch(
-            "bot.render_math_image",
-            new_callable=AsyncMock,
-            return_value=str(image_path),
-        ) as render_call, patch(
-            "bot.r2_archive.archive_images", return_value=[]
+        with (
+            patch(
+                "bot.render_math_image",
+                new_callable=AsyncMock,
+                return_value=str(image_path),
+            ) as render_call,
+            patch("bot.r2_archive.archive_images", return_value=[]),
         ):
             await bot._send_segmented(msg, response, [])
 
@@ -1428,6 +2080,25 @@ class TestAdaptiveSegmentedMath:
 # ---------------------------------------------------------------------------
 # _patched_close
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("user abort", "user_abort"),
+        ("shutdown", "shutdown"),
+        ("stream idle", "stream_idle"),
+        ("", "unexpected"),
+        ("library cancellation", "unexpected"),
+    ],
+)
+def test_cancellation_reason_classification_is_exact(reason, expected):
+    import bot
+
+    args = (reason,) if reason else ()
+    raw, kind = bot._classify_cancellation(asyncio.CancelledError(*args))
+    assert raw == reason
+    assert kind == expected
+
+
 class TestPatchedClose:
     @pytest.mark.asyncio
     async def test_closes_http_session(self):
@@ -1437,7 +2108,10 @@ class TestPatchedClose:
         mock_session.closed = False
         bot._http_session = mock_session
 
-        with patch.object(bot, "_orig_close", new_callable=AsyncMock) as mock_orig:
+        with (
+            patch.object(bot, "_orig_close", new_callable=AsyncMock) as mock_orig,
+            patch.object(bot._runtime_resources, "close", new_callable=AsyncMock),
+        ):
             await bot._patched_close()
             mock_session.close.assert_called_once()
             assert bot._http_session is None
@@ -1451,7 +2125,10 @@ class TestPatchedClose:
         mock_session.closed = True
         bot._http_session = mock_session
 
-        with patch.object(bot, "_orig_close", new_callable=AsyncMock) as mock_orig:
+        with (
+            patch.object(bot, "_orig_close", new_callable=AsyncMock) as mock_orig,
+            patch.object(bot._runtime_resources, "close", new_callable=AsyncMock),
+        ):
             await bot._patched_close()
             mock_session.close.assert_not_called()
             mock_orig.assert_called_once()
@@ -1459,9 +2136,13 @@ class TestPatchedClose:
     @pytest.mark.asyncio
     async def test_handles_none_session(self):
         import bot
+
         bot._http_session = None
 
-        with patch.object(bot, "_orig_close", new_callable=AsyncMock) as mock_orig:
+        with (
+            patch.object(bot, "_orig_close", new_callable=AsyncMock) as mock_orig,
+            patch.object(bot._runtime_resources, "close", new_callable=AsyncMock),
+        ):
             await bot._patched_close()
             mock_orig.assert_called_once()
 
@@ -1471,24 +2152,34 @@ class TestPatchedClose:
 # ---------------------------------------------------------------------------
 class TestMain:
     def test_no_token_raises_system_exit(self, monkeypatch):
-        monkeypatch.setattr("config.DISCORD_TOKEN", "")
-        # Re-import to pick up patched value
-        import importlib
         import main as main_mod
-        monkeypatch.setattr("main.DISCORD_TOKEN", "")
+
+        bootstrap = MagicMock()
+        bootstrap.initialize.side_effect = main_mod.DiscordTokenError(
+            "DISCORD_TOKEN is required"
+        )
+        monkeypatch.setattr(main_mod, "_runtime_bootstrap", bootstrap)
         with pytest.raises(SystemExit) as exc_info:
             main_mod.main()
         assert exc_info.value.code == 1
 
     def test_valid_token_runs_bot(self, monkeypatch):
-        monkeypatch.setattr("main.DISCORD_TOKEN", "fake-token-123")
         # Phase G/D5: cleanup_stale_attachments no longer called from
         # main.main(); it is scheduled inside bot.on_ready. The earlier
         # monkeypatch here patched a now-removed call path.
 
         import main as main_mod
+
+        bootstrap = MagicMock()
+        bootstrap.initialize.return_value = MagicMock(
+            bot_dir=str(Path(__file__).resolve().parents[1]),
+            state_dir=str(Path(__file__).resolve().parents[1] / ".state"),
+            discord_token="fake-token-123",
+        )
+        monkeypatch.setattr(main_mod, "_runtime_bootstrap", bootstrap)
         # main() does `from bot import bot; bot.run(...)` — patch bot.bot at source
         import bot as bot_mod
+
         mock_run = MagicMock()
         monkeypatch.setattr(bot_mod.bot, "run", mock_run)
         # Bypass flock-based PID lock so the test works even when the bot is running
@@ -1496,6 +2187,7 @@ class TestMain:
 
         main_mod.main()
         mock_run.assert_called_once_with("fake-token-123")
+        bootstrap.shutdown_sync.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------
@@ -1586,6 +2278,7 @@ class TestSessionAdditional:
     def test_load_history_empty_channel_returns_empty(self, tmp_state_dir):
         """load_history_channel for nonexistent file returns []."""
         from services.session import load_history_channel
+
         assert load_history_channel(self._CH_MISSING) == []
 
     def test_append_jsonl_adds_timestamp(self, tmp_state_dir):
@@ -1604,6 +2297,7 @@ class TestSessionAdditional:
 # H8: GroupChannel DM gate
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_group_dm_treated_as_dm_for_admin_gate(monkeypatch):
     """Non-admin messages in a GroupChannel must be silently rejected."""
@@ -1613,7 +2307,9 @@ async def test_group_dm_treated_as_dm_for_admin_gate(monkeypatch):
 
     mock_bot_user = MagicMock()
     mock_bot_user.id = 88888
-    with patch.object(type(bot.bot), "user", new_callable=PropertyMock, return_value=mock_bot_user):
+    with patch.object(
+        type(bot.bot), "user", new_callable=PropertyMock, return_value=mock_bot_user
+    ):
         msg = MagicMock(spec=discord.Message)
         msg.author = MagicMock(spec=discord.Member)
         msg.author.id = 12345
@@ -1635,6 +2331,7 @@ async def test_group_dm_treated_as_dm_for_admin_gate(monkeypatch):
 # H6: shared rate_limit module consulted
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_rate_limit_uses_shared_module(monkeypatch):
     """When services.rate_limit is available, check_cooldown must be called."""
@@ -1654,7 +2351,9 @@ async def test_rate_limit_uses_shared_module(monkeypatch):
     mock_bot_user = MagicMock()
     mock_bot_user.id = 88888
 
-    with patch.object(type(bot.bot), "user", new_callable=PropertyMock, return_value=mock_bot_user):
+    with patch.object(
+        type(bot.bot), "user", new_callable=PropertyMock, return_value=mock_bot_user
+    ):
         msg = MagicMock(spec=discord.Message)
         msg.author = MagicMock(spec=discord.Member)
         msg.author.id = 12345
@@ -1682,6 +2381,7 @@ async def test_rate_limit_uses_shared_module(monkeypatch):
 # SRE tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_mem0_failure_logs_warning(caplog):
     """Mem0 store failure should log at WARNING, not DEBUG."""
@@ -1706,12 +2406,17 @@ async def test_mem0_failure_logs_warning(caplog):
                         assistant_text=response_text,
                         user_id=mem0_user_id,
                         context_hint="",
-                        metadata={"channel_id": str(channel_id), "channel_name": "test"},
+                        metadata={
+                            "channel_id": str(channel_id),
+                            "channel_name": "test",
+                        },
                     )
                 except Exception as exc:
                     bot.log.warning(
                         "Mem0 store failed: %s (user=%s, channel=%s)",
-                        exc, mem0_user_id, channel_id,
+                        exc,
+                        mem0_user_id,
+                        channel_id,
                     )
 
             await _mem0_store()
@@ -1739,10 +2444,18 @@ async def test_tree_sync_only_runs_once():
     mock_bot_user = MagicMock()
     mock_bot_user.id = 88888
 
-    with patch.object(type(bot.bot), "guilds", new_callable=PropertyMock, return_value=[]), \
-         patch.object(type(bot.bot), "user", new_callable=PropertyMock, return_value=mock_bot_user), \
-         patch.object(type(bot.bot), "tree", new_callable=PropertyMock, return_value=mock_tree), \
-         patch("bot.build_mention_regex"):
+    with (
+        patch.object(
+            type(bot.bot), "guilds", new_callable=PropertyMock, return_value=[]
+        ),
+        patch.object(
+            type(bot.bot), "user", new_callable=PropertyMock, return_value=mock_bot_user
+        ),
+        patch.object(
+            type(bot.bot), "tree", new_callable=PropertyMock, return_value=mock_tree
+        ),
+        patch("bot.build_mention_regex"),
+    ):
         await bot.on_ready()
         await bot.on_ready()
 
@@ -1774,7 +2487,9 @@ def test_attachments_capped_at_10():
     if len(reply_files) > 10:
         reply_files = reply_files[:10]
 
-    assert len(reply_files) == 10, f"Chunk-reply cap failed: got {len(reply_files)} files"
+    assert len(reply_files) == 10, (
+        f"Chunk-reply cap failed: got {len(reply_files)} files"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1787,6 +2502,7 @@ class TestOnMessageAdminAndQuota:
     def _reset_bot_state(self, monkeypatch):
         import bot
         from services import rate_limit as _rl
+
         bot._channel_semas.clear()
         _rl.reset_for_tests()
         monkeypatch.setattr("bot.COOLDOWN_SECONDS", 5)
@@ -1798,7 +2514,10 @@ class TestOnMessageAdminAndQuota:
         self._mock_bot_user = MagicMock()
         self._mock_bot_user.id = 99900
         self._user_patcher = patch.object(
-            type(bot.bot), "user", new_callable=PropertyMock, return_value=self._mock_bot_user
+            type(bot.bot),
+            "user",
+            new_callable=PropertyMock,
+            return_value=self._mock_bot_user,
         )
         self._user_patcher.start()
         yield
@@ -1806,6 +2525,7 @@ class TestOnMessageAdminAndQuota:
 
     async def _dispatch(self, message):
         import bot
+
         await bot.bot.on_message(message)
 
     @pytest.mark.asyncio
@@ -1816,6 +2536,7 @@ class TestOnMessageAdminAndQuota:
 
         # Exhaust quota for user 55555 in the shared ledger
         from services import rate_limit as _rl
+
         _rl.check_daily_quota("55555", False)
 
         msg = _make_message(content="かなえ hi", author_id=55555)
@@ -1830,6 +2551,7 @@ class TestOnMessageAdminAndQuota:
         (bot.py: ``if is_dm and not is_admin: return``) before the delete
         handler runs. Silent drop IS the security contract — no reply."""
         import bot
+
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {99999})  # 12345 is NOT admin
 
         ref = MagicMock()
@@ -1847,6 +2569,7 @@ class TestOnMessageAdminAndQuota:
     async def test_delete_command_admin_success(self, monkeypatch):
         """Admin delete command deletes the referenced message."""
         import bot
+
         monkeypatch.setattr("bot.ADMIN_USER_IDS", {12345})
 
         ref_msg = AsyncMock()
@@ -1870,11 +2593,13 @@ class TestOnMessageAdminAndQuota:
     async def test_non_admin_cooldown_uses_restricted_seconds(self, monkeypatch):
         """Non-admin uses RESTRICTED_COOLDOWN_SECONDS, not COOLDOWN_SECONDS."""
         import bot
+
         monkeypatch.setattr("bot.ADMIN_USER_IDS", set())
         monkeypatch.setattr("bot.RESTRICTED_COOLDOWN_SECONDS", 120)
 
         # Place a fresh cooldown for non-admin user (shared ledger)
         from services import rate_limit as _rl
+
         _rl.check_cooldown("55555", False)
 
         msg = _make_message(content="かなえ hi", author_id=55555)
@@ -1896,19 +2621,39 @@ class TestOnMessageAdminAndQuota:
         try:
             msg = _make_message(content="かなえ hello", author_id=12345)
 
-            with patch("bot.strip_mention", return_value="hello"), \
-                 patch("bot.call_with_tools", new_callable=AsyncMock, return_value=("see " + tmp_path, None, False)), \
-                 patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-                 patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-                 patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-                 patch("bot.extract_image_paths", return_value=[tmp_path]), \
-                 patch("bot.extract_file_paths", return_value=[]), \
-                 patch("bot.normalize_image_filenames", side_effect=lambda x: x), \
-                 patch("bot.is_attach_ignored", return_value=False), \
-                 patch("bot.split_message", return_value=["see " + tmp_path]), \
-                 patch("bot.cleanup_attachments"), \
-                 patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-                 patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+            with (
+                patch("bot.strip_mention", return_value="hello"),
+                patch(
+                    "bot.call_with_tools",
+                    new_callable=AsyncMock,
+                    return_value=("see " + tmp_path, None, False),
+                ),
+                patch(
+                    "bot.get_http_session",
+                    new_callable=AsyncMock,
+                    return_value=MagicMock(),
+                ),
+                patch(
+                    "bot.download_attachments", new_callable=AsyncMock, return_value=[]
+                ),
+                patch(
+                    "bot.resolve_message_links",
+                    new_callable=AsyncMock,
+                    return_value="hello",
+                ),
+                patch("bot.extract_image_paths", return_value=[tmp_path]),
+                patch("bot.extract_file_paths", return_value=[]),
+                patch("bot.normalize_image_filenames", side_effect=lambda x: x),
+                patch("bot.is_attach_ignored", return_value=False),
+                patch("bot.split_message", return_value=["see " + tmp_path]),
+                patch("bot.cleanup_attachments"),
+                patch(
+                    "bot.fetch_channel_context", new_callable=AsyncMock, return_value=""
+                ),
+                patch(
+                    "bot.fetch_thread_context", new_callable=AsyncMock, return_value=""
+                ),
+            ):
                 await self._dispatch(msg)
 
                 calls = msg.reply.call_args_list
@@ -1929,36 +2674,108 @@ class TestOnMessageAdminAndQuota:
             captured_prompt = prompt
             return ("ok", None, False)
 
-        with patch("bot.strip_mention", return_value="hello"), \
-             patch("bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call), \
-             patch("bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()), \
-             patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]), \
-             patch("bot.download_text_attachments", new_callable=AsyncMock, return_value=[("notes.txt", "secret content")]), \
-             patch("bot.resolve_message_links", new_callable=AsyncMock, return_value="hello"), \
-             patch("bot.extract_image_paths", return_value=[]), \
-             patch("bot.split_message", return_value=["ok"]), \
-             patch("bot.cleanup_attachments"), \
-             patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""), \
-             patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""):
+        with (
+            patch("bot.strip_mention", return_value="hello"),
+            patch(
+                "bot.call_with_tools", new_callable=AsyncMock, side_effect=capture_call
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.download_text_attachments",
+                new_callable=AsyncMock,
+                return_value=[("notes.txt", "secret content")],
+            ),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="hello",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.split_message", return_value=["ok"]),
+            patch("bot.cleanup_attachments"),
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
             await self._dispatch(msg)
 
         assert captured_prompt is not None
         assert "notes.txt" in captured_prompt
         assert "secret content" in captured_prompt
 
+    @pytest.mark.asyncio
+    async def test_trusted_binary_attachment_is_removed_in_turn_finally(self):
+        binary = MagicMock()
+        binary.filename = "payload.bin"
+        binary.content_type = "application/octet-stream"
+        binary.size = 4
+        binary.id = 123
+        binary.url = "https://cdn.discordapp.com/payload.bin"
+        msg = _make_message(
+            content="かなえ inspect",
+            author_id=12345,
+            attachments=[binary],
+        )
+        metadata = {
+            "path": "/tmp/discord_bot_attachments/123-payload.bin",
+            "filename": "payload.bin",
+            "mime": "application/octet-stream",
+            "size": 4,
+        }
+
+        with (
+            patch("bot.strip_mention", return_value="inspect"),
+            patch(
+                "bot.call_with_tools",
+                new_callable=AsyncMock,
+                return_value=("ok", None, False),
+            ),
+            patch(
+                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
+            ),
+            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
+            patch(
+                "bot.download_text_attachments", new_callable=AsyncMock, return_value=[]
+            ),
+            patch(
+                "bot.download_arbitrary_attachments",
+                new_callable=AsyncMock,
+                return_value=[metadata],
+            ),
+            patch(
+                "bot.resolve_message_links",
+                new_callable=AsyncMock,
+                return_value="inspect",
+            ),
+            patch("bot.extract_image_paths", return_value=[]),
+            patch("bot.cleanup_attachments") as cleanup,
+            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
+            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
+        ):
+            await self._dispatch(msg)
+
+        cleanup.assert_called_once()
+        assert metadata["path"] in cleanup.call_args.args[0]
+
+
 class TestCapText:
     def test_no_truncation_when_under_limit(self):
         from bot import _cap_text
+
         assert _cap_text("hello", 10) == "hello"
 
     def test_truncation_when_over_limit(self):
         from bot import _cap_text
+
         result = _cap_text("hello world", 5)
         assert result.startswith("hello")
         assert "truncated" in result
 
     def test_exact_limit_not_truncated(self):
         from bot import _cap_text
+
         assert _cap_text("hello", 5) == "hello"
 
 
@@ -1968,6 +2785,7 @@ class TestCapText:
 class TestWrapUntrusted:
     def test_wraps_in_xml_tag(self):
         from bot import _wrap_untrusted
+
         result = _wrap_untrusted("some text")
         assert "<untrusted_user_input>" in result
         assert "some text" in result
@@ -1980,6 +2798,7 @@ class TestWrapUntrusted:
 class TestGetChannelSema:
     def test_creates_semaphore_for_new_channel(self):
         import bot
+
         bot._channel_semas.clear()
         sema = bot._get_channel_sema(12345)
         assert sema is not None
@@ -1988,6 +2807,7 @@ class TestGetChannelSema:
 
     def test_reuses_existing_semaphore(self):
         import bot
+
         bot._channel_semas.clear()
         s1 = bot._get_channel_sema(111)
         s2 = bot._get_channel_sema(111)
@@ -1996,6 +2816,7 @@ class TestGetChannelSema:
 
     def test_lru_eviction_when_over_limit(self, monkeypatch):
         import bot
+
         monkeypatch.setattr("bot.MAX_CHANNEL_SEMAS", 2)
         bot._channel_semas.clear()
         bot._get_channel_sema(1)
@@ -2008,6 +2829,7 @@ class TestGetChannelSema:
         """locked sema が先頭にあっても、後ろの idle を evict する。"""
         import asyncio
         import bot
+
         monkeypatch.setattr("bot.MAX_CHANNEL_SEMAS", 2)
         bot._channel_semas.clear()
 
@@ -2030,6 +2852,7 @@ class TestGetChannelSema:
         """先頭に locked が積み上がっても、辞書は cap 付近で頭打ちする。"""
         import asyncio
         import bot
+
         monkeypatch.setattr("bot.MAX_CHANNEL_SEMAS", 5)
         bot._channel_semas.clear()
 

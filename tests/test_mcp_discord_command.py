@@ -63,7 +63,8 @@ async def test_command_registered_and_non_admin_blocked(service):
     interaction = _interaction()
     await handler(interaction)
     interaction.response.send_message.assert_awaited_once_with(
-        "admin only", ephemeral=True,
+        "admin only",
+        ephemeral=True,
     )
 
 
@@ -71,7 +72,8 @@ async def test_status_reply_is_ephemeral_and_has_owner_view(service):
     handler = _register()
     interaction = _interaction()
     await handler(interaction)
-    call = interaction.response.send_message.await_args
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    call = interaction.followup.send.await_args
     assert call.kwargs["ephemeral"] is True
     view = call.kwargs["view"]
     assert isinstance(view, mcp_command._McpView)
@@ -85,8 +87,31 @@ async def test_enable_disable_direct_action_uses_persistent_service(service):
     interaction = _interaction()
     await handler(interaction, "disable", "alpha")
     assert service.is_enabled("alpha") is False
-    call = interaction.response.send_message.await_args
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    call = interaction.followup.send.await_args
     assert call.kwargs["ephemeral"] is True
+
+
+async def test_command_defers_before_dispatch(service, monkeypatch):
+    interaction = _interaction()
+
+    async def invoke(_args, _runtime):
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+        return SimpleNamespace(message="done")
+
+    monkeypatch.setattr(
+        mcp_command,
+        "_invoke_mcp",
+        invoke,
+    )
+    await _register()(interaction, "reconnect", "alpha")
+
+
+async def test_server_autocomplete_is_admin_gated(service):
+    interaction = _interaction()
+    deps = SimpleNamespace(is_admin=lambda _user: False)
+    callback = mcp_command._make_server_autocomplete(deps)
+    assert await callback(interaction, "") == []
 
 
 async def test_view_owner_restriction(service):
@@ -102,15 +127,17 @@ async def test_view_owner_restriction(service):
 
 def test_tool_list_paginates():
     runtime = RecordingRuntime(
-        mcp_servers=[{
-            "key": "alpha",
-            "transport": "stdio",
-            "tier": "web",
-            "enabled": True,
-            "selected": False,
-            "probe_status": "reachable",
-            "tool_count": 31,
-        }],
+        mcp_servers=[
+            {
+                "key": "alpha",
+                "transport": "stdio",
+                "tier": "web",
+                "enabled": True,
+                "selected": False,
+                "probe_status": "reachable",
+                "tool_count": 31,
+            }
+        ],
         mcp_probe_results={
             "alpha": {
                 "key": "alpha",

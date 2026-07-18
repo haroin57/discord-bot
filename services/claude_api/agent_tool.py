@@ -9,8 +9,7 @@
 - 入力: ``{description, prompt, subagent_type?}``。subagent_type 既定 = "general-purpose"。
 - 実体: ``services.deep_research.registry.run_subagent`` を流用する（fresh history・
   overloaded リトライ・MCP guard・bounded result・StallWatchdog 全部入り）。subagent は
-  親の advertised tools をそのまま継承する（``Agent`` 自身も含むが、深さ上限を超えた子は
-  Agent 抜きの tools_for_api を渡されるので孫以降は spawn できない）。
+  deep-research dispatcher が実行できる MCP tools だけを継承する。
 - 並列: 1 親ターンで model が複数 ``Agent()`` を撃つと tool_loop の per-turn 並列実行に乗る
   ため、本モジュール側で ``asyncio.Semaphore(SUBAGENT_MAX_PARALLEL)`` で実走を律速する。
 - セッション非汚染: 親の JSONL / sessions には一切触らない（``run_subagent`` の history=[] 仕様）。
@@ -28,10 +27,10 @@ from typing import Any, Callable
 from config import (
     SUBAGENT_DEFAULT_TYPE,
     SUBAGENT_IDLE_TIMEOUT_S,
-    SUBAGENT_MAX_DEPTH,
     SUBAGENT_MAX_PARALLEL,
     SUBAGENT_MAX_TURNS,
 )
+from services.claude_api.capabilities import mcp_tools_for_dispatcher
 
 log = logging.getLogger(__name__)
 
@@ -55,8 +54,8 @@ class AgentSpec:
     """登録される subagent 型の宣言（CLI の AgentDefinition 相当）。"""
 
     name: str
-    description: str          # 広告（schema の subagent_type enum description）
-    system_prompt: str        # subagent の system_prompt（fresh context）
+    description: str  # 広告（schema の subagent_type enum description）
+    system_prompt: str  # subagent の system_prompt（fresh context）
     # 親の advertised tools をそのまま流すなら True、絞るなら False（v1 はみな True）。
     inherit_tools: bool = True
 
@@ -132,7 +131,7 @@ class AgentToolCtx:
     pool: Any
     tools_for_api: list[dict]
     channel_id: int
-    parent_model: str          # subagent は既定で親モデルを継承する（CLI と同じ）
+    parent_model: str  # subagent は既定で親モデルを継承する（CLI と同じ）
     depth: int = 0
     # 並列に走る subagent を律速する semaphore（プロセス共有）。テストで差し替え可。
     sema: asyncio.Semaphore | None = None
@@ -174,10 +173,6 @@ def _get_sema() -> asyncio.Semaphore:
     return _subagent_sema
 
 
-def _strip_agent_from_tools(tools: list[dict]) -> list[dict]:
-    return [t for t in (tools or []) if t.get("name") != "Agent"]
-
-
 async def execute_agent_tool(args: dict, ctx: AgentToolCtx) -> str:
     """Agent ツール呼び出しを subagent 実行にディスパッチする。
 
@@ -192,18 +187,20 @@ async def execute_agent_tool(args: dict, ctx: AgentToolCtx) -> str:
     description = str(args.get("description") or "").strip()
     if not prompt:
         return "<tool_use_error>Agent: 'prompt' is required</tool_use_error>"
-    subtype = str(args.get("subagent_type") or SUBAGENT_DEFAULT_TYPE).strip() or SUBAGENT_DEFAULT_TYPE
+    subtype = (
+        str(args.get("subagent_type") or SUBAGENT_DEFAULT_TYPE).strip()
+        or SUBAGENT_DEFAULT_TYPE
+    )
     spec = get_agent_spec(subtype)
 
-    # 深さ上限を超える子には Agent ツールを与えない（孫 spawn を構造的に禁止）。
-    inherited_tools = ctx.tools_for_api if spec.inherit_tools else []
-    if ctx.depth + 1 >= SUBAGENT_MAX_DEPTH:
-        inherited_tools = _strip_agent_from_tools(inherited_tools)
+    inherited_tools = (
+        mcp_tools_for_dispatcher(ctx.tools_for_api) if spec.inherit_tools else []
+    )
 
     sema = ctx.sema or _get_sema()
     defn = ResearchAgentDef(
         agent_type=f"subagent:{spec.name}",
-        model=ctx.parent_model,    # 親モデルを継承（CLI Agent tool と同じ既定）
+        model=ctx.parent_model,  # 親モデルを継承（CLI Agent tool と同じ既定）
         system_prompt=spec.system_prompt,
         max_tool_turns=SUBAGENT_MAX_TURNS,
         idle_timeout_s=SUBAGENT_IDLE_TIMEOUT_S,
@@ -211,7 +208,10 @@ async def execute_agent_tool(args: dict, ctx: AgentToolCtx) -> str:
 
     log.info(
         "Agent tool dispatch: subagent_type=%s depth=%d desc=%r prompt_len=%d",
-        spec.name, ctx.depth, description[:60], len(prompt),
+        spec.name,
+        ctx.depth,
+        description[:60],
+        len(prompt),
     )
 
     # subagent の usage 集計用に独立 state を作る（親の ResearchState とは分離）。

@@ -7,6 +7,10 @@
     "oracle": {
       "type": "http",
       "url": "http://127.0.0.1:8015/mcp"
+    },
+    "kanae-alarm": {
+      "type": "http",
+      "url": "https://kanae-alarm.haroin57.workers.dev/mcp"
     }
   }
 }

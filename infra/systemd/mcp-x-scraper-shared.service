@@ -8,14 +8,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
+User=kanae-x-scraper
+Group=kanae-x-scraper
+SupplementaryGroups=kanae-code
 # x-scraper lives outside the repo (free-code); its server adds ./src to
 # sys.path relative to the file, so WorkingDirectory is its own root.
 WorkingDirectory=/home/ubuntu/free-code/x-scraper
-Environment=HOME=/home/ubuntu
+Environment=HOME=/var/lib/kanae-x-scraper
 Environment=MCP_HTTP_PORT=8016
-EnvironmentFile=/home/ubuntu/discord-bot/.env
+Environment=PYTHON_DOTENV_DISABLED=1
+EnvironmentFile=/etc/discord-bot/credentials/mcp-x-scraper.env
+StateDirectory=kanae-x-scraper
+StateDirectoryMode=0700
+CacheDirectory=kanae-x-scraper
+CacheDirectoryMode=0700
 ExecStart=/home/ubuntu/free-code/x-scraper/.venv/bin/python /home/ubuntu/free-code/x-scraper/mcp_server.py
 Restart=always
 RestartSec=5
@@ -23,21 +29,32 @@ KillMode=control-group
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=mcp-x-scraper-shared
+UMask=0077
 
 # Resource caps. ~59MB observed as stdio child; scraping spins up async HTTP.
 MemoryHigh=200M
 MemoryMax=300M
 LimitNOFILE=4096
 
-# Light hardening.
 NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/kanae-x-scraper /var/cache/kanae-x-scraper
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
 LockPersonality=yes
+MemoryDenyWriteExecute=no
 RestrictRealtime=yes
 SystemCallArchitectures=native
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target

@@ -248,8 +248,11 @@ export async function stdioToStatelessStreamableHttp(args) {
             id: null,
         }));
     });
-    app.listen(port, () => {
-        logger.info(`Listening on port ${port}`);
-        logger.info(`StreamableHttp endpoint: http://localhost:${port}${streamableHttpPath}`);
+    // LOCAL PATCH (2026-07-14, Phase 0B): supergateway 3.4.3 otherwise calls
+    // listen(port) and exposes the unauthenticated Oracle MCP on every host
+    // interface. This shared endpoint is local-only by contract.
+    app.listen(port, '127.0.0.1', () => {
+        logger.info(`Listening on 127.0.0.1:${port}`);
+        logger.info(`StreamableHttp endpoint: http://127.0.0.1:${port}${streamableHttpPath}`);
     });
 }

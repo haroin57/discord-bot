@@ -21,8 +21,9 @@ implementation lives behind the flag and is absent here.
 
 from __future__ import annotations
 
+from ..registry import _local_jsx_command, _metadata_catalog
 from ..runtime import CommandRuntime
-from ..types import JsxOutcome, LocalJsxCommand
+from ..types import JsxOutcome
 
 _CCR_TERMS_URL = "https://code.claude.com/docs/en/claude-code-on-the-web"
 
@@ -35,21 +36,23 @@ def _dialog(name: str):
     return _call
 
 
-def _gated(name: str, description: str, enabled, **kw) -> LocalJsxCommand:
+def _gated(name: str, description: str, enabled, **kw):
     kw.setdefault("call_fn", _dialog(name))
     kw["is_enabled_fn"] = enabled
-    return LocalJsxCommand(name=name, description=description, **kw)
+    return _local_jsx_command(name=name, description=description, **kw)
 
 
-COMMANDS: list[LocalJsxCommand] = [
+_DEFINITIONS = (
     # remote-setup/index.ts — commands.ts gates on feature('CCR_REMOTE_SETUP');
     # the command's own isEnabled adds a GrowthBook flag + policy check.
     _gated(
         "web-setup",
         "Setup Claude Code on the web (requires connecting your GitHub account)",
-        lambda rt: rt.feature("CCR_REMOTE_SETUP")
-        and rt.feature("tengu_cobalt_lantern")
-        and rt.policy_allowed("allow_remote_sessions"),
+        lambda rt: (
+            rt.feature("CCR_REMOTE_SETUP")
+            and rt.feature("tengu_cobalt_lantern")
+            and rt.policy_allowed("allow_remote_sessions")
+        ),
         availability=["claude-ai"],
         is_hidden_fn=lambda rt: not rt.policy_allowed("allow_remote_sessions"),
     ),
@@ -113,4 +116,6 @@ COMMANDS: list[LocalJsxCommand] = [
         "Run the remote-control server for this session",
         lambda rt: rt.feature("DAEMON") and rt.feature("BRIDGE_MODE"),
     ),
-]
+)
+
+COMMANDS = _metadata_catalog(_DEFINITIONS)

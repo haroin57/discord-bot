@@ -3,32 +3,113 @@
 ## Deploy
 
 ```bash
-cd /home/ubuntu/discord-bot
-./scripts/bot-deploy.sh
+sudo -u kanae-deploy /home/ubuntu/discord-bot/scripts/bot-deploy.sh
 ```
 
-The script:
-1. Tags current HEAD as `pre-deploy-YYYYMMDD-HHMMSS` (rollback anchor)
-2. Fast-forwards to `origin/master`
-3. Reinstalls deps if `requirements.lock` changed
-4. Restarts `discord-bot.service` via systemd
-5. Polls `GET /health` up to 6 times (30 s total) — exits 0 on success, 3 on failure
+The script fails closed on a dirty worktree or active rollback pin and holds the
+same `flock` as auto-deploy and rollback. Before changing HEAD it requires the
+staging receipt/readiness gate and a successful snapshot restore rehearsal. It
+then builds immutable SHA-specific external generations, merges the exact
+fetched commit object, atomically switches the single `current` symlink,
+coordinately restarts every affected consumer, and accepts `GET /ready` only
+when every consumer is active and release readiness reports the exact SHA.
+An fsynced `activation.json` is written before the switch. A rerun resumes any
+incomplete consumer sequence before evaluating rollback pins or Git no-op
+conditions.
+
+If smoke or another build hook dirties the merged checkout, the script
+stores patches and non-ignored untracked files under
+`/var/lib/discord-bot-deploy/<env>/quarantine/`, restores a clean blocked SHA,
+switches to the verified old SHA, and leaves `rollback.pin` active.  Inspect the
+quarantine before removing the pin.  Do not restart manually while HEAD still
+equals the pin's `blocked_sha`.
 
 ## Rollback
 
 ```bash
-./scripts/bot-rollback.sh pre-deploy-20260513-120000
+sudo -u kanae-deploy /usr/local/libexec/discord-bot-rollback \
+  pre-deploy-20260513-120000 <expected-old-sha> <blocked-release-sha>
 ```
 
-Lists available tags if no argument is given. HEAD ends in detached state — investigate the bad commit before re-attaching to master.
+Rollback requires the tag to resolve to the exact expected old SHA and HEAD to
+equal either the exact blocked SHA or an already-restored expected old SHA. It
+is idempotent after interruption and replaces an incomplete forward activation
+with a rollback transaction. It writes
+`/var/lib/discord-bot-deploy/prod/rollback.pin` before detaching HEAD and
+restarting. Auto-deploy cannot overwrite that pin. After the incident is
+resolved, verify that HEAD equals `target_sha`, the checkout is clean, and
+`/ready.release_sha` equals `target_sha`; then remove the pin explicitly before
+the next deploy.
+
+```bash
+sudo -u kanae-deploy git -C /home/ubuntu/discord-bot status --short
+target_sha="$(sudo sed -n 's/^target_sha=//p' \
+  /var/lib/discord-bot-deploy/prod/rollback.pin)"
+test "$(sudo -u kanae-deploy git -C /home/ubuntu/discord-bot rev-parse HEAD)" \
+  = "${target_sha}"
+curl -fsS http://127.0.0.1:3002/ready | jq -e \
+  --arg sha "${target_sha}" '.status == "ok" and .release_sha == $sha'
+```
 
 ## Health Check
 
 ```bash
-curl 127.0.0.1:3002/health | jq
+curl -f 127.0.0.1:3002/live | jq
+curl -f 127.0.0.1:3002/ready | jq
+curl -f 127.0.0.1:3002/health | jq  # compatibility alias for /ready
+curl -f 127.0.0.1:3003/ready | jq   # staging identity
+curl -f 127.0.0.1:3004/ready | jq   # Hermes identity
 ```
 
-Expected: `{"status": "ok", ...}` with HTTP 200. Any non-200 or connection refused means the bot is down.
+An unprovisioned checkout or required consumer is an auto-deploy failure and
+triggers the deploy notification path. Planned absence must be declared with a
+root-owned systemd drop-in setting `Environment=AUTO_DEPLOY_DISABLED=1`; no
+implicit missing-service success path exists.
+
+`/live` reports only HTTP-process liveness. `/ready` reports Discord, OAuth,
+Mem0, host, and release identity readiness and returns 503 while degraded.
+OAuth credential absence, unreadability, invalid/expired token content,
+owner/mode violations, and unavailable/invalid release metadata all fail
+closed. `build_sha` and `release_sha` are read from protected metadata at
+process start, so moving
+the checkout without restarting does not make an old process claim a new
+release. `/health` preserves the old readiness route as an alias.
+Startup also verifies `release-content.jsonl`, its metadata digest, every
+regular `src`/`venv` file mode and SHA-256, root ownership, and the absence of
+write permission. A modified generation returns release readiness failure.
+
+```bash
+target_sha="$(sudo -u kanae-deploy python3 -c \
+  'import json; print(json.load(open("/var/lib/discord-bot-releases/prod/current/release.json"))["release_sha"])')"
+curl -fsS http://127.0.0.1:3002/ready | jq -e \
+  --arg sha "${target_sha}" '.status == "ok" and .release_sha == $sha'
+```
+
+## Source ACL and state boundary verification
+
+Provision source traversal, OAuth credentials, and per-service state by
+following `deploy/OPERATIONS_SECURITY.md`.  Before starting a revised unit,
+verify the effective UID can traverse the mode-`0750` home directory and can
+read but not write the checkout.
+
+```bash
+sudo -u kanae-bot test -x /home/ubuntu
+sudo -u kanae-bot test -x /var/lib/discord-bot-releases/prod/current/venv/bin/python
+sudo -u kanae-bot test -r /var/lib/discord-bot-releases/prod/current/src/main_async.py
+! sudo -u kanae-bot test -w /var/lib/discord-bot-releases/prod/current/src/main_async.py
+sudo -u kanae-bot test -w /var/lib/kanae-bot/state
+! sudo -u kanae-mem0 test -w /var/lib/kanae-bot/state/sessions.json
+sudo -u kanae-bot stat -c '%U:%G %a' \
+  /var/lib/kanae-bot/.claude/.credentials.json
+sudo -u kanae-bot test -r /var/lib/discord-bot-releases/prod/current/release.json
+! sudo -u kanae-bot test -r /home/ubuntu/discord-bot/.git/HEAD
+```
+
+Expected credential output is `kanae-bot:kanae-bot 600`.  Expected state is
+private mode `0700` with no `kanae-state` supplementary group.  Start in this
+order: `chromadb-server`, MCP daemons, schedulers, `hermes-discord-codex`, then
+`discord-bot`.  Verify every service before archiving the old checkout
+`.state`.
 
 ## Logs
 
@@ -39,11 +120,16 @@ journalctl -u discord-bot -n 200    # last 200 lines
 
 ## Disaster Recovery
 
-Backups are written to `~/.local/state/discord-bot/backups/`.
+Backups are written to `/var/lib/discord-bot-backup/snapshots/` from the
+root-owned `/etc/discord-bot/backup-state.inventory`. WAL/SHM physical churn is
+not a retry condition; consistency is proven from each `.backup` result and its
+logical digest. Any SQLite main-database path addition or deletion during the
+attempt discards that attempt. Snapshot publication fsyncs the complete tree
+and rename parents.
 
 To restore:
 1. Stop the service: `sudo systemctl stop discord-bot`
-2. Identify the latest backup: `ls -lt ~/.local/state/discord-bot/backups/ | head`
+2. Identify the latest backup: `ls -lt /var/lib/discord-bot-backup/snapshots/ | head`
 3. Copy the backup files back to their expected paths (sessions JSON, Mem0 DB, etc.)
 4. Start the service: `sudo systemctl start discord-bot`
 5. Confirm health: `curl 127.0.0.1:3002/health | jq`
@@ -102,12 +188,14 @@ sudo systemctl start discord-bot
 リファクタ期間中、state/session/fallback/mem0 を触る PR の本番反映は必ずこの順で行う:
 
 ```bash
-# 1. 整合スナップショット（無停止・SQLite .backup API）+ 復元リハーサル
-scripts/snapshot_state.sh                     # → ~/.local/state/discord-bot/refactor-snapshots/<ts>
+# 1. 明示inventoryによる整合スナップショット + 復元リハーサル
+sudo -u kanae-backup env \
+  SNAPSHOT_STATE_INVENTORY=/etc/discord-bot/backup-state.inventory \
+  SNAPSHOT_ROOT=/var/lib/discord-bot-backup/snapshots scripts/snapshot_state.sh
 scripts/snapshot_state.sh --verify <snap-dir> # integrity_check まで通ることを確認
 
 # 2. 再起動前スモーク（red なら再起動しない）
-scripts/smoke_bot.sh
+BOT_VENV=/var/lib/discord-bot-releases/prod/current/venv scripts/smoke_bot.sh
 
 # 3. 再起動（深夜帯推奨）
 sudo systemctl restart discord-bot
@@ -284,9 +372,16 @@ traceback を `#bot-mcp-log`（channel_id 1522739163412168885）へ配信する�
 
 ### 自動デプロイ (pull 型, scripts/auto_deploy.sh)
 - systemd timer (discord-bot-autodeploy.timer / -dev-autodeploy.timer, 5分毎)
-- origin を fetch → **CI (test.yml) が該当 SHA で conclusion=success の時のみ** ff pull + restart + /health ゲート
-- prod は health 失敗時に pre-deploy タグへ自動 rollback、通知は kanae-notify 経由
-- dev は rollback せず通知のみ (壊れてよい)
+- `flock`取得とdirty-worktree・rollback pin検査後にoriginをfetchする。
+- **CI (test.yml) が該当 SHA で conclusion=success の時のみ** ff pull対象とする。
+- devは新しいtreeでsmokeを実行し、`/ready`成功時だけ
+  `/var/lib/discord-bot-deploy/dev/successful.sha`を原子的に更新する。
+- prodはdev receiptのSHAが対象commitと完全一致し、dev `/ready`のJSONが
+  `status=ok`であることを要求する。
+- prodは状態snapshotと復元リハーサル後にrestartし、5秒間隔・既定36回（180秒）の`/ready`失敗で自動rollbackする。
+- rollbackはtag、期待旧SHA、失敗SHAを外部pinへ固定し、以後のauto deployを停止する。
+- rollback runnerとprotected manifestはcheckout外のroot-owned trust rootを使用する。
+- botとdeployは別UIDで動作し、bot unitはsourceと`.git`へ書き込めない。
 
 ### ブランチ保護 (pre-push hook)
 - **master / dev への直接 push はローカル hook がブロック**する。必ず feature ブランチ → PR 経由

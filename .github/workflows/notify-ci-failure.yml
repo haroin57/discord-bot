@@ -1,6 +1,6 @@
 name: notify-ci-failure
 
-# test / lint / security のいずれかが conclusion=failure で完了したら Discord に通知する。
+# test / lint / security / trusted-release のいずれかが failure なら通知する。
 # GitHub Actions には CI 失敗を直接 Discord へ流す仕組みが無く、これまでは
 # auto_deploy.sh の poll (5分毎・デプロイ対象ブランチ限定) が間接的に拾うだけだった。
 # workflow_run はデフォルトブランチ(master)にあるこのファイルが評価されるため、
@@ -11,11 +11,10 @@ name: notify-ci-failure
 #   それ以外 (dev/feature/PR) → DISCORD_WEBHOOK_DEV(+_2)
 on:
   workflow_run:
-    workflows: [test, lint, security]
+    workflows: [test, lint, security, trusted-release]
     types: [completed]
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   notify:

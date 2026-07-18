@@ -30,7 +30,11 @@ from utils.attachments import (
 # extension-spoofing exfiltration of .env etc.), so test fixtures need real
 # headers.
 _MAGIC = {
-    "png": b"\x89PNG\r\n\x1a\n" + b"\x00" * 8,
+    "png": (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc````"
+        b"\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND\xaeB\x60\x82"
+    ),
     "jpg": b"\xff\xd8\xff\xe0" + b"\x00" * 8,
     "jpeg": b"\xff\xd8\xff\xe0" + b"\x00" * 8,
     "gif": b"GIF89a" + b"\x00" * 8,
@@ -291,7 +295,9 @@ class TestExtractFilePathsDenylist:
 
 
 class TestDownloadAttachments:
-    def _make_attachment(self, content_type="image/png", size=1000, filename="test.png", att_id=1):
+    def _make_attachment(
+        self, content_type="image/png", size=1000, filename="test.png", att_id=1
+    ):
         att = MagicMock()
         att.content_type = content_type
         att.size = size
@@ -354,7 +360,9 @@ class TestHostIsAllowed:
         assert _host_is_allowed("https://media.discordapp.net/attachments/1/2/test.png")
 
     def test_http_rejected(self):
-        assert not _host_is_allowed("http://cdn.discordapp.com/attachments/1/2/test.png")
+        assert not _host_is_allowed(
+            "http://cdn.discordapp.com/attachments/1/2/test.png"
+        )
 
     def test_non_discord_host_rejected(self):
         assert not _host_is_allowed("https://evil.example.com/malware.png")
@@ -388,11 +396,15 @@ class TestHasImageMagic:
 
 class TestLoadAttachignore:
     def test_returns_empty_when_file_missing(self, monkeypatch):
-        monkeypatch.setattr("utils.attachments._ATTACHIGNORE_PATH", "/nonexistent/.attachignore")
+        monkeypatch.setattr(
+            "utils.attachments._ATTACHIGNORE_PATH", "/nonexistent/.attachignore"
+        )
         import utils.attachments as ua
+
         ua._attachignore_cache = None
         ua._attachignore_mtime = -1.0
         from utils.attachments import _load_attachignore
+
         result = _load_attachignore()
         assert result == []
 
@@ -401,9 +413,11 @@ class TestLoadAttachignore:
         afile.write_text("*.secret\n# comment\n\n*.db\n")
         monkeypatch.setattr("utils.attachments._ATTACHIGNORE_PATH", str(afile))
         import utils.attachments as ua
+
         ua._attachignore_cache = None
         ua._attachignore_mtime = -1.0
         from utils.attachments import _load_attachignore
+
         patterns = _load_attachignore()
         assert "*.secret" in patterns
         assert "*.db" in patterns
@@ -414,9 +428,11 @@ class TestLoadAttachignore:
         afile.write_text("*.key\n")
         monkeypatch.setattr("utils.attachments._ATTACHIGNORE_PATH", str(afile))
         import utils.attachments as ua
+
         ua._attachignore_cache = None
         ua._attachignore_mtime = -1.0
         from utils.attachments import _load_attachignore
+
         r1 = _load_attachignore()
         r2 = _load_attachignore()
         assert r1 is r2  # same object returned from cache
@@ -428,6 +444,7 @@ class TestIsAttachIgnored:
         afile.write_text("*.secret\n")
         monkeypatch.setattr("utils.attachments._ATTACHIGNORE_PATH", str(afile))
         import utils.attachments as ua
+
         ua._attachignore_cache = None
         ua._attachignore_mtime = -1.0
         target = tmp_path / "mytoken.secret"
@@ -439,6 +456,7 @@ class TestIsAttachIgnored:
         afile.write_text("*.secret\n")
         monkeypatch.setattr("utils.attachments._ATTACHIGNORE_PATH", str(afile))
         import utils.attachments as ua
+
         ua._attachignore_cache = None
         ua._attachignore_mtime = -1.0
         target = tmp_path / "report.csv"
@@ -446,8 +464,11 @@ class TestIsAttachIgnored:
         assert not is_attach_ignored(str(target))
 
     def test_empty_patterns(self, monkeypatch):
-        monkeypatch.setattr("utils.attachments._ATTACHIGNORE_PATH", "/nonexistent/.attachignore")
+        monkeypatch.setattr(
+            "utils.attachments._ATTACHIGNORE_PATH", "/nonexistent/.attachignore"
+        )
         import utils.attachments as ua
+
         ua._attachignore_cache = None
         ua._attachignore_mtime = -1.0
         assert not is_attach_ignored("/home/ubuntu/file.txt")
@@ -473,8 +494,11 @@ class TestNormalizeImageFilenames:
     def test_ambiguous_not_replaced(self, tmp_path, monkeypatch):
         dir1 = tmp_path / "d1"
         dir2 = tmp_path / "d2"
-        dir1.mkdir(); dir2.mkdir()
-        monkeypatch.setattr("utils.attachments._IMAGE_SEARCH_DIRS", (str(dir1), str(dir2)))
+        dir1.mkdir()
+        dir2.mkdir()
+        monkeypatch.setattr(
+            "utils.attachments._IMAGE_SEARCH_DIRS", (str(dir1), str(dir2))
+        )
         (dir1 / "pic.png").write_bytes(_MAGIC["png"])
         (dir2 / "pic.png").write_bytes(_MAGIC["png"])
         result = normalize_image_filenames("show pic.png")
@@ -507,7 +531,8 @@ class TestExtractImagePathsAdmin:
     def test_symlink_escape_rejected(self, tmp_path, monkeypatch):
         allowed = tmp_path / "allowed"
         outside = tmp_path / "outside"
-        allowed.mkdir(); outside.mkdir()
+        allowed.mkdir()
+        outside.mkdir()
         monkeypatch.setattr("utils.attachments.ALLOWED_IMAGE_DIRS", (str(allowed),))
         real_img = outside / "secret.png"
         real_img.write_bytes(_MAGIC["png"])
@@ -658,8 +683,14 @@ class TestCleanupAttachmentsAsync:
 
 
 class TestDownloadAttachmentsExtra:
-    def _make_att(self, content_type="image/png", size=1000, filename="test.png", att_id=1,
-                  url="https://cdn.discordapp.com/attachments/1/2/test.png"):
+    def _make_att(
+        self,
+        content_type="image/png",
+        size=1000,
+        filename="test.png",
+        att_id=1,
+        url="https://cdn.discordapp.com/attachments/1/2/test.png",
+    ):
         att = MagicMock()
         att.content_type = content_type
         att.size = size
@@ -735,8 +766,13 @@ class TestDownloadAttachmentsExtra:
 
 
 class TestDownloadTextAttachments:
-    def _make_text_att(self, content_type="text/plain", size=100, filename="msg.txt",
-                       url="https://cdn.discordapp.com/attachments/1/1/msg.txt"):
+    def _make_text_att(
+        self,
+        content_type="text/plain",
+        size=100,
+        filename="msg.txt",
+        url="https://cdn.discordapp.com/attachments/1/1/msg.txt",
+    ):
         att = MagicMock()
         att.content_type = content_type
         att.size = size
@@ -788,7 +824,9 @@ class TestDownloadTextAttachments:
     async def test_caps_at_max_text_attachments(self, monkeypatch):
         monkeypatch.setattr("utils.attachments.MAX_TEXT_ATTACHMENTS", 2)
         atts = [self._make_text_att(filename=f"f{i}.txt") for i in range(5)]
-        with patch("utils.attachments._download_text_one", new=AsyncMock(return_value=None)):
+        with patch(
+            "utils.attachments._download_text_one", new=AsyncMock(return_value=None)
+        ):
             result = await download_text_attachments(MagicMock(), atts)
         assert result == []
 
@@ -797,7 +835,8 @@ class TestCleanupStaleAttachmentsMultiDir:
     def test_cleans_multiple_dirs(self, tmp_path, monkeypatch):
         d1 = tmp_path / "mermaid"
         d2 = tmp_path / "table"
-        d1.mkdir(); d2.mkdir()
+        d1.mkdir()
+        d2.mkdir()
         monkeypatch.setattr("config.ATTACHMENT_DIR", str(tmp_path / "att"))
         (tmp_path / "att").mkdir()
         monkeypatch.setattr("config.MERMAID_OUTPUT_DIR", str(d1))
@@ -806,8 +845,10 @@ class TestCleanupStaleAttachmentsMultiDir:
         (tmp_path / "math").mkdir()
         old1 = d1 / "old.png"
         old2 = d2 / "old.png"
-        old1.write_bytes(b"x"); old2.write_bytes(b"x")
-        os.utime(old1, (0, 0)); os.utime(old2, (0, 0))
+        old1.write_bytes(b"x")
+        old2.write_bytes(b"x")
+        os.utime(old1, (0, 0))
+        os.utime(old2, (0, 0))
         cleanup_stale_attachments()
         assert not old1.exists()
         assert not old2.exists()
@@ -854,8 +895,11 @@ class TestDownloadArbitraryAttachments:
     had no way to surface it to kanae.
     """
 
-    def _make_att(self, *, content_type=None, size=1000, filename="Zero Gravity.als", att_id=42):
+    def _make_att(
+        self, *, content_type=None, size=1000, filename="Zero Gravity.als", att_id=42
+    ):
         from unittest.mock import MagicMock
+
         att = MagicMock()
         att.content_type = content_type
         att.size = size
@@ -867,48 +911,64 @@ class TestDownloadArbitraryAttachments:
     @pytest.mark.asyncio
     async def test_returns_empty_for_non_admin(self, tmp_attachment_dir):
         from utils.attachments import download_arbitrary_attachments
+
         att = self._make_att(content_type="application/octet-stream")
         session = MagicMock()
         result = await download_arbitrary_attachments(
-            session, [att], caller_is_admin=False,
+            session,
+            [att],
+            caller_is_admin=False,
         )
         assert result == []
 
     @pytest.mark.asyncio
     async def test_skips_image_and_text_types(self, tmp_attachment_dir):
         from utils.attachments import download_arbitrary_attachments
+
         atts = [
             self._make_att(content_type="image/png", filename="x.png", att_id=1),
             self._make_att(content_type="text/plain", filename="x.txt", att_id=2),
-            self._make_att(content_type="application/json", filename="x.json", att_id=3),
+            self._make_att(
+                content_type="application/json", filename="x.json", att_id=3
+            ),
         ]
         session = MagicMock()
         result = await download_arbitrary_attachments(
-            session, atts, caller_is_admin=True,
+            session,
+            atts,
+            caller_is_admin=True,
         )
         assert result == []
 
     @pytest.mark.asyncio
     async def test_downloads_unknown_mime(self, tmp_attachment_dir):
         from utils.attachments import download_arbitrary_attachments
+
         att = self._make_att(content_type=None, filename="Zero Gravity.als")
 
         # Mock the streaming body so we don't hit the network.
         class _StreamCtx:
             status = 200
+
             class content:
                 @staticmethod
                 async def iter_chunked(_n):
                     for chunk in [b"PK\x03\x04", b"fake-als-body" * 10]:
                         yield chunk
-            async def __aenter__(self): return self
-            async def __aexit__(self, *a): return False
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
 
         session = MagicMock()
         session.get = MagicMock(return_value=_StreamCtx())
 
         result = await download_arbitrary_attachments(
-            session, [att], caller_is_admin=True,
+            session,
+            [att],
+            caller_is_admin=True,
         )
         assert len(result) == 1
         meta = result[0]
@@ -926,42 +986,52 @@ class TestDownloadArbitraryAttachments:
             download_arbitrary_attachments,
             MAX_ARBITRARY_ATTACHMENT_BYTES,
         )
+
         att = self._make_att(
             content_type="application/octet-stream",
             size=MAX_ARBITRARY_ATTACHMENT_BYTES + 1,
         )
         session = MagicMock()
         result = await download_arbitrary_attachments(
-            session, [att], caller_is_admin=True,
+            session,
+            [att],
+            caller_is_admin=True,
         )
         assert result == []
 
     @pytest.mark.asyncio
     async def test_rejects_denylisted_extension(self, tmp_attachment_dir):
         from utils.attachments import download_arbitrary_attachments
+
         att = self._make_att(
             content_type="application/octet-stream",
             filename="payload.exe",
         )
         session = MagicMock()
         result = await download_arbitrary_attachments(
-            session, [att], caller_is_admin=True,
+            session,
+            [att],
+            caller_is_admin=True,
         )
         assert result == []
 
     @pytest.mark.asyncio
     async def test_rejects_non_discord_host(self, tmp_attachment_dir):
         from utils.attachments import download_arbitrary_attachments
+
         att = self._make_att(content_type="application/octet-stream")
         att.url = "https://evil.example.com/payload.bin"
         session = MagicMock()
         result = await download_arbitrary_attachments(
-            session, [att], caller_is_admin=True,
+            session,
+            [att],
+            caller_is_admin=True,
         )
         assert result == []
 
     def test_sanitize_basename_strips_path_separators(self):
         from utils.attachments import _sanitize_basename
+
         # Forward slash is stripped by os.path.basename, '\' is replaced
         # by the regex on POSIX. Either way no path-component separator
         # survives, which is what the realpath guard relies on.
@@ -970,11 +1040,136 @@ class TestDownloadArbitraryAttachments:
 
     def test_sanitize_basename_preserves_japanese(self):
         from utils.attachments import _sanitize_basename
+
         # Japanese chars are \w under re.UNICODE so they survive.
         assert _sanitize_basename("耳コピ.als") == "耳コピ.als"
 
     def test_sanitize_basename_caps_length(self):
         from utils.attachments import _sanitize_basename
+
         long_name = "a" * 200 + ".als"
         result = _sanitize_basename(long_name)
         assert len(result) <= 80
+
+
+@pytest.mark.asyncio
+async def test_downloader_owner_cancels_and_awaits_children():
+    from utils.attachment_downloader import gather_owned
+
+    started = [asyncio.Event(), asyncio.Event()]
+    finalized = [asyncio.Event(), asyncio.Event()]
+
+    async def child(index: int):
+        started[index].set()
+        try:
+            await asyncio.Future()
+        finally:
+            finalized[index].set()
+
+    owner = asyncio.create_task(gather_owned([child(0), child(1)]))
+    await asyncio.gather(*(event.wait() for event in started))
+    owner.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+
+    assert all(event.is_set() for event in finalized)
+
+
+@pytest.mark.asyncio
+async def test_image_download_cancel_removes_part_file(tmp_path):
+    from utils.attachment_downloader import download_image
+
+    started = asyncio.Event()
+
+    class Content:
+        async def iter_chunked(self, _size):
+            yield b"partial"
+            started.set()
+            await asyncio.Future()
+
+    class Response:
+        status = 200
+        content = Content()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    session = MagicMock()
+    session.get.return_value = Response()
+    attachment = MagicMock(
+        id=123,
+        size=0,
+        filename="image.png",
+        url="https://cdn.discordapp.com/image.png",
+    )
+    task = asyncio.create_task(
+        download_image(
+            session,
+            attachment,
+            attachment_dir=str(tmp_path),
+            max_bytes=1024,
+            semaphore=asyncio.Semaphore(1),
+            host_check=lambda _url: True,
+        ),
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_binary_download_cancel_removes_part_file(tmp_path):
+    from utils.attachment_downloader import download_arbitrary
+
+    started = asyncio.Event()
+
+    class Content:
+        async def iter_chunked(self, _size):
+            yield b"partial"
+            started.set()
+            await asyncio.Future()
+
+    class Response:
+        status = 200
+        content = Content()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    session = MagicMock()
+    session.get.return_value = Response()
+    attachment = MagicMock(
+        id=456,
+        size=0,
+        filename="archive.bin",
+        content_type="application/octet-stream",
+        url="https://cdn.discordapp.com/archive.bin",
+    )
+    task = asyncio.create_task(
+        download_arbitrary(
+            session,
+            attachment,
+            attachment_dir=str(tmp_path),
+            max_bytes=1024,
+            denied_extensions=frozenset(),
+            semaphore=asyncio.Semaphore(1),
+            host_check=lambda _url: True,
+            sanitize_basename=lambda name: name,
+        ),
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert list(tmp_path.iterdir()) == []

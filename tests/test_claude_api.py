@@ -116,16 +116,6 @@ class TestTokenExpiry:
         assert om._is_expired() is True
 
 
-class TestLoadOAuthTokens:
-    @pytest.mark.skip(reason="_load_oauth_tokens moved to oauth_manager; not exported from claude_api")
-    def test_loads_from_credentials(self):
-        pass
-
-    @pytest.mark.skip(reason="_load_oauth_tokens moved to oauth_manager; not exported from claude_api")
-    def test_raises_on_missing_file(self):
-        pass
-
-
 class TestGetClient:
     def test_creates_client(self, monkeypatch):
         from services.claude_api import get_client

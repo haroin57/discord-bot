@@ -9,23 +9,25 @@ in each runner module. (P1-b of docs/2026-07-03-grand-refactor-plan.md.)
 
 from __future__ import annotations
 
-import asyncio
-import os
 import time
 from collections.abc import Awaitable, Callable
 
+from services.claude_api.subprocess_runner import (
+    build_allowlisted_env,
+    deadline_after,
+    run_subprocess,
+    SubprocessDeadlineExceeded,
+)
+
 
 def clean_env(strip_keys: tuple[str, ...]) -> dict:
-    """Copy of os.environ without `strip_keys`.
+    """Build the allowlisted child environment without `strip_keys`.
 
     A present API key makes both CLIs bypass their OAuth credential store and
     bill the metered API instead — removal is what forces the subscription
     path, so this must be applied to every subprocess spawn.
     """
-    env = dict(os.environ)
-    for k in strip_keys:
-        env.pop(k, None)
-    return env
+    return build_allowlisted_env(remove=strip_keys)
 
 
 class AvailabilityCache:
@@ -50,7 +52,7 @@ class AvailabilityCache:
 async def run_cli(
     argv: "list[str]",
     *,
-    timeout_s: int,
+    timeout_s: float,
     env: dict,
     cwd: "str | None",
     label: str,
@@ -62,25 +64,14 @@ async def run_cli(
       stdout-loss bug and keeps signals away from the bot process group).
     - On timeout the process is killed and RuntimeError is raised.
     """
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-        start_new_session=True,
-        cwd=cwd,
-    )
     try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await asyncio.gather(proc.wait(), return_exceptions=True)
-        raise RuntimeError(f"{label} timed out after {timeout_s}s")
-    stdout = (stdout_b or b"").decode("utf-8", "replace")
-    stderr = (stderr_b or b"").decode("utf-8", "replace")
-    return proc.returncode, stdout, stderr
+        result = await run_subprocess(
+            argv,
+            deadline=deadline_after(timeout_s),
+            env=env,
+            cwd=cwd,
+            label=label,
+        )
+    except SubprocessDeadlineExceeded as exc:
+        raise RuntimeError(f"{label} timed out after {timeout_s}s") from exc
+    return result.returncode, result.stdout, result.stderr

@@ -12,11 +12,15 @@ tier 十分なら正規に届く）。ChatGPT の Web 自動化（ブラウザ�
 
 ## 構成
 - 本体: `npm install -g @steipete/oracle`（Node 24+、volta の node を使用）
-- ランチャー: `scripts/oracle_mcp_launch.sh`
+- gatewayランチャー: `scripts/oracle_supergateway_launch.sh`
+  - supergatewayパッチをNodeのmodule load前に適用・検証する
+  - loopback bindパッチがなければfail closedし、8015 listenerを作らない
+- Oracleランチャー: `scripts/oracle_mcp_launch.sh`
   - PATH に `~/.volta/bin` を足す（CLI spawn 時の最小 PATH 対策）
-  - `.env` から `OPENAI_API_KEY`（と `GOOGLE_AI_API_KEY`→`GEMINI_API_KEY`）を実行時注入
-    （キーを `.mcp.json` に直書きせず git に乗せない）
+  - systemdの`.env.mcp-oracle`から継承した`OPENAI_API_KEY`を必須検証する
+  - `GOOGLE_AI_API_KEY`があれば`GEMINI_API_KEY`へ写す
 - 登録: `.mcp.json` の `mcpServers.oracle`
+- listener: `127.0.0.1:8015/mcp`のみ。認証なしのため外部bindは禁止する
 
 ## 公開ツール（oracle-mcp）
 - `consult` — Oracle session を実行（`prompt`, `model`, `files` 等）。**これがメイン**。

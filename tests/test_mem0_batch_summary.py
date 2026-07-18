@@ -6,58 +6,36 @@ extractor then capped its whole input at 2000 chars — so a 10-turn batch
 per-turn cut. These tests pin a configurable, testable summary builder.
 """
 
-import sys
-import types
-from unittest.mock import AsyncMock, MagicMock
-
 import pytest
 
 
-def _ensure_stub(name: str, **attrs):
-    if name not in sys.modules:
-        mod = types.ModuleType(name)
-        for k, v in attrs.items():
-            setattr(mod, k, v)
-        sys.modules[name] = mod
-    return sys.modules[name]
+@pytest.fixture
+def build_batch_summary():
+    from services.mem0.batch import build_batch_summary as builder
 
-
-_ensure_stub("services.oauth_manager",
-             ensure_valid_token=AsyncMock(),
-             get_access_token=MagicMock(return_value="tok"),
-             init=MagicMock(),
-             make_async_oauth_client=MagicMock(),
-             prime_subscriber_session=AsyncMock(),
-             get_client=MagicMock(),
-             OAuthRefreshFailed=type("OAuthRefreshFailed", (Exception,), {}),
-             failback_to_primary=MagicMock(),
-             failover_to_secondary=AsyncMock(),
-             get_active_account=MagicMock(return_value="primary"),
-             maybe_restore_primary=AsyncMock())
-
-from services.mem0.batch import build_batch_summary  # noqa: E402
+    return builder
 
 
 class TestBuildBatchSummary:
-    def test_format_is_user_assistant_lines(self):
+    def test_format_is_user_assistant_lines(self, build_batch_summary):
         turns = [{"user": "好きな酒は?", "assistant": "ウイスキーです"}]
         out = build_batch_summary(turns)
         assert "user: 好きな酒は?" in out
         assert "assistant: ウイスキーです" in out
 
-    def test_respects_turn_char_cap(self):
+    def test_respects_turn_char_cap(self, build_batch_summary):
         turns = [{"user": "あ" * 2000, "assistant": "い" * 2000}]
         out = build_batch_summary(turns, turn_chars=600)
         assert out.count("あ") == 600
         assert out.count("い") == 600
 
-    def test_default_cap_larger_than_old_300(self):
+    def test_default_cap_larger_than_old_300(self, build_batch_summary):
         # Regression guard: the old hard 300 gutted long technical turns.
         turns = [{"user": "x" * 800, "assistant": ""}]
         out = build_batch_summary(turns)
         assert out.count("x") > 300
 
-    def test_multiple_turns_joined(self):
+    def test_multiple_turns_joined(self, build_batch_summary):
         turns = [
             {"user": "u1", "assistant": "a1"},
             {"user": "u2", "assistant": "a2"},
@@ -65,9 +43,9 @@ class TestBuildBatchSummary:
         out = build_batch_summary(turns)
         assert "u1" in out and "u2" in out and "a1" in out and "a2" in out
 
-    def test_missing_keys_safe(self):
+    def test_missing_keys_safe(self, build_batch_summary):
         out = build_batch_summary([{"user": "only-user"}])
         assert "only-user" in out
 
-    def test_empty_turns(self):
+    def test_empty_turns(self, build_batch_summary):
         assert build_batch_summary([]) == ""

@@ -16,10 +16,7 @@ the raw PNG bytes (or ``None``). It never raises to the caller.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-
-import aiohttp
 
 from config import (
     CF_ACCOUNT_ID,
@@ -28,6 +25,7 @@ from config import (
     CF_BROWSER_RENDERING_TOKEN,
     CF_BROWSER_RENDERING_URL,
 )
+from utils.browser_backend import render_remote_screenshot
 
 __all__ = ["render_screenshot", "is_configured"]
 
@@ -66,76 +64,16 @@ async def render_screenshot(
     ``None`` so callers fall back to text. Retries ``CF_BROWSER_RENDERING_RETRIES``
     times on network / 5xx / 429.
     """
-    if not is_configured():
-        log.warning(
-            "Cloudflare Browser Rendering not configured "
-            "(CF_BROWSER_RENDERING_TOKEN/CF_ACCOUNT_ID missing); skipping render"
-        )
-        return None
-
-    body: dict = {"html": html}
-    if selector:
-        body["selector"] = selector
-
-    screenshot_options: dict = {}
-    if omit_background:
-        screenshot_options["omitBackground"] = True
-    if screenshot_options:
-        body["screenshotOptions"] = screenshot_options
-
-    if device_scale_factor is not None:
-        # viewport.deviceScaleFactor drives HiDPI capture on the remote browser.
-        # The API's viewport schema requires width+height too, so supply the old
-        # daemon's math viewport (800x600 — the element is selector-clipped
-        # afterwards, so these only bound the page, not the output crop).
-        body["viewport"] = {
-            "width": 800,
-            "height": 600,
-            "deviceScaleFactor": device_scale_factor,
-        }
-
-    goto_options: dict = {"timeout": goto_timeout_ms}
-    if wait_for_network_idle:
-        goto_options["waitUntil"] = "networkidle0"
-    body["gotoOptions"] = goto_options
-
-    headers = {
-        "Authorization": f"Bearer {CF_BROWSER_RENDERING_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    timeout = aiohttp.ClientTimeout(total=CF_BROWSER_RENDERING_TIMEOUT_S)
-
-    attempts = max(1, CF_BROWSER_RENDERING_RETRIES + 1)
-    for attempt in range(attempts):
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    CF_BROWSER_RENDERING_URL, json=body, headers=headers
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.read()
-                        if data:
-                            return data
-                        log.error("Browser Rendering returned 200 but empty body")
-                        return None
-                    # A 4xx other than 429 is a request-shape / auth problem —
-                    # retrying will not help, so bail immediately.
-                    transient = resp.status == 429 or resp.status >= 500
-                    detail = (await resp.text())[:400]
-                    log.error(
-                        "Browser Rendering HTTP %s (attempt %d/%d): %s",
-                        resp.status, attempt + 1, attempts, detail,
-                    )
-                    if not transient:
-                        return None
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            log.error(
-                "Browser Rendering request failed (attempt %d/%d): %s",
-                attempt + 1, attempts, e,
-            )
-
-        # Brief backoff before the retry (skip after the final attempt).
-        if attempt < attempts - 1:
-            await asyncio.sleep(1.0)
-
-    return None
+    return await render_remote_screenshot(
+        html,
+        token=CF_BROWSER_RENDERING_TOKEN,
+        account_id=CF_ACCOUNT_ID,
+        url=CF_BROWSER_RENDERING_URL,
+        timeout_seconds=CF_BROWSER_RENDERING_TIMEOUT_S,
+        retries=CF_BROWSER_RENDERING_RETRIES,
+        selector=selector,
+        device_scale_factor=device_scale_factor,
+        wait_for_network_idle=wait_for_network_idle,
+        goto_timeout_ms=goto_timeout_ms,
+        omit_background=omit_background,
+    )

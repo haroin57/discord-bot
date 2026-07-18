@@ -7,6 +7,7 @@ carries the right metadata (``progress_message``, ``allowed_tools``, ``source``)
 
 from __future__ import annotations
 
+from free_code_commands import build_registry
 from free_code_commands.commands import prompt_commands as pc
 from free_code_commands.runtime import Attribution, RecordingRuntime, ShellResult
 
@@ -16,7 +17,10 @@ def _by_name(name):
 
 
 async def _text(cmd, args, rt):
-    blocks = await cmd.get_prompt_for_command(args, rt)
+    text = f"/{cmd.name} {args}".rstrip()
+    invocation = await build_registry().invoke(text, rt)
+    assert invocation is not None
+    blocks = invocation.result
     assert len(blocks) == 1 and blocks[0].type == "text"
     return blocks[0].text
 
@@ -30,11 +34,11 @@ async def test_commit_metadata():
     commit = _by_name("commit")
     assert commit.progress_message == "creating commit"
     assert commit.source == "builtin"
-    assert commit.allowed_tools == [
+    assert commit.allowed_tools == (
         "Bash(git add:*)",
         "Bash(git status:*)",
         "Bash(git commit:*)",
-    ]
+    )
 
 
 async def test_commit_prompt_expands_shell_and_contains_template():
@@ -57,7 +61,9 @@ async def test_commit_prompt_expands_shell_and_contains_template():
 
 
 async def test_commit_appends_attribution_when_present():
-    rt = RecordingRuntime(attribution=Attribution(commit="Co-Authored-By: Claude <noreply@anthropic.com>"))
+    rt = RecordingRuntime(
+        attribution=Attribution(commit="Co-Authored-By: Claude <noreply@anthropic.com>")
+    )
     text = await _text(_by_name("commit"), "", rt)
     assert "Co-Authored-By: Claude <noreply@anthropic.com>" in text
 
@@ -134,7 +140,12 @@ async def test_statusline_default_and_custom_prompt():
 
 
 async def test_statusline_is_non_interactive_disabled():
-    assert _by_name("statusline").disable_non_interactive is True
+    assert _by_name("statusline").supports_non_interactive is False
+    invocation = await build_registry().invoke(
+        "/statusline",
+        RecordingRuntime(non_interactive=True),
+    )
+    assert invocation is None
 
 
 async def test_insights_headless_shape():

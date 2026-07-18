@@ -218,6 +218,14 @@ def capture(monkeypatch):
     # Silence mem0
     monkeypatch.setattr("bot.search_memories", AsyncMock(return_value=[]))
     monkeypatch.setattr("bot.add_memories", AsyncMock(return_value=None))
+    # The production bot owns and closes one long-lived aiohttp session during
+    # shutdown. This isolated on_message harness has no bot shutdown phase, so
+    # use a non-network session double instead of leaking a real ClientSession
+    # at pytest process exit.
+    monkeypatch.setattr(
+        "bot.get_http_session",
+        AsyncMock(return_value=MagicMock()),
+    )
     # Silence attachment cleanup so we don't touch real tmp paths
     monkeypatch.setattr("bot.cleanup_attachments", lambda paths: None)
     return cap

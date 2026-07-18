@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .env
 .env.hermes-discord
+.env.*
 .state/
 .state-hermes-discord/
 .claude/
@@ -45,3 +46,7 @@ credentials*.json
 # dumps. Only redacted JSON (produced by scripts/redact_capture.py) is safe.
 *.mitm
 docs/captures/**/*_raw.json
+
+# Personal / local-only (quarantined 2026-07-18)
+docs/homelab_*
+kanae_alarm_mcp_server.py

@@ -12,6 +12,7 @@ import logging
 import re
 
 from .types import ResearchState, SourceRef
+from .evidence_registry import verify_citation_support
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ _URL_RE = re.compile(r'https?://[^\s"\'<>)\]}]+')
 _URL_KEYS = ("url", "URL", "link", "href", "uri", "permalink")
 _TITLE_KEYS = ("title", "name", "heading")
 _SNIPPET_KEYS = ("description", "snippet", "content", "text", "summary", "body")
+_LOCAL_RECORD_SPLIT_RE = re.compile(r"\s*(?:[;；|]|\s[-–—]\s)\s*")
 
 
 def _source_type_for(tool_name: str) -> str:
@@ -62,13 +64,71 @@ def _extract_from_json(raw: str):
 
 def _extract_from_text(raw: str) -> list[tuple[str, str, str]]:
     out: list[tuple[str, str, str]] = []
-    for m in _URL_RE.finditer(raw or ""):
-        url = m.group(0).rstrip(".,);:'\"")
-        out.append(("", url, ""))
+    lines = (raw or "").splitlines() or [raw or ""]
+
+    def url_only(value: str) -> bool:
+        without_urls = _URL_RE.sub(" ", value or "")
+        return bool(_URL_RE.search(value or "")) and not re.search(
+            r"[0-9A-Za-z一-龯ぁ-んァ-ヶー]",
+            without_urls,
+        )
+
+    def local_context(line_index: int) -> str:
+        # URL-only records may inherit only the immediately preceding line.
+        # Adjacent URL-only lines are ambiguous and therefore inherit nothing.
+        previous = lines[line_index - 1].strip() if line_index > 0 else ""
+        following = lines[line_index + 1].strip() if line_index + 1 < len(lines) else ""
+        if url_only(previous) or url_only(following):
+            return ""
+        if not previous or _URL_RE.search(previous):
+            return ""
+        words = re.findall(r"[0-9A-Za-z一-龯ぁ-んァ-ヶー]+", previous)
+        return previous if len(words) >= 3 else ""
+
+    for line_index, line in enumerate(lines):
+        matches = list(_URL_RE.finditer(line))
+        if not matches:
+            continue
+        if len(matches) == 1:
+            match = matches[0]
+            url = match.group(0).rstrip(".,);:'\"")
+            context = _URL_RE.sub(" ", line)
+            if not re.search(r"[0-9A-Za-z一-龯ぁ-んァ-ヶー]", context):
+                context = local_context(line_index)
+            snippet = re.sub(r"\s+", " ", context).strip(" -–—:：,、.;")
+            out.append(("", url, snippet[:1000]))
+            continue
+
+        # Multiple URLs may only carry citation evidence when the line has
+        # explicit, independently attributable records. An ambiguous shared
+        # sentence still registers every URL, but with no supporting snippet.
+        records = [
+            record for record in _LOCAL_RECORD_SPLIT_RE.split(line) if record.strip()
+        ]
+        attributable: dict[str, str] = {}
+        if len(records) > 1:
+            for record in records:
+                record_matches = list(_URL_RE.finditer(record))
+                if len(record_matches) != 1:
+                    attributable.clear()
+                    break
+                url = record_matches[0].group(0).rstrip(".,);:'\"")
+                snippet = re.sub(r"\s+", " ", _URL_RE.sub(" ", record)).strip(
+                    " -–—:：,、.;",
+                )
+                if not re.search(r"[0-9A-Za-z一-龯ぁ-んァ-ヶー]", snippet):
+                    attributable.clear()
+                    break
+                attributable[url] = snippet[:1000]
+        for match in matches:
+            url = match.group(0).rstrip(".,);:'\"")
+            out.append(("", url, attributable.get(url, "")))
     return out
 
 
-def parse_sources(tool_name: str, raw_result: str, state: ResearchState) -> list[SourceRef]:
+def parse_sources(
+    tool_name: str, raw_result: str, state: ResearchState
+) -> list[SourceRef]:
     """tool_result 文字列からソースを抽出して state に登録。戻り: 新規/既存 SourceRef 群。
 
     best-effort: 解析に失敗しても例外を投げず空リストを返す（呼び出し側はツール結果
@@ -78,10 +138,16 @@ def parse_sources(tool_name: str, raw_result: str, state: ResearchState) -> list
     found = _extract_from_json(raw_result)
     if found is None:
         found = _extract_from_text(raw_result)
+    from .evidence_registry import EvidenceRegistry
+
+    registry = EvidenceRegistry(state)
     refs: list[SourceRef] = []
     for title, url, snippet in found:
-        ref = state.register_source(
-            url=url, title=title, source_type=source_type, snippet=snippet,
+        ref = registry.register(
+            url=url,
+            title=title,
+            source_type=source_type,
+            snippet=snippet,
         )
         if ref is not None:
             refs.append(ref)
@@ -128,7 +194,9 @@ def extract_cited_sids(report: str) -> list[str]:
     return out
 
 
-def verify_report_citations(report: str, state: ResearchState) -> tuple[list[str], list[str]]:
+def verify_report_citations(
+    report: str, state: ResearchState
+) -> tuple[list[str], list[str]]:
     """本文の ``[S#]`` 引用を実在ソースと機械照合。
 
     戻り: ``(present, missing)``。present = state.sources に存在する sid、
@@ -172,5 +240,14 @@ def build_final_report(report: str, state: ResearchState) -> str:
         parts.append("")
         parts.append(
             f"-# ⚠️ 本文の引用 {', '.join(missing)} は出典一覧に対応が見つかりませんでした。"
+        )
+    unsupported = [
+        check for check in verify_citation_support(body, state) if not check.supported
+    ]
+    if unsupported:
+        labels = list(dict.fromkeys(check.sid for check in unsupported))
+        parts.append("")
+        parts.append(
+            f"-# ⚠️ 本文の引用 {', '.join(labels)} は収集済み根拠との支持関係を確認できませんでした。"
         )
     return "\n".join(parts)

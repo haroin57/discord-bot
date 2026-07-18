@@ -1,10 +1,19 @@
 """Render LaTeX math expressions locally with KaTeX and Puppeteer."""
 
-import hashlib
+import asyncio
 import logging
 import os
 
 from utils.browser_pool import render_with_browser_daemon
+from utils.render_store import (
+    is_cached,
+    prepare,
+    publish_png,
+    remove_if_exists,
+    render_paths,
+    temporary_png_path,
+    write_html,
+)
 
 __all__ = ["render_math_image"]
 
@@ -59,17 +68,22 @@ KATEX_THEME_CSS = """
 .katex .sqrt .sqrt-line { stroke: #f2f3f5; }
 """
 
+
 def _estimate_complexity(latex: str) -> str:
     """Classify a LaTeX expression as 'simple', 'medium', or 'complex'."""
     import re
+
     # Strip whitespace for length check
     stripped = latex.strip()
     # Count structural commands that indicate complexity
-    complex_cmds = len(re.findall(
-        r'\\(frac|sum|prod|int|lim|begin|matrix|sqrt|binom|underset|overset)', stripped
-    ))
-    subscripts = stripped.count('_') + stripped.count('^')
-    raw_len = len(re.sub(r'\\[a-zA-Z]+', '', stripped))  # length without command names
+    complex_cmds = len(
+        re.findall(
+            r"\\(frac|sum|prod|int|lim|begin|matrix|sqrt|binom|underset|overset)",
+            stripped,
+        )
+    )
+    subscripts = stripped.count("_") + stripped.count("^")
+    raw_len = len(re.sub(r"\\[a-zA-Z]+", "", stripped))  # length without command names
 
     if complex_cmds >= 2 or (raw_len > 40 and subscripts >= 3):
         return "complex"
@@ -84,15 +98,45 @@ def _get_scale_params(latex: str, display_mode: bool) -> dict:
     complexity = _estimate_complexity(latex)
     if display_mode:
         params = {
-            "simple":  {"font_size": 10, "body_pad": 1,  "container_pad": "1px 2px",  "screenshot_pad": 1},
-            "medium":  {"font_size": 11, "body_pad": 2,  "container_pad": "2px 3px",  "screenshot_pad": 2},
-            "complex": {"font_size": 12, "body_pad": 2,  "container_pad": "2px 4px",  "screenshot_pad": 2},
+            "simple": {
+                "font_size": 10,
+                "body_pad": 1,
+                "container_pad": "1px 2px",
+                "screenshot_pad": 1,
+            },
+            "medium": {
+                "font_size": 11,
+                "body_pad": 2,
+                "container_pad": "2px 3px",
+                "screenshot_pad": 2,
+            },
+            "complex": {
+                "font_size": 12,
+                "body_pad": 2,
+                "container_pad": "2px 4px",
+                "screenshot_pad": 2,
+            },
         }
     else:
         params = {
-            "simple":  {"font_size": 9,  "body_pad": 1, "container_pad": "1px 2px", "screenshot_pad": 1},
-            "medium":  {"font_size": 10, "body_pad": 1, "container_pad": "1px 2px", "screenshot_pad": 1},
-            "complex": {"font_size": 11, "body_pad": 2, "container_pad": "2px 3px", "screenshot_pad": 2},
+            "simple": {
+                "font_size": 9,
+                "body_pad": 1,
+                "container_pad": "1px 2px",
+                "screenshot_pad": 1,
+            },
+            "medium": {
+                "font_size": 10,
+                "body_pad": 1,
+                "container_pad": "1px 2px",
+                "screenshot_pad": 1,
+            },
+            "complex": {
+                "font_size": 11,
+                "body_pad": 2,
+                "container_pad": "2px 3px",
+                "screenshot_pad": 2,
+            },
         }
     return params[complexity]
 
@@ -106,6 +150,7 @@ def _get_math_css(display_mode: bool, latex: str = "") -> str:
         container_pad=params["container_pad"],
     )
     return base + KATEX_THEME_CSS
+
 
 # Local-only assets avoid Cloudflare's Quick Actions rate limit and remove a
 # network dependency from the response path.
@@ -160,9 +205,21 @@ try {{
 
 
 def _escape_for_json(s: str) -> str:
-    """Escape a LaTeX string for embedding in JSON inside HTML."""
+    """Escape a LaTeX string for embedding in JSON inside HTML.
+
+    JSON escaping alone does not protect an inline script from HTML parsing:
+    a literal ``</script>`` terminates the element before JavaScript parses the
+    string.  Escape characters that are significant to the HTML parser or are
+    JavaScript line separators while preserving the JSON string value.
+    """
     import json
-    return json.dumps(s)
+
+    return (
+        json.dumps(s)
+        .replace("<", "\\u003c")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
 
 
 async def render_math_image(
@@ -179,19 +236,24 @@ async def render_math_image(
     if not _KATEX_AVAILABLE:
         log.warning("render_math_image called without a local KaTeX installation")
         return None
-    os.makedirs(output_dir, exist_ok=True)
+    prepare(output_dir)
 
     # Cache key includes display mode and a template version so a change to
     # HTML_TEMPLATE / KaTeX options (e.g. trust:true -> trust:false) busts
     # previously-cached PNGs that may have been rendered with insecure
     # settings. Bump _TEMPLATE_VERSION on every template/option change.
     _TEMPLATE_VERSION = "4"  # local Puppeteer backend
-    cache_key = f"v{_TEMPLATE_VERSION}:{latex}:{'display' if display_mode else 'inline'}"
-    math_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
-    out_path = os.path.join(output_dir, f"math_{math_hash}.png")
+    cache_key = (
+        f"v{_TEMPLATE_VERSION}:{latex}:{'display' if display_mode else 'inline'}"
+    )
+    out_path, html_path = render_paths(
+        output_dir,
+        prefix="math",
+        cache_key=cache_key,
+    )
 
     # Cache hit
-    if os.path.isfile(out_path):
+    if is_cached(out_path):
         return out_path
 
     scale_params = _get_scale_params(latex, display_mode)
@@ -202,22 +264,27 @@ async def render_math_image(
         display_mode="true" if display_mode else "false",
     )
 
-    html_path = os.path.join(output_dir, f"math_{math_hash}.html")
-    with open(html_path, "w") as f:
-        f.write(full_html)
+    write_html(html_path, full_html)
+    part_path = temporary_png_path(out_path)
 
     try:
         await render_with_browser_daemon(
             html_path=html_path,
-            output_path=out_path,
+            output_path=part_path,
             selector=".math-container",
             pad=scale_params["screenshot_pad"],
             viewport={"width": 800, "height": 600, "deviceScaleFactor": 2},
         )
+        if not publish_png(part_path, out_path):
+            return None
+    except asyncio.CancelledError:
+        raise
     except TimeoutError:
         log.error("Local math render timed out")
         return None
     except Exception as exc:
         log.error("Local math render failed: %s", exc)
         return None
-    return out_path if os.path.isfile(out_path) else None
+    finally:
+        remove_if_exists(part_path)
+    return out_path if is_cached(out_path) else None

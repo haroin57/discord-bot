@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 
+from ..registry import _local_command, _metadata_catalog
 from ..runtime import CommandRuntime
 from ..types import LocalCommand, LocalCommandResult
 
@@ -50,7 +51,7 @@ async def _cost_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
 
 
 def cost() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="cost",
         description="Show the total cost and duration of the current session",
         supports_non_interactive=True,
@@ -72,7 +73,7 @@ async def _version_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
 
 
 def version() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="version",
         description="Print the version this session is running (not what autoupdate downloaded)",
         is_enabled_fn=lambda rt: rt.is_ant(),
@@ -92,7 +93,7 @@ async def _clear_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
 
 
 def clear() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="clear",
         description="Clear conversation history and free up context",
         aliases=["reset", "new"],
@@ -119,7 +120,7 @@ async def _compact_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
 
 
 def compact() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="compact",
         description=(
             "Clear conversation history but keep a summary in context. "
@@ -142,7 +143,7 @@ async def _context_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
 
 
 def context_noninteractive() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="context",
         description="Show current context usage",
         supports_non_interactive=True,
@@ -165,7 +166,7 @@ async def _files_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
 
 
 def files() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="files",
         description="List all files currently in context",
         is_enabled_fn=lambda rt: rt.is_ant(),
@@ -182,12 +183,16 @@ def files() -> LocalCommand:
 async def _heapdump_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
     result = rt.perform_heap_dump()
     if not result.get("success"):
-        return LocalCommandResult.text(f"Failed to create heap dump: {result.get('error')}")
-    return LocalCommandResult.text(f"{result.get('heap_path')}\n{result.get('diag_path')}")
+        return LocalCommandResult.text(
+            f"Failed to create heap dump: {result.get('error')}"
+        )
+    return LocalCommandResult.text(
+        f"{result.get('heap_path')}\n{result.get('diag_path')}"
+    )
 
 
 def heapdump() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="heapdump",
         description="Dump the JS heap to ~/Desktop",
         _is_hidden=True,
@@ -218,7 +223,7 @@ async def _release_notes_call(args: str, rt: CommandRuntime) -> LocalCommandResu
 
 
 def release_notes() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="release-notes",
         description="View release notes",
         supports_non_interactive=True,
@@ -253,7 +258,7 @@ async def _reload_plugins_call(args: str, rt: CommandRuntime) -> LocalCommandRes
 
 
 def reload_plugins() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="reload-plugins",
         description="Activate pending plugin changes in the current session",
         supports_non_interactive=False,
@@ -272,7 +277,7 @@ async def _rewind_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
 
 
 def rewind() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="rewind",
         description="Restore the code and/or conversation to a previous point",
         aliases=["checkpoint"],
@@ -295,7 +300,7 @@ async def _stickers_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
 
 
 def stickers() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="stickers",
         description="Order Claude Code stickers",
         supports_non_interactive=False,
@@ -311,12 +316,14 @@ def stickers() -> LocalCommand:
 async def _install_slack_app_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
     url = "https://slack.com/marketplace/A08SF47R6P4-claude"
     if rt.open_browser(url):
-        return LocalCommandResult.text("Opening Slack app installation page in browser…")
+        return LocalCommandResult.text(
+            "Opening Slack app installation page in browser…"
+        )
     return LocalCommandResult.text(f"Couldn't open browser. Visit: {url}")
 
 
 def install_slack_app() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="install-slack-app",
         description="Install the Claude Slack app",
         availability=["claude-ai"],
@@ -335,7 +342,7 @@ async def _thinkback_play_call(args: str, rt: CommandRuntime) -> LocalCommandRes
 
 
 def thinkback_play() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="thinkback-play",
         description="Play the thinkback animation",
         is_enabled_fn=lambda rt: rt.feature("tengu_thinkback"),
@@ -365,7 +372,7 @@ async def _vim_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
 
 
 def vim() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="vim",
         description="Toggle between Vim and Normal editing modes",
         supports_non_interactive=False,
@@ -396,7 +403,9 @@ async def _voice_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
 
     available, reason = rt.recording_available()
     if not available:
-        return LocalCommandResult.text(reason or "Voice mode is not available in this environment.")
+        return LocalCommandResult.text(
+            reason or "Voice mode is not available in this environment."
+        )
 
     if not rt.voice_stream_available():
         return LocalCommandResult.text(
@@ -410,7 +419,9 @@ async def _voice_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
             if install_command
             else "\nInstall SoX manually for audio recording."
         )
-        return LocalCommandResult.text(f"Voice mode requires audio recording tools.{hint}")
+        return LocalCommandResult.text(
+            f"Voice mode requires audio recording tools.{hint}"
+        )
 
     ok, error = rt.set_voice_enabled(True)
     if not ok:
@@ -421,7 +432,7 @@ async def _voice_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
 
 
 def voice() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="voice",
         description="Toggle voice mode",
         availability=["claude-ai"],
@@ -459,7 +470,7 @@ async def _keybindings_call(args: str, rt: CommandRuntime) -> LocalCommandResult
 
 
 def keybindings() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="keybindings",
         description="Open or create your keybindings configuration file",
         is_enabled_fn=lambda rt: rt.keybinding_customization_enabled(),
@@ -526,7 +537,7 @@ async def _advisor_call(args: str, rt: CommandRuntime) -> LocalCommandResult:
 
 
 def advisor() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="advisor",
         description="Configure the advisor model",
         argument_hint="[<model>|off]",
@@ -574,7 +585,9 @@ async def _bridge_kick_call(args: str, rt: CommandRuntime) -> LocalCommandResult
 
     if sub == "close":
         if a is None or not _is_finite_number(a):
-            return LocalCommandResult.text(f"close: need a numeric code\n{_BRIDGE_USAGE}")
+            return LocalCommandResult.text(
+                f"close: need a numeric code\n{_BRIDGE_USAGE}"
+            )
         rt.bridge_kick("close", a, b)
         code = int(float(a))
         return LocalCommandResult.text(
@@ -592,8 +605,10 @@ async def _bridge_kick_call(args: str, rt: CommandRuntime) -> LocalCommandResult
                 f"poll: need 'transient' or a status code\n{_BRIDGE_USAGE}"
             )
         status = int(float(a))
-        error_type = b if b is not None else (
-            "not_found_error" if status == 404 else "authentication_error"
+        error_type = (
+            b
+            if b is not None
+            else ("not_found_error" if status == 404 else "authentication_error")
         )
         rt.bridge_kick("poll", a, error_type)
         return LocalCommandResult.text(
@@ -640,7 +655,7 @@ async def _bridge_kick_call(args: str, rt: CommandRuntime) -> LocalCommandResult
 
 
 def bridge_kick() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="bridge-kick",
         description="Inject bridge failure states for manual recovery testing",
         is_enabled_fn=lambda rt: rt.is_ant(),
@@ -668,19 +683,21 @@ async def _extra_usage_call(args: str, rt: CommandRuntime) -> LocalCommandResult
 
 
 def extra_usage_noninteractive() -> LocalCommand:
-    return LocalCommand(
+    return _local_command(
         name="extra-usage",
         description="Configure extra usage to keep working when limits are hit",
         supports_non_interactive=True,
-        is_enabled_fn=lambda rt: rt.is_overage_provisioning_allowed()
-        and not rt.env_truthy("DISABLE_EXTRA_USAGE_COMMAND")
-        and rt.is_non_interactive(),
+        is_enabled_fn=lambda rt: (
+            rt.is_overage_provisioning_allowed()
+            and not rt.env_truthy("DISABLE_EXTRA_USAGE_COMMAND")
+            and rt.is_non_interactive()
+        ),
         is_hidden_fn=lambda rt: not rt.is_non_interactive(),
         call_fn=_extra_usage_call,
     )
 
 
-COMMANDS = [
+_DEFINITIONS = (
     cost(),
     version(),
     clear(),
@@ -700,4 +717,36 @@ COMMANDS = [
     advisor(),
     bridge_kick(),
     extra_usage_noninteractive(),
-]
+)
+
+COMMANDS = _metadata_catalog(_DEFINITIONS)
+
+
+def _metadata_factory(name: str):
+    def factory() -> LocalCommand:
+        return next(command for command in COMMANDS if command.name == name)
+
+    return factory
+
+
+# Preserve the historical factory spellings as metadata-only APIs.
+cost = _metadata_factory("cost")
+version = _metadata_factory("version")
+clear = _metadata_factory("clear")
+compact = _metadata_factory("compact")
+context_noninteractive = _metadata_factory("context")
+files = _metadata_factory("files")
+heapdump = _metadata_factory("heapdump")
+release_notes = _metadata_factory("release-notes")
+reload_plugins = _metadata_factory("reload-plugins")
+rewind = _metadata_factory("rewind")
+stickers = _metadata_factory("stickers")
+install_slack_app = _metadata_factory("install-slack-app")
+thinkback_play = _metadata_factory("thinkback-play")
+vim = _metadata_factory("vim")
+voice = _metadata_factory("voice")
+keybindings = _metadata_factory("keybindings")
+advisor = _metadata_factory("advisor")
+bridge_kick = _metadata_factory("bridge-kick")
+extra_usage_noninteractive = _metadata_factory("extra-usage")
+del _metadata_factory

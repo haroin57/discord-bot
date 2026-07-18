@@ -1,21 +1,39 @@
 name: security
+
 on:
-  push:
-    branches: [master, main]
+  workflow_call:
+    inputs:
+      candidate_sha:
+        description: Optional candidate SHA supplied by the trusted release controller.
+        required: false
+        type: string
+  workflow_dispatch:
   schedule:
     - cron: '0 6 * * 1'  # weekly Monday 06:00 UTC
+
+permissions:
+  contents: read
 
 jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          python-version-file: '.python-version'
-      - run: pip install pip-audit
-      - run: pip-audit -r requirements.txt --strict || true  # don't fail on known mem0ai CVE
+          ref: ${{ inputs.candidate_sha || github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-tests
+      - name: Audit locked Python dependencies
+        # No patched stable release exists within the supported major version
+        # for these advisories. Keep each temporary exception explicit so any
+        # newly discovered vulnerability still fails the job.
+        run: >-
+          python -m pip_audit -r requirements.lock --strict
+          --ignore-vuln PYSEC-2026-311
+          --ignore-vuln PYSEC-2026-2636
       - name: Bandit static scan
-        run: |
-          pip install bandit
-          bandit -r services/ utils/ bot.py web_api.py main_async.py mcp_mem0_server.py -ll || true
+        # Fixed /tmp paths are an intentional deployment convention and are
+        # separately constrained by attachment and render-store policies.
+        run: >-
+          bandit -r services/ utils/ bot.py web_api.py main_async.py
+          mcp_mem0_server.py -ll --skip B108

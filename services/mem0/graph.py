@@ -1,9 +1,9 @@
-"""Obsidian-style knowledge graph layer over ChromaDB Mem0.
+"""Obsidian-style knowledge graph projection of the canonical Mem0 ledger.
 
 A thin SQLite store that mirrors the wikilink/backlink model from
 Obsidian:
 
-    fact (ChromaDB row)  ⟷  entity (sqlite row)  via fact_entity_edges
+    canonical fact projection  ⟷  entity (sqlite row)  via fact_entity_edges
 
 Use cases this enables that pure cosine retrieval can't:
   - "Rust" 関連の話全部 → entity lookup → 1-hop sibling facts
@@ -92,6 +92,11 @@ CREATE INDEX IF NOT EXISTS idx_relations_user_valid ON entity_relations(user_id,
 CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_unique_open
     ON entity_relations(src_entity_id, rel_type, dst_entity_id, user_id)
     WHERE valid_to IS NULL;
+
+CREATE TABLE IF NOT EXISTS projection_receipts (
+    event_id      TEXT PRIMARY KEY,
+    processed_at  INTEGER NOT NULL
+);
 """
 
 
@@ -107,6 +112,12 @@ _db_path: str | None = None
 # dropping graph edges (ADR-0007; same fix as history_index). We now apply
 # it exactly once per DB file, serialized under _db_lock.
 _wal_ready_path: str | None = None
+
+
+def _reject_canonical_direct_mutation() -> None:
+    from services.mem0._projection import reject_direct_mutation
+
+    reject_direct_mutation("graph")
 
 
 def _resolve_db_path() -> str:
@@ -197,7 +208,11 @@ def _resolve_appellation(name: str, user_id: str) -> tuple[str, list[str]]:
 # Entity upsert / lookup
 # ---------------------------------------------------------------------------
 def upsert_entity(
-    name: str, type: str, user_id: str, *, aliases: Iterable[str] = (),
+    name: str,
+    type: str,
+    user_id: str,
+    *,
+    aliases: Iterable[str] = (),
 ) -> int:
     """Insert-or-update an entity. Returns the entity id.
 
@@ -210,6 +225,7 @@ def upsert_entity(
          (name + aliases) as aliases unless they already match the canonical.
       4. On miss: INSERT a new entity, then register the alias rows.
     """
+    _reject_canonical_direct_mutation()
     name = _normalize_name(name)
     if not name or not type or not user_id:
         return 0
@@ -227,7 +243,7 @@ def upsert_entity(
     surface_forms = (name, *norm_aliases)
     placeholders = ",".join("?" for _ in surface_forms)
     lookup_sql = (
-        f"SELECT id FROM entities "
+        f"SELECT id FROM entities "  # nosec B608
         f"WHERE user_id=? AND ("
         f"canonical_name IN ({placeholders}) "
         f"OR id IN (SELECT entity_id FROM entity_aliases "
@@ -236,13 +252,13 @@ def upsert_entity(
     )
     with _conn() as c, _db_lock:
         row = c.execute(
-            lookup_sql, (user_id, *surface_forms, *surface_forms),
+            lookup_sql,
+            (user_id, *surface_forms, *surface_forms),
         ).fetchone()
         if row:
             eid = row["id"]
             c.execute(
-                "UPDATE entities SET mention_count = mention_count + 1 "
-                "WHERE id=?",
+                "UPDATE entities SET mention_count = mention_count + 1 WHERE id=?",
                 (eid,),
             )
         else:
@@ -257,7 +273,8 @@ def upsert_entity(
         # naturally skips ``name``; on the merge path it registers ``name``
         # as an alias of the existing canonical too.
         existing_canonical = c.execute(
-            "SELECT canonical_name FROM entities WHERE id=?", (eid,),
+            "SELECT canonical_name FROM entities WHERE id=?",
+            (eid,),
         ).fetchone()["canonical_name"]
         for sf in surface_forms:
             if sf == existing_canonical:
@@ -273,6 +290,102 @@ def upsert_entity(
         c.commit()
     _invalidate_top_entities_cache(user_id)
     return int(eid)
+
+
+def apply_fact_projection(
+    event_id: str,
+    fact_id: str,
+    user_id: str,
+    entities: Iterable[dict],
+    *,
+    delete: bool = False,
+    _capability: object | None = None,
+) -> bool:
+    """Idempotently apply one outbox event in a single graph transaction.
+
+    Mention counts increase only when a new fact/entity edge is inserted, so
+    retrying the same event cannot inflate graph weights.
+    """
+    from services.mem0._projection import require_internal_projection
+
+    require_internal_projection(_capability, "graph")
+    if not event_id or not fact_id:
+        return False
+    touched_users: set[str] = set()
+    now = int(time.time())
+    with _conn() as c, _db_lock:
+        if c.execute(
+            "SELECT 1 FROM projection_receipts WHERE event_id=?",
+            (event_id,),
+        ).fetchone():
+            return True
+        if delete:
+            c.execute("DELETE FROM fact_entity_edges WHERE fact_id=?", (fact_id,))
+        else:
+            for entity in entities or ():
+                if not isinstance(entity, dict):
+                    continue
+                name = _normalize_name(str(entity.get("name") or ""))
+                entity_type = str(entity.get("type") or "")
+                if not name or not entity_type or not user_id:
+                    continue
+                name, appellation_aliases = _resolve_appellation(name, user_id)
+                aliases: list[str] = []
+                seen = {name}
+                for raw in list(entity.get("aliases") or []) + appellation_aliases:
+                    alias = _normalize_name(str(raw))
+                    if alias and alias not in seen:
+                        aliases.append(alias)
+                        seen.add(alias)
+                surfaces = (name, *aliases)
+                placeholders = ",".join("?" for _ in surfaces)
+                row = c.execute(
+                    f"SELECT id FROM entities WHERE user_id=? AND ("  # nosec B608
+                    f"canonical_name IN ({placeholders}) OR id IN ("
+                    f"SELECT entity_id FROM entity_aliases WHERE alias IN "
+                    f"({placeholders}))) LIMIT 1",
+                    (user_id, *surfaces, *surfaces),
+                ).fetchone()
+                if row:
+                    entity_id = int(row["id"])
+                else:
+                    cur = c.execute(
+                        """INSERT INTO entities
+                           (canonical_name,type,user_id,created_at,mention_count)
+                           VALUES (?,?,?,?,0)""",
+                        (name, entity_type, user_id, now),
+                    )
+                    entity_id = int(cur.lastrowid)
+                canonical = c.execute(
+                    "SELECT canonical_name FROM entities WHERE id=?",
+                    (entity_id,),
+                ).fetchone()["canonical_name"]
+                for surface in surfaces:
+                    if surface != canonical:
+                        c.execute(
+                            """INSERT OR IGNORE INTO entity_aliases(entity_id,alias)
+                               VALUES (?,?)""",
+                            (entity_id, surface),
+                        )
+                edge = c.execute(
+                    """INSERT OR IGNORE INTO fact_entity_edges
+                       (fact_id,entity_id,role,created_at) VALUES (?,?,NULL,?)""",
+                    (fact_id, entity_id, now),
+                )
+                if edge.rowcount:
+                    c.execute(
+                        "UPDATE entities SET mention_count=mention_count+1 WHERE id=?",
+                        (entity_id,),
+                    )
+                    touched_users.add(user_id)
+        c.execute(
+            "INSERT INTO projection_receipts(event_id,processed_at) VALUES (?,?)",
+            (event_id, now),
+        )
+        c.commit()
+    for touched in touched_users:
+        _invalidate_top_entities_cache(touched)
+    return True
 
 
 def find_entity(query: str, user_id: str, *, fuzzy: bool = True) -> Entity | None:
@@ -320,6 +433,7 @@ def find_entity(query: str, user_id: str, *, fuzzy: bool = True) -> Entity | Non
 # ---------------------------------------------------------------------------
 def add_edge(fact_id: str, entity_id: int, *, role: str | None = None) -> bool:
     """Link a Mem0 fact to an entity. Idempotent."""
+    _reject_canonical_direct_mutation()
     if not fact_id or not entity_id:
         return False
     now = int(time.time())
@@ -338,7 +452,10 @@ def add_edge(fact_id: str, entity_id: int, *, role: str | None = None) -> bool:
 
 
 def get_related_facts(
-    entity_id: int, *, limit: int = 20, exclude_fact_ids: Iterable[str] = (),
+    entity_id: int,
+    *,
+    limit: int = 20,
+    exclude_fact_ids: Iterable[str] = (),
 ) -> list[str]:
     """Return fact ids that link to ``entity_id``, newest first."""
     if not entity_id:
@@ -376,7 +493,9 @@ def get_entity_degree(entity_id: int) -> int:
     return int(row["n"]) if row else 0
 
 
-def get_co_occurring_entities(entity_id: int, *, limit: int = 10) -> list[tuple[int, float]]:
+def get_co_occurring_entities(
+    entity_id: int, *, limit: int = 10
+) -> list[tuple[int, float]]:
     """Entities that share at least one fact with ``entity_id``, ranked by a
     degree-normalized co-occurrence weight — the graph analogue of cosine
     normalization: ``shared_facts / sqrt(deg(A) * deg(B))``. Without this
@@ -452,12 +571,11 @@ def get_aliases(entity_id: int) -> list[str]:
 def delete_fact_edges(fact_id: str) -> int:
     """Drop all edges for a fact (call when a Mem0 fact is deleted).
     Returns the number of rows removed."""
+    _reject_canonical_direct_mutation()
     if not fact_id:
         return 0
     with _conn() as c, _db_lock:
-        cur = c.execute(
-            "DELETE FROM fact_entity_edges WHERE fact_id=?", (fact_id,)
-        )
+        cur = c.execute("DELETE FROM fact_entity_edges WHERE fact_id=?", (fact_id,))
         c.commit()
         return cur.rowcount or 0
 
@@ -534,7 +652,9 @@ def stats(user_id: str | None = None) -> dict:
         edges = c.execute("SELECT count(*) FROM fact_entity_edges").fetchone()[0]
         aliases = c.execute("SELECT count(*) FROM entity_aliases").fetchone()[0]
     return {
-        "entities": ents, "edges": edges, "aliases": aliases,
+        "entities": ents,
+        "edges": edges,
+        "aliases": aliases,
         "relations": rels,
     }
 
@@ -556,14 +676,20 @@ class Relation:
 
 
 def add_relation(
-    src_id: int, rel_type: str, dst_id: int, user_id: str, *,
-    source_fact_id: str | None = None, valid_from: int | None = None,
+    src_id: int,
+    rel_type: str,
+    dst_id: int,
+    user_id: str,
+    *,
+    source_fact_id: str | None = None,
+    valid_from: int | None = None,
 ) -> int:
     """Insert a typed temporal edge between two entities. Returns the row id
     (0 on failure). The UNIQUE(..., COALESCE(valid_to, 0)) constraint lets
     multiple historical versions coexist per (src, rel, dst) but allows
     only one currently-valid row at a time.
     """
+    _reject_canonical_direct_mutation()
     if not src_id or not dst_id or not rel_type or not user_id:
         return 0
     now = int(time.time())
@@ -574,23 +700,92 @@ def add_relation(
                 "src_entity_id, rel_type, dst_entity_id, user_id, "
                 "created_at, valid_from, valid_to, source_fact_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
-                (int(src_id), rel_type, int(dst_id), str(user_id),
-                 now, valid_from, source_fact_id),
+                (
+                    int(src_id),
+                    rel_type,
+                    int(dst_id),
+                    str(user_id),
+                    now,
+                    valid_from,
+                    source_fact_id,
+                ),
             )
             c.commit()
             return int(cur.lastrowid or 0)
         except Exception as exc:
             log.warning(
                 "add_relation(%s,%s,%s) failed: %s",
-                src_id, rel_type, dst_id, exc,
+                src_id,
+                rel_type,
+                dst_id,
+                exc,
             )
             return 0
+
+
+def apply_relation_projection(
+    event_id: str,
+    src_name: str,
+    rel_type: str,
+    dst_name: str,
+    user_id: str,
+    *,
+    _capability: object | None = None,
+) -> bool:
+    """Apply a canonical relation event and receipt in one transaction."""
+    from services.mem0._projection import require_internal_projection
+
+    require_internal_projection(_capability, "graph")
+    if not event_id or not src_name or not rel_type or not dst_name or not user_id:
+        return False
+    src_name, _ = _resolve_appellation(_normalize_name(src_name), str(user_id))
+    dst_name, _ = _resolve_appellation(_normalize_name(dst_name), str(user_id))
+
+    def resolve(c: sqlite3.Connection, name: str):
+        return c.execute(
+            """SELECT e.id FROM entities e WHERE e.user_id=? AND
+               (e.canonical_name=? OR EXISTS (
+                   SELECT 1 FROM entity_aliases a
+                   WHERE a.entity_id=e.id AND a.alias=?
+               )) LIMIT 1""",
+            (str(user_id), name, name),
+        ).fetchone()
+
+    now = int(time.time())
+    try:
+        with _conn() as c, _db_lock:
+            if c.execute(
+                "SELECT 1 FROM projection_receipts WHERE event_id=?",
+                (event_id,),
+            ).fetchone():
+                return True
+            src = resolve(c, src_name)
+            dst = resolve(c, dst_name)
+            if not (src and dst):
+                return False
+            c.execute(
+                """INSERT OR IGNORE INTO entity_relations
+                   (src_entity_id,rel_type,dst_entity_id,user_id,created_at,
+                    valid_from,valid_to,source_fact_id)
+                   VALUES (?,?,?,?,?,NULL,NULL,NULL)""",
+                (src["id"], rel_type, dst["id"], str(user_id), now),
+            )
+            c.execute(
+                "INSERT INTO projection_receipts(event_id,processed_at) VALUES (?,?)",
+                (event_id, now),
+            )
+            c.commit()
+        return True
+    except Exception as exc:
+        log.warning("graph relation projection failed for %s: %s", event_id, exc)
+        return False
 
 
 def expire_relation(relation_id: int, *, valid_to: int | None = None) -> bool:
     """Set ``valid_to`` on an open relation. Idempotent: re-running with
     the same valid_to is a no-op. Returns True on a single-row update.
     """
+    _reject_canonical_direct_mutation()
     if not relation_id:
         return False
     vt = int(valid_to or time.time())
@@ -609,8 +804,11 @@ def expire_relation(relation_id: int, *, valid_to: int | None = None) -> bool:
 
 
 def get_relations(
-    entity_id: int, *, direction: str = "any",
-    rel_type: str | None = None, only_valid: bool = True,
+    entity_id: int,
+    *,
+    direction: str = "any",
+    rel_type: str | None = None,
+    only_valid: bool = True,
     limit: int = 50,
 ) -> list[Relation]:
     """Fetch relations involving ``entity_id``.
@@ -644,7 +842,7 @@ def get_relations(
         where.append("(valid_to IS NULL OR valid_to > ?)")
         params.append(now)
     sql = (
-        "SELECT id, src_entity_id, rel_type, dst_entity_id, user_id, "
+        "SELECT id, src_entity_id, rel_type, dst_entity_id, user_id, "  # nosec B608
         "created_at, valid_from, valid_to, source_fact_id "
         "FROM entity_relations WHERE "
         + " AND ".join(where)

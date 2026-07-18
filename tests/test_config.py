@@ -66,17 +66,20 @@ class TestLoadSystemPrompt:
 class TestValidateDiscordToken:
     def test_valid_token_returns_value(self, monkeypatch):
         import config
+
         monkeypatch.setattr(config, "DISCORD_TOKEN", "valid-token")
         assert config.validate_discord_token() == "valid-token"
 
     def test_empty_token_raises(self, monkeypatch):
         import config
+
         monkeypatch.setattr(config, "DISCORD_TOKEN", "")
         with pytest.raises(RuntimeError, match="DISCORD_TOKEN"):
             config.validate_discord_token()
 
     def test_whitespace_only_raises(self, monkeypatch):
         import config
+
         monkeypatch.setattr(config, "DISCORD_TOKEN", "   ")
         with pytest.raises(RuntimeError, match="DISCORD_TOKEN"):
             config.validate_discord_token()
@@ -174,20 +177,21 @@ class TestGetMcpServersByKeys:
 class TestSystemPromptConstants:
     def test_system_prompt_loaded(self):
         import config
+
         assert isinstance(config.SYSTEM_PROMPT, str)
         assert len(config.SYSTEM_PROMPT) > 0
 
     def test_restricted_system_prompt(self):
         import config
+
         assert "UNTRUSTED" in config.RESTRICTED_SYSTEM_PROMPT
         assert "NEVER" in config.RESTRICTED_SYSTEM_PROMPT
 
     def test_math_guidance_is_consistent_across_access_levels(self):
         import config
+
         expected = config.MATH_PRESENTATION_MODE == "adaptive"
-        assert (
-            config.MATH_PRESENTATION_GUIDANCE in config.SYSTEM_PROMPT
-        ) is expected
+        assert (config.MATH_PRESENTATION_GUIDANCE in config.SYSTEM_PROMPT) is expected
         assert (
             config.MATH_PRESENTATION_GUIDANCE in config.RESTRICTED_SYSTEM_PROMPT
         ) is expected
@@ -196,21 +200,25 @@ class TestSystemPromptConstants:
 class TestMathPresentationMode:
     def test_defaults_to_legacy(self):
         import config
+
         assert config._parse_math_presentation_mode(None) == "legacy"
 
     @pytest.mark.parametrize("value", ["legacy", "adaptive", " Adaptive "])
     def test_accepts_supported_modes(self, value):
         import config
+
         assert config._parse_math_presentation_mode(value) == value.strip().lower()
 
     @pytest.mark.parametrize("value", ["", "auto", "enabled", "legacy,adaptive"])
     def test_rejects_unsupported_modes(self, value):
         import config
+
         with pytest.raises(RuntimeError, match="MATH_PRESENTATION_MODE"):
             config._parse_math_presentation_mode(value)
 
     def test_guidance_is_gated_by_adaptive_mode(self, monkeypatch):
         import config
+
         base = "base prompt"
 
         monkeypatch.setattr(config, "MATH_PRESENTATION_MODE", "legacy")
@@ -226,18 +234,21 @@ class TestMathPresentationMode:
 class TestBoolEnv:
     def test_bool_env_true_values(self, monkeypatch):
         import config
+
         for val in ("1", "true", "yes", "on", "True", "YES"):
             monkeypatch.setenv("_TEST_BOOL_ENV", val)
             assert config._bool_env("_TEST_BOOL_ENV", False) is True
 
     def test_bool_env_false_values(self, monkeypatch):
         import config
+
         for val in ("0", "false", "no", "off"):
             monkeypatch.setenv("_TEST_BOOL_ENV", val)
             assert config._bool_env("_TEST_BOOL_ENV", True) is False
 
     def test_bool_env_default_when_unset(self, monkeypatch):
         import config
+
         monkeypatch.delenv("_TEST_BOOL_ENV", raising=False)
         assert config._bool_env("_TEST_BOOL_ENV", True) is True
         assert config._bool_env("_TEST_BOOL_ENV", False) is False
@@ -245,14 +256,15 @@ class TestBoolEnv:
 
 class TestAdminUserIdsEnv:
     def test_ensure_mode_700_oserror(self, tmp_path, monkeypatch):
-        """_ensure_mode_700 swallows OSError from chmod."""
+        """_ensure_mode_700 fails closed when the mode cannot be enforced."""
         import config
+
         p = str(tmp_path / "newdir")
-        orig_chmod = __builtins__["__import__"]  # just need to reference builtins
         import unittest.mock as mock
-        with mock.patch("os.chmod", side_effect=OSError("no perm")):
-            # Should not raise
-            config._ensure_mode_700(p)
+
+        with mock.patch("os.fchmod", side_effect=OSError("no perm")):
+            with pytest.raises(RuntimeError, match="secure runtime directory"):
+                config._ensure_mode_700(p)
 
 
 class TestBotKeywordsWarning:
@@ -262,12 +274,16 @@ class TestBotKeywordsWarning:
         # Re-execute the relevant code path via importlib
         import config as cfg
         import importlib
+
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             raw = [s.strip() for s in "ab,かなえ".split(",") if s.strip()]
             filtered = [kw for kw in raw if len(kw) >= 3]
             if len(filtered) < len(raw):
-                warnings.warn("BOT_KEYWORDS entries shorter than 3 chars were dropped", stacklevel=2)
+                warnings.warn(
+                    "BOT_KEYWORDS entries shorter than 3 chars were dropped",
+                    stacklevel=2,
+                )
         assert len(w) == 1
         assert "shorter than 3 chars" in str(w[0].message)
 
@@ -284,6 +300,7 @@ class TestModuleLevelEnvBranches:
         for k, v in env.items():
             monkeypatch.setenv(k, v)
         import config
+
         importlib.reload(config)
         return config
 
@@ -306,11 +323,14 @@ class TestModuleLevelEnvBranches:
         # C3 (Cloudflare offload, 2026-07-04): when BRAVE_MCP_REMOTE_* are set,
         # brave-search must go through the kanae-mcp-brave Worker (streamable
         # HTTP + X-MCP-Auth) even if BRAVE_API_KEY is also present.
-        cfg = self._reload_config(monkeypatch, {
-            "BRAVE_API_KEY": "test-brave-key",
-            "BRAVE_MCP_REMOTE_URL": "https://worker.example.test/mcp",
-            "BRAVE_MCP_AUTH_TOKEN": "test-mcp-token",
-        })
+        cfg = self._reload_config(
+            monkeypatch,
+            {
+                "BRAVE_API_KEY": "test-brave-key",
+                "BRAVE_MCP_REMOTE_URL": "https://worker.example.test/mcp",
+                "BRAVE_MCP_AUTH_TOKEN": "test-mcp-token",
+            },
+        )
         entry = cfg.MCP_SERVERS_WEB["brave-search"]
         assert entry["type"] == "http"
         assert entry["url"] == "https://worker.example.test/mcp"
@@ -320,16 +340,22 @@ class TestModuleLevelEnvBranches:
     def test_tavily_api_key_adds_server(self, monkeypatch):
         cfg = self._reload_config(monkeypatch, {"TAVILY_API_KEY": "test-tavily-key"})
         assert "tavily" in cfg.MCP_SERVERS_WEB
-        assert cfg.MCP_SERVERS_WEB["tavily"]["env"]["TAVILY_API_KEY"] == "test-tavily-key"
+        assert (
+            cfg.MCP_SERVERS_WEB["tavily"]["env"]["TAVILY_API_KEY"] == "test-tavily-key"
+        )
 
     def test_github_token_adds_server(self, monkeypatch):
-        cfg = self._reload_config(monkeypatch, {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_test"})
+        cfg = self._reload_config(
+            monkeypatch, {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_test"}
+        )
         assert "github" in cfg.MCP_SERVERS
         assert "ghp_test" in cfg.MCP_SERVERS["github"]["headers"]["Authorization"]
 
     def test_google_maps_api_key_adds_stdio_server(self, monkeypatch):
         # ADR-0022: direct stdio (bot-owned, self-reaping), not supergateway HTTP.
-        cfg = self._reload_config(monkeypatch, {"GOOGLE_MAPS_API_KEY": "test-google-key"})
+        cfg = self._reload_config(
+            monkeypatch, {"GOOGLE_MAPS_API_KEY": "test-google-key"}
+        )
         assert "google-maps" in cfg.MCP_SERVERS_WEB
         entry = cfg.MCP_SERVERS_WEB["google-maps"]
         assert entry["command"] == "npx"
@@ -339,12 +365,14 @@ class TestModuleLevelEnvBranches:
     def test_admin_user_ids_invalid_raises(self, monkeypatch):
         monkeypatch.setenv("ADMIN_USER_IDS", "notanumber,alsoinvalid")
         import config
+
         with pytest.raises(RuntimeError, match="ADMIN_USER_IDS"):
             importlib.reload(config)
 
     def test_bot_keywords_short_warns_on_reload(self, monkeypatch):
         monkeypatch.setenv("BOT_KEYWORDS", "ab,かなえ")
         import config
+
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             importlib.reload(config)
@@ -354,8 +382,11 @@ class TestModuleLevelEnvBranches:
 
 class TestSpeakerLabels:
     def test_parses_env_and_resolves(self, monkeypatch):
-        monkeypatch.setenv("SPEAKER_LABELS", "573489206240870410:先輩, 1037285234200297522:お父さん")
+        monkeypatch.setenv(
+            "SPEAKER_LABELS", "573489206240870410:先輩, 1037285234200297522:お父さん"
+        )
         import config
+
         importlib.reload(config)
         try:
             assert config.SPEAKER_LABELS[573489206240870410] == "先輩"
@@ -367,6 +398,7 @@ class TestSpeakerLabels:
 
     def test_unknown_and_invalid_return_empty(self, monkeypatch):
         import config
+
         importlib.reload(config)  # no SPEAKER_LABELS env → empty table
         assert config.speaker_label(999) == ""
         assert config.speaker_label(None) == ""
@@ -375,6 +407,7 @@ class TestSpeakerLabels:
     def test_malformed_pairs_skipped(self, monkeypatch):
         monkeypatch.setenv("SPEAKER_LABELS", "noColon, 123:OK, :emptyid, 456:")
         import config
+
         importlib.reload(config)
         try:
             assert config.SPEAKER_LABELS == {123: "OK"}

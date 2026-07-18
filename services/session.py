@@ -10,7 +10,6 @@ import os
 import re
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
 
 from config import (
     COMPACT_HISTORY_ASSISTANT_CHARS,
@@ -22,68 +21,96 @@ from config import (
     MAX_SESSIONS,
     SESSIONS_PATH,
 )
-from utils.atomic_write import atomic_write_json
+from services.session_registry import (
+    ProviderName,
+    SessionInfo,
+    SessionRegistry,
+    SessionRepository,
+)
 
 log = logging.getLogger(__name__)
-
-# Background save tasks for `update_session`. We keep a strong reference so
-# the task is not GC'd before completion; the done callback removes itself.
-_save_tasks: set[asyncio.Task] = set()
-
-
-# ---------------------------------------------------------------------------
-# SessionInfo — rich metadata per channel session
-# ---------------------------------------------------------------------------
-@dataclass
-class SessionInfo:
-    session_id: str
-    mcp_server_keys: list[str] = field(default_factory=list)
-    # 機能6: last turn's usage breakdown (input/cache_read/cache_creation/output
-    # tokens). Surfaced to /context so the admin can see "how close are we to
-    # the 500K compaction trigger". Not persisted to sessions.json — the disk
-    # serializer keeps the legacy {session_id, mcp_server_keys} contract.
-    last_usage: dict | None = None
-
 
 # ---------------------------------------------------------------------------
 # SDK session IDs (channel_id -> SessionInfo for --resume)
 # ---------------------------------------------------------------------------
 
-# Internal composite-key store: (channel_id, user_id | None) -> SessionInfo
-# user_id=None is the legacy fallback bucket for callers that don't supply it.
-_sessions_store: OrderedDict[tuple[int, int | None], SessionInfo] = OrderedDict()
+_session_repository = SessionRepository(lambda: SESSIONS_PATH)
+_session_registry = SessionRegistry(_session_repository, max_sessions=MAX_SESSIONS)
+
+# Private aliases retained for the existing characterization suite. The state
+# itself is owned by SessionRegistry; these are not independent containers.
+_sessions_store = _session_registry._sessions
+_save_tasks = _session_registry._save_tasks
+
+
+def session_registry() -> SessionRegistry:
+    return _session_registry
+
+
+def initialize_session_registry(*, force: bool = False) -> SessionRegistry:
+    _session_registry.load(force=force)
+    return _session_registry
+
+
+async def ensure_session_registry_loaded() -> SessionRegistry:
+    await _session_registry.ensure_loaded()
+    return _session_registry
+
+
+async def flush_session_registry() -> None:
+    await _session_registry.flush()
+
+
+async def close_session_registry() -> None:
+    await _session_registry.close()
+
+
+def reset_session_registry_for_tests() -> None:
+    _session_registry.reset_memory_only()
+
+
+def invalidate_provider_continuity(
+    provider: ProviderName,
+    channel_id: int,
+    user_id: int | None,
+) -> None:
+    _session_registry.invalidate_provider(provider, channel_id, user_id)
+
+
+def validate_provider_continuity(
+    provider: ProviderName,
+    channel_id: int,
+    user_id: int | None,
+) -> None:
+    _session_registry.validate_provider(provider, channel_id, user_id)
+
+
+def is_provider_continuity_invalid(
+    provider: ProviderName,
+    channel_id: int,
+    user_id: int | None,
+) -> bool:
+    return _session_registry.is_provider_invalid(provider, channel_id, user_id)
 
 
 def get_session(channel_id: int, user_id: int | None) -> "SessionInfo | None":
     """Return the SessionInfo for (channel_id, user_id), or None if absent."""
-    return _sessions_store.get((channel_id, user_id))
+    return _session_registry.get(channel_id, user_id)
 
 
 def set_session(channel_id: int, user_id: int | None, info: "SessionInfo") -> None:
-    """Store info under composite key and schedule a non-blocking disk save."""
-    key = (channel_id, user_id)
-    _sessions_store[key] = info
-    _sessions_store.move_to_end(key)
-    while len(_sessions_store) > MAX_SESSIONS:
-        _sessions_store.popitem(last=False)
-    _schedule_save()
+    """Store info under the composite key through the process registry."""
+    _session_registry.set(channel_id, user_id, info)
 
 
 def clear_session(channel_id: int, user_id: int | None) -> None:
     """Remove the session for (channel_id, user_id) if present."""
-    removed = _sessions_store.pop((channel_id, user_id), None)
-    if removed is not None:
-        _schedule_save()
+    _session_registry.clear(channel_id, user_id)
 
 
 def clear_all_sessions_for_channel(channel_id: int) -> int:
     """Drop every (channel_id, *) session. Returns the number dropped."""
-    drop = [k for k in _sessions_store if k[0] == channel_id]
-    for k in drop:
-        _sessions_store.pop(k, None)
-    if drop:
-        _schedule_save()
-    return len(drop)
+    return _session_registry.clear_all_for_channel(channel_id)
 
 
 def clear_channel_context(channel_id: int) -> dict:
@@ -101,7 +128,14 @@ def clear_channel_context(channel_id: int) -> dict:
       {archived_path: str|None, bytes: int, sessions_dropped: int}
     """
     _validate_channel_id(channel_id)
-    report = {"archived_path": None, "bytes": 0, "sessions_dropped": 0}
+    # Do not archive the transcript when durable session state failed to load:
+    # the matching session deletion would be rejected, leaving a split clear.
+    _session_registry._ensure_mutable()
+    report: dict[str, str | int | None] = {
+        "archived_path": None,
+        "bytes": 0,
+        "sessions_dropped": 0,
+    }
     src = _history_file(channel_id)
     try:
         st = os.stat(src)
@@ -115,23 +149,14 @@ def clear_channel_context(channel_id: int) -> dict:
             pass
         report["archived_path"] = dst
     except FileNotFoundError:
-        pass   # 履歴が無いチャンネル: session drop だけやる
+        pass  # 履歴が無いチャンネル: session drop だけやる
     report["sessions_dropped"] = clear_all_sessions_for_channel(channel_id)
     return report
 
 
 def _schedule_save() -> None:
-    """Flush _sessions_store to disk, async if a loop is running."""
-    flat = _flatten_sessions(_sessions_store)
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        save_sessions(flat)
-        return
-    snapshot = OrderedDict(flat)
-    task = loop.create_task(asyncio.to_thread(save_sessions, snapshot))
-    _save_tasks.add(task)
-    task.add_done_callback(_on_save_done)
+    """Compatibility wrapper for the registry's ordered writer."""
+    _session_registry.request_save()
 
 
 def _flatten_sessions(
@@ -149,55 +174,30 @@ def _flatten_sessions(
     return flat
 
 
-# Process-wide channel→SessionInfo view (P4a). bot.py and web_api previously
-# each called load_sessions() and owned SEPARATE dicts hydrated from the same
-# sessions.json — every save from one clobbered updates held only by the
-# other (the split-brain the plan review flagged). One shared instance,
-# lazily loaded, ends that; update_session() mutations are visible to every
-# caller because they all hold the same object.
-_shared_channel_sessions: "OrderedDict[int, SessionInfo] | None" = None
-
-
-def shared_sessions() -> "OrderedDict[int, SessionInfo]":
-    """Return the single process-wide channel-session dict."""
-    global _shared_channel_sessions
-    if _shared_channel_sessions is None:
-        _shared_channel_sessions = load_sessions()
-    return _shared_channel_sessions
+def shared_sessions():
+    """Return the legacy channel view backed directly by SessionRegistry."""
+    initialize_session_registry()
+    return _session_registry.channel_view
 
 
 def load_sessions() -> OrderedDict[int, SessionInfo]:
-    try:
-        with open(SESSIONS_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        result: OrderedDict[int, SessionInfo] = OrderedDict()
-        for k, v in data.items():
-            if isinstance(v, str):
-                # Backward compat: old format was plain session_id string
-                result[int(k)] = SessionInfo(session_id=v)
-            elif isinstance(v, dict):
-                result[int(k)] = SessionInfo(
-                    session_id=v["session_id"],
-                    mcp_server_keys=v.get("mcp_server_keys", []),
-                )
-        # Populate internal store from disk (legacy bucket, user_id=None)
-        for ch_id, info in result.items():
-            _sessions_store[(ch_id, None)] = info
-        return result
-    except (FileNotFoundError, json.JSONDecodeError):
-        return OrderedDict()
+    _session_registry.load()
+    return _session_registry.channel_projection()
 
 
-def save_sessions(s: OrderedDict[int, SessionInfo], *, _path: str | None = None) -> None:
+def save_sessions(
+    s: OrderedDict[int, SessionInfo], *, _path: str | None = None
+) -> None:
     target = _path or SESSIONS_PATH
-    data = {
-        str(k): {
-            "session_id": v.session_id,
-            "mcp_server_keys": v.mcp_server_keys,
-        }
-        for k, v in s.items()
-    }
-    atomic_write_json(target, data)
+    if os.path.abspath(target) == os.path.abspath(SESSIONS_PATH):
+        _session_registry.replace_channel_sessions(s)
+        return
+
+    # Isolated-path compatibility is used by persistence tests and utilities.
+    # It still goes through the same repository/registry format and writer.
+    isolated = SessionRegistry(SessionRepository(target), max_sessions=MAX_SESSIONS)
+    isolated.load()
+    isolated.replace_channel_sessions(s)
 
 
 def update_session(
@@ -217,13 +217,15 @@ def update_session(
     `user_id` is forwarded to `set_session` so the internal composite-key
     store is also updated. Pass None for backward-compatible behavior.
     """
-    sessions[channel_id] = info
-    sessions.move_to_end(channel_id)
-    while len(sessions) > MAX_SESSIONS:
-        sessions.popitem(last=False)
-    # Mirror into composite-key store.
+    # The registry is the durable owner. Admit its mutation before changing a
+    # compatibility mapping so a sticky load failure cannot leak a partial
+    # in-memory update to the caller.
     set_session(channel_id, user_id, info)
-    # set_session already schedules the save; no need to do it again.
+    if sessions is not _session_registry.channel_view:
+        sessions[channel_id] = info
+        sessions.move_to_end(channel_id)
+        while len(sessions) > MAX_SESSIONS:
+            sessions.popitem(last=False)
 
 
 def _on_save_done(task: asyncio.Task) -> None:
@@ -241,7 +243,11 @@ def _on_save_done(task: asyncio.Task) -> None:
     except asyncio.CancelledError:
         return
     if exc is not None:
-        log.error("save_sessions failed: %s", exc, exc_info=(type(exc), exc, exc.__traceback__))
+        log.error(
+            "save_sessions failed: %s",
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +258,9 @@ _CHANNEL_ID_MAX = 10**19
 
 
 def _validate_channel_id(channel_id: int) -> None:
-    if not isinstance(channel_id, int) or not (_CHANNEL_ID_MIN <= channel_id <= _CHANNEL_ID_MAX):
+    if not isinstance(channel_id, int) or not (
+        _CHANNEL_ID_MIN <= channel_id <= _CHANNEL_ID_MAX
+    ):
         raise ValueError(f"invalid channel_id range: {channel_id!r}")
 
 
@@ -291,8 +299,12 @@ def append_jsonl(channel_id: int, entry: dict) -> None:
         content = entry.get("content")
         if role and content:
             from services.mem0 import history_index
+
             history_index.index_line(
-                channel_id, entry.get("timestamp", ""), role, content,
+                channel_id,
+                entry.get("timestamp", ""),
+                role,
+                content,
                 author=entry.get("author", ""),
             )
     except Exception as exc:
@@ -305,14 +317,19 @@ def append_jsonl(channel_id: int, entry: dict) -> None:
     # vector-store hiccup never affects the BM25 path.
     try:
         from config import MEM0_HISTORY_EMBED_ENABLED
+
         if MEM0_HISTORY_EMBED_ENABLED:
             role = entry.get("role")
             content = entry.get("content")
             if role and content:
                 from services.mem0 import history_embed
+
                 history_embed.index_line(
-                    channel_id, entry.get("timestamp", ""), role,
-                    entry.get("author", ""), content,
+                    channel_id,
+                    entry.get("timestamp", ""),
+                    role,
+                    entry.get("author", ""),
+                    content,
                 )
     except Exception as exc:
         log.warning("history embed update failed (non-fatal): %s", exc)
@@ -323,6 +340,7 @@ def append_jsonl(channel_id: int, entry: dict) -> None:
     # affect the canonical local JSONL.
     try:
         from services.r2_archive import archive_history_entry
+
         archive_history_entry(channel_id, entry)
     except Exception as exc:
         log.warning("R2 history staging failed (non-fatal): %s", exc)
@@ -396,6 +414,7 @@ def _strip_display_text_tool_call(content) -> str:
     if not isinstance(content, str):
         return content if isinstance(content, str) else ""
     from services.claude_api.errors import strip_text_tool_call
+
     return strip_text_tool_call(content).strip()
 
 
@@ -413,10 +432,14 @@ def _strip_text_tool_calls_in_blocks(content: list) -> list:
         contains_text_tool_call,
         strip_text_tool_call,
     )
+
     out = []
     for b in content:
-        if (isinstance(b, dict) and b.get("type") == "text"
-                and contains_text_tool_call(b.get("text") or "")):
+        if (
+            isinstance(b, dict)
+            and b.get("type") == "text"
+            and contains_text_tool_call(b.get("text") or "")
+        ):
             cleaned = strip_text_tool_call(b["text"])
             if cleaned.strip():
                 out.append({**b, "text": cleaned})
@@ -457,6 +480,8 @@ def _prepare_api_messages(
                 else:
                     new_content.append(b)
             new_content = _strip_text_tool_calls_in_blocks(new_content)
+            if role == "assistant":
+                new_content = _sanitize_assistant_fallback_blocks(new_content)
             if not new_content:
                 # Whole turn was a text-form tool call artifact — drop it so
                 # it is never persisted (would otherwise poison future resumes).
@@ -518,6 +543,7 @@ def build_compact_history_entries(
     # If the reply was nothing but a text-form call, the display string ends
     # up empty — fine, the (cleaned) api_messages is the load-bearing replay.
     from services.claude_api.errors import contains_text_tool_call
+
     assistant_display = assistant_text or ""
     if contains_text_tool_call(assistant_display):
         assistant_display = _strip_display_text_tool_call(assistant_display)
@@ -579,7 +605,7 @@ def _tail_jsonl(
             # bisected an entry. Trying to json.loads() that half-record was
             # the source of the steady stream of "Skipping corrupted JSONL
             # line: Expecting value" warnings on every load. Drop it.
-            reached_bof = (pos == 0)
+            reached_bof = pos == 0
     except OSError:
         return []
 
@@ -590,6 +616,7 @@ def _tail_jsonl(
     cutoff_dt = None
     if max_age_days is not None:
         from datetime import datetime, timezone, timedelta
+
         cutoff_dt = datetime.now(timezone.utc) - timedelta(days=max_age_days)
 
     messages: list[dict] = []
@@ -608,6 +635,7 @@ def _tail_jsonl(
                 if ts_str:
                     try:
                         from datetime import datetime as _dt, timezone as _tz
+
                         ts = _dt.fromisoformat(ts_str)
                         if ts.tzinfo is None:
                             ts = ts.replace(tzinfo=_tz.utc)
@@ -632,7 +660,9 @@ def _tail_jsonl(
                 msg["is_compact_summary"] = True
                 if isinstance(entry.get("keep_tail_rows"), int):
                     msg["keep_tail_rows"] = entry["keep_tail_rows"]
-            if include_context_snapshot and isinstance(entry.get("context_snapshot"), str):
+            if include_context_snapshot and isinstance(
+                entry.get("context_snapshot"), str
+            ):
                 msg["context_snapshot"] = entry["context_snapshot"]
                 if entry.get("timestamp"):
                     msg["timestamp"] = entry["timestamp"]
@@ -645,12 +675,77 @@ def _tail_jsonl(
 def load_history_channel(channel_id: int) -> list[dict]:
     """Load recent conversation messages for a channel (tail only)."""
     from config import HISTORY_MAX_AGE_DAYS
+
     _validate_channel_id(channel_id)
     return _tail_jsonl(
         _history_file(channel_id),
         MAX_MESSAGES_PER_CHANNEL * 2,
         max_age_days=HISTORY_MAX_AGE_DAYS,
     )
+
+
+_THINKING_BLOCK_TYPES = frozenset(("thinking", "redacted_thinking"))
+
+
+def _sanitize_assistant_fallback_blocks(content: list) -> list:
+    """Apply fallback replay rules when the boundary marker is available."""
+    fallback_at = -1
+    for index, block in enumerate(content):
+        if isinstance(block, dict) and block.get("type") == "fallback":
+            fallback_at = index
+    if fallback_at >= 0:
+        paired_server_ids = {
+            block.get("tool_use_id")
+            for block in content
+            if isinstance(block, dict) and block.get("tool_use_id")
+        }
+        out = []
+        for index, block in enumerate(content):
+            btype = block.get("type") if isinstance(block, dict) else None
+            if index < fallback_at:
+                if btype in (
+                    "thinking",
+                    "redacted_thinking",
+                    "connector_text",
+                    "tool_use",
+                ):
+                    continue
+                if (
+                    btype == "server_tool_use"
+                    and block.get("id") not in paired_server_ids
+                ):
+                    continue
+            if btype == "fallback":
+                block = {
+                    "type": "fallback",
+                    "from": {"model": (block.get("from") or {}).get("model", "")},
+                    "to": {"model": (block.get("to") or {}).get("model", "")},
+                }
+            out.append(block)
+        return out
+
+    return content
+
+
+def _has_markerless_fallback_poison(api_messages: list) -> bool:
+    """Detect the known persisted shape whose fallback boundary was lost."""
+    for message in api_messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list) or len(content) < 2:
+            continue
+        if any(
+            isinstance(block, dict) and block.get("type") == "fallback"
+            for block in content
+        ):
+            continue
+        if all(
+            isinstance(block, dict) and block.get("type") in _THINKING_BLOCK_TYPES
+            for block in content[:2]
+        ):
+            return True
+    return False
 
 
 def _sanitize_replay_messages(api_messages: list) -> list[dict]:
@@ -674,13 +769,19 @@ def _sanitize_replay_messages(api_messages: list) -> list[dict]:
             out.append(m)
             continue
         filtered = [
-            b for b in content
-            if not (isinstance(b, dict) and b.get("type") == "text"
-                    and not isinstance(b.get("text"), str))
+            b
+            for b in content
+            if not (
+                isinstance(b, dict)
+                and b.get("type") == "text"
+                and not isinstance(b.get("text"), str)
+            )
         ]
         # Also strip text-form tool-call XML poison (2026-06-13) from the
         # surviving text blocks, decontaminating existing transcripts on replay.
         filtered = _strip_text_tool_calls_in_blocks(filtered)
+        if m.get("role") == "assistant":
+            filtered = _sanitize_assistant_fallback_blocks(filtered)
         if not filtered:
             # Sanitized down to nothing → interrupted / poison frame, drop it.
             continue
@@ -689,8 +790,7 @@ def _sanitize_replay_messages(api_messages: list) -> list[dict]:
         # replayable content — replaying it standalone induces 400s /
         # regression loops on Fable. Drop the whole frame.
         if m.get("role") == "assistant" and all(
-            isinstance(b, dict)
-            and b.get("type") in ("thinking", "redacted_thinking")
+            isinstance(b, dict) and b.get("type") in _THINKING_BLOCK_TYPES
             for b in filtered
         ):
             continue
@@ -740,7 +840,8 @@ def _prune_orphan_tool_blocks(messages: list[dict]) -> list[dict]:
             ):
                 log.warning(
                     "replay sweep: dropped orphan tool_use id=%s name=%s",
-                    b.get("id", ""), b.get("name", ""),
+                    b.get("id", ""),
+                    b.get("name", ""),
                 )
                 continue
             kept.append(b)
@@ -796,7 +897,7 @@ def _apply_compact_summary(rows: list[dict]) -> list[dict]:
     keep = srow.get("keep_tail_rows")
     keep = keep if isinstance(keep, int) and keep > 0 else 0
     keep_start = max(0, last - keep)
-    return [srow] + rows[keep_start:last] + rows[last + 1:]
+    return [srow] + rows[keep_start:last] + rows[last + 1 :]
 
 
 def history_file_path(channel_id: int) -> str:
@@ -813,6 +914,7 @@ def history_file_path(channel_id: int) -> str:
 def load_compaction_rows(channel_id: int) -> list[dict]:
     """Row-level replay window (compact-summary applied) for compaction."""
     from config import HISTORY_MAX_AGE_DAYS
+
     _validate_channel_id(channel_id)
     rows = _tail_jsonl(
         _history_file(channel_id),
@@ -834,6 +936,7 @@ def load_api_replay_channel(channel_id: int) -> tuple[list[dict], str, str]:
     (``entry.py``) uses the timestamp to drop stale snapshots.
     """
     from config import HISTORY_MAX_AGE_DAYS
+
     _validate_channel_id(channel_id)
     rows = _tail_jsonl(
         _history_file(channel_id),
@@ -880,10 +983,20 @@ def load_api_replay_channel(channel_id: int) -> tuple[list[dict], str, str]:
             # Self-heal: never replay a persisted sentinel/error reply — it
             # primes the model to keep refusing (ADR-0008). Skipping the row
             # drops its api_messages too, so no tool_result is orphaned.
-            if is_non_persistable_reply(row.get("content")):
+            row_content = row.get("content")
+            if isinstance(row_content, str) and is_non_persistable_reply(row_content):
                 continue
             api_messages = row.get("api_messages")
             if isinstance(api_messages, list) and api_messages:
+                if _has_markerless_fallback_poison(api_messages):
+                    # The removed boundary makes the entire structured row
+                    # ambiguous, including tool_use/tool_result pairing. Fall
+                    # back atomically to its display text instead of retaining
+                    # a partial expansion. The append-only JSONL stays intact.
+                    disp = _strip_display_text_tool_call(row.get("content"))
+                    if disp:
+                        messages.append({"role": "assistant", "content": disp})
+                    continue
                 # Lossless CLI-shaped replay: splice this request's full
                 # assistant thinking(+signature)/tool_use + tool_result
                 # expansion in verbatim. The whole tool_use/tool_result chain is
@@ -936,7 +1049,9 @@ def load_api_replay_channel(channel_id: int) -> tuple[list[dict], str, str]:
 # ---------------------------------------------------------------------------
 # History integrity (free-code: deserializeMessagesWithInterruptDetection)
 # ---------------------------------------------------------------------------
-def trim_history(history: list[dict], max_pairs: int = MAX_MESSAGES_PER_CHANNEL) -> None:
+def trim_history(
+    history: list[dict], max_pairs: int = MAX_MESSAGES_PER_CHANNEL
+) -> None:
     """Trim history to max_pairs user/assistant exchanges, keeping pairs intact.
 
     The previous implementation walked `start` forward to find a user-role

@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 import discord
 
@@ -40,6 +41,68 @@ class ContextTasks:
     invest_kb: "asyncio.Task | None"
     history_search: "asyncio.Task | None"
     history_embed: "asyncio.Task | None"
+    _reply_metadata: dict[str, int | None] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    _close_task: "asyncio.Task | None" = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _create_task: Callable[..., asyncio.Task] = field(
+        default=asyncio.create_task,
+        repr=False,
+    )
+
+    @property
+    def reply_author_id(self) -> int | None:
+        return self._reply_metadata.get("author_id")
+
+    def all_tasks(self) -> list[asyncio.Task]:
+        """Return every child task owned by this preprocessing fan-out."""
+        return [
+            task
+            for task in (
+                self.reply,
+                self.thread,
+                self.links,
+                self.cross_thread,
+                self.mem0,
+                self.invest_kb,
+                self.history_search,
+                self.history_embed,
+            )
+            if task is not None
+        ]
+
+    async def _drain(self) -> None:
+        tasks = self.all_tasks()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def close(self) -> None:
+        """Cancel and await unfinished children, including on owner cancel."""
+        if self._close_task is None:
+            try:
+                self._close_task = self._create_task(
+                    self._drain(),
+                    name="context-preprocess-close",
+                )
+            except RuntimeError:
+                # Runtime shutdown has fenced new registrations. The current
+                # active job is already being awaited by RuntimeResources, so
+                # drain its children inline instead of creating a late task.
+                await self._drain()
+                return
+        try:
+            await asyncio.shield(self._close_task)
+        except asyncio.CancelledError:
+            await asyncio.shield(self._close_task)
+            raise
 
 
 def launch_context_tasks(
@@ -71,9 +134,11 @@ def launch_context_tasks(
     mem0_history_embed_enabled: bool,
     mem0_history_embed_limit: int,
     will_resume_override: bool | None = None,
+    create_task: Callable[..., asyncio.Task] | None = None,
 ) -> ContextTasks:
     """Fire all pre-processing tasks for ``message`` in parallel."""
     is_thread = isinstance(message.channel, discord.Thread)
+    reply_metadata: dict[str, int | None] = {"author_id": None}
     # If we expect to resume an existing session in this channel, skip
     # fetching thread/channel context — Claude already has it in its context
     # window. Saves tokens on every resumed turn. 機能1: resume 可否は
@@ -92,8 +157,19 @@ def launch_context_tasks(
         # native thread resume.
         will_resume = caller_is_admin and bool(will_resume_override)
 
+    spawn = create_task or asyncio.create_task
+
     async def _fetch_reply():
         if not (message.reference and message.reference.message_id):
+            return "", [], False
+        if (
+            getattr(message.reference, "type", None)
+            == discord.MessageReferenceType.forward
+        ):
+            # Forwarded content is represented exclusively by
+            # message_snapshots and is always rendered as untrusted context.
+            # Resolving it as a reply would duplicate the content and could
+            # assign trust from the referenced author.
             return "", [], False
         try:
             # Gateway reply payloads normally include referenced_message as
@@ -103,7 +179,10 @@ def launch_context_tasks(
             if not isinstance(ref_msg, discord.Message):
                 ref_msg = message.reference.cached_message
             if ref_msg is None:
-                ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                ref_msg = await message.channel.fetch_message(
+                    message.reference.message_id
+                )
+            reply_metadata["author_id"] = ref_msg.author.id
             # For non-admins, refuse to inline admin messages — they may
             # contain command output / secrets the attacker should not see.
             if not caller_is_admin and ref_msg.author.id in admin_user_ids:
@@ -135,32 +214,49 @@ def launch_context_tasks(
             return ctx, list(ref_msg.attachments), is_trusted
         except Exception as e:
             log.warning("Failed to fetch replied-to message: %s", e)
+            reply_metadata["author_id"] = None
             return "", [], False
 
     async def _fetch_thread():
         if will_resume:
             return ""
+        bot_user_id = getattr(getattr(bot, "user", None), "id", None)
         if is_thread:
             return await fetch_thread_context(
-                message.channel, message, caller_is_admin=caller_is_admin,
+                message.channel,
+                message,
+                caller_is_admin=caller_is_admin,
+                bot_user_id=bot_user_id,
+                admin_user_ids=admin_user_ids,
             )
         return await fetch_channel_context(
-            message.channel, message, caller_is_admin=caller_is_admin,
+            message.channel,
+            message,
+            caller_is_admin=caller_is_admin,
+            bot_user_id=bot_user_id,
+            admin_user_ids=admin_user_ids,
         )
 
-    reply_task = asyncio.create_task(_fetch_reply())
-    thread_task = asyncio.create_task(_fetch_thread())
-    link_task = asyncio.create_task(
-        resolve_message_links(bot, prompt, requester=message.author, caller_is_admin=caller_is_admin)
+    reply_task = spawn(_fetch_reply(), name="context-reply")
+    thread_task = spawn(_fetch_thread(), name="context-channel")
+    link_task = spawn(
+        resolve_message_links(
+            bot, prompt, requester=message.author, caller_is_admin=caller_is_admin
+        ),
+        name="context-links",
     )
     # Cross-thread context from channel mentions (<#id>)
-    cross_thread_task = asyncio.create_task(
+    cross_thread_task = spawn(
         resolve_channel_mention_contexts(
-            bot, prompt,
+            bot,
+            prompt,
             current_channel_id=message.channel.id,
             requester=message.author,
             caller_is_admin=caller_is_admin,
-        )
+            bot_user_id=getattr(getattr(bot, "user", None), "id", None),
+            admin_user_ids=admin_user_ids,
+        ),
+        name="context-cross-thread",
     )
 
     # Always recall Mem0 memories so Claude has long-term context, even on
@@ -172,7 +268,8 @@ def launch_context_tasks(
     history_embed_task: "asyncio.Task | None" = None
     if len(raw_user_text) >= mem0_min_query_length:
         mem0_llm_mode = should_use_memory_llm_mode(
-            raw_user_text, enabled=mem0_smart_search,
+            raw_user_text,
+            enabled=mem0_smart_search,
         )
         # Admins always rewrite+rerank so a multi-fact topic (the 日経VI
         # strategy ≈ 6 memories) surfaces, not only on explicit recall asks;
@@ -184,13 +281,17 @@ def launch_context_tasks(
         _recall_limit = (
             mem0_recall_limit if caller_is_admin else mem0_recall_limit_restricted
         )
-        mem0_task = asyncio.create_task(
+        mem0_task = spawn(
             search_memories_smart(
-                raw_user_text, mem0_user_id, limit=_recall_limit,
-                rewrite=mem0_llm_mode, rerank=mem0_llm_mode,
+                raw_user_text,
+                mem0_user_id,
+                limit=_recall_limit,
+                rewrite=mem0_llm_mode,
+                rerank=mem0_llm_mode,
                 include_core=True,
                 current_channel_id=str(message.channel.id),
-            )
+            ),
+            name="context-mem0",
         )
 
         # invest_kb recall — neutral long-form investment knowledge stored in
@@ -200,14 +301,21 @@ def launch_context_tasks(
         # slow down non-admin restricted calls for no benefit.
         if caller_is_admin:
             from config import (
-                INVEST_KB_ENABLED, INVEST_KB_LIMIT, INVEST_KB_QUERY_GATE,
+                INVEST_KB_ENABLED,
+                INVEST_KB_LIMIT,
+                INVEST_KB_QUERY_GATE,
             )
+
             if INVEST_KB_ENABLED:
                 from services.invest_kb import is_investment_query, search_invest_kb
+
                 gate = INVEST_KB_QUERY_GATE
-                if gate == "always" or (gate == "auto" and is_investment_query(raw_user_text)):
-                    invest_kb_task = asyncio.create_task(
-                        search_invest_kb(raw_user_text, limit=INVEST_KB_LIMIT)
+                if gate == "always" or (
+                    gate == "auto" and is_investment_query(raw_user_text)
+                ):
+                    invest_kb_task = spawn(
+                        search_invest_kb(raw_user_text, limit=INVEST_KB_LIMIT),
+                        name="context-invest-kb",
                     )
 
         # Per-turn literal-keyword recall over this channel's raw JSONL
@@ -216,12 +324,15 @@ def launch_context_tasks(
         # so surfacing it to a non-admin could leak admin lines.
         if caller_is_admin and mem0_history_search_enabled:
             from services.mem0 import history_index
-            history_search_task = asyncio.create_task(
+
+            history_search_task = spawn(
                 asyncio.to_thread(
                     history_index.search_history,
-                    raw_user_text, message.channel.id,
+                    raw_user_text,
+                    message.channel.id,
                     mem0_history_search_limit,
-                )
+                ),
+                name="context-history-search",
             )
 
         # Phase 5: semantic (vector) recall over the same raw transcript, run
@@ -229,12 +340,15 @@ def launch_context_tasks(
         # (default OFF), admin-only (transcript may hold other admins' lines).
         if caller_is_admin and mem0_history_embed_enabled:
             from services.mem0 import history_embed
-            history_embed_task = asyncio.create_task(
+
+            history_embed_task = spawn(
                 asyncio.to_thread(
                     history_embed.search_semantic,
-                    raw_user_text, message.channel.id,
+                    raw_user_text,
+                    message.channel.id,
                     mem0_history_embed_limit,
-                )
+                ),
+                name="context-history-embed",
             )
 
     return ContextTasks(
@@ -247,4 +361,6 @@ def launch_context_tasks(
         invest_kb=invest_kb_task,
         history_search=history_search_task,
         history_embed=history_embed_task,
+        _reply_metadata=reply_metadata,
+        _create_task=spawn,
     )

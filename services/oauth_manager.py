@@ -10,11 +10,12 @@ internal client) use Bearer auth instead of x-api-key.
 を保持し、quota 切れ / OAuth 恒久死で failover へ切替える。refresh の書き戻し先は
 **必ずそのアカウント自身の credentials ファイル**（failover の refresh が primary
 ファイルを clobber しない — 片方の login し直しがもう片方を壊す事故の恒久封じ）。
-切替状態は .state/oauth_failover.json に永続化され再起動を跨ぐ。
+切替状態は BOT_STATE_DIR/oauth_failover.json に永続化され再起動を跨ぐ。
 
 Reference: free-code/src/services/oauth/client.ts
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -41,7 +42,7 @@ class OAuthRefreshFailed(RuntimeError):
 # write credentials back to disk unless the directory AND the existing file
 # are restricted to the current user.
 
-_CREDS_DIR_MODE_MASK = 0o077   # group/other must have no bits set
+_CREDS_DIR_MODE_MASK = 0o077  # group/other must have no bits set
 _CREDS_FILE_MODE_MASK = 0o077
 
 
@@ -58,23 +59,37 @@ def _verify_path_privacy(path: str, *, is_dir: bool) -> bool:
     if st.st_uid != os.getuid():
         log.error(
             "Refusing to touch %s: owner=%d but we are uid=%d",
-            path, st.st_uid, os.getuid(),
+            path,
+            st.st_uid,
+            os.getuid(),
         )
         return False
     mode = stat.S_IMODE(st.st_mode)
+    if is_dir and not stat.S_ISDIR(st.st_mode):
+        log.error("Refusing to touch %s: expected a directory", path)
+        return False
+    if not is_dir and not stat.S_ISREG(st.st_mode):
+        log.error("Refusing to touch %s: expected a regular file", path)
+        return False
     mask = _CREDS_DIR_MODE_MASK if is_dir else _CREDS_FILE_MODE_MASK
     if mode & mask:
         log.error(
             "Refusing to touch %s: mode=%#o grants g/o access (mask %#o)",
-            path, mode, mask,
+            path,
+            mode,
+            mask,
         )
         return False
     return True
 
+
 # ---------------------------------------------------------------------------
 # Constants (from free-code/src/constants/oauth.ts)
 # ---------------------------------------------------------------------------
-CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
+CREDENTIALS_PATH = os.environ.get(
+    "OAUTH_PRIMARY_CREDENTIALS_PATH",
+    os.path.expanduser("~/.claude/.credentials.json"),
+)
 FAILOVER_CREDENTIALS_PATH = os.environ.get(
     "OAUTH_FAILOVER_CREDENTIALS_PATH",
     os.path.expanduser("~/.claude/.credentials-failover.json"),
@@ -82,13 +97,15 @@ FAILOVER_CREDENTIALS_PATH = os.environ.get(
 # 切替機能のフラグ（OAUTH_NO_REFRESH と同じく env 直読み — config より前に
 # import されるモジュールなので config 依存を作らない）
 OAUTH_FAILOVER_ENABLED = os.environ.get(
-    "OAUTH_FAILOVER_ENABLED", "true",
+    "OAUTH_FAILOVER_ENABLED",
+    "true",
 ).lower() not in ("0", "false", "no", "off", "")
-# 切替状態の永続先（BOT_DIR/.state — config.STATE_DIR と同じ場所を自前解決）
-FAILOVER_STATE_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    ".state", "oauth_failover.json",
+# 切替状態の永続先。checkout は read-only のため、必ず外部 state root を使う。
+_OAUTH_STATE_DIR = os.environ.get(
+    "BOT_STATE_DIR",
+    os.path.join(os.path.expanduser("~"), ".local", "state", "discord-bot"),
 )
+FAILOVER_STATE_PATH = os.path.join(_OAUTH_STATE_DIR, "oauth_failover.json")
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
@@ -114,15 +131,17 @@ _REFRESH_FAILURE_ALERT_THRESHOLD = 3
 @dataclass
 class _AccountState:
     """1 アカウント分の OAuth 状態。refresh の書き戻し先は credentials_path。"""
-    name: str                       # "primary" | "failover"
+
+    name: str  # "primary" | "failover"
     credentials_path: str
     access_token: "str | None" = None
     refresh_token: "str | None" = None
-    expires_at: int = 0             # epoch ms
+    expires_at: int = 0  # epoch ms
     refresh_failure_count: int = 0
     # True when the last refresh failure was permanent (invalid_grant).
     refresh_permanent: bool = False
     session_primed: bool = False
+    refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 _accounts: dict[str, _AccountState] = {
@@ -131,7 +150,7 @@ _accounts: dict[str, _AccountState] = {
 }
 _active: str = "primary"
 # quota 起因 failover 時の primary 再試行時刻（epoch 秒）。auth 起因は None
-#（手動復旧 = /login による credential 更新の検知まで張り付き）。
+# （手動復旧 = /login による credential 更新の検知まで張り付き）。
 _primary_retry_at: "float | None" = None
 _failover_reason: "str | None" = None
 # failover 発動時刻。auth 起因の自動復旧判定（primary credential の mtime が
@@ -162,13 +181,17 @@ def _record_refresh_failure(account: _AccountState, err) -> None:
         log.error(
             "OAuth refresh failed %d consecutive times (account=%s): %s. "
             "Bot will start returning 401 from Anthropic API soon.",
-            account.refresh_failure_count, account.name, err,
+            account.refresh_failure_count,
+            account.name,
+            err,
         )
     else:
         log.warning(
             "OAuth refresh failed (%d/%d, account=%s): %s",
-            account.refresh_failure_count, _REFRESH_FAILURE_ALERT_THRESHOLD,
-            account.name, err,
+            account.refresh_failure_count,
+            _REFRESH_FAILURE_ALERT_THRESHOLD,
+            account.name,
+            err,
         )
 
 
@@ -176,37 +199,75 @@ def _record_refresh_success(account: _AccountState) -> None:
     if account.refresh_failure_count > 0:
         log.info(
             "OAuth refresh recovered after %d failures (account=%s)",
-            account.refresh_failure_count, account.name,
+            account.refresh_failure_count,
+            account.name,
         )
     account.refresh_failure_count = 0
     account.refresh_permanent = False
 
 
 def is_oauth_healthy() -> bool:
-    """Public helper for the /health endpoint (active account 基準).
+    """Return True when the credential serving the active account is ready.
 
-    ``ensure_valid_token()`` の実供給条件と一致させる: access token が存在し
-    未期限切れなら refresh_failure_count を一切見ずに即返す（下記 line ~400）。
-    つまり有効なトークンを保持している間は OAuth は健全 — 過去の rotation 衝突で
-    ``refresh_failure_count`` が張り付いていても実際の API 供給には無関係。
-    実際に refresh が走る（= トークンが期限切れ/期限間近な）ときだけ、閾値超えの
-    連続失敗が本当の degraded を意味する。
+    Standby health is redundancy information, not a serving-readiness gate.  A
+    broken standby must remain visible in ``oauth_status_detail()`` without
+    taking a healthy active account out of service.
     """
-    acct = _acct()
-    if acct.access_token and not _is_expired(acct):
-        return True
-    return acct.refresh_failure_count < _REFRESH_FAILURE_ALERT_THRESHOLD
+    ok, _ = _credential_readiness(_acct())
+    return ok
+
+
+def _credential_readiness(account: _AccountState) -> tuple[bool, str | None]:
+    """Validate the credential actually used after a restart, without refreshing it."""
+    path = account.credentials_path
+    parent = os.path.dirname(path)
+    if not os.path.exists(parent):
+        return False, "credentials_directory_missing"
+    if not _verify_path_privacy(parent, is_dir=True):
+        return False, "credentials_directory_insecure"
+    if not os.path.exists(path):
+        return False, "credentials_missing"
+    if not _verify_path_privacy(path, is_dir=False):
+        return False, "credentials_file_insecure"
+    credentials = _read_credentials(path)
+    if not isinstance(credentials, dict):
+        return False, "credentials_unreadable"
+    access = credentials.get("accessToken")
+    refresh = credentials.get("refreshToken")
+    expires_at = credentials.get("expiresAt")
+    if not isinstance(access, str) or not access.strip():
+        return False, "access_token_invalid"
+    if not isinstance(refresh, str) or not refresh.strip():
+        return False, "refresh_token_invalid"
+    if not isinstance(expires_at, int) or isinstance(expires_at, bool):
+        return False, "token_expiry_invalid"
+    if expires_at <= int(time.time() * 1000) + EXPIRY_BUFFER_MS:
+        return False, "access_token_expired"
+    return True, None
 
 
 def oauth_status_detail() -> dict:
     """Read-only OAuth status snapshot for the /health payload（副作用なし）。"""
     acct = _acct()
+    credential_ok, credential_reason = _credential_readiness(acct)
+    standby_name = "failover" if _active == "primary" else "primary"
+    standby_ok, standby_reason = _credential_readiness(_accounts[standby_name])
+    redundancy_ok = not OAUTH_FAILOVER_ENABLED or standby_ok
     return {
         "active": _active,
+        "credential_ok": credential_ok,
+        "credential_reason": credential_reason,
+        "failover_enabled": OAUTH_FAILOVER_ENABLED,
+        "standby": standby_name,
+        "standby_credential_ok": standby_ok,
+        "standby_credential_reason": standby_reason,
+        "redundancy_ok": redundancy_ok,
+        "redundancy_reason": standby_reason if not redundancy_ok else None,
         "token_expired": _is_expired(acct),
         "refresh_failures": acct.refresh_failure_count,
         "refresh_permanent": acct.refresh_permanent,
     }
+
 
 # Subprocess mode: when this is true, ensure_valid_token() never invokes
 # refresh_token(). Instead it re-reads credentials from disk so the
@@ -233,16 +294,20 @@ def _read_credentials(path: "str | None" = None) -> dict | None:
         with open(path) as f:
             data = json.load(f)
         return data.get("claudeAiOauth")
-    except (FileNotFoundError, json.JSONDecodeError, KeyError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
         log.warning("Failed to read OAuth credentials from %s: %s", path, exc)
         return None
 
 
 def _save_credentials(
-    access: str, refresh: str, expires_at: int, extra: dict | None = None,
-    *, path: "str | None" = None,
-) -> None:
-    """Write updated tokens back to the credentials file (atomic write).
+    access: str,
+    refresh: str,
+    expires_at: int,
+    extra: dict | None = None,
+    *,
+    path: "str | None" = None,
+) -> bool:
+    """Durably write and verify updated credentials.
 
     H-2 defence:
       * verify ``~/.claude`` is owned by us and has no g/o bits before
@@ -251,6 +316,13 @@ def _save_credentials(
       * verify any existing ``.credentials.json`` is also privately-owned
         so we're not overwriting a file attached to someone else
       * fchmod the new fd to 0o600 BEFORE any content lands in it
+      * fsync the file before replace and the parent directory after replace
+      * read the replaced file back and verify the OAuth fields without logging
+        their values
+
+    Returns ``True`` only after durable replacement and read-back verification.
+    All failures are reported as ``False`` so refresh cannot claim success with
+    a memory-only token rotation.
     """
     if path is None:
         path = CREDENTIALS_PATH  # 実行時解決（テストの monkeypatch を尊重）
@@ -258,10 +330,10 @@ def _save_credentials(
         creds_dir = os.path.dirname(path)
         if not _verify_path_privacy(creds_dir, is_dir=True):
             log.error("Refusing to save credentials: %s is not private", creds_dir)
-            return
+            return False
         if not _verify_path_privacy(path, is_dir=False):
             log.error("Refusing to overwrite credentials: %s is not private", path)
-            return
+            return False
 
         try:
             with open(path) as f:
@@ -284,17 +356,53 @@ def _save_credentials(
         fd, tmp_path = tempfile.mkstemp(dir=creds_dir, suffix=".tmp")
         try:
             os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = -1  # fdopen owns and closes the descriptor from here.
                 json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, path)
-        except BaseException:
+            tmp_path = ""
+
+            dir_flags = os.O_RDONLY
+            dir_flags |= getattr(os, "O_DIRECTORY", 0)
+            dir_flags |= getattr(os, "O_CLOEXEC", 0)
+            dir_flags |= getattr(os, "O_NOFOLLOW", 0)
+            dir_fd = os.open(creds_dir, dir_flags)
             try:
-                os.unlink(tmp_path)
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except BaseException:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                if tmp_path:
+                    os.unlink(tmp_path)
             except OSError:
                 pass
             raise
+
+        if not _verify_path_privacy(path, is_dir=False):
+            log.error("OAuth credential verification failed: file privacy invalid")
+            return False
+        written = _read_credentials(path)
+        if not isinstance(written, dict) or (
+            written.get("accessToken") != access
+            or written.get("refreshToken") != refresh
+            or written.get("expiresAt") != expires_at
+        ):
+            log.error("OAuth credential verification failed after durable write")
+            return False
+        return True
     except Exception as exc:
-        log.warning("Failed to save OAuth credentials: %s", exc)
+        log.warning(
+            "Failed to save OAuth credentials (error=%s)", type(exc).__name__
+        )
+        return False
 
 
 def _is_expired(account: "_AccountState | None" = None) -> bool:
@@ -304,16 +412,30 @@ def _is_expired(account: "_AccountState | None" = None) -> bool:
     return (now_ms + EXPIRY_BUFFER_MS) >= acct.expires_at
 
 
-async def refresh_token(account: "_AccountState | None" = None) -> bool:
-    """Refresh the OAuth access token using the refresh token.
-
-    書き戻し先は必ず ``account.credentials_path``（failover の refresh が
-    primary ファイルを clobber しない）。引数省略時は active アカウント。
-    """
+def _is_hard_expired(account: "_AccountState | None" = None) -> bool:
+    """Return True only after the access token's actual expiry timestamp."""
     acct = account if account is not None else _acct()
+    expires_at = acct.expires_at
+    if not isinstance(expires_at, int) or isinstance(expires_at, bool):
+        return True
+    return int(time.time() * 1000) >= expires_at
 
+
+def _discard_hard_expired_access(account: _AccountState) -> None:
+    """Ensure no caller can reuse an access token that is actually expired."""
+    if _is_hard_expired(account):
+        account.access_token = None
+
+
+async def _refresh_token_locked(acct: _AccountState) -> bool:
+    """Refresh ``acct`` while its account-specific refresh lock is held.
+
+    書き戻し先は必ず ``acct.credentials_path``（failover の refresh が
+    primary ファイルを clobber しない）。
+    """
     if not acct.refresh_token:
         _record_refresh_failure(acct, "no refresh token available")
+        _discard_hard_expired_access(acct)
         return False
 
     body = {
@@ -350,10 +472,12 @@ async def refresh_token(account: "_AccountState | None" = None) -> bool:
                     acct.refresh_permanent = True
                     log.error(
                         "OAuth refresh token invalid (invalid_grant, "
-                        "account=%s) — re-login required: %s",
-                        acct.name, text,
+                        "account=%s) — re-login required",
+                        acct.name,
                     )
-                _record_refresh_failure(acct, f"HTTP {resp.status}: {text}")
+                error_code = "invalid_grant" if is_permanent else "oauth_error"
+                _record_refresh_failure(acct, f"HTTP {resp.status} ({error_code})")
+                _discard_hard_expired_access(acct)
                 return False
 
             data = await resp.json()
@@ -361,30 +485,64 @@ async def refresh_token(account: "_AccountState | None" = None) -> bool:
         new_access = data["access_token"]
         new_refresh = data.get("refresh_token", acct.refresh_token)
         expires_in = data["expires_in"]  # seconds
+        if (
+            not isinstance(new_access, str)
+            or not new_access
+            or not isinstance(new_refresh, str)
+            or not new_refresh
+            or not isinstance(expires_in, int)
+            or isinstance(expires_in, bool)
+            or expires_in <= 0
+        ):
+            raise ValueError("invalid OAuth refresh response")
         new_expires_at = int(time.time() * 1000) + expires_in * 1000
 
+        # Persist to disk — そのアカウント自身のファイルへ
+        if not _save_credentials(
+            new_access,
+            new_refresh,
+            new_expires_at,
+            path=acct.credentials_path,
+        ):
+            _record_refresh_failure(acct, "credential persistence failed")
+            _discard_hard_expired_access(acct)
+            return False
+
+        # Publish the rotation to in-memory readers only after durable write and
+        # read-back verification succeeded.
         acct.access_token = new_access
         acct.refresh_token = new_refresh
         acct.expires_at = new_expires_at
 
-        # auth_token is injected directly via SDK patch, no env var needed
-
-        # Persist to disk — そのアカウント自身のファイルへ
-        _save_credentials(
-            acct.access_token, acct.refresh_token, acct.expires_at,
-            path=acct.credentials_path,
-        )
-
         _record_refresh_success(acct)
         log.info(
             "OAuth token refreshed (account=%s), expires in %ds",
-            acct.name, expires_in,
+            acct.name,
+            expires_in,
         )
         return True
 
     except Exception as exc:
         _record_refresh_failure(acct, exc)
+        _discard_hard_expired_access(acct)
         return False
+
+
+async def refresh_token(account: "_AccountState | None" = None) -> bool:
+    """Serialize refresh per account and re-read disk after acquiring the lock.
+
+    A waiter observes a token persisted by the preceding refresher and returns
+    without issuing a second rotation request.
+    """
+    acct = account if account is not None else _acct()
+    async with acct.refresh_lock:
+        _load_account_from_disk(acct)
+        if acct.access_token and not _is_expired(acct):
+            return True
+        if acct.refresh_permanent:
+            _discard_hard_expired_access(acct)
+            return False
+        return await _refresh_token_locked(acct)
 
 
 async def ensure_valid_token() -> str | None:
@@ -398,7 +556,7 @@ async def ensure_valid_token() -> str | None:
     parent is picked up. This avoids the parent/child refresh race where
     each end invalidates the other's in-flight access token.
     （v1 制約: 子プロセスは常に primary ファイルを読む。failover 中の子は
-    親の切替に追従しない — 将来 .state/oauth_failover.json を見て読み先を
+    親の切替に追従しない — 将来 BOT_STATE_DIR/oauth_failover.json を見て読み先を
     切替える拡張余地あり。子は書かないので clobber リスクは無い。）
     """
     acct = _acct()
@@ -412,44 +570,52 @@ async def ensure_valid_token() -> str | None:
             disk_expires = creds.get("expiresAt", 0)
             if disk_token and disk_token != primary.access_token:
                 primary.access_token = disk_token
-                primary.refresh_token = creds.get(
-                    "refreshToken", primary.refresh_token)
+                primary.refresh_token = creds.get("refreshToken", primary.refresh_token)
                 primary.expires_at = disk_expires
                 log.info("OAuth token reloaded from disk (no-refresh mode)")
+        if _is_hard_expired(primary):
+            primary.access_token = None
         return primary.access_token
 
     if acct.access_token and not _is_expired(acct):
         return acct.access_token
 
     if _is_expired(acct) and acct.refresh_token:
-        # Permanent failure (invalid_grant): raise immediately without retrying.
-        if acct.refresh_permanent:
-            raise OAuthRefreshFailed(
-                "refresh token invalid (invalid_grant) — re-login required"
-            )
         log.info(
             "OAuth token expired or expiring soon, refreshing (account=%s)",
             acct.name,
         )
-        if await refresh_token(acct):
+        if (
+            await refresh_token(acct)
+            and acct.access_token
+            and not _is_hard_expired(acct)
+        ):
             return acct.access_token
 
-    # Token is expired and refresh is not recovering — raise if at threshold.
-    if (
-        _is_expired(acct)
-        and acct.refresh_failure_count >= _REFRESH_FAILURE_ALERT_THRESHOLD
-    ):
+    # A refresh failure inside the early-refresh buffer may continue using the
+    # still-live token. Once the actual expiry passes, never return it.
+    hard_expired = _is_hard_expired(acct)
+    if hard_expired:
+        acct.access_token = None
+    if hard_expired and acct.refresh_permanent:
+        raise OAuthRefreshFailed(
+            "refresh token invalid (invalid_grant) — re-login required"
+        )
+    if hard_expired and acct.refresh_failure_count >= _REFRESH_FAILURE_ALERT_THRESHOLD:
         raise OAuthRefreshFailed(
             f"OAuth token expired and refresh has failed "
             f"{acct.refresh_failure_count} consecutive times"
         )
 
-    return acct.access_token
+    return acct.access_token if not hard_expired else None
 
 
 def get_access_token() -> str | None:
     """Synchronous getter for the active account's access token (no refresh)."""
-    return _acct().access_token
+    acct = _acct()
+    if _is_hard_expired(acct):
+        return None
+    return acct.access_token
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +675,11 @@ def _patch_anthropic_sdk_locked() -> None:
             headers = dict(kwargs.pop("default_headers", None) or {})
             existing_beta = headers.get("anthropic-beta", "")
             if OAUTH_BETA_HEADER not in existing_beta:
-                beta = f"{existing_beta},{OAUTH_BETA_HEADER}".strip(",") if existing_beta else OAUTH_BETA_HEADER
+                beta = (
+                    f"{existing_beta},{OAUTH_BETA_HEADER}".strip(",")
+                    if existing_beta
+                    else OAUTH_BETA_HEADER
+                )
                 headers["anthropic-beta"] = beta
             kwargs["default_headers"] = headers
             _orig_anthropic_init(self, **kwargs)
@@ -536,7 +706,8 @@ def _merge_oauth_headers(headers: dict | None) -> dict:
     if OAUTH_BETA_HEADER not in existing_beta:
         out["anthropic-beta"] = (
             f"{existing_beta},{OAUTH_BETA_HEADER}".strip(",")
-            if existing_beta else OAUTH_BETA_HEADER
+            if existing_beta
+            else OAUTH_BETA_HEADER
         )
     out.setdefault("anthropic-dangerous-direct-browser-access", "true")
     return out
@@ -612,6 +783,7 @@ def _make_nodejs_ssl_context():
     bucket, not to perfectly impersonate a Node client.
     """
     import ssl as _ssl
+
     ctx = _ssl.create_default_context()
     ctx.set_ciphers(_NODEJS_TLS12_CIPHER_ORDER)
     ctx.set_alpn_protocols(["h2", "http/1.1"])
@@ -621,6 +793,7 @@ def _make_nodejs_ssl_context():
 def _make_http_client_with_hook():
     import httpx
     from services.claude_api.attestation import cch_request_hook
+
     return httpx.AsyncClient(
         event_hooks={"request": [_sanitize_outgoing_request, cch_request_hook]},
         timeout=600.0,
@@ -673,7 +846,9 @@ async def prime_subscriber_session() -> None:
                     async with sess.get(url, headers=headers, timeout=10) as resp:
                         log.info(
                             "session prime (account=%s): %s → HTTP %d",
-                            acct.name, url, resp.status,
+                            acct.name,
+                            url,
+                            resp.status,
                         )
                 except Exception as exc:
                     log.warning("session prime %s failed: %s", url, exc)
@@ -691,12 +866,15 @@ def make_async_oauth_client(**kwargs):
     Stainless headers so the call looks more like the Node CLI.
     """
     import anthropic
+
     acct = _acct()
     if acct.access_token is None:
         raise RuntimeError("OAuth not initialized; call init() first")
     kwargs.pop("api_key", None)
     kwargs["auth_token"] = acct.access_token
-    kwargs["default_headers"] = _merge_oauth_headers(kwargs.pop("default_headers", None))
+    kwargs["default_headers"] = _merge_oauth_headers(
+        kwargs.pop("default_headers", None)
+    )
     kwargs.setdefault("http_client", _make_http_client_with_hook())
     return anthropic.AsyncAnthropic(**kwargs)
 
@@ -711,6 +889,7 @@ def make_async_oauth_client(**kwargs):
 # Init
 # ---------------------------------------------------------------------------
 
+
 def _load_account_from_disk(account: _AccountState) -> bool:
     """credentials ファイルからアカウント状態をロードする。
 
@@ -722,16 +901,25 @@ def _load_account_from_disk(account: _AccountState) -> bool:
     試させる（張り付いた permanent failure での偽 degraded / 期限切れ時の即死を防ぐ）。
     """
     creds = _read_credentials(account.credentials_path)
-    if not creds or not creds.get("accessToken"):
+    if not creds:
         return False
     new_access = creds.get("accessToken")
     new_refresh = creds.get("refreshToken")
     new_expires = creds.get("expiresAt", 0)
+    if (
+        not isinstance(new_access, str)
+        or not new_access
+        or not isinstance(new_refresh, str)
+        or not new_refresh
+        or not isinstance(new_expires, int)
+        or isinstance(new_expires, bool)
+    ):
+        return False
     rotated = (
-        (bool(account.refresh_token) and bool(new_refresh)
-         and new_refresh != account.refresh_token)
-        or new_expires > account.expires_at
-    )
+        bool(account.refresh_token)
+        and bool(new_refresh)
+        and new_refresh != account.refresh_token
+    ) or new_expires > account.expires_at
     account.access_token = new_access
     account.refresh_token = new_refresh
     account.expires_at = new_expires
@@ -739,7 +927,9 @@ def _load_account_from_disk(account: _AccountState) -> bool:
         log.info(
             "OAuth: newer credential detected on disk (account=%s) — clearing "
             "stale refresh-failure state (count=%d, permanent=%s)",
-            account.name, account.refresh_failure_count, account.refresh_permanent,
+            account.name,
+            account.refresh_failure_count,
+            account.refresh_permanent,
         )
         account.refresh_failure_count = 0
         account.refresh_permanent = False
@@ -753,7 +943,7 @@ def init() -> bool:
     Returns True if a valid token was loaded for the ACTIVE account.
     primary をロードし、failover credentials があればそれもロードする
     （無くても失敗にしない — 単一アカウント運用の後方互換）。
-    `.state/oauth_failover.json` から active を復元する。
+    `BOT_STATE_DIR/oauth_failover.json` から active を復元する。
     """
     # パスを実行時解決（テストの monkeypatch / env 変更を尊重）
     _accounts["primary"].credentials_path = CREDENTIALS_PATH
@@ -796,7 +986,10 @@ def init() -> bool:
     expired_str = "EXPIRED" if _is_expired(acct) else "valid"
     log.info(
         "OAuth loaded — active=%s token %s, expires_at=%d, failover_available=%s",
-        _active, expired_str, acct.expires_at, failover_ok,
+        _active,
+        expired_str,
+        acct.expires_at,
+        failover_ok,
     )
 
     return True
@@ -805,6 +998,7 @@ def init() -> bool:
 # ---------------------------------------------------------------------------
 # Failover（二重アカウント切替）
 # ---------------------------------------------------------------------------
+
 
 def _set_active(name: str, *, reason: "str | None", retry_at: "float | None") -> None:
     global _active, _failover_reason, _primary_retry_at
@@ -816,14 +1010,18 @@ def _set_active(name: str, *, reason: "str | None", retry_at: "float | None") ->
 def _persist_failover_state() -> None:
     try:
         from utils.atomic_write import atomic_write_json
-        atomic_write_json(FAILOVER_STATE_PATH, {
-            "active": _active,
-            "reason": _failover_reason,
-            "primary_retry_at": _primary_retry_at,
-            # 発動時刻を保持（retry 延長等の再 persist で上書きしない —
-            # auth 自動復旧の mtime 比較の基準になる）。
-            "since": _failover_since or time.time(),
-        })
+
+        atomic_write_json(
+            FAILOVER_STATE_PATH,
+            {
+                "active": _active,
+                "reason": _failover_reason,
+                "primary_retry_at": _primary_retry_at,
+                # 発動時刻を保持（retry 延長等の再 persist で上書きしない —
+                # auth 自動復旧の mtime 比較の基準になる）。
+                "since": _failover_since or time.time(),
+            },
+        )
     except Exception as exc:  # noqa: BLE001 - 永続化失敗は運転継続
         log.warning("failover state persist failed (non-fatal): %s", exc)
 
@@ -854,12 +1052,15 @@ def _load_failover_state() -> None:
             _failover_since = 0.0
         log.warning(
             "OAuth failover state restored: reason=%s primary_retry_at=%s",
-            _failover_reason, _primary_retry_at,
+            _failover_reason,
+            _primary_retry_at,
         )
 
 
 def failover_to_secondary(
-    reason: str, *, primary_retry_at: "float | None" = None,
+    reason: str,
+    *,
+    primary_retry_at: "float | None" = None,
 ) -> bool:
     """primary → failover へ切替える。成功で True。
 
@@ -875,7 +1076,8 @@ def failover_to_secondary(
     if not _load_account_from_disk(failover):
         log.error(
             "oauth failover requested (reason=%s) but %s is missing/unreadable",
-            reason, FAILOVER_CREDENTIALS_PATH,
+            reason,
+            FAILOVER_CREDENTIALS_PATH,
         )
         return False
     failover.refresh_failure_count = 0
@@ -889,12 +1091,14 @@ def failover_to_secondary(
     _persist_failover_state()
     try:
         from services.claude_api.ratelimit import reset_state
+
         reset_state()
     except Exception:  # noqa: BLE001 - ratelimit 未import 文脈でも切替は成立させる
         pass
     log.warning(
         "OAuth FAILOVER: primary → failover (reason=%s, primary_retry_at=%s)",
-        reason, retry_at,
+        reason,
+        retry_at,
     )
     return True
 
@@ -922,6 +1126,7 @@ def _activate_primary(log_msg: str) -> None:
     _clear_failover_state()
     try:
         from services.claude_api.ratelimit import reset_state
+
         reset_state()
     except Exception:  # noqa: BLE001
         pass
@@ -1002,13 +1207,12 @@ async def failback_to_primary(reason: str) -> bool:
     _last_forced_failback_at = now
     if not await _revive_primary():
         log.info(
-            "forced failback (reason=%s): primary still dead — staying on "
-            "failover", reason,
+            "forced failback (reason=%s): primary still dead — staying on failover",
+            reason,
         )
         return False
     _activate_primary(
-        f"OAuth FAILBACK (forced, reason={reason}): failover dead — "
-        "failover → primary",
+        f"OAuth FAILBACK (forced, reason={reason}): failover dead — failover → primary",
     )
     return True
 

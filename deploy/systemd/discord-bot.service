@@ -10,16 +10,42 @@ StartLimitAction=none
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/home/ubuntu/discord-bot
-EnvironmentFile=/home/ubuntu/discord-bot/.env
-ExecStart=/home/ubuntu/discord-bot/.venv/bin/python /home/ubuntu/discord-bot/main_async.py
+User=kanae-bot
+Group=kanae-bot
+SupplementaryGroups=kanae-code
+WorkingDirectory=/var/lib/discord-bot-releases/prod/current/src
+EnvironmentFile=/etc/discord-bot/credentials/discord-bot.env
+Environment=HOME=/var/lib/kanae-bot
+Environment=BOT_STATE_DIR=/var/lib/kanae-bot/state
+Environment=TMPDIR=/var/cache/kanae-bot
+Environment=WRANGLER_CACHE_DIR=/var/cache/kanae-bot/wrangler
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CODEX_BIN=/home/ubuntu/.volta/tools/image/packages/@openai/codex/bin/codex
+Environment=CODEX_APP_SERVER_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=R2_ARCHIVE_WRANGLER_BIN=/home/ubuntu/.volta/tools/image/packages/wrangler/lib/node_modules/wrangler/bin/wrangler.js
+Environment=PYTHON_DOTENV_DISABLED=1
+Environment=WEB_API_HOST=127.0.0.1
+Environment=WEB_API_PORT=3002
+Environment=OAUTH_PRIMARY_CREDENTIALS_PATH=/var/lib/kanae-bot/.claude/.credentials.json
+Environment=OAUTH_FAILOVER_CREDENTIALS_PATH=/var/lib/kanae-bot/.claude/.credentials-failover.json
+Environment=OAUTH_FAILOVER_ENABLED=true
+Environment=BOT_RELEASE_ROOT=/var/lib/discord-bot-releases/prod
+Environment=BOT_RELEASE_METADATA_PATH=/var/lib/discord-bot-releases/prod/current/release.json
+Environment=BOT_RELEASE_METADATA_OWNER=root
+StateDirectory=kanae-bot kanae-bot/state
+StateDirectoryMode=0700
+CacheDirectory=kanae-bot
+CacheDirectoryMode=0700
+ExecStart=/var/lib/discord-bot-releases/prod/current/venv/bin/python /var/lib/discord-bot-releases/prod/current/src/main_async.py
 Restart=on-failure
 RestartSec=10s
+# Keep systemd from sending SIGKILL before the application-level 1800-second
+# in-flight Discord turn drain and final resource cleanup have completed.
+TimeoutStopSec=1980s
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=discord-bot
+UMask=0007
 
 # Security hardening (audit 2026-05-13: H11)
 NoNewPrivileges=yes
@@ -31,13 +57,8 @@ NoNewPrivileges=yes
 PrivateTmp=no
 ProtectSystem=strict
 ProtectHome=read-only
-# ReadWritePaths: allow writes to (a) the bot's own source/state dirs,
-# (b) /tmp paths the bot renders into, AND (c) caches/configs that the
-# Claude Code CLI subprocess + npx-launched MCP servers (brave-search,
-# context7, playwright) need at runtime. Without .npm and .claude here,
-# npm cache writes fail with EROFS, brave-search MCP cannot start, and
-# Claude Code's plugin orphan cleanup fails — pushing the CLI to exit 1.
-ReadWritePaths=/home/ubuntu/discord-bot /home/ubuntu/.local/state/discord-bot /home/ubuntu/.npm /home/ubuntu/.claude /home/ubuntu/.cache /tmp/discord_bot_attachments /tmp/mermaid_output /tmp/table_renders /tmp/math_renders
+# Source and .git remain read-only. Runtime state is private to kanae-bot.
+ReadWritePaths=/var/lib/kanae-bot /var/cache/kanae-bot /tmp/discord_bot_attachments /tmp/mermaid_output /tmp/table_renders /tmp/math_renders
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

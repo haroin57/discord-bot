@@ -15,6 +15,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc````"
+    b"\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
 # ---------------------------------------------------------------------------
 # Async iterator helper for mocking discord.py async iterators
 # ---------------------------------------------------------------------------
@@ -36,7 +43,9 @@ class AsyncIteratorMock:
             raise StopAsyncIteration
 
 
-def _make_discord_message(display_name="User", content="hello", embeds=None, attachments=None):
+def _make_discord_message(
+    display_name="User", content="hello", embeds=None, attachments=None
+):
     msg = MagicMock()
     msg.author.display_name = display_name
     msg.content = content
@@ -97,7 +106,9 @@ class TestFetchThreadContext:
         att = MagicMock()
         att.filename = "image.png"
 
-        msg1 = _make_discord_message("User1", "Check this", embeds=[embed], attachments=[att])
+        msg1 = _make_discord_message(
+            "User1", "Check this", embeds=[embed], attachments=[att]
+        )
 
         thread = MagicMock()
         thread.name = "media-thread"
@@ -224,7 +235,9 @@ class TestFetchChannelContext:
         att = MagicMock()
         att.filename = "doc.pdf"
 
-        msg = _make_discord_message("Reporter", "Update", embeds=[embed], attachments=[att])
+        msg = _make_discord_message(
+            "Reporter", "Update", embeds=[embed], attachments=[att]
+        )
 
         channel = MagicMock()
         channel.history.return_value = AsyncIteratorMock([msg])
@@ -256,9 +269,8 @@ class TestResolveOneLink:
 
         mock_channel = MagicMock()
         mock_channel.name = "channel"
-        # guild=None => treated as DM by the auth guard. We pass requester=None
-        # below so the auth check is skipped entirely.
-        mock_channel.guild = None
+        mock_channel.guild = MagicMock()
+        mock_channel.guild.id = 111
         mock_channel.fetch_message = AsyncMock(return_value=mock_msg)
 
         mock_client = MagicMock()
@@ -285,7 +297,8 @@ class TestResolveOneLink:
 
         mock_channel = MagicMock()
         mock_channel.name = "uploads"
-        mock_channel.guild = None
+        mock_channel.guild = MagicMock()
+        mock_channel.guild.id = 1
         mock_channel.fetch_message = AsyncMock(return_value=mock_msg)
 
         mock_client = MagicMock()
@@ -308,15 +321,15 @@ class TestResolveOneLink:
 
         mock_channel = MagicMock()
         mock_channel.name = "ch"
-        mock_channel.guild = None
+        mock_channel.guild = MagicMock()
+        mock_channel.guild.id = 1
         mock_channel.fetch_message = AsyncMock(return_value=mock_msg)
 
         mock_client = MagicMock()
         mock_client.get_channel = MagicMock(return_value=mock_channel)
 
         text = (
-            "https://discord.com/channels/1/2/3 and "
-            "https://discord.com/channels/4/5/6"
+            "https://discord.com/channels/1/2/3 and https://discord.com/channels/1/5/6"
         )
         result = await resolve_message_links(mock_client, text, requester=None)
         # Both links resolved
@@ -337,16 +350,14 @@ class TestResolveOneLink:
 
         mock_channel = MagicMock()
         mock_channel.name = "ch"
-        mock_channel.guild = None
+        mock_channel.guild = MagicMock()
+        mock_channel.guild.id = 1
         mock_channel.fetch_message = AsyncMock(return_value=mock_msg)
 
         mock_client = MagicMock()
         mock_client.get_channel = MagicMock(return_value=mock_channel)
 
-        text = (
-            "https://discord.com/channels/1/2/3 "
-            "https://discord.com/channels/4/5/6"
-        )
+        text = "https://discord.com/channels/1/2/3 https://discord.com/channels/1/5/6"
         result = await resolve_message_links(mock_client, text, requester=None)
         # Only 1 resolved
         assert result.count("[Referenced message by U") == 1
@@ -360,8 +371,9 @@ class TestResolveOneLink:
 class TestDownloadOne:
     """Cover lines 50-62 of attachments.py via download_attachments."""
 
-    def _make_attachment(self, content_type="image/png", size=100,
-                         filename="test.png", att_id=42):
+    def _make_attachment(
+        self, content_type="image/png", size=100, filename="test.png", att_id=42
+    ):
         att = MagicMock()
         att.content_type = content_type
         att.size = size
@@ -378,7 +390,7 @@ class TestDownloadOne:
 
         att = self._make_attachment()
 
-        chunk_data = b"fake image data"
+        chunk_data = _PNG
 
         mock_resp = MagicMock()
         mock_resp.status = 200
@@ -452,7 +464,7 @@ class TestDownloadOne:
 
         att = self._make_attachment(filename="noext")
 
-        chunk_data = b"data"
+        chunk_data = _PNG
         mock_resp = MagicMock()
         mock_resp.status = 200
         mock_resp.content = MagicMock()
@@ -532,7 +544,9 @@ class TestStreamSync:
         monkeypatch.setattr("services.claude_api.append_jsonl", lambda *a: None)
         monkeypatch.setattr("services.claude_api.fix_history_integrity", lambda h: None)
         monkeypatch.setattr("services.claude_api.trim_history", lambda h, m: None)
-        monkeypatch.setattr("services.claude_api.ensure_valid_token", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            "services.claude_api.ensure_valid_token", AsyncMock(return_value=None)
+        )
 
         stream_call_count = 0
 
@@ -540,6 +554,7 @@ class TestStreamSync:
             nonlocal stream_call_count
             from services.claude_api import _stream_once as real_stream_once
             import services.claude_api as _api
+
             # Only intercept _stream_once calls
             if fn is _api._stream_once:
                 stream_call_count += 1
@@ -576,10 +591,13 @@ class TestStreamSync:
         monkeypatch.setattr("services.claude_api.append_jsonl", lambda *a: None)
         monkeypatch.setattr("services.claude_api.fix_history_integrity", lambda h: None)
         monkeypatch.setattr("services.claude_api.trim_history", lambda h, m: None)
-        monkeypatch.setattr("services.claude_api.ensure_valid_token", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            "services.claude_api.ensure_valid_token", AsyncMock(return_value=None)
+        )
 
         async def fake_to_thread(fn, *args):
             import services.claude_api as _api
+
             if fn is _api._stream_once:
                 raise anthropic.RateLimitError(
                     message="rate limited",
@@ -673,7 +691,9 @@ class TestCallDirect:
         monkeypatch.setattr("services.claude_api._stream_once", fake_stream)
 
         conversation = OrderedDict()
-        result = await call_direct("Hello", 999, conversation, conv_context="Thread ctx")
+        result = await call_direct(
+            "Hello", 999, conversation, conv_context="Thread ctx"
+        )
 
         assert result == "Response text"
         history = conversation[999]
@@ -714,9 +734,10 @@ class TestCallDirect:
     async def test_error_handling_pops_user_msg(self, monkeypatch):
         from services.claude_api import call_direct
 
-        monkeypatch.setattr("services.claude_api.get_client", MagicMock(
-            side_effect=Exception("API down")
-        ))
+        monkeypatch.setattr(
+            "services.claude_api.get_client",
+            MagicMock(side_effect=Exception("API down")),
+        )
         monkeypatch.setattr("services.claude_api.append_jsonl", lambda *a: None)
         monkeypatch.setattr("services.claude_api.fix_history_integrity", lambda h: None)
         monkeypatch.setattr("services.claude_api.trim_history", lambda h, m: None)
@@ -727,7 +748,9 @@ class TestCallDirect:
         assert "エラー" in result or "error" in result.lower() or "API" in result
         # The user message should have been popped from history
         history = conversation[1]
-        assert not any(m.get("role") == "user" and m.get("content") == "fail" for m in history)
+        assert not any(
+            m.get("role") == "user" and m.get("content") == "fail" for m in history
+        )
 
     @pytest.mark.asyncio
     async def test_empty_response_returns_fallback(self, monkeypatch):
@@ -780,8 +803,7 @@ class TestCallDirect:
         assert result == "Reply"
         # Thread context should NOT be seeded for existing channels
         assert not any(
-            "過去のスレッド履歴" in str(m.get("content", ""))
-            for m in conversation[1]
+            "過去のスレッド履歴" in str(m.get("content", "")) for m in conversation[1]
         )
 
 

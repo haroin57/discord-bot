@@ -8,6 +8,7 @@ import discord
 from discord import app_commands
 
 from bot_commands._deps import CommandDeps
+from bot_commands.state import state_from_deps
 from services.skills import (
     Skill,
     SkillError,
@@ -191,9 +192,7 @@ class _SkillsView(discord.ui.View):
 
 
 def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
-    skill_overrides = getattr(deps, "skill_overrides", None)
-    if skill_overrides is None:
-        skill_overrides = {}
+    skill_overrides = state_from_deps(deps).skill_mapping()
 
     async def skill_autocomplete(
         interaction: discord.Interaction,
@@ -204,13 +203,19 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
         needle = (current or "").strip().casefold()
         result: list[app_commands.Choice[str]] = []
         for skill in user_invocable_skills().values():
-            if needle and needle not in skill.name.casefold() and needle not in skill.description.casefold():
+            if (
+                needle
+                and needle not in skill.name.casefold()
+                and needle not in skill.description.casefold()
+            ):
                 continue
             label = skill.name
             if skill.description:
                 label += f" — {skill.description}"
             result.append(
-                app_commands.Choice(name=_description_text(label, 100), value=skill.name)
+                app_commands.Choice(
+                    name=_description_text(label, 100), value=skill.name
+                )
             )
             if len(result) >= _MAX_SELECT_OPTIONS:
                 break
@@ -224,12 +229,14 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
         action="list / load / off / reload",
         skill="loadするskill名。省略時は選択メニューを表示",
     )
-    @app_commands.choices(action=[
-        app_commands.Choice(name="List / menu", value="list"),
-        app_commands.Choice(name="Load", value="load"),
-        app_commands.Choice(name="Off", value="off"),
-        app_commands.Choice(name="Reload", value="reload"),
-    ])
+    @app_commands.choices(
+        action=[
+            app_commands.Choice(name="List / menu", value="list"),
+            app_commands.Choice(name="Load", value="load"),
+            app_commands.Choice(name="Off", value="off"),
+            app_commands.Choice(name="Reload", value="reload"),
+        ]
+    )
     @app_commands.autocomplete(skill=skill_autocomplete)
     async def skills_cmd(
         interaction: discord.Interaction,
