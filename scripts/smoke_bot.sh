@@ -29,9 +29,14 @@ for mod in (
 EOF
 
 echo "[smoke] 2/2 fast test subset (session/state/config surface)"
-"${PY}" -m pytest -q -x \
-    -p no:cacheprovider \
-    tests/test_config.py tests/test_session.py tests/test_atomic_write.py \
-    2>&1
+(
+    # The deploy controller keeps trusted state under umask 077. These tests
+    # exercise explicit public file modes and must use the normal runtime mask.
+    umask 022
+    "${PY}" -m pytest -q -x \
+        -p no:cacheprovider \
+        tests/test_config.py tests/test_session.py tests/test_atomic_write.py \
+        2>&1
+)
 
 echo "[smoke] ALL GREEN — safe to restart"
