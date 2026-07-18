@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -294,7 +297,107 @@ def test_third_party_action_is_sha_pinned_and_permissions_are_restricted():
     assert workflow["permissions"] == {"contents": "read"}
     assert _workflow("security.yml")["permissions"] == {"contents": "read"}
     assert _workflow("notify-push.yml")["permissions"] == {}
-    assert _workflow("notify-ci-failure.yml")["permissions"] == {}
+    assert _workflow("notify-ci-failure.yml")["permissions"] == {"actions": "read"}
+
+
+def test_ci_failure_notification_rechecks_latest_attempt_before_sending():
+    workflow = _workflow("notify-ci-failure.yml")
+    assert workflow["concurrency"] == {
+        "group": "notify-ci-failure-${{ github.event.workflow_run.id }}",
+        "cancel-in-progress": "true",
+    }
+
+    recheck = _named_step(
+        workflow,
+        "notify",
+        "Recheck latest workflow attempt after grace period",
+    )
+    assert recheck["id"] == "latest-run"
+    assert recheck["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert recheck["env"]["RUN_ID"] == "${{ github.event.workflow_run.id }}"
+    assert (
+        recheck["env"]["ORIGINAL_ATTEMPT"]
+        == "${{ github.event.workflow_run.run_attempt }}"
+    )
+    command = recheck["run"]
+    assert "sleep 60" in command
+    assert "/actions/runs/${RUN_ID}" in command
+    assert ".run_attempt" in command
+    assert 'LATEST_STATUS}" == "completed"' in command
+    assert 'LATEST_CONCLUSION}" == "failure"' in command
+    assert "should_notify=%s" in command
+
+    notify = _named_step(
+        workflow,
+        "notify",
+        "Notify branch-specific Discord channels on CI failure",
+    )
+    assert notify["if"] == "steps.latest-run.outputs.should_notify == 'true'"
+
+
+@pytest.mark.parametrize(
+    ("latest_run", "expected"),
+    [
+        (
+            {"run_attempt": 1, "status": "completed", "conclusion": "failure"},
+            "true",
+        ),
+        (
+            {"run_attempt": 2, "status": "in_progress", "conclusion": None},
+            "false",
+        ),
+        (
+            {"run_attempt": 2, "status": "completed", "conclusion": "success"},
+            "false",
+        ),
+    ],
+)
+def test_ci_failure_notification_decision_uses_latest_attempt(
+    tmp_path: Path,
+    latest_run: dict[str, object],
+    expected: str,
+):
+    workflow = _workflow("notify-ci-failure.yml")
+    recheck = _named_step(
+        workflow,
+        "notify",
+        "Recheck latest workflow attempt after grace period",
+    )
+
+    fixture = tmp_path / "run.json"
+    fixture.write_text(json.dumps(latest_run), encoding="utf-8")
+    output = tmp_path / "github-output"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "sleep").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (fake_bin / "curl").write_text(
+        '#!/bin/sh\ncat "${RUN_FIXTURE}"\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "sleep").chmod(0o755)
+    (fake_bin / "curl").chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", "-c", recheck["run"]],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "GH_TOKEN": "test-token",
+            "GH_API_URL": "https://api.github.test",
+            "GH_REPOSITORY": "owner/repository",
+            "RUN_ID": "12345",
+            "ORIGINAL_ATTEMPT": "1",
+            "RUN_FIXTURE": str(fixture),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert output.read_text(encoding="utf-8") == f"should_notify={expected}\n"
 
 
 def test_security_findings_are_blocking():
