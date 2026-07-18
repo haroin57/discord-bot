@@ -49,7 +49,9 @@ def normalize_tool_input(tool_input) -> str:
 
 def _call_hash(name: str, tool_input) -> str:
     raw = f"{name}\x00{normalize_tool_input(tool_input)}"
-    return hashlib.sha1(raw.encode("utf-8", "surrogatepass")).hexdigest()
+    return hashlib.sha1(
+        raw.encode("utf-8", "surrogatepass"), usedforsecurity=False
+    ).hexdigest()
 
 
 @dataclass(frozen=True)

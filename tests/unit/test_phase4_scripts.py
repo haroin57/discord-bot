@@ -902,6 +902,8 @@ def test_tool_loop_protected_subset_matches_immutable_evidence(monkeypatch):
         del repo, candidate
         if relative == release.PROTECTED_EVIDENCE_RELATIVE:
             return manifest
+        if relative in {"services/session.py", "tests/test_session.py"}:
+            return b"refactored outside the protected tool-loop subset"
         return (root / relative).read_bytes()
 
     monkeypatch.setattr(release, "_git_blob", fake_blob)

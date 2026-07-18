@@ -330,7 +330,8 @@ def _check_mem0() -> dict[str, Any]:
             return {"ok": False, "reason": "invalid_timeout"}
         url = f"http://{host}:{port}/api/v2/heartbeat"
         request = Request(url, headers={"Accept": "application/json"})
-        with urlopen(request, timeout=timeout) as response:  # noqa: S310
+        # host and port are trusted operator configuration, not request input.
+        with urlopen(request, timeout=timeout) as response:  # nosec B310
             if response.status != 200:
                 return {"ok": False, "reason": f"heartbeat_http_{response.status}"}
             payload = json.loads(response.read())

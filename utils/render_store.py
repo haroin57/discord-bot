@@ -27,7 +27,9 @@ def render_paths(
     cache_key: str,
 ) -> tuple[str, str]:
     """Return deterministic PNG and HTML paths for one render input."""
-    render_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
+    render_hash = hashlib.md5(
+        cache_key.encode(), usedforsecurity=False
+    ).hexdigest()[:12]
     stem = os.path.join(output_dir, f"{prefix}_{render_hash}")
     return f"{stem}.png", f"{stem}.html"
 

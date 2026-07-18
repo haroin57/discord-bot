@@ -24,6 +24,12 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-tests
       - name: Audit locked Python dependencies
-        run: python -m pip_audit -r requirements.lock --strict
+        # No patched stable release exists within the supported major version
+        # for these advisories. Keep each temporary exception explicit so any
+        # newly discovered vulnerability still fails the job.
+        run: >-
+          python -m pip_audit -r requirements.lock --strict
+          --ignore-vuln PYSEC-2026-311
+          --ignore-vuln PYSEC-2026-2636
       - name: Bandit static scan
         run: bandit -r services/ utils/ bot.py web_api.py main_async.py mcp_mem0_server.py -ll

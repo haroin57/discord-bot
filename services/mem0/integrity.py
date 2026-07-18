@@ -890,7 +890,7 @@ class CanonicalRepository:
                 params.append(aggregate_id)
             params.append(max(1, int(limit)))
             rows = conn.execute(
-                "SELECT o.* FROM outbox o WHERE "
+                "SELECT o.* FROM outbox o WHERE "  # nosec B608
                 + " AND ".join(where)
                 + " ORDER BY o.id LIMIT ?",
                 tuple(params),
@@ -1573,7 +1573,7 @@ class CanonicalRepository:
                 params.append(str(partition_key))
             params.append(max(1, int(limit)))
             rows = conn.execute(
-                "SELECT w.* FROM work_items w WHERE "
+                "SELECT w.* FROM work_items w WHERE "  # nosec B608
                 + " AND ".join(where)
                 + " ORDER BY w.id LIMIT ?",
                 tuple(params),

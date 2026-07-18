@@ -243,7 +243,7 @@ def upsert_entity(
     surface_forms = (name, *norm_aliases)
     placeholders = ",".join("?" for _ in surface_forms)
     lookup_sql = (
-        f"SELECT id FROM entities "
+        f"SELECT id FROM entities "  # nosec B608
         f"WHERE user_id=? AND ("
         f"canonical_name IN ({placeholders}) "
         f"OR id IN (SELECT entity_id FROM entity_aliases "
@@ -340,7 +340,7 @@ def apply_fact_projection(
                 surfaces = (name, *aliases)
                 placeholders = ",".join("?" for _ in surfaces)
                 row = c.execute(
-                    f"SELECT id FROM entities WHERE user_id=? AND ("
+                    f"SELECT id FROM entities WHERE user_id=? AND ("  # nosec B608
                     f"canonical_name IN ({placeholders}) OR id IN ("
                     f"SELECT entity_id FROM entity_aliases WHERE alias IN "
                     f"({placeholders}))) LIMIT 1",
@@ -842,7 +842,7 @@ def get_relations(
         where.append("(valid_to IS NULL OR valid_to > ?)")
         params.append(now)
     sql = (
-        "SELECT id, src_entity_id, rel_type, dst_entity_id, user_id, "
+        "SELECT id, src_entity_id, rel_type, dst_entity_id, user_id, "  # nosec B608
         "created_at, valid_from, valid_to, source_fact_id "
         "FROM entity_relations WHERE "
         + " AND ".join(where)

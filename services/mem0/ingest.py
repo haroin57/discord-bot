@@ -30,7 +30,9 @@ _INSERT_SEEN_MAX = 8000
 
 
 def _fact_key(user_id: str, text: str) -> str:
-    return _hashlib.md5(f"{user_id}\x00{(text or '').strip()}".encode()).hexdigest()
+    return _hashlib.md5(
+        f"{user_id}\x00{(text or '').strip()}".encode(), usedforsecurity=False
+    ).hexdigest()
 
 
 async def _claim_insert(user_id: str, text: str) -> bool:

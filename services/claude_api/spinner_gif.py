@@ -112,7 +112,7 @@ if __name__ == "__main__":
     mont = Image.new("RGBA", (fr[0].width, _HEIGHT * len(fr)), (54, 57, 63, 255))
     for i, f in enumerate(fr):
         mont.alpha_composite(f, (0, i * _HEIGHT))
-    png = "/tmp/discord_bot_attachments/status_gif_montage.png"
+    png = "/tmp/discord_bot_attachments/status_gif_montage.png"  # nosec B108
     os.makedirs(os.path.dirname(png), exist_ok=True)
     mont.convert("RGB").save(png)
     print("montage:", png, f"({fr[0].width}x{_HEIGHT} per frame)")

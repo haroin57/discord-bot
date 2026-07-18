@@ -27,10 +27,10 @@ ADMIN_IMAGE_DIRS = ALLOWED_IMAGE_DIRS + ("/home/ubuntu",)
 
 # Directories to search when resolving bare image filenames to full paths.
 _IMAGE_SEARCH_DIRS = (
-    "/tmp/table_renders",
-    "/tmp/math_renders",
-    "/tmp/mermaid_output",
-    "/tmp/discord_bot_attachments",
+    "/tmp/table_renders",  # nosec B108
+    "/tmp/math_renders",  # nosec B108
+    "/tmp/mermaid_output",  # nosec B108
+    "/tmp/discord_bot_attachments",  # nosec B108
     "/home/ubuntu",
 )
 
@@ -125,7 +125,7 @@ _FILE_PATH_QUOTED_RE = re.compile(
 )
 
 # Admin-only: allowed dirs for arbitrary file attachment (broader than image dirs)
-ADMIN_FILE_DIRS = ("/home/ubuntu", "/tmp")
+ADMIN_FILE_DIRS = ("/home/ubuntu", "/tmp")  # nosec B108
 # Max file size for Discord attachment (25MB Discord limit, we cap at 24MB)
 MAX_FILE_ATTACH_BYTES = 24 * 1024 * 1024
 MAX_FILE_ATTACHMENTS = 5

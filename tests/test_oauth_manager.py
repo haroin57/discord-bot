@@ -884,6 +884,7 @@ class TestPatchAnthropicSdk:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.process_state_mutation
 class TestInit:
     def test_returns_true_with_valid_creds(self, tmp_path, monkeypatch):
         import services.oauth_manager as om
@@ -1437,6 +1438,7 @@ def _setup_dual(tmp_path, monkeypatch, *, with_failover=True):
     return primary, fo
 
 
+@pytest.mark.process_state_mutation
 class TestFailoverToSecondary:
     def test_success_switches_and_persists(self, tmp_path, monkeypatch):
         import services.oauth_manager as om
@@ -1499,6 +1501,7 @@ class TestFailoverToSecondary:
         assert om.failover_to_secondary("quota") is False
 
 
+@pytest.mark.process_state_mutation
 class TestMaybeRestorePrimary:
     @pytest.mark.asyncio
     async def test_before_retry_at_stays(self, tmp_path, monkeypatch):
@@ -1574,6 +1577,7 @@ def _touch_future(path, offset_s: float = 5.0) -> None:
     os.utime(str(path), (t, t))
 
 
+@pytest.mark.process_state_mutation
 class TestAuthFailbackOnRelogin:
     @pytest.mark.asyncio
     async def test_relogin_restores_primary(self, tmp_path, monkeypatch):
@@ -1667,6 +1671,7 @@ class TestAuthFailbackOnRelogin:
         assert om.get_active_account() == "primary"
 
 
+@pytest.mark.process_state_mutation
 class TestFailbackToPrimary:
     @pytest.mark.asyncio
     async def test_forced_failback_when_primary_alive(self, tmp_path, monkeypatch):
@@ -1749,6 +1754,7 @@ class TestFailbackToPrimary:
         assert om.get_active_account() == "primary"
 
 
+@pytest.mark.process_state_mutation
 class TestFailoverPersistence:
     def test_state_survives_reinit(self, tmp_path, monkeypatch):
         import services.oauth_manager as om
@@ -1774,6 +1780,7 @@ class TestFailoverPersistence:
         assert om.get_active_account() == "primary"
 
 
+@pytest.mark.process_state_mutation
 class TestRefreshWriteback:
     @pytest.mark.asyncio
     async def test_failover_refresh_never_touches_primary_file(
@@ -1825,6 +1832,7 @@ class TestRefreshWriteback:
         assert fo_data["accessToken"] == "fo-new"  # failover のみ更新
 
 
+@pytest.mark.process_state_mutation
 class TestPrimePerAccount:
     def test_switch_resets_primed_flag(self, tmp_path, monkeypatch):
         import services.oauth_manager as om

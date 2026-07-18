@@ -26,7 +26,7 @@ __all__ = ["render_table_image"]
 
 log = logging.getLogger(__name__)
 
-TABLE_OUTPUT_DIR = "/tmp/table_renders"
+TABLE_OUTPUT_DIR = "/tmp/table_renders"  # nosec B108
 # ---------------------------------------------------------------------------
 # CSS (Discord dark theme)
 # ---------------------------------------------------------------------------

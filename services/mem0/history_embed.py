@@ -58,7 +58,9 @@ def _get_collection():
 
 
 def _line_id(channel_id, ts: str, role: str, text: str) -> str:
-    h = hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:12]
+    h = hashlib.sha1(
+        (text or "").encode("utf-8"), usedforsecurity=False
+    ).hexdigest()[:12]
     return f"{channel_id}:{ts}:{role}:{h}"
 
 
