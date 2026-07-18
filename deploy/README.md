@@ -22,7 +22,8 @@ Chroma liveness endpoint. Arbitrary consumer subsets are rejected.
 1. Provision the service identities and filesystem boundaries in
    [OPERATIONS_SECURITY.md](OPERATIONS_SECURITY.md).
 2. Copy the units to `/etc/systemd/system/`.
-3. Install the root-owned rollback runner and protected manifest trust root.
+3. Install the root-owned rollback, release-publisher, and snapshot helpers and
+   the protected manifest trust root.
 4. Create the service-specific credential files under
    `/etc/discord-bot/credentials` with owner `root:root` and mode `0600`.
 5. Run `systemctl daemon-reload && systemctl enable --now discord-bot`.
@@ -33,6 +34,9 @@ Chroma liveness endpoint. Arbitrary consumer subsets are rejected.
   output `root root 600`.
 - `stat -c '%U %a' /usr/local/libexec/discord-bot-rollback` must output
   `root 755` or stricter.
+- `stat -c '%U %a' /usr/local/libexec/discord-bot-snapshot` must output
+  `root 755` or stricter, and `visudo -cf
+  /etc/sudoers.d/discord-bot-snapshot` must pass.
 - `systemctl show discord-bot -p User` must output `User=kanae-bot`.
 - `journalctl -fu discord-bot` shows no startup errors
 

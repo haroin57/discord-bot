@@ -1,0 +1,2 @@
+Cmnd_Alias DISCORD_BOT_SNAPSHOT = /usr/local/libexec/discord-bot-snapshot, /usr/local/libexec/discord-bot-snapshot --verify *
+kanae-deploy ALL=(root) NOPASSWD: DISCORD_BOT_SNAPSHOT
