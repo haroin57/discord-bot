@@ -1,5 +1,23 @@
 # Deploy assets
 
+## Deployment checkouts
+
+CD uses dedicated, secret-free checkouts owned by `kanae-deploy`:
+
+- production: `/var/lib/discord-bot-deploy/checkouts/prod`
+- staging: `/var/lib/discord-bot-deploy/checkouts/dev`
+
+Developer worktrees under `/home/ubuntu` are not deployment inputs. This keeps
+uncommitted development work, local virtual environments, and dotenv files out
+of the pull-based deployment transaction.
+
+Production supports two fail-closed consumer profiles. The installed unit uses
+`AUTO_DEPLOY_PROFILE=core` while only `discord-bot.service` consumes the atomic
+release tree. After every production consumer has been migrated to
+`/var/lib/discord-bot-releases/prod/current`, switch the unit to `full`; the
+full profile requires the complete consumer set, ports 3004 and 3002, and the
+Chroma liveness endpoint. Arbitrary consumer subsets are rejected.
+
 ## Initial install
 1. Provision the service identities and filesystem boundaries in
    [OPERATIONS_SECURITY.md](OPERATIONS_SECURITY.md).

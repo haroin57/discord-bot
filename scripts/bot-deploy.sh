@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/release_artifact_lib.sh
 source "${SCRIPT_DIR}/release_artifact_lib.sh"
 
-BOT_DIR="${DEPLOY_BOT_DIR:-/home/ubuntu/discord-bot}"
+BOT_DIR="${DEPLOY_BOT_DIR:-/var/lib/discord-bot-deploy/checkouts/prod}"
 SERVICE="${DEPLOY_SERVICE:-discord-bot}"
 DEPLOY_STATE_DIR="${DEPLOY_STATE_DIR:-/var/lib/discord-bot-deploy/prod}"
 LOCK_FILE="${DEPLOY_LOCK_FILE:-${DEPLOY_STATE_DIR}/deploy.lock}"

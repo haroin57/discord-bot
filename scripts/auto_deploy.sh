@@ -20,16 +20,24 @@ if [[ "${ENV}" != "prod" && "${ENV}" != "dev" ]]; then
 fi
 
 if [[ "${ENV}" == "prod" ]]; then
-    BOT_DIR="${AUTO_DEPLOY_BOT_DIR:-/home/ubuntu/discord-bot}"
+    BOT_DIR="${AUTO_DEPLOY_BOT_DIR:-/var/lib/discord-bot-deploy/checkouts/prod}"
     BRANCH="master"
     SERVICE="${AUTO_DEPLOY_SERVICE:-discord-bot}"
-    RELEASE_CONSUMERS="${AUTO_DEPLOY_CONSUMERS:-chromadb-server mcp-mem0-shared mcp-second-opinion-shared mcp-oracle-shared vi-signal-scheduler intervention-scheduler hermes-discord-codex discord-bot kanae-mcp-forward kanae-systemd-forward}"
-    RELEASE_READY_PORTS="${AUTO_DEPLOY_READY_PORTS:-3004 3002}"
-    RELEASE_LIVENESS_URLS="${AUTO_DEPLOY_LIVENESS_URLS:-http://127.0.0.1:8765/api/v2/heartbeat}"
+    DEPLOY_PROFILE="${AUTO_DEPLOY_PROFILE:-full}"
+    if [[ "${DEPLOY_PROFILE}" == "core" ]]; then
+        RELEASE_CONSUMERS="${AUTO_DEPLOY_CONSUMERS:-discord-bot}"
+        RELEASE_READY_PORTS="${AUTO_DEPLOY_READY_PORTS:-3002}"
+        RELEASE_LIVENESS_URLS="${AUTO_DEPLOY_LIVENESS_URLS:-}"
+    else
+        RELEASE_CONSUMERS="${AUTO_DEPLOY_CONSUMERS:-chromadb-server mcp-mem0-shared mcp-second-opinion-shared mcp-oracle-shared vi-signal-scheduler intervention-scheduler hermes-discord-codex discord-bot kanae-mcp-forward kanae-systemd-forward}"
+        RELEASE_READY_PORTS="${AUTO_DEPLOY_READY_PORTS:-3004 3002}"
+        RELEASE_LIVENESS_URLS="${AUTO_DEPLOY_LIVENESS_URLS:-http://127.0.0.1:8765/api/v2/heartbeat}"
+    fi
 else
-    BOT_DIR="${AUTO_DEPLOY_BOT_DIR:-/home/ubuntu/discord-bot-dev}"
+    BOT_DIR="${AUTO_DEPLOY_BOT_DIR:-/var/lib/discord-bot-deploy/checkouts/dev}"
     BRANCH="dev"
     SERVICE="${AUTO_DEPLOY_SERVICE:-discord-bot-dev}"
+    DEPLOY_PROFILE="staging"
     RELEASE_CONSUMERS="${AUTO_DEPLOY_CONSUMERS:-discord-bot-dev}"
     RELEASE_READY_PORTS="${AUTO_DEPLOY_READY_PORTS:-3003}"
     RELEASE_LIVENESS_URLS="${AUTO_DEPLOY_LIVENESS_URLS:-}"
@@ -69,7 +77,8 @@ DEPLOY_NOTIFY_WEBHOOK_URL="${DEPLOY_NOTIFY_WEBHOOK_URL:-}"
 log() { echo "[auto_deploy/${ENV}] $*"; }
 
 validate_deploy_identity() {
-    local expected_bot expected_consumers expected_ports expected_gate expected_runner item
+    local expected_bot expected_consumers expected_ports expected_liveness
+    local expected_gate expected_runner item
     if [[ "${AUTO_DEPLOY_TEST_MODE}" == "1" ]]; then
         [[ "$(realpath -m "${BOT_DIR}")" == /tmp/* \
             && "$(realpath -m "${DEPLOY_STATE_DIR}")" == /tmp/* \
@@ -85,14 +94,27 @@ validate_deploy_identity() {
         && "${RELEASE_PUBLISHER_USE_SUDO}" == "1" \
         && "${RELEASE_GENERATION_OWNER_UID}" == "0" ]] || return 1
     if [[ "${ENV}" == "prod" ]]; then
-        expected_bot="/home/ubuntu/discord-bot"
-        expected_consumers="chromadb-server mcp-mem0-shared mcp-second-opinion-shared mcp-oracle-shared vi-signal-scheduler intervention-scheduler hermes-discord-codex discord-bot kanae-mcp-forward kanae-systemd-forward"
-        expected_ports="3004 3002"
+        expected_bot="/var/lib/discord-bot-deploy/checkouts/prod"
+        case "${DEPLOY_PROFILE}" in
+            core)
+                expected_consumers="discord-bot"
+                expected_ports="3002"
+                expected_liveness=""
+                ;;
+            full)
+                expected_consumers="chromadb-server mcp-mem0-shared mcp-second-opinion-shared mcp-oracle-shared vi-signal-scheduler intervention-scheduler hermes-discord-codex discord-bot kanae-mcp-forward kanae-systemd-forward"
+                expected_ports="3004 3002"
+                expected_liveness="http://127.0.0.1:8765/api/v2/heartbeat"
+                ;;
+            *) return 1 ;;
+        esac
         expected_runner="/usr/local/libexec/discord-bot-rollback"
     else
-        expected_bot="/home/ubuntu/discord-bot-dev"
+        [[ "${DEPLOY_PROFILE}" == "staging" ]] || return 1
+        expected_bot="/var/lib/discord-bot-deploy/checkouts/dev"
         expected_consumers="discord-bot-dev"
         expected_ports="3003"
+        expected_liveness=""
         expected_runner="/usr/local/libexec/discord-bot-rollback"
     fi
     expected_gate="${expected_bot}/scripts/release_gate.sh"
@@ -109,6 +131,7 @@ validate_deploy_identity() {
     done
     [[ "$(xargs -n1 <<<"${RELEASE_READY_PORTS}" | sort -u | xargs)" \
         == "$(xargs -n1 <<<"${expected_ports}" | sort -u | xargs)" ]] || return 1
+    [[ "${RELEASE_LIVENESS_URLS}" == "${expected_liveness}" ]] || return 1
 }
 
 notify() {

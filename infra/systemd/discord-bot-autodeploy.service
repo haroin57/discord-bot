@@ -8,26 +8,27 @@ Type=oneshot
 User=kanae-deploy
 Group=kanae-deploy
 SupplementaryGroups=kanae-code
-WorkingDirectory=/home/ubuntu/discord-bot
+WorkingDirectory=/var/lib/discord-bot-deploy/checkouts/prod
 EnvironmentFile=/etc/discord-bot/credentials/deploy.env
 Environment=HOME=/var/lib/discord-bot-deploy
 Environment=AUTO_DEPLOY_STATE_DIR=/var/lib/discord-bot-deploy/prod
 Environment=AUTO_DEPLOY_RELEASE_ROOT=/var/lib/discord-bot-releases/prod
 Environment=AUTO_DEPLOY_DISABLED=0
 Environment=AUTO_DEPLOY_TEST_MODE=0
-Environment=AUTO_DEPLOY_BOT_DIR=/home/ubuntu/discord-bot
+Environment=AUTO_DEPLOY_PROFILE=core
+Environment=AUTO_DEPLOY_BOT_DIR=/var/lib/discord-bot-deploy/checkouts/prod
 Environment=AUTO_DEPLOY_SERVICE=discord-bot
-Environment="AUTO_DEPLOY_CONSUMERS=chromadb-server mcp-mem0-shared mcp-second-opinion-shared mcp-oracle-shared vi-signal-scheduler intervention-scheduler hermes-discord-codex discord-bot kanae-mcp-forward kanae-systemd-forward"
-Environment="AUTO_DEPLOY_READY_PORTS=3004 3002"
-Environment=AUTO_DEPLOY_LIVENESS_URLS=http://127.0.0.1:8765/api/v2/heartbeat
-Environment=AUTO_DEPLOY_RELEASE_GATE=/home/ubuntu/discord-bot/scripts/release_gate.sh
+Environment=AUTO_DEPLOY_CONSUMERS=discord-bot
+Environment=AUTO_DEPLOY_READY_PORTS=3002
+Environment=AUTO_DEPLOY_LIVENESS_URLS=
+Environment=AUTO_DEPLOY_RELEASE_GATE=/var/lib/discord-bot-deploy/checkouts/prod/scripts/release_gate.sh
 Environment=AUTO_DEPLOY_TRUSTED_ROLLBACK_RUNNER=/usr/local/libexec/discord-bot-rollback
 Environment=AUTO_DEPLOY_RELEASE_PUBLISHER=/usr/local/libexec/discord-bot-release-publisher
 Environment=AUTO_DEPLOY_PUBLISHER_USE_SUDO=1
 Environment=AUTO_DEPLOY_GENERATION_OWNER_UID=0
 StateDirectory=discord-bot-deploy
 StateDirectoryMode=0700
-ExecStart=/home/ubuntu/discord-bot/scripts/auto_deploy.sh prod
+ExecStart=/var/lib/discord-bot-deploy/checkouts/prod/scripts/auto_deploy.sh prod
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=discord-bot-autodeploy
@@ -40,7 +41,7 @@ UMask=0022
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/ubuntu/discord-bot /var/lib/discord-bot-deploy /var/lib/discord-bot-releases/prod /var/lib/discord-bot-backup/release-gate
+ReadWritePaths=/var/lib/discord-bot-deploy /var/lib/discord-bot-releases/prod /var/lib/discord-bot-backup/release-gate
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

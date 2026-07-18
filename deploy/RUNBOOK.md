@@ -3,7 +3,8 @@
 ## Deploy
 
 ```bash
-sudo -u kanae-deploy /home/ubuntu/discord-bot/scripts/bot-deploy.sh
+sudo -u kanae-deploy \
+  /var/lib/discord-bot-deploy/checkouts/prod/scripts/bot-deploy.sh
 ```
 
 The script fails closed on a dirty worktree or active rollback pin and holds the
@@ -42,10 +43,12 @@ resolved, verify that HEAD equals `target_sha`, the checkout is clean, and
 the next deploy.
 
 ```bash
-sudo -u kanae-deploy git -C /home/ubuntu/discord-bot status --short
+sudo -u kanae-deploy git \
+  -C /var/lib/discord-bot-deploy/checkouts/prod status --short
 target_sha="$(sudo sed -n 's/^target_sha=//p' \
   /var/lib/discord-bot-deploy/prod/rollback.pin)"
-test "$(sudo -u kanae-deploy git -C /home/ubuntu/discord-bot rev-parse HEAD)" \
+test "$(sudo -u kanae-deploy git \
+  -C /var/lib/discord-bot-deploy/checkouts/prod rev-parse HEAD)" \
   = "${target_sha}"
 curl -fsS http://127.0.0.1:3002/ready | jq -e \
   --arg sha "${target_sha}" '.status == "ok" and .release_sha == $sha'
