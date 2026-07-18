@@ -1673,3 +1673,11 @@ exit "$rc"
 def test_operational_shell_syntax(script: str):
     result = _run("bash", "-n", str(ROOT / script))
     assert result.returncode == 0, result.stderr
+
+
+def test_runtime_smoke_uses_only_release_dependencies_and_preserves_failures():
+    smoke = (ROOT / "scripts/smoke_bot.sh").read_text(encoding="utf-8")
+    assert '${BOT_VENV}/bin/ruff' not in smoke
+    assert '${BOT_VENV}/bin/mypy' not in smoke
+    assert "-p no:cacheprovider" in smoke
+    assert "| tail" not in smoke
