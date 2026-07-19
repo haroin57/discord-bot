@@ -282,3 +282,61 @@ class TestBareTransportErrorRetry:
         after_bare = src[bare:grp]
         assert '_error_message("overloaded")' in after_bare
         assert "TRANSIENT_MAX_ATTEMPTS - 1" in after_bare
+
+
+# ---------------------------------------------------------------------------
+# Fable → Opus fallback on token exhaustion (2026-07-20)
+# ---------------------------------------------------------------------------
+class TestFableTokenExhaustionFallback:
+    """When the primary model is Fable and it runs out of USAGE budget — a
+    rate_limit (429) that outlives Fable's transient retries, or a hard
+    billing/credit exhaustion — the loop escapes to Opus 4.8 for the remaining
+    attempt instead of surfacing the error. This reuses the existing
+    overload/model_not_found escape machinery on the *quota* axis.
+
+    call_with_tools drives a deep async loop (run_agent_loop + session +
+    api_client) that is impractical to fully mock, so — exactly like
+    TestBareTransportErrorRetry (ADR-0007) — the invariants are asserted against
+    the function source structure, plus the config knob is unit-tested."""
+
+    def _src(self):
+        import inspect
+
+        from services.claude_api import entry as entry_mod
+
+        return inspect.getsource(entry_mod.call_with_tools)
+
+    def test_config_flag_defaults_on_and_reuses_opus_target(self):
+        import config
+
+        # Default ON (the feature haroin asked for on 2026-07-20).
+        assert config.FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED is True
+        # No new model config — the target reuses the refusal-fallback model.
+        assert config.FABLE_REFUSAL_FALLBACK_MODEL == "claude-opus-4-8"
+
+    def test_rate_limit_leg_gated_by_flag_and_reserves_last_attempt(self):
+        src = self._src()
+        # The 429 leg is a NEW trigger folded into the overload escape, gated by
+        # the token-exhaustion flag so it can be turned off independently.
+        assert "_rate_limit_escape" in src
+        assert "FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED" in src
+        assert 'category == "overloaded" or _rate_limit_escape' in src
+        # Fires only near retry-budget exhaustion → Fable keeps the early
+        # attempts ("429全般（Fableリトライ後）"), Opus gets the last one.
+        assert "TRANSIENT_MAX_ATTEMPTS - 2" in src
+
+    def test_billing_leg_escapes_to_opus_bounded(self):
+        src = self._src()
+        # Hard credit/quota exhaustion → Opus once, but only while a retry
+        # attempt remains, so `continue` can never run past the loop budget.
+        assert "Fable credit exhausted" in src
+        assert "attempt < TRANSIENT_MAX_ATTEMPTS - 1" in src
+
+    def test_escape_is_single_shot_and_fable_only(self):
+        src = self._src()
+        # Only from a Fable primary — never flip an already-Opus request.
+        assert '"fable" in (effective_model or "").lower()' in src
+        # `forced_model is None` guards every escape leg, so the ladder is
+        # single-shot (model_not_found + overload/rate_limit + billing = 3).
+        assert src.count("forced_model = FABLE_REFUSAL_FALLBACK_MODEL") >= 3
+        assert src.count("forced_model is None") >= 3

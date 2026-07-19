@@ -252,6 +252,19 @@ FABLE_REFUSAL_FALLBACK_MODEL = os.environ.get(
 FABLE_REFUSAL_FALLBACK_ENABLED = os.environ.get(
     "FABLE_REFUSAL_FALLBACK_ENABLED", "1"
 ) not in ("0", "false", "False", "")
+# Token-exhaustion model fallback (2026-07-20). When the primary model is a
+# Fable model and it runs OUT OF USAGE BUDGET — a rate_limit (429) that survives
+# Fable's transient retries, or a hard billing/credit exhaustion — escape to the
+# refusal-fallback model (Opus 4.8) for the remaining attempt(s) instead of
+# surfacing the error to the user. This is a QUOTA axis, distinct from the
+# refusal fallback (Fable's content classifier), the model_not_found 404 escape,
+# and the overload (529) escape. `auth` (OAuth token expiry) is DELIBERATELY
+# excluded: both models share the same OAuth token, so switching models cannot
+# help — that is the oauth_manager failover machinery's job. Reuses
+# FABLE_REFUSAL_FALLBACK_MODEL as the target. Set to 0 to disable.
+FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED = os.environ.get(
+    "FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED", "1"
+) not in ("0", "false", "False", "")
 # Server-side model fallback (ADR-0015). The official CLI 2.1.177 sends a
 # top-level `fallbacks: [{"model": <id>}]` body field (paired with the
 # server-side-fallback / fallback-credit betas already in MODEL_BETAS) so the
