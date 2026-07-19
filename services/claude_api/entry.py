@@ -35,6 +35,7 @@ from config import (
     CWD,
     FABLE_REFUSAL_FALLBACK_ENABLED,
     FABLE_REFUSAL_FALLBACK_MODEL,
+    FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED,
     HISTORY_COMPACT_TRIGGER_TOKENS,
     MICROCOMPACT_ENABLED,
     MICROCOMPACT_GAP_MIN,
@@ -1272,6 +1273,31 @@ async def call_with_tools(
                                     "[ch=%d] billing/credit limit hit — not retrying",
                                     channel_id,
                                 )
+                                # Fable のクレジット/quota 枯渇 → Opus 4.8 へ一度
+                                # だけ逃がす（2026-07-20）。同一アカウントの別モデル
+                                # 切替。dead な failover アカウントより先に試す
+                                # （枯渇したアカウントを failover しても無意味だが、
+                                # 別モデルは別バケットで通る場合がある）。残り
+                                # attempt があるときのみ continue する。
+                                if (
+                                    FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED
+                                    and FABLE_REFUSAL_FALLBACK_ENABLED
+                                    and forced_model is None
+                                    and effective_model != FABLE_REFUSAL_FALLBACK_MODEL
+                                    and "fable" in (effective_model or "").lower()
+                                    and attempt < TRANSIENT_MAX_ATTEMPTS - 1
+                                ):
+                                    forced_model = FABLE_REFUSAL_FALLBACK_MODEL
+                                    log.warning(
+                                        "[ch=%d] Fable credit exhausted → fallback to %s",
+                                        channel_id,
+                                        forced_model,
+                                    )
+                                    await _safe_status(
+                                        status_callback,
+                                        "⚠️ 枠切れのため Opus にフォールバック中",
+                                    )
+                                    continue
                                 # subscriber quota の credit 系 429 — failover へ
                                 if await _try_failover(
                                     "quota",
@@ -1316,13 +1342,20 @@ async def call_with_tools(
                                 None,
                                 resumable,
                             )
-                        # Overload escape hatch (audit #6, CLI
-                        # tengu_api_opus_fallback): when 529s have nearly
-                        # exhausted the budget and we are still on Fable,
-                        # spend the remaining attempt(s) on the fallback
-                        # model instead of hammering the same overloaded pool.
+                        # Overload / token-exhaustion escape hatch (audit #6, CLI
+                        # tengu_api_opus_fallback): when 529 overload OR a 429
+                        # rate-limit has nearly exhausted the retry budget and we
+                        # are still on Fable, spend the remaining attempt on the
+                        # fallback model instead of hammering the same pool.
+                        # The rate_limit leg (= "Fable token切れ後に Opus") is
+                        # gated by FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED
+                        # (2026-07-20); the 529 leg is the original behaviour.
+                        _rate_limit_escape = (
+                            category == "rate_limit"
+                            and FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED
+                        )
                         if (
-                            category == "overloaded"
+                            (category == "overloaded" or _rate_limit_escape)
                             and attempt >= TRANSIENT_MAX_ATTEMPTS - 2
                             and forced_model is None
                             and FABLE_REFUSAL_FALLBACK_ENABLED
@@ -1330,8 +1363,9 @@ async def call_with_tools(
                         ):
                             forced_model = FABLE_REFUSAL_FALLBACK_MODEL
                             log.warning(
-                                "[ch=%d] overload streak on %s → trying %s",
+                                "[ch=%d] %s streak on %s → trying %s",
                                 channel_id,
+                                category,
                                 effective_model,
                                 forced_model,
                             )
