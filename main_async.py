@@ -196,7 +196,7 @@ async def _bootstrap_oauth() -> bool:
     original_account = oauth_manager.get_active_account()
     switched = False
     if original_account == "primary":
-        switched = oauth_manager.failover_to_secondary("auth")
+        switched = await oauth_manager.prepare_and_failover_to_secondary("auth")
     else:
         switched = await oauth_manager.failback_to_primary("startup")
     if switched and await _active_is_ready():

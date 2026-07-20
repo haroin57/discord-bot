@@ -1478,6 +1478,35 @@ class TestFailoverToSecondary:
         fo.write_text("not json")
         assert om.failover_to_secondary("quota") is False
 
+    def test_expired_failover_is_rejected_without_state_change(
+        self, tmp_path, monkeypatch
+    ):
+        import services.oauth_manager as om
+
+        _primary, fo = _setup_dual(tmp_path, monkeypatch)
+        payload = json.loads(fo.read_text())
+        payload["claudeAiOauth"]["expiresAt"] = 1
+        fo.write_text(json.dumps(payload))
+        om.init()
+
+        assert om.failover_to_secondary("quota") is False
+        assert om.get_active_account() == "primary"
+        assert not os.path.exists(om.FAILOVER_STATE_PATH)
+
+    def test_switch_does_not_forget_known_permanent_refresh_failure(
+        self, tmp_path, monkeypatch
+    ):
+        import services.oauth_manager as om
+
+        _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        om._accounts["failover"].refresh_permanent = True
+        om._accounts["failover"].refresh_failure_count = 1
+
+        assert om.failover_to_secondary("quota") is True
+        assert om._accounts["failover"].refresh_permanent is True
+        assert om._accounts["failover"].refresh_failure_count == 1
+
     def test_flag_off_returns_false(self, tmp_path, monkeypatch):
         import services.oauth_manager as om
 
@@ -1499,6 +1528,70 @@ class TestFailoverToSecondary:
         _setup_dual(tmp_path, monkeypatch)
         monkeypatch.setattr(om, "OAUTH_NO_REFRESH", True)
         assert om.failover_to_secondary("quota") is False
+
+    @pytest.mark.asyncio
+    async def test_prepare_rejects_expired_standby_when_refresh_fails(
+        self, tmp_path, monkeypatch
+    ):
+        import services.oauth_manager as om
+
+        _primary, fo = _setup_dual(tmp_path, monkeypatch)
+        payload = json.loads(fo.read_text())
+        payload["claudeAiOauth"]["expiresAt"] = 1
+        fo.write_text(json.dumps(payload))
+        om.init()
+
+        async def fail_refresh(account=None):
+            account.refresh_permanent = True
+            account.refresh_failure_count += 1
+            return False
+
+        monkeypatch.setattr(om, "refresh_token", fail_refresh)
+
+        assert await om.prepare_and_failover_to_secondary("quota") is False
+        assert om.get_active_account() == "primary"
+        assert not os.path.exists(om.FAILOVER_STATE_PATH)
+        assert om._accounts["failover"].refresh_permanent is True
+
+    @pytest.mark.asyncio
+    async def test_prepare_refreshes_expired_standby_before_switch(
+        self, tmp_path, monkeypatch
+    ):
+        import services.oauth_manager as om
+
+        _primary, fo = _setup_dual(tmp_path, monkeypatch)
+        payload = json.loads(fo.read_text())
+        payload["claudeAiOauth"]["expiresAt"] = 1
+        fo.write_text(json.dumps(payload))
+        om.init()
+
+        async def refresh_standby(account=None):
+            refreshed = json.loads(fo.read_text())
+            refreshed["claudeAiOauth"]["accessToken"] = "fo-refreshed"
+            refreshed["claudeAiOauth"]["refreshToken"] = "fo-refreshed-ref"
+            refreshed["claudeAiOauth"]["expiresAt"] = (
+                int(time.time() * 1000) + 3_600_000
+            )
+            fo.write_text(json.dumps(refreshed))
+            return True
+
+        monkeypatch.setattr(om, "refresh_token", refresh_standby)
+
+        assert await om.prepare_and_failover_to_secondary("quota") is True
+        assert om.get_active_account() == "failover"
+        assert om.get_access_token() == "fo-refreshed"
+
+    def test_failed_client_build_rollback_restores_primary(self, tmp_path, monkeypatch):
+        import services.oauth_manager as om
+
+        _setup_dual(tmp_path, monkeypatch)
+        om.init()
+        assert om.failover_to_secondary("quota") is True
+
+        assert om.rollback_failed_failover("client_rebuild_failed") is True
+        assert om.get_active_account() == "primary"
+        assert om.get_access_token() == "prim-acc"
+        assert not os.path.exists(om.FAILOVER_STATE_PATH)
 
 
 @pytest.mark.process_state_mutation

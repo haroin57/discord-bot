@@ -122,9 +122,10 @@ from services.claude_api.ratelimit import (
 from services.oauth_manager import (
     OAuthRefreshFailed,
     failback_to_primary as oauth_failback_to_primary,
-    failover_to_secondary as oauth_failover_to_secondary,
     get_active_account as oauth_get_active_account,
     maybe_restore_primary as oauth_maybe_restore_primary,
+    prepare_and_failover_to_secondary as oauth_prepare_and_failover,
+    rollback_failed_failover as oauth_rollback_failed_failover,
 )
 from services.claude_api.session_store import (
     _clear_session_time,
@@ -224,6 +225,37 @@ def _quota_exhausted_signal() -> bool:
         or st.seven_d_status == "rejected"
         or st.five_h_utilization >= 1.0
         or st.seven_d_utilization >= 1.0
+    )
+
+
+def _should_escape_fable_rate_limit(
+    *,
+    category: str,
+    attempt: int,
+    effective_model: str,
+    forced_model: "str | None",
+    quota_exhausted: bool,
+    retry_after: "float | None",
+) -> bool:
+    """Return whether this 429 should spend the next attempt on Opus.
+
+    A structural quota signal or an unchatably long Retry-After must escape on
+    the first application attempt.  Ambiguous 429s retain the existing retry
+    budget and escape only on the penultimate attempt.  The final-attempt guard
+    prevents ``continue`` from falling out of the retry loop without a result.
+    """
+    return (
+        category == "rate_limit"
+        and FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED
+        and FABLE_REFUSAL_FALLBACK_ENABLED
+        and forced_model is None
+        and "fable" in (effective_model or "").lower()
+        and attempt < TRANSIENT_MAX_ATTEMPTS - 1
+        and (
+            quota_exhausted
+            or attempt >= TRANSIENT_MAX_ATTEMPTS - 2
+            or (retry_after is not None and retry_after > RETRY_AFTER_MAX_S)
+        )
     )
 
 
@@ -724,21 +756,28 @@ async def call_with_tools(
                 nonlocal api_client
                 if restricted:
                     return False
-                if oauth_get_active_account() == "failover":
+                switching_to_secondary = oauth_get_active_account() != "failover"
+                if not switching_to_secondary:
                     switched = await oauth_failback_to_primary(reason)
                     status_msg = "✅ サブ枠が使えないためメインアカウントに復帰"
                 else:
-                    switched = oauth_failover_to_secondary(
+                    switched = await oauth_prepare_and_failover(
                         reason,
                         primary_retry_at=retry_at,
                     )
-                    status_msg = "⚠️ メイン枠が使えないためサブアカウントに切替"
+                    status_msg = (
+                        "⚠️ メイン認証が失効したためサブアカウントに切替"
+                        if reason == "auth"
+                        else "⚠️ メイン枠が使えないためサブアカウントに切替"
+                    )
                 if not switched:
                     return False
                 try:
                     api_client = await _make_api_client(restricted)
                 except Exception as exc:
                     log.error("failover client rebuild failed: %s", exc)
+                    if switching_to_secondary:
+                        oauth_rollback_failed_failover("client_rebuild_failed")
                     return False
                 _agent_dispatch["api_client"] = api_client
                 await _safe_status(status_callback, status_msg)
@@ -747,15 +786,15 @@ async def call_with_tools(
             try:
                 api_client = await _make_api_client(restricted)
             except OAuthRefreshFailed as exc:
-                # primary の OAuth が恒久死（invalid_grant 等）— failover へ。
-                log.error("primary OAuth dead at client build: %s", exc)
-                if not restricted and oauth_failover_to_secondary("auth"):
-                    api_client = await _make_api_client(restricted)
-                    await _safe_status(
-                        status_callback,
-                        "⚠️ メイン認証が失効したためサブアカウントに切替",
-                    )
-                else:
+                # active account の OAuth が恒久死（invalid_grant 等）。primary
+                # なら ready な failover へ、failover なら primary へ双方向切替を
+                # 試す。切替先 client の構築も _try_failover 内で検証される。
+                log.error(
+                    "OAuth dead at client build (account=%s): %s",
+                    oauth_get_active_account(),
+                    exc,
+                )
+                if restricted or not await _try_failover("auth", None):
                     return _error_message("auth"), None, resumable
             _agent_dispatch["api_client"] = api_client
 
@@ -1317,10 +1356,42 @@ async def call_with_tools(
                         # the function tail returns the "unknown" fallback
                         # ("内部エラー"), masking an overloaded as a generic
                         # failure (ADR-0006).
+                        retry_after = retry_after_from_headers(
+                            _anthropic_error_headers(exc)
+                        )
+                        quota_exhausted = (
+                            category == "rate_limit" and _quota_exhausted_signal()
+                        )
+
+                        # Fable subscriber quota は、dead/別アカウントへの OAuth
+                        # failover より先に同一 primary の Opus bucket へ逃がす。
+                        # structural quota と長い Retry-After は初回から、曖昧な
+                        # 429 は従来どおり retry 終盤で single-shot escape する。
+                        _rate_limit_escape = _should_escape_fable_rate_limit(
+                            category=category,
+                            attempt=attempt,
+                            effective_model=effective_model or "",
+                            forced_model=forced_model,
+                            quota_exhausted=quota_exhausted,
+                            retry_after=retry_after,
+                        )
+                        if _rate_limit_escape:
+                            forced_model = FABLE_REFUSAL_FALLBACK_MODEL
+                            log.warning(
+                                "[ch=%d] Fable rate limit on %s → trying %s",
+                                channel_id,
+                                effective_model,
+                                forced_model,
+                            )
+                            await _safe_status(
+                                status_callback,
+                                "⚠️ Fable 枠切れのため Opus にフォールバック中",
+                            )
+                            continue
+
                         # OAuth 二重アカウント: subscriber 枠が構造的に尽きている
-                        # シグナル（5h/7d バケットが rejected / utilization>=1.0）
-                        # なら、backoff は数学的に全滅確定 — 即 failover。
-                        if category == "rate_limit" and _quota_exhausted_signal():
+                        # シグナルなら model escape 不適用時だけ即 failover。
+                        if category == "rate_limit" and quota_exhausted:
                             if await _try_failover(
                                 "quota",
                                 _failover_retry_at(exc),
@@ -1342,20 +1413,11 @@ async def call_with_tools(
                                 None,
                                 resumable,
                             )
-                        # Overload / token-exhaustion escape hatch (audit #6, CLI
-                        # tengu_api_opus_fallback): when 529 overload OR a 429
-                        # rate-limit has nearly exhausted the retry budget and we
-                        # are still on Fable, spend the remaining attempt on the
-                        # fallback model instead of hammering the same pool.
-                        # The rate_limit leg (= "Fable token切れ後に Opus") is
-                        # gated by FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED
-                        # (2026-07-20); the 529 leg is the original behaviour.
-                        _rate_limit_escape = (
-                            category == "rate_limit"
-                            and FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED
-                        )
+                        # Original overload escape hatch (audit #6, CLI
+                        # tengu_api_opus_fallback).  The 429 leg is handled above
+                        # because it must preempt every OAuth quota-failover path.
                         if (
-                            (category == "overloaded" or _rate_limit_escape)
+                            category == "overloaded"
                             and attempt >= TRANSIENT_MAX_ATTEMPTS - 2
                             and forced_model is None
                             and FABLE_REFUSAL_FALLBACK_ENABLED
@@ -1375,9 +1437,6 @@ async def call_with_tools(
                         # RETRY_AFTER_MAX_S is pointless for a chat reply —
                         # surface the classified error immediately instead.
                         backoff = compute_backoff(attempt)
-                        retry_after = retry_after_from_headers(
-                            _anthropic_error_headers(exc)
-                        )
                         if retry_after is not None:
                             if retry_after > RETRY_AFTER_MAX_S:
                                 log.warning(
