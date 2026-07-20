@@ -316,14 +316,87 @@ class TestFableTokenExhaustionFallback:
 
     def test_rate_limit_leg_gated_by_flag_and_reserves_last_attempt(self):
         src = self._src()
-        # The 429 leg is a NEW trigger folded into the overload escape, gated by
-        # the token-exhaustion flag so it can be turned off independently.
+        # The 429 leg uses a dedicated predicate and remains independently gated.
         assert "_rate_limit_escape" in src
-        assert "FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED" in src
-        assert 'category == "overloaded" or _rate_limit_escape' in src
-        # Fires only near retry-budget exhaustion → Fable keeps the early
-        # attempts ("429全般（Fableリトライ後）"), Opus gets the last one.
-        assert "TRANSIENT_MAX_ATTEMPTS - 2" in src
+        assert "_should_escape_fable_rate_limit" in src
+        assert "if _rate_limit_escape:" in src
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected"),
+        [
+            ({"quota_exhausted": True}, True),
+            ({"retry_after": 121.0}, True),
+            ({}, False),
+            ({"attempt": 2}, True),
+            ({"attempt": 3, "quota_exhausted": True}, False),
+            ({"forced_model": "claude-fable-5", "quota_exhausted": True}, False),
+            ({"effective_model": "claude-opus-4-8", "quota_exhausted": True}, False),
+            ({"category": "overloaded", "quota_exhausted": True}, False),
+        ],
+    )
+    def test_rate_limit_escape_decision(self, overrides, expected):
+        from services.claude_api.entry import _should_escape_fable_rate_limit
+
+        args = {
+            "category": "rate_limit",
+            "attempt": 0,
+            "effective_model": "claude-fable-5",
+            "forced_model": None,
+            "quota_exhausted": False,
+            "retry_after": None,
+        }
+        args.update(overrides)
+        assert _should_escape_fable_rate_limit(**args) is expected
+
+    def test_rate_limit_escape_preempts_every_oauth_failover_path(self):
+        src = self._src()
+        escape = src.index("_rate_limit_escape = _should_escape_fable_rate_limit")
+        structural_failover = src.index(
+            'if category == "rate_limit" and quota_exhausted:'
+        )
+        long_retry_failover = src.index("time.time() + retry_after")
+        escape_block = src[escape:structural_failover]
+
+        assert "forced_model = FABLE_REFUSAL_FALLBACK_MODEL" in escape_block
+        assert "continue" in escape_block
+        assert escape < structural_failover < long_retry_failover
+
+    def test_oauth_switch_prepares_standby_and_rolls_back_failed_client(self):
+        src = self._src()
+        switch_helper = src.index("async def _try_failover")
+        initial_client = src.index("try:\n                api_client =", switch_helper)
+        helper_src = src[switch_helper:initial_client]
+
+        assert "await oauth_prepare_and_failover(" in helper_src
+        assert 'oauth_rollback_failed_failover("client_rebuild_failed")' in helper_src
+        assert helper_src.index("await oauth_prepare_and_failover(") < helper_src.index(
+            'oauth_rollback_failed_failover("client_rebuild_failed")'
+        )
+
+    def test_initial_auth_failure_uses_bidirectional_switch_helper(self):
+        src = self._src()
+        initial_client = src.index("try:\n                api_client =")
+        retry_loop = src.index("for attempt in range", initial_client)
+        initial_block = src[initial_client:retry_loop]
+
+        assert 'await _try_failover("auth", None)' in initial_block
+
+    def test_rate_limit_escape_flag_can_disable_decision(self, monkeypatch):
+        from services.claude_api import entry as entry_mod
+
+        monkeypatch.setattr(
+            entry_mod,
+            "FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED",
+            False,
+        )
+        assert not entry_mod._should_escape_fable_rate_limit(
+            category="rate_limit",
+            attempt=0,
+            effective_model="claude-fable-5",
+            forced_model=None,
+            quota_exhausted=True,
+            retry_after=999.0,
+        )
 
     def test_billing_leg_escapes_to_opus_bounded(self):
         src = self._src()
@@ -336,7 +409,7 @@ class TestFableTokenExhaustionFallback:
         src = self._src()
         # Only from a Fable primary — never flip an already-Opus request.
         assert '"fable" in (effective_model or "").lower()' in src
-        # `forced_model is None` guards every escape leg, so the ladder is
-        # single-shot (model_not_found + overload/rate_limit + billing = 3).
+        # The direct escape legs remain single-shot; the rate-limit helper is
+        # covered behaviorally above.
         assert src.count("forced_model = FABLE_REFUSAL_FALLBACK_MODEL") >= 3
-        assert src.count("forced_model is None") >= 3
+        assert src.count("forced_model is None") >= 2

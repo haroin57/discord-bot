@@ -488,13 +488,17 @@ class TestMainAsync:
             attempts.append(active["name"])
             return None if active["name"] == "primary" else "standby-token"
 
-        def _failover(_reason):
+        async def _failover(_reason):
             active["name"] = "failover"
             return True
 
         monkeypatch.setattr(oauth_manager, "ensure_valid_token", _ensure)
         monkeypatch.setattr(oauth_manager, "get_active_account", lambda: active["name"])
-        monkeypatch.setattr(oauth_manager, "failover_to_secondary", _failover)
+        monkeypatch.setattr(
+            oauth_manager,
+            "prepare_and_failover_to_secondary",
+            _failover,
+        )
         monkeypatch.setattr(
             oauth_manager,
             "oauth_status_detail",
@@ -503,6 +507,41 @@ class TestMainAsync:
 
         assert await mod._bootstrap_oauth() is True
         assert attempts == ["primary", "failover"]
+
+    async def test_oauth_bootstrap_restores_primary_when_active_failover_is_dead(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        mod = _reload_main_async(monkeypatch, tmp_path, mock_oauth=False)
+        from services import oauth_manager
+
+        active = {"name": "failover"}
+        attempts = []
+        monkeypatch.setattr(oauth_manager, "init", lambda: True)
+
+        async def _ensure():
+            attempts.append(active["name"])
+            if active["name"] == "failover":
+                raise oauth_manager.OAuthRefreshFailed("invalid_grant")
+            return "primary-token"
+
+        async def _failback(_reason):
+            active["name"] = "primary"
+            return True
+
+        monkeypatch.setattr(oauth_manager, "ensure_valid_token", _ensure)
+        monkeypatch.setattr(oauth_manager, "get_active_account", lambda: active["name"])
+        monkeypatch.setattr(oauth_manager, "failback_to_primary", _failback)
+        monkeypatch.setattr(
+            oauth_manager,
+            "oauth_status_detail",
+            lambda: {"credential_ok": active["name"] == "primary"},
+        )
+
+        assert await mod._bootstrap_oauth() is True
+        assert attempts == ["failover", "primary"]
+        assert active["name"] == "primary"
 
     async def test_settings_initialized_before_services(self, monkeypatch, tmp_path):
         mod = _reload_main_async(monkeypatch, tmp_path)

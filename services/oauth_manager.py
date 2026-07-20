@@ -1065,8 +1065,10 @@ def failover_to_secondary(
     """primary → failover へ切替える。成功で True。
 
     reason: "quota"（reset 時刻で自動復帰）| "auth"（手動復旧まで張り付き）。
-    failover credentials が無い/壊れている/フラグ OFF/既に failover/子プロセス
-    では False（呼び元は従来のエラー処理を続行する）。
+    failover credentials が serving-ready でない/フラグ OFF/既に failover/
+    子プロセスでは False（呼び元は従来のエラー処理を続行する）。期限切れ
+    credential の refresh は ``prepare_and_failover_to_secondary()`` が状態変更前に
+    行う。この同期 API 自体は dead standby を active にしない。
     """
     if not OAUTH_FAILOVER_ENABLED or OAUTH_NO_REFRESH:
         return False
@@ -1080,8 +1082,14 @@ def failover_to_secondary(
             FAILOVER_CREDENTIALS_PATH,
         )
         return False
-    failover.refresh_failure_count = 0
-    failover.refresh_permanent = False
+    ready, readiness_reason = _credential_readiness(failover)
+    if not ready:
+        log.error(
+            "oauth failover requested (reason=%s) but standby is not ready: %s",
+            reason,
+            readiness_reason,
+        )
+        return False
     failover.session_primed = False
     retry_at = primary_retry_at if reason != "auth" else None
     global _failover_since, _auth_failback_tried_mtime
@@ -1100,6 +1108,63 @@ def failover_to_secondary(
         reason,
         retry_at,
     )
+    return True
+
+
+async def prepare_and_failover_to_secondary(
+    reason: str,
+    *,
+    primary_retry_at: "float | None" = None,
+) -> bool:
+    """Refresh/validate standby before atomically making it active.
+
+    ``failover_to_secondary()`` intentionally stays synchronous for existing
+    callers and tests.  Production async paths use this wrapper so an expired
+    but refreshable standby remains usable, while an ``invalid_grant`` or other
+    unusable credential is rejected before active/state are mutated.
+    """
+    if not OAUTH_FAILOVER_ENABLED or OAUTH_NO_REFRESH or _active == "failover":
+        return False
+
+    failover = _accounts["failover"]
+    if not _load_account_from_disk(failover):
+        log.error(
+            "oauth failover preparation (reason=%s) failed: %s is missing/unreadable",
+            reason,
+            FAILOVER_CREDENTIALS_PATH,
+        )
+        return False
+
+    ready, readiness_reason = _credential_readiness(failover)
+    if not ready and readiness_reason == "access_token_expired":
+        log.info(
+            "oauth failover standby expired; refreshing before switch (reason=%s)",
+            reason,
+        )
+        if await refresh_token(failover):
+            ready, readiness_reason = _credential_readiness(failover)
+
+    if not ready:
+        log.error(
+            "oauth failover preparation (reason=%s) rejected standby: %s",
+            reason,
+            readiness_reason,
+        )
+        return False
+
+    return failover_to_secondary(reason, primary_retry_at=primary_retry_at)
+
+
+def rollback_failed_failover(reason: str) -> bool:
+    """Undo a just-committed secondary switch when client construction fails.
+
+    Callers must invoke this only after they switched from primary in the same
+    request.  An unavailable primary may still be restored: retaining the
+    previously selected account is safer than persisting an unverified standby.
+    """
+    if _active != "failover":
+        return False
+    _activate_primary(f"OAuth FAILOVER ROLLBACK (reason={reason}): failover -> primary")
     return True
 
 
