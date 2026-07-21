@@ -8,6 +8,7 @@ inside the /health route handler.
 import json
 import hashlib
 import logging
+import math
 import os
 import pwd
 import re
@@ -274,9 +275,16 @@ def _check_discord(bot) -> dict[str, Any]:
             bool(accepting_jobs()) if callable(accepting_jobs) else True
         )
         latency = bot.latency if is_ready else None
+        # discord.py の latency は初回 heartbeat ack 前に float("nan") を返す。
+        # ready な gateway の latency 不明は「不明」であって障害ではない。
+        latency_ms = (
+            int(latency * 1000)
+            if isinstance(latency, (int, float)) and math.isfinite(latency)
+            else None
+        )
         status = {
             "ok": is_ready and accepting,
-            "gateway_latency_ms": int(latency * 1000) if latency else None,
+            "gateway_latency_ms": latency_ms,
         }
         if is_ready and not accepting:
             status["reason"] = "shutdown_draining"
