@@ -1076,9 +1076,13 @@ class TestRefreshFailureCounter:
         info_msgs = [r for r in caplog.records if r.levelno == logging.INFO]
         assert any("recovered" in r.message for r in info_msgs)
 
-    def test_is_oauth_healthy_rejects_expired_disk_credential(
+    def test_is_oauth_healthy_tolerates_idle_expired_but_refreshable_credential(
         self, tmp_path, monkeypatch
     ):
+        """ADR-0041 Fix A: idle で access token が期限切れでも refresh 可能
+        （refresh token 有効・失敗履歴なし）なら healthy。
+        2026-07-21 の 10 時間偽 DOWN（idle 期限切れ → degraded 張り付き）の
+        regression テスト。"""
         import services.oauth_manager as om
 
         creds_dir = _make_creds_dir(tmp_path)
@@ -1093,7 +1097,95 @@ class TestRefreshFailureCounter:
             },
         )
         om._accounts["primary"].credentials_path = str(creds_file)
+        assert om.is_oauth_healthy() is True
+
+    def test_is_oauth_healthy_rejects_dead_refresh_path_when_expired(
+        self, tmp_path, monkeypatch
+    ):
+        """期限切れ + refresh 経路が死んでいる（invalid_grant 判明済み or
+        連続失敗閾値超え）だけが本当の degraded。"""
+        import services.oauth_manager as om
+
+        creds_dir = _make_creds_dir(tmp_path)
+        creds_file = _make_creds_file(
+            creds_dir,
+            {
+                "claudeAiOauth": {
+                    "accessToken": "tok",
+                    "refreshToken": "refresh",
+                    "expiresAt": 1,
+                }
+            },
+        )
+        om._accounts["primary"].credentials_path = str(creds_file)
+
+        om._accounts["primary"].refresh_permanent = True
         assert om.is_oauth_healthy() is False
+
+        om._accounts["primary"].refresh_permanent = False
+        om._accounts["primary"].refresh_failure_count = (
+            om._REFRESH_FAILURE_ALERT_THRESHOLD
+        )
+        assert om.is_oauth_healthy() is False
+
+    def test_is_oauth_healthy_with_valid_memory_token_ignores_disk_state(
+        self, tmp_path, monkeypatch
+    ):
+        """有効な in-memory token を保持している間は disk 状態に依らず健全
+        （実際に供給できている事実が優先）。"""
+        import services.oauth_manager as om
+
+        om._accounts["primary"].access_token = "live-token"
+        om._accounts["primary"].expires_at = int(time.time() * 1000) + 3600_000
+        om._accounts["primary"].credentials_path = str(tmp_path / "missing.json")
+        assert om.is_oauth_healthy() is True
+
+    def test_redundancy_survives_standby_access_token_expiry(
+        self, tmp_path, monkeypatch
+    ):
+        """standby の access token 期限切れは切替時 refresh で回復する設計
+        (prepare_and_failover_to_secondary) なので冗長性喪失ではない。
+        invalid_grant 判明済み (refresh_permanent) なら喪失。"""
+        import services.oauth_manager as om
+
+        creds_dir = _make_creds_dir(tmp_path)
+        creds_file = _make_creds_file(
+            creds_dir,
+            {
+                "claudeAiOauth": {
+                    "accessToken": "valid-tok",
+                    "refreshToken": "refresh",
+                    "expiresAt": int(time.time() * 1000) + 3600_000,
+                }
+            },
+        )
+        om._accounts["primary"].credentials_path = str(creds_file)
+        failover_file = creds_dir / ".credentials-failover.json"
+        failover_file.write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "stale-tok",
+                        "refreshToken": "refresh",
+                        "expiresAt": 1,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        failover_file.chmod(0o600)
+        om._accounts["failover"].credentials_path = str(failover_file)
+
+        detail = om.oauth_status_detail()
+        assert detail["standby_credential_ok"] is False
+        assert detail["standby_credential_reason"] == "access_token_expired"
+        assert detail["redundancy_ok"] is True
+        assert detail["redundancy_reason"] is None
+
+        om._accounts["failover"].refresh_permanent = True
+        detail = om.oauth_status_detail()
+        assert detail["redundancy_ok"] is False
+        assert detail["redundancy_reason"] == "refresh_permanent"
 
     def test_is_oauth_healthy_validates_private_disk_credential(
         self, tmp_path, monkeypatch

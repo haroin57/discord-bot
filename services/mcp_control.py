@@ -161,6 +161,7 @@ class McpControlService:
 
     def _tier(self, key: str) -> str:
         from config import (
+            MCP_SERVERS_ALARM,
             MCP_SERVERS_BASE,
             MCP_SERVERS_DOCS,
             MCP_SERVERS_HEAVY,
@@ -181,6 +182,7 @@ class McpControlService:
             ("docs", MCP_SERVERS_DOCS),
             ("realestate", MCP_SERVERS_REALESTATE),
             ("iot", MCP_SERVERS_IOT),
+            ("alarm", MCP_SERVERS_ALARM),
             ("inshi", MCP_SERVERS_INSHI),
         )
         return next((name for name, bucket in tiers if key in bucket), "other")

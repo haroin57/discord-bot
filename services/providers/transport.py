@@ -27,6 +27,10 @@ CODEX_CAPABILITIES = frozenset(
         ProviderCapability.THINKING_STREAM,
         ProviderCapability.THINKING_FINALIZE,
         ProviderCapability.PROGRESS,
+        ProviderCapability.SCRATCH_STREAM,
+        ProviderCapability.SCRATCH_FINALIZE,
+        ProviderCapability.VERIFY_STREAM,
+        ProviderCapability.VERIFY_FINALIZE,
     }
 )
 

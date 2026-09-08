@@ -883,6 +883,24 @@ def _guild_message_addresses_bot(message: discord.Message) -> bool:
 
 
 @bot.event
+async def on_raw_message_delete(payload):
+    from services import guild_context
+    await guild_context.forget([payload.message_id])
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload):
+    from services import guild_context
+    await guild_context.forget(list(payload.message_ids))
+
+
+@bot.event
+async def on_raw_message_edit(payload):
+    from services import guild_context
+    await guild_context.observe_edit(payload)
+
+
+@bot.event
 async def on_message(message: discord.Message):
     # Own the dispatch before admission awaits or spawns indexing work. This
     # closes the phase gap where a SIGTERM could otherwise miss a task that had
@@ -890,6 +908,10 @@ async def on_message(message: discord.Message):
     # cleanup completed.
     if not _runtime_resources.register_dispatch_task(asyncio.current_task()):
         return
+    from services import guild_context
+    # Receipt precedes admission: a correction addressed to another speaker
+    # must still be visible to subsequent turns, without making the bot reply.
+    await guild_context.observe(message)
     admitted = await bot_admission.admit_message(
         message,
         bot=bot,
@@ -1238,6 +1260,13 @@ async def on_message(message: discord.Message):
             recalling_phase=JobPhase.RECALLING,
         )
         prompt = prompt_result.prompt
+        shared_context = await guild_context.context_for(
+            message, bot, max_chars=min(24000, max(0, MAX_PROMPT_CHARS - len(prompt) - 2)),
+        )
+        if shared_context:
+            # Also inject on native thread resume, which otherwise skips the
+            # other speakers' messages in the full channel context.
+            prompt = f"{shared_context}\n\n{prompt}"
         _active_skill_prompt = prompt_result.active_skill_prompt
 
         model_result = await bot_model.invoke_model(

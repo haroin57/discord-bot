@@ -78,7 +78,7 @@ def _global_codex_config() -> dict[str, Any]:
         return {}
 
 
-def configured_mcp_endpoints() -> dict[str, str]:
+def configured_mcp_endpoints(user_id: int | None = None) -> dict[str, str]:
     """Return the bot's explicit, credential-free MCP endpoint allowlist."""
     endpoints: dict[str, str] = {}
     mem0_url = _safe_mcp_url(CODEX_APP_SERVER_MEM0_MCP_URL)
@@ -115,10 +115,20 @@ def configured_mcp_endpoints() -> dict[str, str]:
             log.warning("Inherited Codex MCP server has no safe URL: %s", name)
             continue
         endpoints[name] = url
+    from services.codex_app_server import mcp_bridge
+    if mcp_bridge.enabled():
+        endpoints = {name: url for name, url in endpoints.items()
+                     if mcp_bridge.server_allowed(name, user_id)}
+        # The per-service bridge uses this bot's memory namespace and current
+        # helper provider; do not route to another daemon's Claude credentials.
+        endpoints.pop('kanae-mem0', None)
+        # Route the alarm through the same per-call enable/authorization gate
+        # as the other private tools, instead of also exposing a raw URL.
+        endpoints.pop('kanae-alarm', None)
     return endpoints
 
 
-def build_app_server_extra_args(model: str) -> list[str]:
+def build_app_server_extra_args(model: str, user_id: int | None = None) -> list[str]:
     """Build explicit model + credential-free MCP config overrides.
 
     The running Discord service has a deliberately narrow PATH and also owns
@@ -139,7 +149,7 @@ def build_app_server_extra_args(model: str) -> list[str]:
     if CODEX_APP_SERVER_USE_LEGACY_LANDLOCK:
         args.extend(["--enable", "use_legacy_landlock"])
     args.extend(["-c", f"model={_toml_string(model)}"])
-    endpoints = configured_mcp_endpoints()
+    endpoints = configured_mcp_endpoints(user_id)
 
     for name, url in sorted(endpoints.items()):
         args.extend([
@@ -157,6 +167,9 @@ def build_app_server_extra_args(model: str) -> list[str]:
     for name in sorted((global_config.get("plugins") or {}).keys()):
         if _PLUGIN_NAME_RE.fullmatch(str(name)):
             args.extend(["-c", f"plugins.{name}.enabled=false"])
+    from services.codex_app_server import mcp_bridge
+    if mcp_bridge.enabled():
+        args.extend(mcp_bridge.bridge_args(user_id))
     return args
 
 
@@ -291,12 +304,15 @@ class CodexSessionManager:
                 if session is not None:
                     await session.close()
                 stored = self._state.get(key) or {}
+                from services.codex_app_server import mcp_bridge
+                extra_args = (build_app_server_extra_args(model, user_id)
+                              if mcp_bridge.enabled() else build_app_server_extra_args(model))
                 session = CodexSession(
                     cwd=CODEX_APP_SERVER_CWD,
                     codex_bin=CODEX_BIN,
                     stored_thread_id=stored.get("thread_id"),
                     global_args=build_app_server_global_args(),
-                    extra_args=build_app_server_extra_args(model),
+                    extra_args=extra_args,
                     sandbox=CODEX_APP_SERVER_SANDBOX,
                     approval_policy=CODEX_APP_SERVER_APPROVAL_POLICY,
                     turn_timeout_s=CODEX_APP_SERVER_TIMEOUT_S,

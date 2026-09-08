@@ -8,6 +8,7 @@ inside the /health route handler.
 import json
 import hashlib
 import logging
+import math
 import os
 import pwd
 import re
@@ -274,9 +275,16 @@ def _check_discord(bot) -> dict[str, Any]:
             bool(accepting_jobs()) if callable(accepting_jobs) else True
         )
         latency = bot.latency if is_ready else None
+        # discord.py reports NaN before the first heartbeat acknowledgement.
+        # A ready gateway with unknown latency is not an outage.
+        latency_ms = (
+            int(latency * 1000)
+            if isinstance(latency, (int, float)) and math.isfinite(latency)
+            else None
+        )
         status = {
             "ok": is_ready and accepting,
-            "gateway_latency_ms": int(latency * 1000) if latency else None,
+            "gateway_latency_ms": latency_ms,
         }
         if is_ready and not accepting:
             status["reason"] = "shutdown_draining"
@@ -398,9 +406,15 @@ def get_readiness_snapshot(bot=None) -> dict[str, Any]:
     mem0_st = _check_mem0()
     system_st = _check_system()
     release_st = _check_release()
+    from services.codex_app_server import readiness as codex_readiness
+    claude_required = codex_readiness.claude_required()
+    codex_st = codex_readiness.check() if os.environ.get('DEFAULT_LLM_PROVIDER', '').lower() == 'codex' else None
+    if not claude_required:
+        oauth_st['required'] = False
     overall_ok = (
         discord_st["ok"]
-        and oauth_st["ok"]
+        and (oauth_st["ok"] or not claude_required)
+        and (codex_st is None or codex_st['ok'])
         and mem0_st["ok"]
         and system_st["ok"]
         and release_st["ok"]
@@ -416,6 +430,7 @@ def get_readiness_snapshot(bot=None) -> dict[str, Any]:
             "mem0": mem0_st,
             "system": system_st,
             "release": release_st,
+            **({'codex': codex_st} if codex_st is not None else {}),
         },
     }
 

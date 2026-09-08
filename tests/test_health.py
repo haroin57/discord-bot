@@ -378,3 +378,93 @@ def test_mem0_readiness_rejects_non_heartbeat_200(monkeypatch):
         snapshot = _check_mem0()
 
     assert snapshot == {"ok": False, "reason": "invalid_heartbeat_payload"}
+
+
+def test_discord_check_tolerates_nan_latency():
+    """discord.py の latency は初回 heartbeat ack 前に float("nan") を返す。
+    ready な gateway の latency 不明は degraded ではない。"""
+    from services.health import _check_discord
+
+    bot = MagicMock()
+    bot.is_ready.return_value = True
+    bot.accepting_jobs = lambda: True
+    bot.latency = float("nan")
+
+    status = _check_discord(bot)
+
+    assert status["ok"] is True
+    assert status["gateway_latency_ms"] is None
+
+
+def test_health_stays_ok_when_oauth_token_idle_expired_but_refreshable(
+    tmp_path, monkeypatch
+):
+    """2026-07-21 の 10 時間偽 DOWN の regression テスト（ADR-0041 Fix A 復元）。
+
+    idle 中に disk の access token が自然期限切れしても、refresh token が有効で
+    失敗履歴が無ければ次の利用時に 1 refresh で回復する。/health はこの状態を
+    degraded と報告してはならない。"""
+    import importlib
+
+    # 他テストファイルが sys.modules に stub を残すことがある（test_oauth_manager
+    # の autouse fixture と同じ汚染対策）。実モジュールで検証する。
+    om = importlib.import_module("services.oauth_manager")
+    if not hasattr(om, "_accounts"):
+        om = importlib.reload(om)
+    monkeypatch.setitem(sys.modules, "services.oauth_manager", om)
+
+    creds_dir = tmp_path / ".claude"
+    creds_dir.mkdir(mode=0o700)
+    creds_file = creds_dir / ".credentials.json"
+    creds_file.write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "stale-tok",
+                    "refreshToken": "refresh",
+                    "expiresAt": 1,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    creds_file.chmod(0o600)
+    monkeypatch.setattr(
+        om._accounts["primary"], "credentials_path", str(creds_file)
+    )
+    monkeypatch.setattr(om._accounts["primary"], "access_token", None)
+    monkeypatch.setattr(om._accounts["primary"], "refresh_token", None)
+    monkeypatch.setattr(om._accounts["primary"], "expires_at", 0)
+    monkeypatch.setattr(om._accounts["primary"], "refresh_failure_count", 0)
+    monkeypatch.setattr(om._accounts["primary"], "refresh_permanent", False)
+    # standby はこのテストの対象外 — ホスト実ファイルに触れないよう隔離する
+    monkeypatch.setattr(
+        om._accounts["failover"],
+        "credentials_path",
+        str(tmp_path / "missing-failover.json"),
+    )
+    monkeypatch.setattr(om._accounts["failover"], "refresh_permanent", False)
+    monkeypatch.setattr(om, "_active", "primary")
+
+    bot = MagicMock()
+    bot.is_ready.return_value = True
+    bot.accepting_jobs = lambda: True
+    bot.latency = 0.05
+
+    with (
+        patch("services.health._check_mem0", return_value={"ok": True}),
+        patch("services.health._check_system", return_value={"ok": True}),
+        patch(
+            "services.health._check_release",
+            return_value={"ok": True, "sha": "a" * 40},
+        ),
+    ):
+        snapshot = get_readiness_snapshot(bot=bot)
+
+    assert snapshot["subsystems"]["oauth"]["ok"] is True
+    assert snapshot["subsystems"]["oauth"]["credential_ok"] is False
+    assert (
+        snapshot["subsystems"]["oauth"]["credential_reason"]
+        == "access_token_expired"
+    )
+    assert snapshot["status"] == "ok"

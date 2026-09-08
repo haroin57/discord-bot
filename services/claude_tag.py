@@ -449,7 +449,11 @@ async def _process(
         body = _status_text(text)
         deps.track_task(_safe_edit(anchor, body[:1990]), name="claude_tag_status")
 
-    response_text, _session, _resumed = await call_with_tools(
+    provider_call = call_with_tools
+    from config import DEFAULT_LLM_PROVIDER
+    if DEFAULT_LLM_PROVIDER == 'codex':
+        from services.codex_app_server.entry import call_with_tools as provider_call
+    response_text, _session, _resumed = await provider_call(
         prompt,
         send_target.id,
         deps.sessions,

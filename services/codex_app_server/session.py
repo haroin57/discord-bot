@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -36,6 +37,12 @@ class CodexUnavailableError(RuntimeError):
 
 class CodexAuthError(RuntimeError):
     """The app-server is not authenticated with a ChatGPT account."""
+
+
+def _auth_failure(message: str) -> CodexAuthError:
+    from services.codex_app_server.readiness import record_auth_result
+    record_auth_result(False)
+    return CodexAuthError(message)
 
 
 class CodexProtocolError(RuntimeError):
@@ -117,6 +124,18 @@ def _is_missing_thread_error(exc: BaseException) -> bool:
     )
 
 
+def _tool_failed(item: dict[str, Any]) -> bool:
+    """Normalize terminal native/dynamic/MCP failures for the evidence ledger."""
+    if item.get('status') in {'failed', 'declined', 'cancelled', 'canceled'}:
+        return True
+    if item.get('success') is False or item.get('error'):
+        return True
+    if item.get('type') == 'commandExecution' and item.get('exitCode') not in (None, 0):
+        return True
+    result = item.get('result')
+    return isinstance(result, dict) and result.get('isError') is True
+
+
 async def _invoke(callback: Callback | None, *args: Any) -> Any:
     if callback is None:
         return None
@@ -132,7 +151,7 @@ async def _invoke(callback: Callback | None, *args: Any) -> Any:
         return None
 
 
-def build_turn_input(prompt: Any) -> list[dict[str, Any]]:
+def build_turn_input(prompt: Any, *, allow_local_images: bool = True) -> list[dict[str, Any]]:
     """Translate the bot prompt and downloaded image paths to Codex inputs."""
     items: list[dict[str, Any]] = []
     text_parts: list[str] = []
@@ -170,6 +189,8 @@ def build_turn_input(prompt: Any) -> list[dict[str, Any]]:
     # bot.py already downloaded and size-validated these paths.  Passing them
     # as localImage makes vision work natively instead of asking Codex to infer
     # an image from a prose-only path.
+    if not allow_local_images:
+        return [item for item in items if item.get('type') == 'text']
     seen: set[str] = set()
     for match in _IMAGE_LINE_RE.finditer(text):
         raw = match.group("path").strip()
@@ -208,6 +229,12 @@ class CodexSession:
         post_tool_timeout_s: float = 180.0,
         child_env: dict[str, str] | None = None,
         client_factory: Callable[..., AsyncCodexAppServerClient] | None = None,
+        dynamic_tools: list[dict] | None = None,
+        tool_executor: Callable[..., Awaitable[str]] | None = None,
+        ephemeral: bool = False,
+        max_tool_calls: int = 30,
+        allow_host_approvals: bool = True,
+        allow_local_images: bool = True,
     ) -> None:
         self.cwd = os.path.abspath(os.path.expanduser(cwd))
         expanded_bin = os.path.expanduser(codex_bin)
@@ -224,6 +251,13 @@ class CodexSession:
         self.turn_timeout_s = turn_timeout_s
         self.post_tool_timeout_s = post_tool_timeout_s
         self.child_env = dict(child_env or {})
+        self.dynamic_tools = list(dynamic_tools or [])
+        self.tool_executor = tool_executor
+        self.ephemeral = ephemeral
+        self.max_tool_calls = max(0, max_tool_calls)
+        self.allow_host_approvals = allow_host_approvals
+        self.allow_local_images = allow_local_images
+        self._tool_call_count = 0
         self._client_factory = client_factory or AsyncCodexAppServerClient
         self._client: AsyncCodexAppServerClient | None = None
         self.thread_id = (stored_thread_id or "").strip() or None
@@ -266,7 +300,7 @@ class CodexSession:
                 client_name="kanae_discord_bot",
                 client_title="Kanae Discord Bot",
                 client_version="1.0",
-                capabilities={},
+                capabilities={"experimentalApi": True} if self.dynamic_tools else {},
             )
         except FileNotFoundError as exc:
             raise CodexUnavailableError(
@@ -280,7 +314,7 @@ class CodexSession:
             account = await self._client.request("account/read", {}, timeout=15)
         except (CodexAppServerError, CodexProcessError, TimeoutError) as exc:
             if _looks_like_auth_failure(exc, *self._client.stderr_tail(20)):
-                raise CodexAuthError(
+                raise _auth_failure(
                     "Codex ChatGPT authentication is unavailable; run `codex login`."
                 ) from exc
             raise CodexUnavailableError(f"Codex account preflight failed: {exc}") from exc
@@ -291,7 +325,7 @@ class CodexSession:
             # This integration intentionally proves and uses the ChatGPT OAuth
             # subscription route. API-key accounts are rejected rather than
             # silently changing billing paths.
-            raise CodexAuthError(
+            raise _auth_failure(
                 "Codex is not logged in with ChatGPT OAuth; run `codex login`."
             )
 
@@ -314,7 +348,7 @@ class CodexSession:
             except CodexAppServerError as exc:
                 if not _is_missing_thread_error(exc):
                     if _looks_like_auth_failure(exc, *self._client.stderr_tail(20)):
-                        raise CodexAuthError(
+                        raise _auth_failure(
                             "Codex OAuth session refresh failed; run `codex login`."
                         ) from exc
                     raise
@@ -326,11 +360,19 @@ class CodexSession:
                 self._resume_fell_back = True
 
         if result is None:
-            result = await self._client.request(
-                "thread/start",
-                {**common, "ephemeral": False},
-                timeout=30,
-            )
+            start_options = {"ephemeral": self.ephemeral}
+            if self.dynamic_tools:
+                start_options["dynamicTools"] = self.dynamic_tools
+            try:
+                result = await self._client.request(
+                    "thread/start",
+                    {**common, **start_options},
+                    timeout=30,
+                )
+            except (CodexAppServerError, CodexProcessError, TimeoutError) as exc:
+                if _looks_like_auth_failure(exc, *self._client.stderr_tail(20)):
+                    raise _auth_failure("Codex OAuth thread startup failed; run `codex login`.") from exc
+                raise
             self.resumed = False
 
         thread_id = _thread_id_from_result(result)
@@ -391,6 +433,9 @@ class CodexSession:
         thinking_finalize_callback: Callback | None = None,
         progress: dict[str, Any] | None = None,
         resume_fallback_context: str = "",
+        tool_result_callback: Callback | None = None,
+        scratch_stream_callback: Callback | None = None,
+        scratch_finalize_callback: Callback | None = None,
     ) -> CodexTurnResult:
         thread_id = await self.ensure_started(
             model=model, developer_instructions=developer_instructions,
@@ -411,7 +456,7 @@ class CodexSession:
 
         params: dict[str, Any] = {
             "threadId": thread_id,
-            "input": build_turn_input(effective_prompt),
+            "input": build_turn_input(effective_prompt, allow_local_images=self.allow_local_images),
             "model": model,
             "effort": effort,
             "cwd": self.cwd,
@@ -421,7 +466,7 @@ class CodexSession:
             started = await self._client.request("turn/start", params, timeout=30)
         except (CodexAppServerError, CodexProcessError, TimeoutError) as exc:
             if _looks_like_auth_failure(exc, *self._client.stderr_tail(30)):
-                raise CodexAuthError(
+                raise _auth_failure(
                     "Codex OAuth request failed; run `codex login` and retry."
                 ) from exc
             raise CodexTurnError(f"Codex turn/start failed: {exc}") from exc
@@ -430,6 +475,7 @@ class CodexSession:
         if not turn_id:
             raise CodexProtocolError("turn/start returned no turn id")
         self._active_turn_id = turn_id
+        self._tool_call_count = 0
 
         item_partials: dict[str, str] = {}
         reasoning_partial = ""
@@ -567,6 +613,19 @@ class CodexSession:
                         "dynamicToolCall", "webSearch", "imageGeneration",
                     }:
                         post_tool_last_activity_at = time.monotonic()
+                        name = str(item.get('tool') or item_type)
+                        arguments = item.get('arguments') or {}
+                        if not isinstance(arguments, dict):
+                            arguments = {'input': str(arguments)}
+                        if item_type == 'commandExecution':
+                            arguments = {'command': item.get('command', '')}
+                        is_error = _tool_failed(item)
+                        await _invoke(tool_result_callback, name, arguments,
+                                      json.dumps(item, ensure_ascii=False), is_error)
+                        if name == 'Scratchpad' and arguments.get('section') and not is_error:
+                            await _invoke(scratch_stream_callback, str(arguments['section']),
+                                          str(arguments.get('content', '')), str(arguments.get('op', 'write')))
+                            await _invoke(scratch_finalize_callback)
                     continue
 
                 if method == "model/rerouted":
@@ -594,7 +653,7 @@ class CodexSession:
                         await _invoke(status_callback, "Codex が接続を再試行中")
                         continue
                     if _looks_like_auth_failure(message):
-                        raise CodexAuthError(
+                        raise _auth_failure(
                             "Codex OAuth failed; run `codex login` and retry."
                         )
                     raise CodexTurnError(message)
@@ -618,7 +677,7 @@ class CodexSession:
                         error = turn.get("error") or {}
                         message = str(error.get("message") or f"turn status={status}")
                         if _looks_like_auth_failure(message):
-                            raise CodexAuthError(
+                            raise _auth_failure(
                                 "Codex OAuth failed; run `codex login` and retry."
                             )
                         raise CodexTurnError(message)
@@ -631,6 +690,8 @@ class CodexSession:
                 raise CodexTurnError("Codex completed without an agent message")
             was_resumed = self.resumed or self._has_completed_turn
             self._has_completed_turn = True
+            from services.codex_app_server.readiness import record_auth_result
+            record_auth_result(True)
             return CodexTurnResult(
                 final_text=answer,
                 thread_id=thread_id,
@@ -688,6 +749,26 @@ class CodexSession:
         method = str(request.get("method") or "")
         params = request.get("params") or {}
 
+        if method == "item/tool/call" and self.tool_executor is not None:
+            name = str(params.get("tool") or "")
+            allowed = {tool["name"] for tool in self.dynamic_tools}
+            valid_thread = bool(self.thread_id) and params.get("threadId") == self.thread_id
+            valid_turn = bool(self._active_turn_id) and params.get("turnId") == self._active_turn_id
+            arguments = params.get("arguments")
+            if (name not in allowed or not valid_thread or not valid_turn
+                    or not isinstance(arguments, dict)
+                    or self._tool_call_count >= self.max_tool_calls):
+                result = {"success": False, "contentItems": [{"type": "inputText", "text": "Tool call denied by host policy or budget."}]}
+            else:
+                self._tool_call_count += 1
+                try:
+                    text = await asyncio.wait_for(self.tool_executor(name, arguments), timeout=self.post_tool_timeout_s)
+                    result = {"success": True, "contentItems": [{"type": "inputText", "text": str(text)}]}
+                except Exception as exc:
+                    result = {"success": False, "contentItems": [{"type": "inputText", "text": f"Tool execution failed: {type(exc).__name__}"}]}
+            await self._client.respond(request_id, result)
+            return
+
         if method in {
             "item/commandExecution/requestApproval", "execCommandApproval",
         }:
@@ -741,6 +822,8 @@ class CodexSession:
     async def _request_approval(
         self, tool_name: str, tool_input: dict[str, Any], detail: str,
     ) -> bool:
+        if not self.allow_host_approvals:
+            return False
         decision, rule = evaluate_permission(tool_name, tool_input)
         if decision == "deny":
             log.warning("Codex tool denied by permission rule %s", rule)

@@ -582,6 +582,17 @@ def test_runtime_units_have_distinct_uids_and_bot_cannot_write_checkout():
         assert "kanae-state" not in text
 
 
+def test_discord_bot_units_disable_keyword_wakeups():
+    units = (
+        ROOT / "deploy/systemd/discord-bot.service",
+        ROOT / "deploy/systemd/discord-bot-dev.service",
+        ROOT / "deploy/systemd/hermes-discord-codex.service",
+    )
+    for unit in units:
+        text = unit.read_text(encoding="utf-8")
+        assert re.search(r"^Environment=BOT_KEYWORDS=$", text, re.MULTILINE)
+
+
 def test_state_writers_use_private_service_directories():
     expected = {
         ROOT / "deploy/systemd/discord-bot.service": "/var/lib/kanae-bot/state",

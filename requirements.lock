@@ -75,6 +75,7 @@ matplotlib==3.10.9
 mcp==1.28.1
 mdurl==0.1.2
 mem0ai==1.0.11
+./vendor/mem0-alpha
 mmh3==5.2.1
 mpmath==1.3.0
 msgpack==1.2.1

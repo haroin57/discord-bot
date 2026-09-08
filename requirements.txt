@@ -15,6 +15,7 @@ mcp==1.28.1                        # PR4 of claude-api-unify: direct pin so dele
 aiohttp>=3.14.1,<4.0
 xxhash>=3.7,<4.0
 mem0ai>=1.0,<2.0                 # TODO: bump to >=2.0 once stable lands (fixes CVE-2026-7597, currently only in 2.0.0b2)
+./vendor/mem0-alpha              # Source-pinned 0.3.0 snapshot; see vendor/mem0-alpha/PROVENANCE.md.
 chromadb>=1.0,<2.0
 psutil>=5.9,<8.0
 bleach>=6.4,<7.0                 # HTML sanitization for table_renderer

@@ -1,6 +1,7 @@
 """Configuration and constants — matches free-code constants/ pattern."""
 
 import os
+import sys
 
 
 def _parse_int_setting(
@@ -49,7 +50,7 @@ RESTRICTED_COOLDOWN_SECONDS = int(os.environ.get("BOT_RESTRICTED_COOLDOWN", "30"
 # Per-user daily quota for non-admins (messages-per-24h). 0 disables.
 RESTRICTED_DAILY_QUOTA = int(os.environ.get("BOT_RESTRICTED_DAILY_QUOTA", "30"))
 _raw_keywords = [
-    s.strip() for s in os.environ.get("BOT_KEYWORDS", "かなえ").split(",") if s.strip()
+    s.strip() for s in os.environ.get("BOT_KEYWORDS", "").split(",") if s.strip()
 ]
 BOT_KEYWORDS = [kw for kw in _raw_keywords if len(kw) >= 3]
 if len(BOT_KEYWORDS) < len(_raw_keywords):
@@ -170,10 +171,9 @@ def kanae_honorific(user_id: int | str | None) -> str:
 #   - targets ONLY haroin (not b0nchichi, not other admins) — gated on the
 #     Discord author id, never on message content
 #   - time-windowed (JST), deterministic, re-evaluated every turn
-#   - reversible at will: flip SLEEP_ENFORCE_ENABLED=false, or just tell kanae
-#     to stand down while clear-headed
+#   - opt-in and reversible at will via SLEEP_ENFORCE_ENABLED
 # Boolean parse: anything other than the falsy set below counts as enabled.
-_raw_sleep_enabled = os.environ.get("SLEEP_ENFORCE_ENABLED", "true").strip().lower()
+_raw_sleep_enabled = os.environ.get("SLEEP_ENFORCE_ENABLED", "false").strip().lower()
 SLEEP_ENFORCE_ENABLED = _raw_sleep_enabled not in ("0", "false", "no", "off", "")
 
 # Target user. Defaults to whoever is labelled "haroin" in SPEAKER_LABELS so
@@ -1585,7 +1585,7 @@ MCP_SERVERS_WEB: dict = {
     # sys.path[0] が polymarket/ になり polymarket_parser を解決。
     "polymarket": {
         "command": "/home/ubuntu/mcp-servers/yfj-quote/.venv/bin/python",
-        "args": ["/home/ubuntu/mcp-servers/polymarket/mcp_server.py"],
+        "args": [os.environ.get("POLYMARKET_MCP_SCRIPT", "/home/ubuntu/mcp-servers/polymarket/mcp_server.py")],
     },
     # minkabu-fx: みんかぶFX(OANDA)為替オーダーブック (注文/建玉の価格帯別分布)。
     # ドル円バタフライを株価感覚で fetch する (docs/2026-06-24_minkabu_fx_mcp_plan.md)。
@@ -1659,8 +1659,17 @@ MCP_SERVERS_HEAVY: dict = {
 MCP_SERVERS_MEMORY: dict = {
     # Direct stdio (bot-owned, self-reaping) — see x-scraper note / ADR-0022.
     "mem0": {
-        "command": "/home/ubuntu/discord-bot/.venv/bin/python",
-        "args": ["/home/ubuntu/discord-bot/mcp_mem0_server.py"],
+        "command": sys.executable,
+        "args": [os.path.join(BOT_DIR, "mcp_mem0_server.py")],
+        "env": {
+            **{key: value for key, value in os.environ.items()
+               if key.startswith(("MEM0_", "CHROMA_", "CODEX_APP_SERVER_"))
+               or key in {"OPENAI_API_KEY", "OPENROUTER_API_KEY", "OPENCODE_API_KEY",
+                          "BOT_STATE_DIR", "BOT_AUX_LLM_PROVIDER", "CODEX_BIN",
+                          "OAUTH_PRIMARY_CREDENTIALS_PATH", "OAUTH_FAILOVER_CREDENTIALS_PATH"}},
+            "PYTHON_DOTENV_DISABLED": "1",
+            "OAUTH_NO_REFRESH": "1",
+        },
     },
 }
 
@@ -1673,7 +1682,7 @@ MCP_SERVERS_REALESTATE: dict = {
     # that here since server.py only reads REALESTATE_ALLOWED_USER_IDS.
     "realestate": {
         "command": "/home/ubuntu/realestate-mcp/.venv/bin/python",
-        "args": ["/home/ubuntu/realestate-mcp/server.py"],
+        "args": [os.environ.get("REALESTATE_MCP_SCRIPT", "/home/ubuntu/realestate-mcp/server.py")],
         "env": {
             "REALESTATE_ALLOWED_USER_IDS": (
                 os.environ.get("REALESTATE_ALLOWED_USER_IDS")
@@ -1700,10 +1709,38 @@ for _s in _raw_nature_ids.split(","):
 MCP_SERVERS_IOT: dict = {
     "nature-remo": {
         "command": "/home/ubuntu/nature-remo-mcp/.venv/bin/python",
-        "args": ["/home/ubuntu/nature-remo-mcp/server.py"],
+        "args": [os.environ.get("NATURE_REMO_MCP_SCRIPT", "/home/ubuntu/nature-remo-mcp/server.py")],
         "env": {
             "NATURE_REMO_TOKEN": os.environ.get("NATURE_REMO_TOKEN", ""),
         },
+    },
+}
+
+
+# ALARM tier — kanae-alarm MCP（Cloudflare Workers, streamable HTTP）。
+# Mac 目覚まし（大音量 YouTube 再生）を set / list / cancel / log する。Workers が
+# Cloudflare Tunnel 経由で Mac に fetch する実装で、時刻は JST 基準で解釈される。
+#
+# 認可: 「haroin の Mac を大音量で鳴らす」個人アクションなので、nature-remo と同じく
+# admin 全員ではなく個人ゲートにする。KANAE_ALARM_ALLOWED_USER_IDS が空なら
+# NATURE_REMO_ALLOWED_USER_IDS を継承する（どちらも haroin 単独なので実用上同じ／
+# .env 追記なしで有効化できる）。両方空なら fail-closed で誰も spawn できない。
+_raw_alarm_ids = os.environ.get("KANAE_ALARM_ALLOWED_USER_IDS", "")
+KANAE_ALARM_ALLOWED_USER_IDS: set[int] = set()
+for _s in _raw_alarm_ids.split(","):
+    _s = _s.strip()
+    if _s.isdigit():
+        KANAE_ALARM_ALLOWED_USER_IDS.add(int(_s))
+if not KANAE_ALARM_ALLOWED_USER_IDS:
+    KANAE_ALARM_ALLOWED_USER_IDS = set(NATURE_REMO_ALLOWED_USER_IDS)
+
+KANAE_ALARM_MCP_URL = os.environ.get(
+    "KANAE_ALARM_MCP_URL", "https://kanae-alarm.haroin57.workers.dev/mcp"
+)
+MCP_SERVERS_ALARM: dict = {
+    "kanae-alarm": {
+        "type": "http",
+        "url": KANAE_ALARM_MCP_URL,
     },
 }
 
@@ -1756,6 +1793,7 @@ MCP_SERVERS: dict = {
     **MCP_SERVERS_DOCS,
     **MCP_SERVERS_REALESTATE,
     **MCP_SERVERS_IOT,
+    **MCP_SERVERS_ALARM,
     **MCP_SERVERS_MAIL,
     **MCP_SERVERS_INSHI,
 }
