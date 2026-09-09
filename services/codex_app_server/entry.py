@@ -20,6 +20,7 @@ from config import (
 )
 from services.codex_app_server.manager import get_manager
 from services.codex_app_server.session import CodexUnavailableError
+from services.codex_app_server.turn_hooks import TurnHooks
 from services.correlation import get_request_id
 from services.session import (
     append_jsonl,
@@ -177,6 +178,9 @@ async def call_with_tools(
     evidence = new_index(channel_id) if auxiliary.enabled() else None
     deliberate = evidence is not None and tier == 'deliberate'
     execution_turn = 0
+    # Deliberate execution and verifier-requested revisions belong to the
+    # same Discord request. Share the hook cap across all of them.
+    request_hooks = TurnHooks()
     async def record_tool_result(name, arguments, content, is_error):
         if evidence is not None:
             await evidence.add(seq=evidence.next_seq(), turn=execution_turn, tool=name,
@@ -199,7 +203,7 @@ async def call_with_tools(
             tool_invocation_callback=tool_invocation_callback,
             thinking_stream_callback=thinking_stream_callback,
             thinking_finalize_callback=thinking_finalize_callback,
-            progress=progress, **extra,
+            progress=progress, turn_hooks=request_hooks, **extra,
         )
     if deliberate:
         from services.codex_app_server.deliberation import run

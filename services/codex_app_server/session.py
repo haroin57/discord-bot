@@ -27,6 +27,7 @@ from services.codex_app_server.client import (
     CodexAppServerError,
     CodexProcessError,
 )
+from services.codex_app_server.turn_hooks import TurnHooks
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +69,8 @@ class CodexTurnResult:
     model_context_window: int | None = None
     compacted: bool = False
     completed_items: list[dict[str, Any]] = field(default_factory=list)
+    hook_recovery_nudges: int = 0
+    hook_completion_reviews: int = 0
 
 
 Callback = Callable[..., Awaitable[Any] | Any]
@@ -227,6 +230,7 @@ class CodexSession:
         approval_policy: str = "untrusted",
         turn_timeout_s: float = 1800.0,
         post_tool_timeout_s: float = 180.0,
+        turn_hooks_enabled: bool = False,
         child_env: dict[str, str] | None = None,
         client_factory: Callable[..., AsyncCodexAppServerClient] | None = None,
         dynamic_tools: list[dict] | None = None,
@@ -250,6 +254,7 @@ class CodexSession:
         self.approval_policy = approval_policy
         self.turn_timeout_s = turn_timeout_s
         self.post_tool_timeout_s = post_tool_timeout_s
+        self.turn_hooks_enabled = turn_hooks_enabled
         self.child_env = dict(child_env or {})
         self.dynamic_tools = list(dynamic_tools or [])
         self.tool_executor = tool_executor
@@ -436,6 +441,7 @@ class CodexSession:
         tool_result_callback: Callback | None = None,
         scratch_stream_callback: Callback | None = None,
         scratch_finalize_callback: Callback | None = None,
+        turn_hooks: TurnHooks | None = None,
     ) -> CodexTurnResult:
         thread_id = await self.ensure_started(
             model=model, developer_instructions=developer_instructions,
@@ -478,10 +484,13 @@ class CodexSession:
         self._tool_call_count = 0
 
         item_partials: dict[str, str] = {}
+        item_phases: dict[str, str] = {}
+        hooks = (turn_hooks or TurnHooks()) if self.turn_hooks_enabled else None
         reasoning_partial = ""
         completed_items: list[dict[str, Any]] = []
         final_text = ""
         last_agent_text = ""
+        last_agent_phase = ""
         token_usage_last: dict[str, Any] | None = None
         token_usage_total: dict[str, Any] | None = None
         context_window: int | None = None
@@ -532,6 +541,11 @@ class CodexSession:
                 event_params = event.get("params") or {}
                 event_thread = event_params.get("threadId")
                 event_turn = event_params.get("turnId")
+                if method == "turn/completed":
+                    # Some protocol versions carry the id only in `turn`.
+                    event_turn = event_turn or (
+                        event_params.get("turn") or {}
+                    ).get("id")
                 if event_thread not in (None, thread_id):
                     continue
                 if event_turn not in (None, turn_id):
@@ -558,8 +572,17 @@ class CodexSession:
                     compacted = True
                     continue
 
+                if method == "turn/plan/updated":
+                    if hooks is not None:
+                        hooks.observe_plan(event_params.get("plan"))
+                    continue
+
                 if method == "item/started":
                     item = event_params.get("item") or {}
+                    if item.get("type") == "agentMessage":
+                        item_phases[str(item.get("id") or "")] = str(
+                            item.get("phase") or "",
+                        )
                     if item.get("type") == "contextCompaction":
                         compacted = True
                     await self._announce_tool(item, tool_invocation_callback)
@@ -573,6 +596,14 @@ class CodexSession:
                     item_id = str(event_params.get("itemId") or "")
                     delta = str(event_params.get("delta") or "")
                     if delta:
+                        # A final answer (including an unknown legacy phase)
+                        # must not reach Discord before the completion hook.
+                        # Explicit commentary continues to stream normally.
+                        if (
+                            hooks is not None
+                            and item_phases.get(item_id) != "commentary"
+                        ):
+                            continue
                         item_partials[item_id] = item_partials.get(item_id, "") + delta
                         await _invoke(text_stream_callback, item_partials[item_id])
                     continue
@@ -601,15 +632,50 @@ class CodexSession:
                         continue
                     completed_items.append(item)
                     item_type = item.get("type")
+                    if hooks is not None:
+                        recovery_prompt = hooks.observe_item(item, turn_id=turn_id)
+                        if recovery_prompt:
+                            log.info(
+                                "Codex hook repeated_failure thread=%s turn=%s",
+                                thread_id[:12], turn_id[:12],
+                            )
+                            await _invoke(
+                                status_callback,
+                                "同じ操作の失敗が続いたため、手順を見直しています。",
+                            )
+                            try:
+                                await self._client.request(
+                                    "turn/steer",
+                                    {
+                                        "threadId": thread_id,
+                                        "expectedTurnId": turn_id,
+                                        "input": [{"type": "text", "text": recovery_prompt}],
+                                    },
+                                    timeout=max(
+                                        0.001, min(5.0, deadline - time.monotonic()),
+                                    ),
+                                )
+                            except (CodexAppServerError, CodexProcessError, TimeoutError):
+                                # It may already have completed, or the server
+                                # may not support steering. Do not resend an
+                                # ambiguously accepted nudge. Stop still checks.
+                                log.info(
+                                    "Codex recovery steer unavailable; "
+                                    "completion hook remains active",
+                                )
                     if item_type == "agentMessage":
-                        item_partials.pop(str(item.get("id") or ""), None)
+                        item_id = str(item.get("id") or "")
+                        item_partials.pop(item_id, None)
+                        item_phases.pop(item_id, None)
                         text = str(item.get("text") or "")
                         if text:
                             last_agent_text = text
                             phase = str(item.get("phase") or "")
+                            last_agent_phase = phase
                             if phase in {"final_answer", "finalAnswer"}:
                                 final_text = text
-                            await _invoke(incremental_text_callback, text)
+                            if hooks is None or phase == "commentary":
+                                await _invoke(incremental_text_callback, text)
                     elif item_type == "reasoning":
                         await _invoke(thinking_finalize_callback)
                         reasoning_partial = ""
@@ -676,6 +742,7 @@ class CodexSession:
                                 and item.get("text")
                             ):
                                 last_agent_text = str(item["text"])
+                                last_agent_phase = str(item.get("phase") or "")
                                 if str(item.get("phase") or "") in {
                                     "final_answer", "finalAnswer",
                                 }:
@@ -690,11 +757,69 @@ class CodexSession:
                         raise CodexTurnError(message)
                     if status == "interrupted":
                         raise asyncio.CancelledError
+                    if hooks is not None:
+                        # Normally item/completed is authoritative. Also cover
+                        # servers that supply completed items only in the
+                        # terminal snapshot; observe_item deduplicates ids.
+                        for item in turn.get("items") or []:
+                            if isinstance(item, dict):
+                                hooks.observe_item(
+                                    item, turn_id=turn_id, allow_recovery=False,
+                                )
+                        review_prompt = hooks.completion_prompt()
+                        if review_prompt:
+                            log.info(
+                                "Codex hook completion_review thread=%s failures=%d pending_steps=%d",
+                                thread_id[:12], hooks.failure_count, hooks.pending_steps,
+                            )
+                            await _invoke(
+                                status_callback,
+                                "実行結果と未完了の手順を確認しています。",
+                            )
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError(
+                                    "Codex completion check exceeded the turn deadline",
+                                )
+                            # Continue on the same thread, under the same model,
+                            # effort, permissions, manager lock and deadline.
+                            # Never replay the original request or its tools.
+                            review_params = dict(params)
+                            review_params["input"] = [
+                                {"type": "text", "text": review_prompt},
+                            ]
+                            try:
+                                reviewed = await self._client.request(
+                                    "turn/start", review_params,
+                                    timeout=min(30.0, remaining),
+                                )
+                            except (CodexAppServerError, CodexProcessError) as exc:
+                                raise CodexTurnError(
+                                    "Codex completion check could not start",
+                                ) from exc
+                            next_turn_id = str(
+                                (reviewed.get("turn") or {}).get("id") or "",
+                            )
+                            if not next_turn_id or next_turn_id == turn_id:
+                                raise CodexProtocolError(
+                                    "completion check returned no new turn id",
+                                )
+                            turn_id = next_turn_id
+                            self._active_turn_id = turn_id
+                            final_text = last_agent_text = reasoning_partial = ""
+                            last_agent_phase = ""
+                            item_partials.clear()
+                            item_phases.clear()
+                            post_tool_last_activity_at = None
+                            continue
                     break
 
             answer = (final_text or last_agent_text).strip()
             if not answer:
                 raise CodexTurnError("Codex completed without an agent message")
+            if hooks is not None and (final_text or last_agent_phase != "commentary"):
+                await _invoke(text_stream_callback, answer)
+                await _invoke(incremental_text_callback, answer)
             was_resumed = self.resumed or self._has_completed_turn
             self._has_completed_turn = True
             from services.codex_app_server.readiness import record_auth_result
@@ -713,6 +838,8 @@ class CodexSession:
                 model_context_window=context_window,
                 compacted=compacted,
                 completed_items=completed_items,
+                hook_recovery_nudges=hooks.recovery_nudges if hooks else 0,
+                hook_completion_reviews=hooks.completion_reviews if hooks else 0,
             )
         except asyncio.CancelledError:
             await self.interrupt()

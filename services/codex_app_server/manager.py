@@ -31,6 +31,7 @@ from config import (
     CODEX_APP_SERVER_SANDBOX,
     CODEX_APP_SERVER_STATE_PATH,
     CODEX_APP_SERVER_TIMEOUT_S,
+    CODEX_APP_SERVER_TURN_HOOKS_ENABLED,
     CODEX_APP_SERVER_USE_LEGACY_LANDLOCK,
     CODEX_BIN,
 )
@@ -395,6 +396,7 @@ class CodexSessionManager:
                     approval_policy=CODEX_APP_SERVER_APPROVAL_POLICY,
                     turn_timeout_s=CODEX_APP_SERVER_TIMEOUT_S,
                     post_tool_timeout_s=CODEX_APP_SERVER_POST_TOOL_TIMEOUT_S,
+                    turn_hooks_enabled=CODEX_APP_SERVER_TURN_HOOKS_ENABLED,
                     child_env={"PATH": CODEX_APP_SERVER_PATH},
                 )
                 self._sessions[key] = session

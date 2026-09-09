@@ -1002,6 +1002,11 @@ CODEX_APP_SERVER_POST_TOOL_TIMEOUT_S = float(
         "180",
     )
 )
+# Native tool-failure recovery + bounded completion check, main Discord turns
+# only. Auxiliary structured-output/verifier sessions do not enable these.
+CODEX_APP_SERVER_TURN_HOOKS_ENABLED = os.environ.get(
+    "CODEX_APP_SERVER_TURN_HOOKS_ENABLED", "true",
+).lower() not in ("0", "false", "no", "off", "")
 CODEX_APP_SERVER_MAX_SESSIONS = int(
     os.environ.get(
         "CODEX_APP_SERVER_MAX_SESSIONS",

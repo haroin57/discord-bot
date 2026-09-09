@@ -346,9 +346,11 @@ async def test_entry_records_failure_and_revision_turn_without_streaming_drafts(
     monkeypatch.setattr(entry, 'append_jsonl', lambda *_args, **_kwargs: None)
     evidence = SimpleNamespace(add=AsyncMock(), next_seq=lambda: 1)
     monkeypatch.setattr('services.claude_api.evidence.new_index', lambda _: evidence)
+    hook_states = []
     async def execute(_channel, _user, prompt, **kwargs):
         assert kwargs['text_stream_callback'] is None
         assert kwargs['incremental_text_callback'] is None
+        hook_states.append(kwargs['turn_hooks'])
         await kwargs['tool_result_callback']('Bash', {}, 'failed', prompt == 'first')
         return result(prompt)
     manager = SimpleNamespace(has_thread=lambda *_: False, has_live_session=lambda *_: False, run_turn=execute)
@@ -360,6 +362,7 @@ async def test_entry_records_failure_and_revision_turn_without_streaming_drafts(
     output = await entry.call_with_tools('task', 10, {}, user_id=20, tier='deliberate',
         text_stream_callback=Mock(), incremental_text_callback=Mock())
     assert output == ('revision', None, False)
+    assert len(hook_states) == 2 and hook_states[0] is hook_states[1]
     assert [(call.kwargs['turn'], call.kwargs['is_error']) for call in evidence.add.await_args_list] == [(1, True), (2, False)]
 
 
