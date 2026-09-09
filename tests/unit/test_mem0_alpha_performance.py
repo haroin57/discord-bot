@@ -12,6 +12,19 @@ import pytest
 pytestmark = pytest.mark.skipif(os.environ.get('MEM0_ALPHA_ENABLED') != '1', reason='alpha-only lane')
 
 
+@pytest.fixture(scope='module', autouse=True)
+def mem0_alpha_bootstrap():
+    """Initialize the import-time bridge before per-test state snapshots.
+
+    Like the parity lane's mem0_pkg fixture, this is module setup rather
+    than a test mutation: the bridge intentionally mirrors settings into
+    the process environment once and aliases the implementation modules.
+    Individual tests remain covered by the unchanged process-state guard.
+    """
+    import services.mem0 as package
+    return package
+
+
 @pytest.mark.asyncio
 async def test_alpha_morphology_is_off_loop(monkeypatch):
     from services.mem0 import search
