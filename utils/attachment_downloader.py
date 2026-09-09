@@ -10,6 +10,8 @@ import tempfile
 import unicodedata
 import warnings
 from collections.abc import Awaitable, Callable, Coroutine
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, TypeVar
 
 import aiohttp
@@ -35,6 +37,41 @@ _TEXT_MIMES = {
     "application/x-yaml",
     "application/yaml",
 }
+
+# A validation receipt, not a payload cache. Each caller/provenance group owns
+# a fresh set; asyncio children share that set only for the group's lifetime.
+_validated_attachments: ContextVar[set[tuple] | None] = ContextVar(
+    "validated_attachment_downloads", default=None,
+)
+
+
+@contextmanager
+def attachment_reuse_scope():
+    """Avoid re-downloading successfully validated media within one group."""
+    token = _validated_attachments.set(set())
+    try:
+        yield
+    finally:
+        _validated_attachments.reset(token)
+
+
+def _attachment_key(attachment) -> tuple | None:
+    values = tuple(getattr(attachment, field, None) for field in
+                   ("id", "url", "content_type", "filename", "size"))
+    if not all(type(value) in (str, int, type(None)) for value in values):
+        return None
+    return (id(attachment), *values)
+
+
+def _record_validated(attachment) -> None:
+    receipts = _validated_attachments.get()
+    if receipts is not None and (key := _attachment_key(attachment)) is not None:
+        receipts.add(key)
+
+
+def _already_validated(attachment) -> bool:
+    receipts = _validated_attachments.get()
+    return receipts is not None and _attachment_key(attachment) in receipts
 
 
 def _declared_mime(attachment: Any) -> str:
@@ -219,6 +256,7 @@ async def download_image(
                 log.info(
                     "Downloaded attachment: %s -> %s", attachment.filename, destination
                 )
+                _record_validated(attachment)
                 return destination
         except Exception as exc:
             log.warning(
@@ -311,6 +349,7 @@ async def download_text(
                     attachment.filename,
                     len(data),
                 )
+                _record_validated(attachment)
                 return attachment.filename or "attachment.txt", text
         except Exception as exc:
             log.warning(
@@ -373,6 +412,11 @@ async def download_arbitrary(
             attachment.filename,
             extension,
         )
+        return None
+    if _already_validated(attachment):
+        # The dedicated downloader already returned this exact validated
+        # upload to the caller. Failed/oversized/mislabeled uploads have no
+        # receipt and still run the existing binary-policy fallback below.
         return None
     safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(attachment.id))[:64] or "att"
     safe_base = sanitize_basename(attachment.filename or "")
