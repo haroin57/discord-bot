@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import hashlib
 import logging
 import os
 import struct
+import threading
 import time
 import uuid
 import zlib
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from functools import partial
+from typing import Any, TypeVar
+from weakref import WeakValueDictionary
 
 from PIL import Image, UnidentifiedImageError
 
@@ -18,6 +26,59 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 PNG_IEND = b"\x00\x00\x00\x00IEND\xaeB\x60\x82"
 MAX_PNG_DIMENSION = 16_384
 MAX_PNG_PIXELS = 100_000_000
+
+# Python 3.13 warnings filters are process-wide. Attachment validation uses
+# catch_warnings to fail closed on decompression warnings; keep these image
+# validators from overlapping that context or inheriting each other's filters.
+image_validation_lock = threading.RLock()
+
+_T = TypeVar("_T")
+_render_locks: WeakValueDictionary[
+    tuple[asyncio.AbstractEventLoop, str], asyncio.Lock
+] = WeakValueDictionary()
+
+
+@asynccontextmanager
+async def render_lock(path: str) -> AsyncIterator[None]:
+    """Serialize the same cache entry without retaining idle keys or loops."""
+    key = (asyncio.get_running_loop(), os.path.realpath(path))
+    lock = _render_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _render_locks[key] = lock
+    # Keep a strong reference through waiting, rendering, and cancellation.
+    async with lock:
+        yield
+
+
+async def run_file_operation(
+    function: Callable[..., _T], /, *args: Any, **kwargs: Any
+) -> _T:
+    """Run blocking image/file work and drain it before cancellation cleanup.
+
+    Cancelling to_thread's waiter cannot stop its worker. Shield and retrieve
+    it, including repeated owner cancellation, before callers close/unlink the
+    files it uses or release their concurrency permit.
+    """
+    context = contextvars.copy_context()
+    task = asyncio.get_running_loop().run_in_executor(
+        None, partial(context.run, function, *args, **kwargs)
+    )
+    # An executor Future is not in asyncio.all_tasks(): loop-wide shutdown must
+    # not cancel a to_thread Task and hide its still-running underlying worker.
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancelled:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if not task.cancelled():
+            task.exception()
+        raise cancelled
 
 
 def render_paths(
@@ -88,6 +149,11 @@ def _has_valid_png_structure(data: bytes) -> bool:
 
 
 def _fully_decodes_png(path: str) -> bool:
+    with image_validation_lock:
+        return _decode_png(path)
+
+
+def _decode_png(path: str) -> bool:
     try:
         with Image.open(path) as image:
             if image.format != "PNG":
@@ -133,7 +199,16 @@ def publish_png(part_path: str, path: str) -> bool:
     if not is_cached(part_path):
         return False
     os.replace(part_path, path)
-    return is_cached(path)
+    # Atomic rename publishes the same validated bytes; do not decode again.
+    return True
+
+
+async def publish_png_async(part_path: str, path: str) -> bool:
+    """Validate off-loop, then publish only if the caller is still active."""
+    if not await run_file_operation(is_cached, part_path):
+        return False
+    os.replace(part_path, path)
+    return True
 
 
 def remove_if_exists(path: str) -> None:

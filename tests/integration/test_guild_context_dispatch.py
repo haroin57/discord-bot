@@ -27,6 +27,9 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, '_runtime_resources', resources)
     monkeypatch.setattr(bot, '_turn_outbox', MagicMock())
     bot._turn_outbox.snapshot.return_value = None
+    async def run_io(operation, *args, **kwargs):
+        return operation(*args, **kwargs)
+    bot._turn_outbox.run_io = AsyncMock(side_effect=run_io)
     status = MagicMock()
     for name in ('initial_reply', 'update', 'close', 'edit_final'):
         setattr(status, name, AsyncMock())

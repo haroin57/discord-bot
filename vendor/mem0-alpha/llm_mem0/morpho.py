@@ -42,6 +42,7 @@ log = logging.getLogger(__name__)
 
 _tokenizer = None
 _tokenizer_lock = threading.Lock()
+_tokenization_lock = threading.Lock()
 
 
 def _get_tokenizer():
@@ -88,6 +89,13 @@ def _is_content_token(token) -> bool:
 
 
 def tokenize_keywords(text: str) -> list[str]:
+    # Janome Matcher caches test membership outside their mutation lock.
+    # Serialize the complete generator, not just Tokenizer construction.
+    with _tokenization_lock:
+        return _tokenize_keywords_locked(text)
+
+
+def _tokenize_keywords_locked(text: str) -> list[str]:
     """Surface forms of content words. Empty list if Janome unavailable
     or input is empty."""
     if not text or not text.strip():

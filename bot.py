@@ -448,7 +448,7 @@ async def _reconcile_turn_outbox(request_id: str) -> bool:
 
 
 async def _replay_turn_outbox() -> None:
-    for turn in _turn_outbox.pending():
+    for turn in await _turn_outbox.run_io(_turn_outbox.pending):
         await _reconcile_turn_outbox(turn["request_id"])
 
 
@@ -1084,7 +1084,8 @@ async def on_message(message: discord.Message):
     _renderer = None
     delivery = bot_publish.DeliveryState(
         request_id=turn_request_id,
-        receipt_callback=lambda state: _turn_outbox.record_delivery(
+        receipt_callback=lambda state: _turn_outbox.run_io(
+            _turn_outbox.record_delivery,
             turn_request_id,
             message_ids=state.message_ids,
             streamed=state.streamed,
@@ -1099,7 +1100,7 @@ async def on_message(message: discord.Message):
         )
 
     async def _register_turn_archive(**kwargs) -> None:
-        await asyncio.to_thread(
+        await _turn_outbox.run_io(
             _turn_outbox.add_archive_job,
             turn_request_id,
             **kwargs,
@@ -1114,7 +1115,8 @@ async def on_message(message: discord.Message):
         # Stage the immutable request and its archive intent only after FIFO
         # admission. No model/stream callback can acknowledge a turn whose
         # durable request payload has not been atomically written.
-        _turn_outbox.stage_request(
+        await _turn_outbox.run_io(
+            _turn_outbox.stage_request,
             turn_request_id,
             request_message_id=message.id,
             channel_id=message.channel.id,
@@ -1355,7 +1357,8 @@ async def on_message(message: discord.Message):
         record_response_text = response_text or (
             getattr(_renderer, "committed", "") or ""
         )
-        _turn_outbox.prepare(
+        await _turn_outbox.run_io(
+            _turn_outbox.prepare,
             turn_request_id,
             {
                 "caller_is_admin": caller_is_admin,
@@ -1373,7 +1376,8 @@ async def on_message(message: discord.Message):
             nonlocal turn_committed
             if turn_committed:
                 return
-            _turn_outbox.record_delivery(
+            await _turn_outbox.run_io(
+                _turn_outbox.record_delivery,
                 turn_request_id,
                 message_ids=delivery.message_ids,
                 streamed=delivery.streamed,
@@ -1579,10 +1583,14 @@ async def on_message(message: discord.Message):
                         cleanup_attachments,
                         [*image_paths, *binary_paths],
                     )
-                    turn_snapshot = _turn_outbox.snapshot(turn_request_id)
+                    turn_snapshot = await _turn_outbox.run_io(
+                        _turn_outbox.snapshot, turn_request_id
+                    )
                     if turn_snapshot is not None and turn_snapshot.get(
                         "delivery", {}
                     ).get("acknowledged"):
                         await _reconcile_turn_outbox(turn_request_id)
                     else:
-                        _turn_outbox.discard_unacknowledged(turn_request_id)
+                        await _turn_outbox.run_io(
+                            _turn_outbox.discard_unacknowledged, turn_request_id
+                        )

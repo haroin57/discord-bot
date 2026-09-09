@@ -16,9 +16,15 @@ lane without relying on an operator's editable development installation.
 - `SNAPSHOT.sha256` pins every included upstream file by relative path. Verify
   with `sha256sum --check SNAPSHOT.sha256` from this directory.
 
-Every included upstream file is byte-for-byte equal to the captured source.
-The only additional files are this provenance, the checksum manifest, and a
-local build-artifact `.gitignore`.
+The initial snapshot was byte-for-byte equal to the captured source. Local
+performance patches on 2026-09-09 change `llm_mem0/search.py`, `llm_mem0/morpho.py`, and the package
+version to `0.3.0+botperf.1`: off-loop morphological analysis, single-flight
+bounded core-memory caching, cancellation ownership, and bounded concurrent
+graph sibling reads. Shared Janome tokenization is serialized to protect its
+mutable matcher caches. Candidate selection, scoring, scope and archive checks
+are preserved. `SNAPSHOT.sha256` describes the current patched files.
+The additional files are this provenance, the checksum manifest, and a local
+build-artifact `.gitignore`.
 The original upstream working directory is not modified by packaging.
 
 Both requirements files use `./vendor/mem0-alpha`. Run pip from the repository

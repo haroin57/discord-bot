@@ -9,7 +9,9 @@ in each runner module. (P1-b of docs/2026-07-03-grand-refactor-plan.md.)
 
 from __future__ import annotations
 
+import asyncio
 import time
+import weakref
 from collections.abc import Awaitable, Callable
 
 from services.claude_api.subprocess_runner import (
@@ -36,14 +38,27 @@ class AvailabilityCache:
     def __init__(self, ttl_s: float = 300.0) -> None:
         self._ttl_s = ttl_s
         self._entry: "tuple[float, bool] | None" = None
+        self._locks: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+
+    def _fresh(self) -> bool:
+        return self._entry is not None and time.monotonic() - self._entry[0] < self._ttl_s
 
     async def get(self, probe: Callable[[], Awaitable[bool]]) -> bool:
-        now = time.monotonic()
-        if self._entry is not None and now - self._entry[0] < self._ttl_s:
+        if self._fresh():
             return self._entry[1]
-        ok = await probe()
-        self._entry = (now, ok)
-        return ok
+        # A burst of second-opinion requests must not launch one availability
+        # subprocess each. Keep locks loop-local for worker asyncio.run users.
+        loop = asyncio.get_running_loop()
+        lock = self._locks.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[loop] = lock
+        async with lock:
+            if self._fresh():
+                return self._entry[1]
+            ok = await probe()
+            self._entry = (time.monotonic(), ok)
+            return ok
 
     def reset(self) -> None:
         self._entry = None

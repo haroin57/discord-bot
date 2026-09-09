@@ -49,40 +49,76 @@ class GuildContextStore:
                 if 'duplicate column' not in str(exc):
                     raise
         db.execute('CREATE INDEX IF NOT EXISTS messages_guild ON messages(guild_id, created_at)')
+        # The recency key includes edits, not only original creation time.
+        # Keep reads/retention indexed without changing correction ordering.
+        db.execute('''CREATE INDEX IF NOT EXISTS messages_guild_updated
+            ON messages(guild_id, MAX(created_at,version) DESC, message_id DESC)''')
+        db.execute('''CREATE INDEX IF NOT EXISTS messages_updated
+            ON messages(MAX(created_at,version))''')
         db.execute('''CREATE TABLE IF NOT EXISTS deleted_messages (
             message_id INTEGER PRIMARY KEY, deleted_at REAL NOT NULL)''')
         db.execute('''CREATE TABLE IF NOT EXISTS pending_edits (
             message_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL,
             channel_id INTEGER NOT NULL, content TEXT NOT NULL, version REAL NOT NULL)''')
+        db.execute('CREATE INDEX IF NOT EXISTS deleted_messages_age ON deleted_messages(deleted_at)')
+        db.execute('CREATE INDEX IF NOT EXISTS pending_edits_age ON pending_edits(version)')
         return db
 
     def record(self, *, message_id: int, guild_id: int, channel_id: int,
                author_id: int, author: str, content: str, bot: bool,
                created_at: float, version: float | None = None) -> None:
-        if not isinstance(content, str) or not all(type(x) is int and x > 0 for x in (message_id, guild_id, channel_id, author_id)):
+        self.record_many([dict(message_id=message_id, guild_id=guild_id,
+                               channel_id=channel_id, author_id=author_id,
+                               author=author, content=content, bot=bot,
+                               created_at=created_at, version=version)])
+
+    def record_many(self, records: list[dict]) -> None:
+        """Persist a history page with one transaction and one retention pass.
+
+        Pending gateway edits and deletion tombstones are still checked for
+        every record, including gateway events received while fetching history.
+        """
+        valid = [r for r in records if isinstance(r.get('content'), str)
+                 and all(type(r.get(k)) is int and r[k] > 0
+                         for k in ('message_id', 'guild_id', 'channel_id', 'author_id'))]
+        if not valid:
             return
         with closing(self._connect()) as db, db:
-            db.execute('''INSERT INTO messages
+            for record in valid:
+                message_id, guild_id, channel_id = (record[k] for k in ('message_id', 'guild_id', 'channel_id'))
+                created_at = record['created_at']
+                version = record.get('version')
+                db.execute('''INSERT INTO messages
                 (message_id,guild_id,channel_id,author_id,author,content,bot,created_at,version)
                 SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS
                 (SELECT 1 FROM deleted_messages WHERE message_id=?)
                 ON CONFLICT(message_id) DO UPDATE SET
                     content=excluded.content, author=excluded.author, version=excluded.version
                 WHERE excluded.version > messages.version''',
-                       (message_id, guild_id, channel_id, author_id, author[:100],
-                        content[:_MAX_MESSAGE_CHARS], int(bot), created_at,
+                       (message_id, guild_id, channel_id, record['author_id'], record['author'][:100],
+                        record['content'][:_MAX_MESSAGE_CHARS], int(record['bot']), created_at,
                         version if version is not None else created_at, message_id))
-            pending = db.execute('SELECT * FROM pending_edits WHERE message_id=?', (message_id,)).fetchone()
-            if pending and pending['guild_id'] == guild_id and pending['channel_id'] == channel_id:
-                db.execute('UPDATE messages SET content=?,version=? WHERE message_id=? AND version<=?',
-                           (pending['content'], pending['version'], message_id, pending['version']))
+                pending = db.execute('SELECT * FROM pending_edits WHERE message_id=?', (message_id,)).fetchone()
+                if pending and pending['guild_id'] == guild_id and pending['channel_id'] == channel_id:
+                    db.execute('UPDATE messages SET content=?,version=? WHERE message_id=? AND version<=?',
+                               (pending['content'], pending['version'], message_id, pending['version']))
             db.execute('DELETE FROM messages WHERE MAX(created_at,version) < ?', (time.time() - _MAX_AGE_S,))
             db.execute('DELETE FROM deleted_messages WHERE deleted_at < ?', (time.time() - _MAX_AGE_S,))
             db.execute('DELETE FROM pending_edits WHERE version < ?', (time.time() - _MAX_AGE_S,))
-            db.execute('''DELETE FROM messages WHERE guild_id=? AND message_id NOT IN
+            for guild_id in {r['guild_id'] for r in valid}:
+                db.execute('''DELETE FROM messages WHERE guild_id=? AND message_id NOT IN
                 (SELECT message_id FROM messages WHERE guild_id=?
                  ORDER BY MAX(created_at,version) DESC, message_id DESC LIMIT ?)''',
                        (guild_id, guild_id, _MAX_ROWS_PER_GUILD))
+
+    def history_ids(self, guild_id: int, channel_id: int, *, before: float) -> set[int]:
+        """Read reconciliation IDs without copying up to 6 MB of message text."""
+        with closing(self._connect()) as db:
+            rows = db.execute('''SELECT message_id FROM messages
+                WHERE guild_id=? AND channel_id=? AND created_at<? AND content!=''
+                AND MAX(created_at,version)>=?''',
+                              (guild_id, channel_id, before, time.time() - _MAX_AGE_S))
+            return {row['message_id'] for row in rows}
 
     def delete(self, message_ids: list[int]) -> None:
         ids = [value for value in message_ids if type(value) is int and value > 0]
@@ -198,6 +234,11 @@ def render(rows: list[dict], *, visible_channel_ids: set[int], max_chars: int = 
     for row in rows:  # newest first, so recent corrections survive the cap
         if row['channel_id'] not in visible_channel_ids:
             continue
+        # JSON encoding cannot be shorter than the unescaped content. Avoid
+        # serializing megabytes of rows that cannot possibly fit the budget;
+        # still inspect older short messages that can fit remaining space.
+        if len(row['content']) > max_chars - used:
+            continue
         item = {key: row[key] for key in ('message_id', 'channel_id', 'author_id', 'author', 'bot', 'content', 'created_at')}
         item['updated_at'] = max(row['created_at'], row.get('version', 0))
         encoded = json.dumps(item, ensure_ascii=False).replace('&', '\\u0026').replace('<', '\\u003c').replace('>', '\\u003e')
@@ -239,14 +280,23 @@ async def _hydrate_visible(message: Any) -> None:
                 # Compare only messages known before the history request.
                 # Gateway receipts concurrent with the request are not deletes.
                 async with _store_lock:
-                    prior_rows = await asyncio.to_thread(get_store().recent, guild_id)
-                prior_ids = {row['message_id'] for row in prior_rows
-                             if row['channel_id'] == channel.id and row['created_at'] < time.time() - 10}
+                    prior_ids = await asyncio.to_thread(get_store().history_ids, guild_id,
+                                                        channel.id, before=time.time() - 10)
                 seen_ids: set[int] = set()
-                async with asyncio.timeout(5):
-                    async for item in channel.history(limit=60):
-                        seen_ids.add(item.id)
-                        await observe(item)
+                records: list[dict] = []
+                try:
+                    async with asyncio.timeout(5):
+                        async for item in channel.history(limit=60):
+                            seen_ids.add(item.id)
+                            record = _message_record(item)
+                            if record:
+                                records.append(record)
+                finally:
+                    # Preserve partial successful history on HTTP failure,
+                    # without treating an incomplete page as deletion proof.
+                    if records:
+                        async with _store_lock:
+                            await asyncio.to_thread(get_store().record_many, records)
                 # Reconcile deletions while disconnected, but only within the
                 # fetched window. Older history is deliberately not inferred.
                 missing = prior_ids - seen_ids

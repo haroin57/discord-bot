@@ -61,6 +61,76 @@ async def run_actor(queue, configs, *, timeout_s=160):
                     future.set_exception(exc)
 
 
+class ServerActors:
+    """Independent servers overlap; each task-affine server stays serial.
+
+    Lazy actor creation does not spawn transports until an actual tool call.
+    The shared admission limit bounds total queued/in-flight requests, not
+    merely the queue length for each server.
+    """
+
+    def __init__(self, configs, *, timeout_s=160, request_timeout_s=175):
+        self.configs = configs
+        self.timeout_s = timeout_s
+        self.request_timeout_s = request_timeout_s
+        self.actors = {}
+        self.admission = asyncio.Semaphore(32)
+        self.closed = False
+
+    def _finished(self, key, queue, task):
+        # Retrieve startup/cleanup exceptions and fail queued callers promptly.
+        # A terminated actor must never leave a reusable dead queue behind.
+        if not task.cancelled():
+            task.exception()
+        if self.actors.get(key) == (queue, task):
+            self.actors.pop(key, None)
+        while not queue.empty():
+            _, _, _, future = queue.get_nowait()
+            if not future.done():
+                if self.closed:
+                    future.cancel()
+                else:
+                    future.set_exception(RuntimeError('MCP server actor stopped'))
+
+    async def submit(self, method, name, arguments):
+        key = name if method == 'discover' else name.split('__', 2)[1]
+        if key not in self.configs:
+            raise ValueError('Server not authorized')
+        future = asyncio.get_running_loop().create_future()
+        try:
+            async with asyncio.timeout(self.request_timeout_s), self.admission:
+                if self.closed:
+                    raise RuntimeError('MCP actors closed')
+                actor = self.actors.get(key)
+                if actor is not None and actor[1].done():
+                    self._finished(key, *actor)
+                    actor = None
+                if actor is None:
+                    queue = asyncio.Queue(maxsize=32)
+                    task = asyncio.create_task(
+                        run_actor(queue, {key: self.configs[key]}, timeout_s=self.timeout_s),
+                        name=f'codex-mcp:{key}',
+                    )
+                    actor = self.actors[key] = (queue, task)
+                    task.add_done_callback(lambda done, k=key, q=queue: self._finished(k, q, done))
+                await actor[0].put((method, name, arguments, future))
+                return await future
+        finally:
+            if not future.done():
+                future.cancel()
+
+    async def close(self):
+        self.closed = True
+        actors = list(self.actors.values())
+        self.actors.clear()
+        for queue, task in actors:
+            task.cancel()
+            while not queue.empty():
+                _, _, _, future = queue.get_nowait()
+                future.cancel()
+        await asyncio.gather(*(task for _, task in actors), return_exceptions=True)
+
+
 async def serve(payload: dict) -> None:
     os.environ['PYTHON_DOTENV_DISABLED'] = '1'
     os.environ['OAUTH_NO_REFRESH'] = '1'
@@ -72,18 +142,11 @@ async def serve(payload: dict) -> None:
 
     server = Server('discord-tools')
     configs = payload['servers']
-    queue = asyncio.Queue(maxsize=32)
+    actors = ServerActors(configs)
     scratchpad: dict[str, str] = {}
 
     async def submit(method, name, arguments):
-        future = asyncio.get_running_loop().create_future()
-        try:
-            async with asyncio.timeout(175):
-                await queue.put((method, name, arguments, future))
-                return await future
-        finally:
-            if not future.done():
-                future.cancel()
+        return await actors.submit(method, name, arguments)
 
     @server.list_tools()
     async def list_tools():
@@ -144,16 +207,11 @@ async def serve(payload: dict) -> None:
             text = await submit('call', f'mcp__{key}__{tool_name}', tool_args)
         return [TextContent(type='text', text=text)]
 
-    task = asyncio.create_task(run_actor(queue, configs))
     try:
         async with stdio_server() as (read, write):
             await server.run(read, write, server.create_initialization_options())
     finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        await actors.close()
 
 
 if __name__ == '__main__':

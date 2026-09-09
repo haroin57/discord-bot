@@ -16,6 +16,7 @@ import aiohttp
 from PIL import Image, UnidentifiedImageError
 
 from utils.image_validator import identify_image_mime
+from utils.render_store import image_validation_lock, run_file_operation
 
 log = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ def _fully_decoded_image(
         actual_mime = identify_image_mime(head)
         if actual_mime is None or actual_mime != declared_mime:
             return False
-        with warnings.catch_warnings():
+        with image_validation_lock, warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(path) as image:
                 if not _dimensions_allowed(
@@ -198,9 +199,10 @@ async def download_image(
                                 max_bytes,
                             )
                             return None
-                        file.write(chunk)
+                        await run_file_operation(file.write, chunk)
                 declared_mime = _declared_mime(attachment)
-                if not _fully_decoded_image(
+                if not await run_file_operation(
+                    _fully_decoded_image,
                     part_path,
                     declared_mime=declared_mime,
                     max_width=max_width,
@@ -284,14 +286,20 @@ async def download_text(
             async with session.get(attachment.url, allow_redirects=False) as response:
                 if response.status != 200:
                     return None
-                data = await response.read()
-                if len(data) > max_bytes:
-                    log.warning(
-                        "Text attachment %s too large after download",
-                        attachment.filename,
-                    )
-                    return None
-                text = _decode_text(data)
+                chunks = []
+                total = 0
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        log.warning(
+                            "Aborting text attachment %s: exceeded %d bytes mid-stream",
+                            attachment.filename,
+                            max_bytes,
+                        )
+                        return None
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+                text = await run_file_operation(_decode_text, data)
                 if text is None:
                     log.warning(
                         "Rejecting text attachment with invalid encoding/control bytes: %s",
@@ -404,19 +412,19 @@ async def download_arbitrary(
                                 max_bytes,
                             )
                             return None
-                        file.write(chunk)
+                        await run_file_operation(file.write, chunk)
                 declared_mime = _declared_mime(attachment)
-                if declared_mime in _IMAGE_MIMES and _fully_decoded_image(
+                if declared_mime in _IMAGE_MIMES and await run_file_operation(
+                    _fully_decoded_image,
                     part_path,
                     declared_mime=declared_mime,
                 ):
                     # The dedicated image path already owns this valid payload.
                     return None
                 if declared_mime in _TEXT_MIMES:
-                    with open(part_path, "rb") as file:
-                        if _decode_text(file.read()) is not None:
-                            # The dedicated text path already owns this valid payload.
-                            return None
+                    if await run_file_operation(_is_text_file, part_path):
+                        # The dedicated text path already owns this valid payload.
+                        return None
                 os.replace(part_path, destination)
                 part_path = None
                 log.info(
@@ -445,6 +453,11 @@ async def download_arbitrary(
             except OSError:
                 pass
     return None
+
+
+def _is_text_file(path: str) -> bool:
+    with open(path, "rb") as file:
+        return _decode_text(file.read()) is not None
 
 
 async def download_arbitraries(

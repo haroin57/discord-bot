@@ -1008,6 +1008,9 @@ CODEX_APP_SERVER_MAX_SESSIONS = int(
         "8",
     )
 )
+CODEX_APP_SERVER_IDLE_TIMEOUT_S = float(
+    os.environ.get("CODEX_APP_SERVER_IDLE_TIMEOUT_S", "900")
+)
 CODEX_APP_SERVER_STATE_PATH = os.environ.get(
     "CODEX_APP_SERVER_STATE_PATH",
     os.path.join(STATE_DIR, "codex_app_server_sessions.json"),

@@ -8,9 +8,11 @@ from utils.browser_pool import render_with_browser_daemon
 from utils.render_store import (
     is_cached,
     prepare,
-    publish_png,
+    publish_png_async,
     remove_if_exists,
     render_paths,
+    render_lock,
+    run_file_operation,
     temporary_png_path,
     write_html,
 )
@@ -236,8 +238,6 @@ async def render_math_image(
     if not _KATEX_AVAILABLE:
         log.warning("render_math_image called without a local KaTeX installation")
         return None
-    prepare(output_dir)
-
     # Cache key includes display mode and a template version so a change to
     # HTML_TEMPLATE / KaTeX options (e.g. trust:true -> trust:false) busts
     # previously-cached PNGs that may have been rendered with insecure
@@ -252,8 +252,19 @@ async def render_math_image(
         cache_key=cache_key,
     )
 
+    async with render_lock(out_path):
+        return await _render_math_image(
+            latex, display_mode, out_path, html_path, output_dir
+        )
+
+
+async def _render_math_image(
+    latex: str, display_mode: bool, out_path: str, html_path: str, output_dir: str
+) -> str | None:
+    await run_file_operation(prepare, output_dir)
+
     # Cache hit
-    if is_cached(out_path):
+    if await run_file_operation(is_cached, out_path):
         return out_path
 
     scale_params = _get_scale_params(latex, display_mode)
@@ -264,7 +275,7 @@ async def render_math_image(
         display_mode="true" if display_mode else "false",
     )
 
-    write_html(html_path, full_html)
+    await run_file_operation(write_html, html_path, full_html)
     part_path = temporary_png_path(out_path)
 
     try:
@@ -275,7 +286,7 @@ async def render_math_image(
             pad=scale_params["screenshot_pad"],
             viewport={"width": 800, "height": 600, "deviceScaleFactor": 2},
         )
-        if not publish_png(part_path, out_path):
+        if not await publish_png_async(part_path, out_path):
             return None
     except asyncio.CancelledError:
         raise
@@ -287,4 +298,4 @@ async def render_math_image(
         return None
     finally:
         remove_if_exists(part_path)
-    return out_path if is_cached(out_path) else None
+    return out_path

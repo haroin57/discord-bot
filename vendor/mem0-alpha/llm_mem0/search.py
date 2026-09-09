@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import time
+import weakref
 
 from .client import _get_mem0, mem_get_all, mem_search
 from .llm import complete_json, escape_braces
@@ -579,11 +580,24 @@ async def _expand_query_via_graph(query: str, user_id: str) -> list[str]:
 # 重いので user_id 単位の TTL キャッシュで償却する。
 _CORE_CACHE: dict[str, tuple[float, list[dict]]] = {}
 _CORE_CACHE_KEEP = 10  # キャッシュに保持する上限（取り出しは max_items で切る）
+_CORE_CACHE_USERS = 256
+_CORE_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
 async def get_core_memories(
     user_id: str, max_items: int = 3,
     *, current_channel_id: str | None = None,
+) -> list[dict]:
+    # Single-flight the provider fill only; recheck scope for every caller.
+    lock = _CORE_LOCKS.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        return await _get_core_memories_locked(
+            user_id, max_items, current_channel_id=current_channel_id,
+        )
+
+
+async def _get_core_memories_locked(
+    user_id: str, max_items: int, *, current_channel_id: str | None,
 ) -> list[dict]:
     """常時注入すべきコア事実（imp=5, tier∈{Live,Hot}）を返す。
 
@@ -632,7 +646,9 @@ async def get_core_memories(
         core = core[:_CORE_CACHE_KEEP]
         for m in core:
             m["_core"] = True
-        _CORE_CACHE[user_id] = (now, core)
+        if user_id not in _CORE_CACHE and len(_CORE_CACHE) >= _CORE_CACHE_USERS:
+            _CORE_CACHE.pop(min(_CORE_CACHE, key=lambda uid: _CORE_CACHE[uid][0]))
+        _CORE_CACHE[user_id] = (time.monotonic(), core)
         return [
             dict(m) for m in core
             if _is_fact_valid(m, current_channel_id)
@@ -803,7 +819,8 @@ async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[st
     # Morphological variant: "森川あかりで誰が一番好き？" → "森川 あかり
     # 一番 好き" weights the proper nouns rather than letting stop-particles
     # drag the vector toward the question-form centroid.
-    morpho_variant = _expand_query_via_morpho(query)
+    # Cold dictionary initialization and tokenization must not block Discord.
+    morpho_variant = await asyncio.to_thread(_expand_query_via_morpho, query)
     if morpho_variant and morpho_variant not in queries:
         log.info("morpho_expand: %r → %r", (query or "")[:60], morpho_variant)
         queries.append(morpho_variant)
@@ -916,6 +933,22 @@ async def search_memories_smart(
         )
         if include_core else None
     )
+    try:
+        return await _search_memories_smart_with_core(
+            query, user_id, limit, rewrite, rerank, current_channel_id, core_task,
+        )
+    finally:
+        # Preprocessing can be cancelled while query expansion is still busy.
+        # Its parallel recall task is owned by this call, not the next turn.
+        if core_task is not None:
+            if not core_task.done():
+                core_task.cancel()
+            await asyncio.gather(core_task, return_exceptions=True)
+
+
+async def _search_memories_smart_with_core(
+    query, user_id, limit, rewrite, rerank, current_channel_id, core_task,
+):
     queries = await _expand_queries(query, user_id, rewrite=rewrite)
     # Phase A-1: hybrid retrieval (vector + BM25 RRF fusion). Falls back to
     # vector-only when MEM0_HYBRID_ENABLED=false. Same return shape as
@@ -1127,12 +1160,19 @@ async def _graph_expand_candidates(
     base_distance = settings.MEM0_GRAPH_SIBLING_BASE_DISTANCE
     activation_weight = settings.MEM0_GRAPH_SIBLING_ACTIVATION_WEIGHT
     min_distance = settings.MEM0_GRAPH_SIBLING_MIN_DISTANCE
-    siblings: list[dict] = []
-    for fid, act in fact_best_activation.items():
+    # Fetch independent provider documents in bounded groups. Result order,
+    # scoring, visibility, and the number of candidates remain unchanged.
+    fetch_slots = asyncio.Semaphore(4)
+    async def fetch_sibling(fid):
         try:
-            fact = await asyncio.to_thread(mem.get, fid)
+            async with fetch_slots:
+                return await asyncio.to_thread(mem.get, fid)
         except Exception:
-            continue
+            return None
+
+    fetched = await asyncio.gather(*(fetch_sibling(fid) for fid in fact_best_activation))
+    siblings: list[dict] = []
+    for (fid, act), fact in zip(fact_best_activation.items(), fetched):
         # Phase R: graph 経由の sibling は search_memories の validity
         # フィルタを通らないので、archived / 他会話 scope をここで落とす。
         if not (

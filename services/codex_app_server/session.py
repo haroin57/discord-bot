@@ -566,6 +566,10 @@ class CodexSession:
                     continue
 
                 if method == "item/agentMessage/delta":
+                    if text_stream_callback is None:
+                        # Final text comes from item/turn completion. Helpers
+                        # without a stream consumer need no growing duplicate.
+                        continue
                     item_id = str(event_params.get("itemId") or "")
                     delta = str(event_params.get("delta") or "")
                     if delta:
@@ -577,6 +581,8 @@ class CodexSession:
                     "item/reasoning/summaryTextDelta",
                     "item/plan/delta",
                 }:
+                    if thinking_stream_callback is None:
+                        continue
                     delta = str(event_params.get("delta") or "")
                     if delta:
                         reasoning_partial += delta
@@ -596,6 +602,7 @@ class CodexSession:
                     completed_items.append(item)
                     item_type = item.get("type")
                     if item_type == "agentMessage":
+                        item_partials.pop(str(item.get("id") or ""), None)
                         text = str(item.get("text") or "")
                         if text:
                             last_agent_text = text

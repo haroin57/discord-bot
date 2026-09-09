@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 
-from utils.render_store import cleanup_stale_files
+from utils.render_store import cleanup_stale_files, run_file_operation
 
 
 def write_file(path: str, data: bytes) -> None:
@@ -50,7 +49,7 @@ def cleanup(paths: list[str]) -> None:
 
 async def cleanup_async(paths: list[str]) -> None:
     if paths:
-        await asyncio.to_thread(cleanup, paths)
+        await run_file_operation(cleanup, paths)
 
 
 def cleanup_stale(directories: list[str], *, max_age_seconds: float = 3600) -> None:
