@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import closing, contextmanager
+import hashlib
+import json
 import logging
 import os
+from pathlib import Path
+import sqlite3
 import threading
 import time
 
@@ -33,6 +38,7 @@ _mem0_instance = None
 _mem0_provider: str | None = None
 # AuthBackend.provider_id() snapshot at build time — drift triggers rebuild.
 _mem0_provider_id: str | None = None
+_mem0_storage_config: tuple | None = None
 # Last init failure timestamp (monotonic seconds). When set, _get_mem0()
 # returns None without re-trying until _INIT_RETRY_COOLDOWN_SEC has elapsed.
 # This allows automatic recovery after a transient ChromaDB outage instead of
@@ -42,6 +48,98 @@ _INIT_RETRY_COOLDOWN_SEC = 60.0
 # _get_mem0 is called via asyncio.to_thread from several coroutines at once;
 # without a lock two threads could both run the (multi-second) init.
 _init_lock = threading.Lock()
+_INGEST_RECEIPT_LOCKS = [threading.RLock() for _ in range(128)]
+
+
+@contextmanager
+def _ingest_receipt_lock(key: str):
+    """Share one worker-only lock between insertion and explicit deletion.
+
+    Acquire the memory-mutation stripe before this lock when both are needed.
+    Separate lock files prevent collisions with memory-mutation stripes.
+    """
+    import fcntl
+
+    stripe = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) % len(_INGEST_RECEIPT_LOCKS)
+    directory = Path(settings.STATE_DIR) / "ingest_receipt_locks"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with _INGEST_RECEIPT_LOCKS[stripe]:
+        fd = os.open(directory / f"{stripe}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
+
+def _write_deleted_receipt(key: str) -> str | None:
+    """Commit a tombstone before touching the provider; return the exact old row."""
+    directory = Path(settings.STATE_DIR)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with closing(sqlite3.connect(directory / "mem0_ingest_receipts.sqlite3", timeout=30)) as db:
+        db.execute("PRAGMA synchronous=FULL")
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("CREATE TABLE IF NOT EXISTS receipts (key TEXT PRIMARY KEY, response TEXT NOT NULL)")
+        row = db.execute("SELECT response FROM receipts WHERE key=?", (key,)).fetchone()
+        db.execute("INSERT OR REPLACE INTO receipts VALUES (?, ?)",
+                   (key, json.dumps({"deleted": True, "results": []})))
+        db.commit()
+    # Ensure the receipt file name is durable too, including first creation.
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return row[0] if row else None
+
+
+def _restore_deleted_receipt(key: str, previous: str | None) -> None:
+    """Called only while holding the receipt lock after confirming no deletion."""
+    path = Path(settings.STATE_DIR) / "mem0_ingest_receipts.sqlite3"
+    with closing(sqlite3.connect(path, timeout=30)) as db:
+        db.execute("PRAGMA synchronous=FULL")
+        db.execute("BEGIN IMMEDIATE")
+        if previous is None:
+            db.execute("DELETE FROM receipts WHERE key=?", (key,))
+        else:
+            db.execute("INSERT OR REPLACE INTO receipts VALUES (?, ?)", (key, previous))
+        db.commit()
+
+
+def _delete_primary_with_receipt(mem, memory_id: str) -> None:
+    """Keep uncertain outcomes suppressed instead of resurrecting a deleted fact."""
+    getter = getattr(mem, "get", None)
+    row = getter(memory_id) if callable(getter) else None
+    metadata = row.get("metadata") if isinstance(row, dict) else None
+    key = metadata.get("ingest_key") if isinstance(metadata, dict) else None
+    if key is None or key == "":
+        # Older rows have no ingest receipt. Retain the legacy delete API.
+        mem.delete(memory_id)
+        return
+    if not isinstance(key, str):
+        raise ValueError("invalid memory ingest key")
+    with _ingest_receipt_lock(key):
+        previous = _write_deleted_receipt(key)
+        try:
+            mem.delete(memory_id)
+        except Exception:
+            # A timeout can follow a committed deletion. Only a fresh positive
+            # existence check permits undoing the tombstone. A crash/BaseException
+            # or failed check keeps it durable so an old request cannot reinsert.
+            try:
+                current = getter(memory_id)
+                current_meta = current.get("metadata") if isinstance(current, dict) else None
+                if isinstance(current_meta, dict) and current_meta.get("ingest_key") == key:
+                    _restore_deleted_receipt(key, previous)
+            except Exception as exc:
+                log.warning("delete outcome uncertain; retaining ingest tombstone: %s", type(exc).__name__)
+            raise
+
+
+def _storage_config() -> tuple:
+    return (os.path.abspath(settings.STATE_DIR), settings.CHROMA_MODE, settings.CHROMA_HOST,
+            settings.CHROMA_PORT, settings.MEM0_COLLECTION_NAME, settings.MEM0_EMBEDDER_PROVIDER,
+            settings.MEM0_EMBEDDER_MODEL, getattr(settings, "MEM0_HISTORY_DB_PATH", ""))
 
 
 def _build_config() -> dict:
@@ -54,6 +152,8 @@ def _build_config() -> dict:
     CHROMA_MODE=embedded: direct on-disk access under STATE_DIR (single
     process only).
     """
+    if settings.CHROMA_MODE not in {"server", "embedded"}:
+        raise ValueError("CHROMA_MODE must be server or embedded")
     if settings.CHROMA_MODE == "server":
         vector_cfg = {
             "collection_name": settings.MEM0_COLLECTION_NAME,
@@ -71,7 +171,7 @@ def _build_config() -> dict:
     backend = get_auth_backend()
     llm_model = settings.MEM0_LLM_MODEL or backend.default_model()
 
-    return {
+    cfg = {
         "llm": backend.mem0_llm_config(model=llm_model),
         "vector_store": {
             "provider": "chroma",
@@ -85,6 +185,12 @@ def _build_config() -> dict:
         },
         "version": "v1.1",
     }
+    history_path = getattr(settings, "MEM0_HISTORY_DB_PATH", "")
+    if history_path:
+        history_path = os.path.abspath(os.path.expanduser(history_path))
+        os.makedirs(os.path.dirname(history_path), exist_ok=True)
+        cfg["history_db_path"] = history_path
+    return cfg
 
 
 def _ping_chromadb_if_server_mode() -> None:
@@ -139,7 +245,12 @@ def _get_mem0():
     NOTE: first init does a synchronous ChromaDB heartbeat +
     Memory.from_config; call via ``asyncio.to_thread`` from event loops.
     """
-    global _mem0_instance, _mem0_provider, _mem0_provider_id, _init_failed_at
+    global _mem0_instance, _mem0_provider, _mem0_provider_id, _init_failed_at, _mem0_storage_config
+
+    if (_mem0_instance is not None and _mem0_storage_config is not None
+            and _mem0_storage_config != _storage_config()):
+        log.error("mem0 storage/embedder configuration changed after initialization; restart required")
+        return None
 
     if _mem0_instance is not None and not _provider_drifted():
         _sync_backend_state(_mem0_instance)
@@ -166,6 +277,7 @@ def _get_mem0():
 
             cfg = _build_config()
             _mem0_instance = Memory.from_config(cfg)
+            _mem0_storage_config = _storage_config()
             _mem0_provider = cfg["llm"]["provider"]
             try:
                 _mem0_provider_id = get_auth_backend().provider_id()
@@ -225,9 +337,11 @@ def mem_search(mem, *, query: str, user_id: str, limit: int):
 def mem_get_all(mem, *, user_id: str, limit: int | None = None):
     """``mem.get_all`` across mem0ai API generations. Sync — wrap in to_thread."""
     global _filters_style
-    kwargs: dict = {}
-    if limit is not None:
-        kwargs["limit"] = limit
+    # Chroma supports None as an unbounded query. Omitting the argument
+    # instead silently applies the SDK's default (100), losing older facts.
+    if limit is not None and (not isinstance(limit, int) or limit < 1):
+        raise ValueError("limit must be a positive integer or None")
+    kwargs: dict = {"limit": limit}
     if _filters_style:
         return mem.get_all(filters={"user_id": user_id}, **kwargs)
     try:
@@ -247,7 +361,9 @@ def mem_get_all(mem, *, user_id: str, limit: int | None = None):
 # scripts and by search.py's graph-expansion path)
 # ---------------------------------------------------------------------------
 
-async def get_all_memories(user_id: str, limit: int | None = None) -> list[dict]:
+async def get_all_memories(
+    user_id: str, limit: int | None = None, *, strict: bool = False,
+) -> list[dict]:
     """Retrieve memories for a user.
 
     `limit` is forwarded to mem0 / ChromaDB so the underlying query can stop
@@ -257,13 +373,35 @@ async def get_all_memories(user_id: str, limit: int | None = None) -> list[dict]
     """
     mem = await asyncio.to_thread(_get_mem0)
     if not mem:
+        if strict:
+            raise RuntimeError("memory store unavailable")
         return []
     try:
         raw = await asyncio.to_thread(mem_get_all, mem, user_id=user_id, limit=limit)
         return raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
     except Exception as exc:
+        if strict:
+            raise
         log.warning("mem0 get_all error: %s", exc)
         return []
+
+
+def _delete_memory_sync(mem, memory_id: str) -> bool:
+    from . import bm25_index, fact_store, graph
+    from .reinforce import memory_mutation_lock
+    from .search import invalidate_core_cache
+
+    with memory_mutation_lock(memory_id):
+        _delete_primary_with_receipt(mem, memory_id)
+        # Each mirror is independent; one failed cleanup must not skip the rest.
+        for cleanup in (graph.delete_fact_edges, graph.expire_relations_for_fact,
+                        bm25_index.remove_fact, fact_store.remove_fact):
+            try:
+                cleanup(memory_id)
+            except Exception as exc:
+                log.warning("memory side-index cleanup failed: %s", exc)
+        invalidate_core_cache()
+    return True
 
 
 async def delete_memory(memory_id: str) -> bool:
@@ -272,8 +410,9 @@ async def delete_memory(memory_id: str) -> bool:
     if not mem:
         return False
     try:
-        await asyncio.to_thread(mem.delete, memory_id)
-        return True
+        # Keep delete + cleanup in the same worker even if its awaiting task
+        # is cancelled during shutdown.
+        return await asyncio.to_thread(_delete_memory_sync, mem, memory_id)
     except Exception as exc:
         log.warning("mem0 delete error: %s", exc)
         return False

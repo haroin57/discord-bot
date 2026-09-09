@@ -34,6 +34,8 @@ from .ingest import add_memories
 from .search import (
     assess_recall_confidence,
     search_memories,
+    search_memories_at_time,
+    search_memories_hybrid,
     search_memories_multi,
     search_memories_smart,
     should_use_memory_llm_mode,
@@ -50,6 +52,8 @@ __all__ = [
     "format_memories_for_prompt",
     "get_all_memories",
     "search_memories",
+    "search_memories_at_time",
+    "search_memories_hybrid",
     "search_memories_multi",
     "search_memories_smart",
     "should_use_memory_llm_mode",

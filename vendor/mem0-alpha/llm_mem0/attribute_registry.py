@@ -108,3 +108,83 @@ def conditions_are_conflict_candidate(cond_a: str, cond_b: str) -> bool:
     可能性があり conflict 判定(classify_conflict)へ進める。
     """
     return condition_compatibility(cond_a, cond_b) != "disjoint"
+
+
+def fact_metadata(fact: dict, base: dict | None = None) -> dict:
+    """Comparable identity independent of whether a fact is stored or extracted."""
+    md = {**(base or {}), **(fact.get("metadata") or {})}
+    for key in ("attribute", "condition", "scope", "value", "source_timestamp", "valid_from", "valid_to"):
+        if key in fact:
+            md[key] = fact[key]
+    scope = md.get("scope") or "global"
+    if scope == "conversation" and md.get("channel_id") is not None:
+        scope = f"conversation:{md['channel_id']}"
+    md["scope"] = scope
+    return md
+
+
+def same_fact_domain(old: dict, new: dict) -> bool:
+    """Missing legacy metadata never broadens an explicitly scoped candidate."""
+    if (old.get("scope") or "global") != (new.get("scope") or "global"):
+        return False
+    if (old.get("condition") or "") != (new.get("condition") or ""):
+        return False
+    if any(old.get(key) != new.get(key) for key in ("valid_from", "valid_to")):
+        return False
+    a, b = old.get("attribute"), new.get("attribute")
+    return not (a and b and a != b)
+
+
+def observation_time(md: dict) -> float | None:
+    import math
+    from datetime import datetime, timezone
+    value = md.get("user_confirmed_at", md.get("source_timestamp"))
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            result = parsed.replace(tzinfo=timezone.utc).timestamp() if parsed.tzinfo is None else parsed.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return result if math.isfinite(result) else None
+
+
+def validate_effective_interval(metadata: dict) -> None:
+    """Effective time is explicit Unix seconds, not the observation time."""
+    import math
+    for key in ("valid_from", "valid_to"):
+        if key in metadata:
+            value = metadata[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{key} must be finite Unix seconds")
+    if ("valid_from" in metadata and "valid_to" in metadata
+            and metadata["valid_from"] > metadata["valid_to"]):
+        raise ValueError("valid_from must not exceed valid_to")
+
+
+def can_supersede(old: dict, new: dict) -> bool:
+    """Conservative common gate for every destructive conflict/merge route.
+
+    A narrower condition cannot invalidate the remainder of a general rule.
+    Historical observations do not become current merely by arriving later.
+    """
+    if not same_fact_domain(old, new):
+        return False
+    attribute = old.get("attribute") or new.get("attribute") or ""
+    if not attribute or not is_update_cardinality(attribute):
+        return False
+    previous, current = observation_time(old), observation_time(new)
+    if previous is not None and (current is None or current < previous):
+        return False
+    # An old legacy row is known to exist by its ingestion timestamp. A
+    # backfill before that time cannot safely retire it without evidence.
+    if previous is None and current is not None:
+        try:
+            if current < float(old.get("timestamp") or 0):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True

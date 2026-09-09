@@ -49,12 +49,20 @@ def atomic_write_bytes(
     raw_fd = os.open(tmp, flags, mode)
     fd: int | None = raw_fd
     try:
-        with os.fdopen(raw_fd, "wb") as f:
+        stream = os.fdopen(raw_fd, "wb")
+        fd = None  # fdopen owns it even if write/flush/fsync raises below
+        with stream as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        fd = None  # fdopen took ownership
         os.replace(tmp, target)
+        # Persist the rename as well as the file body. Without a directory
+        # fsync a power loss can lose a newly acknowledged batch filename.
+        directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except Exception:
         if fd is not None:
             try:

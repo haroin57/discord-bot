@@ -232,6 +232,8 @@ async def call_with_tools(
         str(prompt_for_history),
         result.final_text,
         author=author,
+        author_id=str(user_id) if user_id is not None else "",
+        source_id=f"codex:{result.thread_id}:{result.turn_id}",
     )
     try:
         await asyncio.to_thread(append_jsonl, channel_id, user_entry)

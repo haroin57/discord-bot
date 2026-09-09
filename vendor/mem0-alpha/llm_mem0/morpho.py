@@ -34,7 +34,9 @@ re-instantiation.
 from __future__ import annotations
 
 import logging
+import re
 import threading
+import unicodedata
 from typing import Iterable
 
 log = logging.getLogger(__name__)
@@ -43,6 +45,22 @@ log = logging.getLogger(__name__)
 _tokenizer = None
 _tokenizer_lock = threading.Lock()
 _tokenization_lock = threading.Lock()
+TOKENIZER_VERSION = 2
+_EXACT_PREFIX = "mem0exact"
+# Preserve one-character identifiers, signed language names, versions, and
+# compound dates as single FTS terms. unicode61 otherwise splits C++ into C.
+_EXACT_RE = re.compile(
+    r"\d{1,4}年\d{1,2}月\d{1,2}日|\d{1,2}月\d{1,2}日|"
+    r"[A-Za-z][A-Za-z0-9_]*(?:\+\+|#)|"
+    r"(?<![A-Za-z0-9_])\d+(?:[.\-/]\d+)+(?![A-Za-z0-9_])|"
+    r"(?<![A-Za-z0-9_])[A-Za-z](?![A-Za-z0-9_+#])|"
+    r"\d+(?:年|月|日|歳|才|個|円|件|kg|km|ms|GB|MB)?"
+)
+
+
+def _exact_tokens(text: str) -> list[str]:
+    return list(dict.fromkeys(_EXACT_PREFIX + match.group().casefold().encode("utf-8").hex()
+                              for match in _EXACT_RE.finditer(text)))
 
 
 def _get_tokenizer():
@@ -100,9 +118,11 @@ def _tokenize_keywords_locked(text: str) -> list[str]:
     or input is empty."""
     if not text or not text.strip():
         return []
+    text = unicodedata.normalize("NFKC", text)
+    exact = _exact_tokens(text)
     t = _get_tokenizer()
     if not t:
-        return []
+        return exact
     out: list[str] = []
     try:
         for token in t.tokenize(text):
@@ -111,20 +131,28 @@ def _tokenize_keywords_locked(text: str) -> list[str]:
             surface = (token.surface or "").strip()
             if not surface:
                 continue
+            if surface in ("年", "月", "日") and re.search(r"\d" + surface, text):
+                continue  # represented by the complete exact date, not 月 OR 日
             # Default-dictionary Janome splits new proper nouns
             # ("上伊那ぼたん" → "上伊那"/"ぼ"/"たん") so a 1-char surface
             # tends to be either a verb-stem fragment ("し" / "い") or
-            # an over-segmented noun byte. Both are noise in BM25 and
-            # in the keyword query variant; drop them. ASCII 1-char
-            # tokens like "C" would also drop here — accepted tradeoff
-            # since C as a search query is meaningless without context.
-            if len(surface) < 2:
+            # an over-segmented noun byte. Retain standalone kanji nouns;
+            # ASCII identifiers use the collision-resistant exact channel.
+            if len(surface) < 2 and not (
+                re.fullmatch(r"[\u3400-\u9fff]", surface)
+                and token.part_of_speech.split(",")[:2] in (["名詞", "一般"], ["名詞", "固有名詞"])
+            ):
                 continue
             out.append(surface)
+            lemma = getattr(token, "base_form", None)
+            if isinstance(lemma, str) and len(lemma) >= 2 and lemma != "*" and lemma != surface:
+                out.append(lemma)
     except Exception as exc:
         log.warning("morpho tokenize failed (fail-open): %s", exc)
-        return []
-    return out
+        return exact
+    # Exact identifiers precede common content words so the query token budget
+    # never cuts the date/version that disambiguates otherwise identical facts.
+    return list(dict.fromkeys(exact + out))
 
 
 def tokenize_for_index(text: str) -> str:
@@ -156,6 +184,11 @@ def extract_query_keywords(query: str, *, max_tokens: int = 8) -> str:
     seen: set[str] = set()
     out: list[str] = []
     for k in kws:
+        if k.startswith(_EXACT_PREFIX):
+            try:
+                k = bytes.fromhex(k[len(_EXACT_PREFIX):]).decode("utf-8")
+            except (ValueError, UnicodeError):
+                continue
         if k in seen:
             continue
         seen.add(k)

@@ -36,6 +36,8 @@ is the auth backend's concern — callers need no explicit refresh here.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
 
@@ -109,10 +111,11 @@ def is_gist_exempt(metadata: dict) -> bool:
     try:
         imp = int(metadata.get("importance", 0))
     except (TypeError, ValueError):
-        imp = 0
+        return True
     if imp > settings.MEM0_GIST_MAX_IMPORTANCE:
         return True
-    if (metadata.get("attribute") or "").strip():
+    attribute = metadata.get("attribute") or ""
+    if not isinstance(attribute, str) or attribute.strip():
         return True
     if metadata.get("gist_of"):
         return True
@@ -162,12 +165,15 @@ async def recompute_tiers_for_user(user_id: str, *, dry_run: bool = True) -> dic
             changed += 1
             continue
         try:
-            text = r.get("memory") or r.get("text") or ""
-            await asyncio.to_thread(
-                mem.update, memory_id=r.get("id"), data=text,
-                metadata={"tier": new_tier},
-            )
-            changed += 1
+            from .reinforce import mutate_memory_metadata_sync
+            def mutation(fresh):
+                current = fresh.get("metadata") or {}
+                if current.get("valid_to"):
+                    return None
+                tier = activation_to_tier(compute_fact_activation(current, now=time.time()))
+                return {"tier": tier} if current.get("tier") != tier else None
+            changed += int(await asyncio.to_thread(
+                mutate_memory_metadata_sync, mem, r.get("id"), mutation))
         except Exception as exc:
             log.warning("tier decay update failed for %s (non-fatal): %s", r.get("id"), exc)
     return {"checked": checked, "changed": changed, "transitions": transitions}
@@ -214,7 +220,7 @@ async def gist_compress_for_user(
             continue
         candidates.append(r)
 
-    clusters: dict[int, list[dict]] = {}
+    clusters: dict[tuple, list[dict]] = {}
     for r in candidates:
         fid = r.get("id")
         if not fid:
@@ -223,19 +229,38 @@ async def gist_compress_for_user(
         if not entities:
             continue  # no clustering key — left untouched, never guessed
         key_entity = max(entities, key=lambda e: e.mention_count)
-        clusters.setdefault(key_entity.id, []).append(r)
+        md = r.get("metadata") or {}
+        scope, condition = md.get("scope") or "global", md.get("condition") or ""
+        if not isinstance(scope, str) or not isinstance(condition, str):
+            continue
+        category, subcategory = md.get("category") or "meta", md.get("subcategory") or ""
+        if not isinstance(category, str) or not isinstance(subcategory, str):
+            continue
+        key = (key_entity.id, scope, condition, category, subcategory)
+        clusters.setdefault(key, []).append(r)
 
     result = {"clusters": 0, "compressed": 0, "archived": 0}
     now_ts = int(time.time())
-    for entity_id, members in list(clusters.items())[:max_clusters]:
-        if len(members) < min_cluster_size:
-            continue
+    eligible = [(key, members) for key, members in clusters.items() if len(members) >= min_cluster_size]
+    for (entity_id, scope, condition, category, subcategory), members in eligible[:max(0, max_clusters)]:
         texts = [m.get("memory") or m.get("text") or "" for m in members]
         texts = [t for t in texts if t]
         if len(texts) < min_cluster_size:
             continue
-        consolidated = await synthesize_cluster(texts)
-        if not consolidated:
+        member_ids = sorted(m["id"] for m in members)
+        operation_id = hashlib.sha256(json.dumps([user_id, member_ids]).encode()).hexdigest()
+        previous = [r for r in rows if (r.get("metadata") or {}).get("gist_operation_id") == operation_id
+                    and not (r.get("metadata") or {}).get("valid_to")]
+        consolidated = None
+        if previous:
+            try:
+                consolidated = json.loads(previous[0]["metadata"]["gist_plan"])
+            except (KeyError, TypeError, ValueError):
+                continue  # incomplete/unknown old plan: retain originals
+        if consolidated is None:
+            consolidated = await synthesize_cluster(texts)
+        if (not isinstance(consolidated, list) or not consolidated
+                or any(not isinstance(t, str) or not t.strip() for t in consolidated)):
             continue  # fail-open: leave the cluster untouched
         result["clusters"] += 1
         log.info(
@@ -246,46 +271,73 @@ async def gist_compress_for_user(
             result["compressed"] += len(consolidated)
             continue
 
-        member_ids = [m.get("id") for m in members if m.get("id")]
         base_meta = {
-            "category": (members[0].get("metadata") or {}).get("category", "meta"),
+            "category": category, "subcategory": subcategory,
+            "scope": scope, "condition": condition,
             "importance": max(1, min(
                 int((m.get("metadata") or {}).get("importance", 2)) for m in members
             )),
             "tier": 3,
             "gist_of": ",".join(member_ids),
+            "derived_from": ",".join(member_ids), "source": "consolidation_gist",
+            "gist_operation_id": operation_id, "gist_plan": json.dumps(consolidated, ensure_ascii=False),
             "timestamp": now_ts,
         }
         new_ids: list[str] = []
-        for gist_text in consolidated:
+        complete = True
+        for position, gist_text in enumerate(consolidated):
+            known = [r for r in previous if (r.get("metadata") or {}).get("gist_position") == position
+                     and (r.get("memory") or r.get("text")) == gist_text]
+            if known:
+                new_ids.append(known[0]["id"])
+                continue
             try:
                 res = await asyncio.to_thread(
                     mem.add, [{"role": "user", "content": gist_text}],
-                    user_id=user_id, metadata=dict(base_meta), infer=False,
+                    user_id=user_id, metadata={**base_meta, "gist_position": position}, infer=False,
                 )
+                saved = []
                 for rr in ((res.get("results") or []) if isinstance(res, dict) else []):
                     nid = rr.get("id")
                     if nid:
-                        new_ids.append(nid)
-                        await asyncio.to_thread(graph.add_edge, nid, entity_id)
+                        saved.append(nid)
+                if (not saved or res.get("error") or res.get("failed")
+                        or res.get("status") in {"error", "partial"}):
+                    complete = False
+                new_ids.extend(saved)
+                for nid in saved:
+                    from . import bm25_index
+                    for operation, args in ((graph.add_edge, (nid, entity_id)),
+                                            (bm25_index.index_fact, (nid, gist_text, user_id))):
+                        try:
+                            await asyncio.to_thread(operation, *args)
+                        except Exception as exc:
+                            log.warning("gist side-index update failed: %s", exc)
             except Exception as exc:
+                complete = False
                 log.warning("gist insert failed (non-fatal): %s", exc)
         result["compressed"] += len(new_ids)
+        if new_ids:
+            from .search import invalidate_core_cache
+            await asyncio.to_thread(invalidate_core_cache, user_id)
+        if not complete or len(new_ids) < len(consolidated):
+            continue
 
         for m in members:
             mid = m.get("id")
             if not mid:
                 continue
             try:
-                text = m.get("memory") or m.get("text") or ""
-                await asyncio.to_thread(
-                    mem.update, memory_id=mid, data=text,
-                    metadata={
-                        "valid_to": now_ts,
-                        "gist_superseded_by": ",".join(new_ids),
-                    },
-                )
-                result["archived"] += 1
+                from .reinforce import mutate_memory_metadata_sync
+                def archive(fresh):
+                    md = fresh.get("metadata") or {}
+                    if (md.get("valid_to") or is_gist_exempt(md)
+                            or (fresh.get("memory") or fresh.get("text")) != (m.get("memory") or m.get("text"))
+                            or (md.get("scope") or "global", md.get("condition") or "") != (scope, condition)):
+                        return None
+                    return {"valid_to": now_ts, "gist_superseded_by": ",".join(new_ids)}
+                result["archived"] += int(await asyncio.to_thread(
+                    mutate_memory_metadata_sync, mem, mid, archive))
             except Exception as exc:
                 log.warning("gist archive failed for %s (non-fatal): %s", mid, exc)
     return result

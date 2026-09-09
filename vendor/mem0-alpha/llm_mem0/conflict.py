@@ -53,7 +53,9 @@ _CONFLICT_PROMPT = """以下の2つの fact が矛盾するか、または片方
 VALID_CONFLICT_TYPES = ("update", "correction", "addition", "none")
 
 
-async def classify_conflict(existing_text: str, candidate_text: str) -> dict:
+async def classify_conflict(existing_text: str, candidate_text: str, *,
+                            existing_metadata: dict | None = None,
+                            candidate_metadata: dict | None = None) -> dict:
     """Ask the helper model how the candidate relates to the existing fact.
 
     Returns ``{"conflict_type": <one of VALID_CONFLICT_TYPES>, "reason": str}``.
@@ -63,6 +65,10 @@ async def classify_conflict(existing_text: str, candidate_text: str) -> dict:
     """
     if not existing_text or not candidate_text:
         return {"conflict_type": "addition", "reason": "empty-input"}
+    if existing_metadata is not None or candidate_metadata is not None:
+        from .attribute_registry import can_supersede
+        if not can_supersede(existing_metadata or {}, candidate_metadata or {}):
+            return {"conflict_type": "addition", "reason": "incompatible-domain-or-time"}
     data = await complete_json(
         system=(
             "You classify whether a new fact contradicts, updates, or "

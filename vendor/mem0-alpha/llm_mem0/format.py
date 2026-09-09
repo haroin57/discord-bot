@@ -48,6 +48,16 @@ _TIER_LABELS = {0: "Live", 1: "Hot", 2: "Warm", 3: "Cold"}
 def _format_epoch(ts) -> str | None:
     """unix 秒を YYYY-MM-DD に。壊れた値は None（メタ無し扱い）。"""
     try:
+        if isinstance(ts, bool):
+            return None
+        if isinstance(ts, str) and not ts.isdecimal():
+            try:
+                ts = float(ts)
+            except ValueError:
+                parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    return None
+                ts = parsed.timestamp()
         ts = int(ts)
         if ts <= 0:
             return None
@@ -79,18 +89,27 @@ def _fact_meta_suffix(m: dict) -> str:
     )
     if inner:
         bits.append(f"[{inner}]")
-    date_str = _format_epoch(
-        md.get("last_reinforced_at") or md.get("created_at_unix")
-        or md.get("timestamp")
-    )
-    if date_str:
-        bits.append(f"[{date_str}]")
+    # Recall/reinforcement is not an independent confirmation by the user.
+    for label, value in (
+        ("記録", md.get("created_at_unix") or md.get("timestamp")),
+        ("発言日時", md.get("source_timestamp")),
+        ("確認", md.get("user_confirmed_at")),
+        ("最終参照・強化", md.get("last_reinforced_at")),
+        ("有効開始", md.get("valid_from")),
+        ("有効終了", md.get("valid_to")),
+    ):
+        date_str = _format_epoch(value)
+        if date_str:
+            bits.append(f"[{label}: {date_str}]")
     # Phase R (Mem0 v5 T2): 保存時に構造化した condition/scope を注入時に
     # 落とさない（flattening 防止）。「夜は紅茶」が条件を失って「紅茶が好き」
     # として無条件注入されるのを防ぐ。metadata が無ければ何も足さない。
     cond = md.get("condition")
     if isinstance(cond, str) and cond.strip():
-        bits.append(f"[条件: {_scrub_fact_text(cond.strip()[:48])}]")
+        condition = cond.strip()
+        if len(condition) > 512:
+            condition = condition[:256] + " …[中略]… " + condition[-256:]
+        bits.append(f"[条件: {_scrub_fact_text(condition)}]")
     scope = md.get("scope")
     if isinstance(scope, str):
         if scope.startswith("conversation"):
@@ -167,14 +186,20 @@ def format_history_for_prompt(results: list[dict]) -> str:
             # JSONL author 保存の修正後に実名化される)。
             who = author or "過去の発言者"
         elif role == "assistant":
-            who = "私"
+            who = author or "過去のアシスタント"
         elif role == "channel":
             # Non-mention channel message — the speaker can be anyone, so show
             # the author display name when known.
             who = author or "誰か"
         else:
             who = author or role
-        lines.append(f"- ({who}) {_scrub_fact_text(text)}")
+        who = _scrub_fact_text(str(who).replace("\n", " ")[:100])
+        timestamp = _scrub_fact_text(str(r.get("ts") or "").replace("\n", " ")[:64])
+        source = r.get("source_id") or r.get("message_id") or r.get("source_message_id")
+        provenance = f" [時刻: {timestamp}]" if timestamp else ""
+        if source is not None:
+            provenance += f" [出典ID: {_scrub_fact_text(str(source))[:100]}]"
+        lines.append(f"- ({who}){provenance} {_scrub_fact_text(text)}")
     if len(lines) == 1:
         return ""
     lines.append("[End of history]")

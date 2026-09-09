@@ -32,6 +32,8 @@ that imports it, so the core library keeps working without it.
 from __future__ import annotations
 
 import asyncio
+import html
+import json
 import logging
 
 log = logging.getLogger(__name__)
@@ -72,6 +74,23 @@ def _resolve_user_id(user_id: str) -> str:
     return uid
 
 
+def _limit(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
+        raise ValueError("limit must be between 1 and 100")
+    return value
+
+
+def _safe_details(value):
+    from .format import _scrub_fact_text
+    if isinstance(value, str):
+        return html.escape(_scrub_fact_text(value[:4000]), quote=False)
+    if isinstance(value, dict):
+        return {str(_safe_details(k)): _safe_details(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_safe_details(v) for v in value]
+    return value
+
+
 @mcp.tool()
 async def add_memory(
     user_text: str,
@@ -109,6 +128,8 @@ async def add_memory(
     if isinstance(result, dict):
         if result.get("error"):
             return f"Error: {result['error']}"
+        if result.get("status") in {"error", "partial"} or result.get("failed"):
+            return "Error: ingestion incomplete; retry with the same source identifiers."
         n = len(result.get("results") or [])
         if n:
             skipped = result.get("skipped") or {}
@@ -125,6 +146,9 @@ async def search_memory(
     user_id: str = "",
     limit: int = 5,
     smart: bool = False,
+    channel_id: str | None = None,
+    as_of: int | str | None = None,
+    details: bool = False,
 ) -> str:
     """Search long-term memories; returns a prompt-ready, injection-safe block.
 
@@ -133,15 +157,33 @@ async def search_memory(
         user_id: Whose memories to search (falls back to MEM0_DEFAULT_USER_ID).
         limit: Maximum number of memories to return.
         smart: Enable query-rewrite + LLM rerank (slower, higher recall).
+        channel_id: Conversation scope to include.
+        as_of: Unix seconds or ISO8601 with timezone, for historical validity.
+        details: Include IDs, provenance and retrieval evidence as untrusted JSON data.
     """
     try:
         uid = _resolve_user_id(user_id)
-    except _MissingUserId as exc:
+        limit = _limit(limit)
+    except ValueError as exc:
         return f"Error: {exc}"
-    if smart:
-        memories = await search_memories_smart(query, uid, limit=limit)
-    else:
-        memories = await search_memories(query, uid, limit=limit)
+    kwargs = {"limit": limit}
+    if channel_id is not None:
+        kwargs["current_channel_id"] = channel_id
+    try:
+        from .client import _get_mem0
+        if await asyncio.to_thread(_get_mem0) is None:
+            return "Error: memory store unavailable."
+        if as_of is not None:
+            from .search import search_memories_at_time
+            memories = await search_memories_at_time(query, uid, as_of, **kwargs)
+        elif smart:
+            memories = await search_memories_smart(query, uid, **kwargs)
+        else:
+            memories = await search_memories(query, uid, **kwargs)
+    except (ValueError, RuntimeError):
+        return "Error: search failed; check the store and temporal parameters."
+    if details:
+        return json.dumps({"untrusted_memory_data": _safe_details(memories)}, ensure_ascii=False)
     if not memories:
         return "(no relevant memories)"
     return format_memories_for_prompt(memories)
@@ -151,6 +193,8 @@ async def search_memory(
 async def list_memories(
     user_id: str = "",
     limit: int = 50,
+    offset: int = 0,
+    details: bool = False,
 ) -> str:
     """List stored memories with their IDs, for review and housekeeping.
 
@@ -160,12 +204,22 @@ async def list_memories(
     Args:
         user_id: Whose memories to list (falls back to MEM0_DEFAULT_USER_ID).
         limit: Maximum number of rows to return.
+        offset: Number of rows to skip (0..10000); enumeration is not a snapshot.
+        details: Include complete metadata as untrusted JSON data.
     """
     try:
         uid = _resolve_user_id(user_id)
-    except _MissingUserId as exc:
+        limit = _limit(limit)
+        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 10000:
+            raise ValueError("offset must be between 0 and 10000")
+    except ValueError as exc:
         return f"Error: {exc}"
-    rows = await get_all_memories(uid, limit=max(int(limit), 1))
+    try:
+        rows = (await get_all_memories(uid, limit=limit + offset, strict=True))[offset:]
+    except Exception:
+        return "Error: memory store unavailable or enumeration failed."
+    if details:
+        return json.dumps({"untrusted_memory_data": _safe_details(rows), "offset": offset}, ensure_ascii=False)
     if not rows:
         return "(no memories stored for this user)"
     lines = []
@@ -180,7 +234,7 @@ async def list_memories(
             meta_bits.append("archived")
         meta = f" [{' '.join(meta_bits)}]" if meta_bits else ""
         text = (r.get("memory") or r.get("text") or "").replace("\n", " ")
-        lines.append(f"{r.get('id', '?')}{meta}  {text[:200]}")
+        lines.append(_safe_details(f"{r.get('id', '?')}{meta}  {text[:200]}"))
     return "\n".join(lines)
 
 
@@ -201,16 +255,23 @@ async def delete_memory(memory_id: str) -> str:
     ok = await _delete_memory(mid)
     if not ok:
         return f"Error: failed to delete {mid} (wrong id, or store unavailable)."
-    # Side indices are best-effort mirrors; clean them so BM25/graph recall
-    # can't resurface the deleted fact.
+    return f"Deleted {_safe_details(mid)}."
+
+
+@mcp.tool()
+async def fact_history(attribute: str, user_id: str = "", limit: int = 50) -> str:
+    """Inspect a user's derived attribute correction links and validity times.
+
+    Body copies are truncated; IDs refer to the authoritative memory store.
+    """
     try:
-        from llm_mem0 import bm25_index, graph
-        await asyncio.to_thread(graph.delete_fact_edges, mid)
-        await asyncio.to_thread(bm25_index.remove_fact, mid)
-    except Exception as exc:
-        log.warning("side-index cleanup for %s failed (non-fatal): %s", mid, exc)
-        return f"Deleted {mid} (side-index cleanup incomplete: {exc})."
-    return f"Deleted {mid}."
+        uid = _resolve_user_id(user_id)
+        limit = _limit(limit)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    from .fact_store import get_history
+    rows = await asyncio.to_thread(get_history, uid, attribute, limit)
+    return json.dumps({"untrusted_fact_history": _safe_details(rows)}, ensure_ascii=False)
 
 
 def main() -> None:

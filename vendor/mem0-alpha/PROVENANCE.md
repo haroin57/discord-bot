@@ -27,6 +27,21 @@ The additional files are this provenance, the checksum manifest, and a local
 build-artifact `.gitignore`.
 The original upstream working directory is not modified by packaging.
 
+The quality patch set dated 2026-09-09 is version `0.3.1+botquality.1`,
+based on the bot repository's `bd2808baa3d1e7700cb2591cc289abb4f6b240d6`
+snapshot (`0.3.0+botperf.1`). It adds durable subject-partitioned ingestion,
+retry receipts and cooperative POSIX writer locks, grounded/chunked extraction,
+conservative replacement and lineage handling, hydrated hybrid retrieval,
+exact-term tokenization, explicit historical queries, source-aware replay,
+transactional index rebuilding and cache revision propagation. The patch also
+changes bot recording/session/MCP integration outside this package.
+`../../docs/mem0-alpha-quality-plan.md` and
+`../../docs/mem0-alpha-quality-results.md` record the audit, tests and limitations.
+Existing databases are not reindexed or moved by packaging. Linux/POSIX flock
+is now required for the shared-state durability path. The checksum manifest
+continues to describe the complete current package sources, not the upstream
+base or a production deployment.
+
 Both requirements files use `./vendor/mem0-alpha`. Run pip from the repository
 root, and build immutable releases from their archived `src` directory so the
 dependency cannot resolve to mutable operator files. Pip builds and installs

@@ -1,106 +1,138 @@
-"""Per-channel turn accumulator for batch memory ingestion.
+"""Durable, speaker-aware memory batches with explicit acknowledgement.
 
-Instead of writing to the memory store every turn, turns are accumulated on
-disk and flushed as a single batch when the count reaches
-``settings.MEM0_BATCH_SIZE`` (default 10). This reduces LLM extraction calls
-from N to 1 per batch window.
-
-State files live under ``.state/mem0_batch/{channel_id}.json`` and survive
-process restarts. The next session picks up where the previous one left off.
-
-Concurrency: every mutation is a read-modify-write of the JSON file.
-``atomic_write_json`` prevents torn files but NOT lost updates, so all
-mutations are serialized under a process-wide lock (callers invoke these
-sync functions directly or via ``asyncio.to_thread``; either way the lock
-covers them). Cross-process ingestion should stick to one writer process.
+Existing JSON input remains readable. Unowned old turns are retained, never
+guessed into a new speaker's account. POSIX file locks serialize processes.
+Delivery is at-least-once: an uncertain provider outcome still needs fact dedup.
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass
+import fcntl
 import json
-import logging
+import math
 import os
+from pathlib import Path
 import threading
 import time
-from pathlib import Path
+import uuid
 
 from .atomic_write import atomic_write_json
 from .settings import settings
 
-log = logging.getLogger(__name__)
-
-# Back-compat module constant (frozen at import); live value is
-# settings.MEM0_BATCH_SIZE.
 BATCH_SIZE = settings.MEM0_BATCH_SIZE
-
-# Per-turn storage caps: protect the batch file from one pathological turn.
-# build_batch_summary applies the (smaller) prompt-facing cap on read.
-_TURN_USER_MAX_CHARS = 2000
-_TURN_ASSISTANT_MAX_CHARS = 3000
-
-# Serializes load→mutate→save across threads (lost-update guard).
-_batch_lock = threading.Lock()
+MAX_TURN_CHARS = 128_000
+_COMPLETED_REQUESTS = 2048
+_batch_lock = threading.RLock()
 
 
-def _batch_dir(state_dir: str | os.PathLike) -> Path:
-    d = Path(state_dir) / "mem0_batch"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+def _batch_file(state_dir, channel_id) -> Path:
+    channel = str(int(channel_id))
+    directory = Path(state_dir) / "mem0_batch"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return directory / f"{channel}.json"
 
 
-def _batch_file(state_dir: str | os.PathLike, channel_id: int) -> Path:
-    return _batch_dir(state_dir) / f"{channel_id}.json"
-
-
-def _load_raw(state_dir: str | os.PathLike, channel_id: int) -> dict:
-    p = _batch_file(state_dir, channel_id)
-    if not p.is_file():
-        return {"turns": [], "extracted_facts": []}
-    try:
-        with p.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return {"turns": [], "extracted_facts": []}
-        return data
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("batch load failed for ch=%d: %s", channel_id, exc)
-        return {"turns": [], "extracted_facts": []}
-
-
-def _save_raw(state_dir: str | os.PathLike, channel_id: int, data: dict) -> None:
-    p = _batch_file(state_dir, channel_id)
-    atomic_write_json(p, data)
-
-
-def append_turn(
-    state_dir: str | os.PathLike,
-    channel_id: int,
-    user_text: str,
-    assistant_text: str,
-) -> int:
-    """Append a conversation turn and return the updated count."""
+@contextmanager
+def _locked(state_dir, channel_id):
+    path = _batch_file(state_dir, channel_id)
     with _batch_lock:
+        fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def _load_raw(state_dir, channel_id) -> dict:
+    path = _batch_file(state_dir, channel_id)
+    if not path.exists():
+        return {"version": 2, "turns": [], "extracted_facts": [], "inflight": {}, "completed": []}
+    # Fail explicitly instead of overwriting corrupted/unreadable input.
+    with path.open(encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict):
+        raise ValueError("invalid memory batch object")
+    for key, expected, default in (("turns", list, []), ("extracted_facts", list, []),
+                                   ("inflight", dict, {}), ("completed", list, [])):
+        data.setdefault(key, default)
+        if not isinstance(data[key], expected):
+            raise ValueError(f"invalid memory batch field: {key}")
+    if any(not isinstance(t, dict) for t in data["turns"]):
+        raise ValueError("invalid memory batch turn")
+    for pending in data["inflight"].values():
+        if (not isinstance(pending, dict) or not isinstance(pending.get("turns"), list)
+                or not isinstance(pending.get("lease_until"), (int, float))
+                or not all(isinstance(t, dict) for t in pending["turns"])
+                or not all(k in pending for k in ("user_id", "token", "extracted_facts"))):
+            raise ValueError("invalid memory batch lease")
+    return data
+
+
+def _save_raw(state_dir, channel_id, data):
+    atomic_write_json(_batch_file(state_dir, channel_id), data)
+
+
+def _owner(turn):
+    return str(turn.get("user_id") or "")
+
+
+def _request_key(turn):
+    if turn.get("message_id"):
+        return [_owner(turn), "message:" + str(turn["message_id"])]
+    request = turn.get("request_id")
+    return [_owner(turn), str(request)] if request else None
+
+
+def _all_turns(data):
+    yield from data["turns"]
+    for pending in data["inflight"].values():
+        yield from pending["turns"]
+
+
+def append_turn(state_dir, channel_id, user_text: str, assistant_text: str, *,
+                request_id: str | None = None, user_id: str | None = None,
+                author_id: str | None = None, source_timestamp: str | None = None,
+                message_id: str | None = None, force_flush: bool = False) -> int:
+    """Persist full input; return this owner's outstanding turn count.
+
+    Redelivered request IDs are ignored across pending and recently completed
+    batches. Oversized input is rejected explicitly, not silently truncated.
+    """
+    if len(user_text) > MAX_TURN_CHARS or len(assistant_text) > MAX_TURN_CHARS:
+        raise ValueError(f"memory turn exceeds {MAX_TURN_CHARS} characters")
+    owner = str(user_id or "")
+    turn = {"id": uuid.uuid4().hex, "user": user_text, "assistant": assistant_text,
+            "ts": source_timestamp or time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "user_id": owner, "author_id": str(author_id or ""),
+            "message_id": str(message_id or ""),
+            "force_flush": bool(force_flush),
+            "request_id": str(request_id or "")}
+    with _locked(state_dir, channel_id):
         data = _load_raw(state_dir, channel_id)
-        turns = data.get("turns", [])
-        turns.append({
-            "user": user_text[:_TURN_USER_MAX_CHARS],
-            "assistant": assistant_text[:_TURN_ASSISTANT_MAX_CHARS],
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        })
-        data["turns"] = turns
+        key = _request_key(turn)
+        duplicate = key is not None and (key in data["completed"] or
+                    any(_request_key(t) == key for t in _all_turns(data)))
+        if not duplicate:
+            data["turns"].append(turn)
+        # A prior replace can have succeeded while directory fsync failed.
+        # Redelivery must re-establish durability before reporting success.
         _save_raw(state_dir, channel_id, data)
-        return len(turns)
+        return sum(_owner(t) == owner for t in _all_turns(data))
 
 
 def build_batch_summary(turns: list[dict], turn_chars: int | None = None) -> str:
-    """Render accumulated turns into the ``user: …\\nassistant: …`` summary fed
-    to the extractor. Each turn's user/assistant text is capped at
-    ``turn_chars`` (default ``MEM0_BATCH_TURN_CHARS``). Kept here, pure and
-    testable, instead of inline in the caller so the truncation budget is one
-    documented knob rather than a magic ``[:300]``.
+    """Render role-separated turns. Explicit MAX_TURN_CHARS preserves full text.
+
+    The default prompt cap remains compatible with existing standalone callers;
+    the durable bot recorder opts into full input and bounded extractor chunks.
     """
     if turn_chars is None:
         turn_chars = settings.MEM0_BATCH_TURN_CHARS
+    turn_chars = max(0, int(turn_chars))
     return "\n".join(
         f"user: {(t.get('user') or '')[:turn_chars]}\n"
         f"assistant: {(t.get('assistant') or '')[:turn_chars]}"
@@ -108,35 +140,147 @@ def build_batch_summary(turns: list[dict], turn_chars: int | None = None) -> str
     )
 
 
-def append_extracted_facts(
-    state_dir: str | os.PathLike,
-    channel_id: int,
-    facts: list[str],
-) -> None:
-    """Accumulate LLM-extracted facts for batch flush."""
-    if not facts:
-        return
-    with _batch_lock:
-        data = _load_raw(state_dir, channel_id)
-        existing = data.get("extracted_facts", [])
-        existing.extend(facts)
-        data["extracted_facts"] = existing
-        _save_raw(state_dir, channel_id, data)
+def append_extracted_facts(state_dir, channel_id, facts: list[str]) -> None:
+    """Retain legacy unowned facts without assigning them to a new speaker."""
+    if facts:
+        with _locked(state_dir, channel_id):
+            data = _load_raw(state_dir, channel_id)
+            data["extracted_facts"].extend(facts)
+            _save_raw(state_dir, channel_id, data)
 
 
-def pop_batch(
-    state_dir: str | os.PathLike,
-    channel_id: int,
-) -> tuple[list[dict], list[str]]:
-    """Return all accumulated turns + extracted facts and reset the file.
+@dataclass(frozen=True)
+class BatchLease:
+    channel_id: int
+    batch_id: str
+    token: str
+    user_id: str
+    turns: list[dict]
+    extracted_facts: list[str]
 
-    Returns ``(turns, extracted_facts)``. Atomic w.r.t. the other mutators:
-    a turn appended concurrently either lands in this pop or in the next
-    batch, never in neither.
+    def __iter__(self):
+        yield self.turns
+        yield self.extracted_facts
+
+
+def claim_batch(state_dir, channel_id, *, user_id: str | None = None,
+                lease_seconds: float = 300, max_turns: int = 50) -> BatchLease | None:
+    """Lease an owner's oldest retry or pending input, never deleting it.
+
+    None means the unowned legacy queue, not every speaker. One claim per owner
+    may be active; different speakers proceed separately.
     """
-    with _batch_lock:
+    if not math.isfinite(lease_seconds) or lease_seconds <= 0 or max_turns <= 0:
+        raise ValueError("lease_seconds and max_turns must be positive")
+    owner, now = str(user_id or ""), time.time()
+    with _locked(state_dir, channel_id):
         data = _load_raw(state_dir, channel_id)
-        turns = data.get("turns", [])
-        extracted_facts = data.get("extracted_facts", [])
-        _save_raw(state_dir, channel_id, {"turns": [], "extracted_facts": []})
-        return turns, extracted_facts
+        pending = [(bid, p) for bid, p in data["inflight"].items() if p["user_id"] == owner]
+        if any(p["lease_until"] > now for _, p in pending):
+            return None
+        if pending:
+            batch_id, payload = pending[0]
+        else:
+            turns = [t for t in data["turns"] if _owner(t) == owner][:max_turns]
+            facts = list(data["extracted_facts"]) if not owner else []
+            if not turns and not facts:
+                return None
+            selected = {id(t) for t in turns}
+            data["turns"] = [t for t in data["turns"] if id(t) not in selected]
+            if not owner:
+                data["extracted_facts"] = []
+            batch_id = uuid.uuid4().hex
+            payload = {"user_id": owner, "turns": turns, "extracted_facts": facts}
+            data["inflight"][batch_id] = payload
+        payload.update(token=uuid.uuid4().hex, lease_until=now + lease_seconds)
+        _save_raw(state_dir, channel_id, data)
+        return BatchLease(int(channel_id), batch_id, payload["token"], owner,
+                          payload["turns"], payload["extracted_facts"])
+
+
+def _matches(data, lease):
+    payload = data["inflight"].get(lease.batch_id)
+    return payload if (payload and payload["token"] == lease.token and
+                       payload["user_id"] == lease.user_id and
+                       payload["lease_until"] > time.time()) else None
+
+
+def renew_batch(state_dir, lease: BatchLease, *, lease_seconds: float = 300) -> bool:
+    if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+        raise ValueError("lease_seconds must be positive")
+    with _locked(state_dir, lease.channel_id):
+        data = _load_raw(state_dir, lease.channel_id)
+        payload = _matches(data, lease)
+        if payload is None:
+            return False
+        payload["lease_until"] = time.time() + lease_seconds
+        _save_raw(state_dir, lease.channel_id, data)
+        return True
+
+
+def ack_batch(state_dir, lease: BatchLease) -> bool:
+    """Remove input only after successful ingestion by the current lease owner."""
+    with _locked(state_dir, lease.channel_id):
+        data = _load_raw(state_dir, lease.channel_id)
+        payload = _matches(data, lease)
+        if payload is None:
+            return False
+        for turn in payload["turns"]:
+            key = _request_key(turn)
+            if key and key not in data["completed"]:
+                data["completed"].append(key)
+        data["completed"] = data["completed"][-_COMPLETED_REQUESTS:]
+        del data["inflight"][lease.batch_id]
+        _save_raw(state_dir, lease.channel_id, data)
+        return True
+
+
+def retry_batch(state_dir, lease: BatchLease, error: str = "") -> bool:
+    """Release a claim, retaining its stable batch ID and all source turns."""
+    with _locked(state_dir, lease.channel_id):
+        data = _load_raw(state_dir, lease.channel_id)
+        payload = _matches(data, lease)
+        if payload is None:
+            return False
+        payload.update(lease_until=0, last_error=str(error)[:300])
+        _save_raw(state_dir, lease.channel_id, data)
+        return True
+
+
+def has_retry_batch(state_dir, channel_id, *, user_id: str) -> bool:
+    with _locked(state_dir, channel_id):
+        data = _load_raw(state_dir, channel_id)
+        return any(p["user_id"] == str(user_id) and p["lease_until"] <= time.time()
+                   for p in data["inflight"].values())
+
+
+def has_ready_batch(state_dir, channel_id, *, user_id: str) -> bool:
+    """A force-record request remains ready even while an older claim runs."""
+    with _locked(state_dir, channel_id):
+        data = _load_raw(state_dir, channel_id)
+        turns = [t for t in data["turns"] if _owner(t) == str(user_id)]
+        return (len(turns) >= max(1, settings.MEM0_BATCH_SIZE)
+                or any(t.get("force_flush") for t in turns)
+                or any(p["user_id"] == str(user_id) and p["lease_until"] <= time.time()
+                       for p in data["inflight"].values()))
+
+
+def batch_status(state_dir, channel_id) -> dict:
+    """Content-free diagnostic counts, including unknown legacy ownership."""
+    with _locked(state_dir, channel_id):
+        data = _load_raw(state_dir, channel_id)
+        return {"pending_turns": len(data["turns"]),
+                "unowned_turns": sum(not _owner(t) for t in _all_turns(data)),
+                "inflight_batches": len(data["inflight"]),
+                "retry_batches": sum(p["lease_until"] <= time.time() for p in data["inflight"].values()),
+                "unowned_facts": len(data["extracted_facts"])}
+
+
+def pop_batch(state_dir, channel_id) -> BatchLease:
+    """Compatibility lease of unowned input; call ack_batch after success.
+
+    Tuple unpacking still works. Unlike a destructive pop, unacknowledged input
+    remains recoverable after expiry. New callers should pass an explicit owner
+    to claim_batch instead.
+    """
+    return claim_batch(state_dir, channel_id) or BatchLease(int(channel_id), "", "", "", [], [])

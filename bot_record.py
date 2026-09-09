@@ -17,6 +17,8 @@ and importing them inside the function keeps that patch effective.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
+import json
 import logging
 from typing import Awaitable, Callable
 
@@ -47,6 +49,17 @@ async def record_turn(
     the optional legacy context hint, and fire a fire-and-forget background
     store via track_task when flushing.
     """
+    from services.mem0 import batch as batch_module
+
+    if hasattr(batch_module, "claim_batch"):
+        await _record_alpha_turn(
+            batch=batch_module, message=message, raw_user_text=raw_user_text,
+            response_text=response_text, mem0_user_id=mem0_user_id,
+            add_memories=add_memories, track_task=track_task,
+            is_force_record_request=is_force_record_request, request_id=request_id,
+        )
+        return
+
     from services.mem0.batch import (
         append_turn as _batch_append_turn,
         pop_batch as _batch_pop,
@@ -127,3 +140,127 @@ async def record_turn(
             _turn_count,
             _BATCH_SIZE,
         )
+
+
+async def _record_alpha_turn(*, batch, message, raw_user_text, response_text,
+                             mem0_user_id, add_memories, track_task,
+                             is_force_record_request, request_id):
+    """Persist attributable turns; acknowledge only a successful provider result.
+
+    A failure remains on disk for the next turn/retry. Existing unknown-owner
+    batches are deliberately left untouched. Shared conversation context is a
+    separate read policy and is not narrowed by speaker-aware fact storage.
+    """
+    channel_id = message.channel.id
+    author_id = str(getattr(message.author, "id", "") or mem0_user_id)
+    created_at = getattr(message, "created_at", None)
+    message_id = getattr(message, "id", None)
+    if created_at is None and type(message_id) is int and 10**14 <= message_id < 2**64:
+        # Durable outbox replay reconstructs id/channel/author only. Discord
+        # snowflakes retain the original event time, unlike the retry clock.
+        created_at = discord.utils.snowflake_time(message_id)
+    timestamp = created_at.isoformat() if created_at is not None else None
+    source_id = request_id or str(getattr(message, "id", "") or "")
+    force_flush = is_force_record_request(raw_user_text)
+    await asyncio.to_thread(
+        batch.append_turn, STATE_DIR, channel_id, raw_user_text, response_text,
+        request_id=source_id, user_id=mem0_user_id, author_id=author_id,
+        source_timestamp=timestamp, message_id=str(getattr(message, "id", "") or ""),
+        force_flush=force_flush,
+    )
+    ready = await asyncio.to_thread(
+        batch.has_ready_batch, STATE_DIR, channel_id, user_id=mem0_user_id,
+    )
+    if not ready:
+        return
+
+    async def store_one(lease):
+        lost_lease = asyncio.Event()
+
+        async def renew():
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    ok = await asyncio.to_thread(batch.renew_batch, STATE_DIR, lease)
+                except Exception:
+                    ok = False
+                if not ok:
+                    lost_lease.set()
+                    return
+
+        heartbeat = asyncio.create_task(renew(), name="mem0_batch_lease_renew")
+        acknowledged = False
+        error = "cancelled or incomplete ingest"
+        try:
+            # Keep all turns/roles intact. Extraction handles bounded chunks;
+            # assistant statements remain context, not independent user facts.
+            messages = []
+            for turn in lease.turns:
+                messages.extend([
+                    {"role": "user", "content": turn.get("user", "")},
+                    {"role": "assistant", "content": turn.get("assistant", "")},
+                ])
+            result = await add_memories(
+                messages=messages, user_id=lease.user_id,
+                metadata={
+                    "channel_id": str(channel_id),
+                    "channel_name": getattr(message.channel, "name", "DM"),
+                    "batch_id": lease.batch_id,
+                    "batch_size": str(len(lease.turns)),
+                    "source": "discord_batch",
+                    "source_author_id": lease.turns[0].get("author_id", "") if lease.turns else "",
+                    "source_message_ids": json.dumps([
+                        t["message_id"] for t in lease.turns if t.get("message_id")
+                    ]),
+                    "source_timestamp": lease.turns[0].get("ts", "") if lease.turns else "",
+                },
+            )
+            if (not isinstance(result, dict) or result.get("error")
+                    or result.get("status") in {"error", "partial"}
+                    or result.get("failed")
+                    or not (result.get("status") == "ok" or (
+                        "status" not in result and isinstance(result.get("results"), list)
+                    ))):
+                error = "memory provider reported incomplete ingestion"
+                return
+            if lost_lease.is_set():
+                error = "batch lease ownership lost"
+                return
+            acknowledged = await asyncio.to_thread(batch.ack_batch, STATE_DIR, lease)
+            if not acknowledged:
+                error = "batch acknowledgement rejected"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = type(exc).__name__
+        finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
+            if not acknowledged:
+                # A failed retry write still leaves the original lease on disk;
+                # it becomes recoverable automatically when the lease expires.
+                try:
+                    await asyncio.shield(asyncio.to_thread(batch.retry_batch, STATE_DIR, lease, error))
+                except Exception as exc:
+                    log.warning("Mem0 retry persistence failed: %s", type(exc).__name__)
+                log.warning("Mem0 batch retained for retry: channel=%s reason=%s", channel_id, error)
+        return acknowledged
+
+    async def store_batch():
+        while True:
+            lease = await asyncio.to_thread(
+                batch.claim_batch, STATE_DIR, channel_id, user_id=mem0_user_id,
+            )
+            if lease is None:
+                # The current owner will drain ready successors after its ACK.
+                return
+            if not await store_one(lease):
+                return  # Never spin on a failing provider.
+            ready = await asyncio.to_thread(
+                batch.has_ready_batch, STATE_DIR, channel_id, user_id=mem0_user_id,
+            )
+            if not ready:
+                return
+
+    track_task(store_batch(), name="mem0_batch_store")

@@ -1939,6 +1939,7 @@ async def call_with_tools(
                     assistant_text=response_text,
                     previous_context_snapshot=latest_context_snapshot,
                     author=author,
+                    author_id=str(user_id) if user_id is not None else "",
                     api_messages=api_messages,
                 )
                 await asyncio.to_thread(append_jsonl, channel_id, user_entry)

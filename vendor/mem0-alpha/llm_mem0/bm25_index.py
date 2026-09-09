@@ -41,6 +41,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
     text,
     tokenize = 'unicode61 remove_diacritics 1'
 );
+CREATE TABLE IF NOT EXISTS facts_tokenizer_versions (
+    fact_id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL
+);
 """
 
 _store = SqliteStore("mem0_bm25.sqlite", _SCHEMA)
@@ -82,12 +86,15 @@ def index_fact(fact_id: str, text: str, user_id: str) -> bool:
     tokenized = _tokenize(text)
 
     def _insert(c) -> bool:
+        from .morpho import TOKENIZER_VERSION
         c.execute("DELETE FROM facts_fts WHERE fact_id = ?", (fact_id,))
         c.execute(
             "INSERT INTO facts_fts(fact_id, user_id, orig_text, text) "
             "VALUES (?, ?, ?, ?)",
             (fact_id, user_id, text, tokenized),
         )
+        c.execute("INSERT OR REPLACE INTO facts_tokenizer_versions(fact_id, version) VALUES (?, ?)",
+                  (fact_id, TOKENIZER_VERSION))
         return True
 
     return bool(_store.write(_insert, what="index_fact", default=False))
@@ -100,6 +107,7 @@ def remove_fact(fact_id: str) -> int:
 
     def _delete(c) -> int:
         cur = c.execute("DELETE FROM facts_fts WHERE fact_id = ?", (fact_id,))
+        c.execute("DELETE FROM facts_tokenizer_versions WHERE fact_id = ?", (fact_id,))
         return cur.rowcount or 0
 
     return _store.write(_delete, what="remove_fact", default=0) or 0
@@ -175,10 +183,9 @@ def rrf_merge(
     should already be sorted ascending by score upstream. BM25 hits already
     carry a ``rank`` field.
 
-    The merged output keeps the richest representation per id: cosine
-    ``score`` if present (so the LLM rerank's existing reinforcement-boost
-    math keeps working), otherwise a neutral mid-range placeholder so
-    downstream filters don't drop it.
+    The merged output retains raw ``vector_distance``/``score`` when present.
+    Lexical-only hits have no cosine score. ``rrf_score`` and retrieval_sources
+    preserve the separate evidence used for ordering and confidence.
     """
     fused: dict[str, dict] = {}
 
@@ -192,16 +199,21 @@ def rrf_merge(
             # Copy so we don't mutate caller's dict.
             merged = dict(item)
             merged["rrf_score"] = score_inc
-            # Provide a neutral cosine distance if missing — graph-expand
-            # downstream uses 0.8 for the same purpose; we match that.
-            if merged.get("score") is None:
-                merged["score"] = 0.8
+            # Never manufacture a cosine distance for a lexical-only hit.
+            if "vector_distance" not in merged:
+                merged["vector_distance"] = item.get("score") if source == "vector" else None
+            merged["score"] = merged["vector_distance"]
+            merged["retrieval_sources"] = [source]
+            if source == "bm25":
+                merged["bm25_rank"] = rrf_rank
             fused[fid] = merged
         else:
             existing["rrf_score"] = existing.get("rrf_score", 0.0) + score_inc
             # Prefer the cosine score from vector_hits over the placeholder.
-            if existing.get("score") in (None, 0.8) and item.get("score") is not None:
-                existing["score"] = item["score"]
+            existing["retrieval_sources"] = sorted(set(existing.get("retrieval_sources", [])) | {source})
+            if source == "bm25":
+                existing["bm25_rank"] = rrf_rank
+                existing["bm25_score"] = item.get("bm25_score")
 
     # INVARIANT: `memory` must be the richest representation per id — the
     # ChromaDB full sentence, never the FTS5 tokenized form. vector_hits are
@@ -210,41 +222,61 @@ def rrf_merge(
     # text. search_bm25 returns orig_text (the raw sentence) as memory,
     # so a BM25-only id is safe too. Do NOT re-point search_bm25 at the
     # tokenized `text` column or this invariant breaks silently.
+    source = "vector"
+    seen = set()
     for i, item in enumerate(vector_hits or []):
-        _bump(item, i + 1)
+        fid = item.get("id") or item.get("memory")
+        if fid and fid not in seen:
+            seen.add(fid)
+            _bump(item, i + 1)
+    source = "bm25"
+    seen = set()
     for item in bm25_hits or []:
-        r = int(item.get("rank") or 1)
+        fid = item.get("id") or item.get("memory")
+        if not fid or fid in seen:
+            continue
+        seen.add(fid)
+        r = item.get("rank")
+        r = r if type(r) is int and r > 0 else 1
         _bump(item, r)
 
     # Descending by RRF score — bigger = more relevant.
-    merged = sorted(fused.values(), key=lambda x: -x.get("rrf_score", 0.0))
+    merged = sorted(fused.values(), key=lambda x: (-x.get("rrf_score", 0.0), str(x.get("id") or x.get("memory") or "")))
     return merged[: max(int(limit), 1)]
 
 
 def reindex_all(facts: Iterable[tuple[str, str, str]]) -> int:
-    """Wipe-and-rebuild the FTS5 index from an iterable of (fact_id, text, user_id).
+    """Atomically rebuild FTS5 from (fact_id, text, user_id) source rows.
 
     Used by index-rebuild scripts after dumping every Mem0 fact from
     ChromaDB. Each fact's text is morphologically tokenized before
     insertion. Returns the row count.
 
-    SQLite virtual tables can't change their ``tokenize=`` option after
-    creation — so when ``_SCHEMA`` changes we must wipe the underlying file,
-    not just DELETE the rows; the next connection recreates everything from
-    the current schema.
+    The FTS5 unicode61 schema is unchanged by the exact-token preprocessor.
+    DELETE and replacement inserts share a transaction, so an interrupted
+    iterator or failed insert leaves the old index available. A future FTS
+    schema change requires a separate explicit migration, not this function.
     """
-    _store.wipe()
+    try:
+        prepared = [(fid, uid, text, _tokenize(text))
+                    for fid, text, uid in facts if fid and text and uid]
+    except Exception as exc:
+        log.warning("reindex_all preparation failed: %s", exc)
+        return 0
 
     def _insert_all(c) -> int:
+        from .morpho import TOKENIZER_VERSION
+        c.execute("DELETE FROM facts_fts")
+        c.execute("DELETE FROM facts_tokenizer_versions")
         count = 0
-        for fid, text, uid in facts:
-            if not fid or not text or not uid:
-                continue
+        for fid, uid, text, tokenized in prepared:
             c.execute(
                 "INSERT INTO facts_fts(fact_id, user_id, orig_text, text) "
                 "VALUES (?, ?, ?, ?)",
-                (fid, uid, text, _tokenize(text)),
+                (fid, uid, text, tokenized),
             )
+            c.execute("INSERT OR REPLACE INTO facts_tokenizer_versions(fact_id, version) VALUES (?, ?)",
+                      (fid, TOKENIZER_VERSION))
             count += 1
         return count
 
@@ -252,8 +284,16 @@ def reindex_all(facts: Iterable[tuple[str, str, str]]) -> int:
 
 
 def stats() -> dict:
+    from .morpho import TOKENIZER_VERSION
     total = _store.read(
         lambda c: c.execute("SELECT count(*) FROM facts_fts").fetchone()[0],
         what="stats", default=-1,
     )
-    return {"rows": total, "db_path": _store.resolve_path()}
+    legacy = _store.read(
+        lambda c: c.execute(
+            "SELECT COUNT(*) FROM facts_fts f LEFT JOIN facts_tokenizer_versions v ON v.fact_id=f.fact_id "
+            "WHERE v.version IS NULL OR v.version<>?", (TOKENIZER_VERSION,),
+        ).fetchone()[0], what="tokenizer_stats", default=-1,
+    )
+    return {"rows": total, "db_path": _store.resolve_path(),
+            "query_tokenizer_version": TOKENIZER_VERSION, "legacy_tokenizer_rows": legacy}

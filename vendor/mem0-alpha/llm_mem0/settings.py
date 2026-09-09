@@ -48,6 +48,9 @@ _SPECS: dict[str, _Spec] = {
     "CHROMA_HOST": _Spec("127.0.0.1", str),
     "CHROMA_PORT": _Spec(8765, int),
     "MEM0_COLLECTION_NAME": _Spec("memories", str),
+    # Optional explicit SDK revision-history database. Empty preserves the
+    # existing SDK location; changing it requires a deliberate migration.
+    "MEM0_HISTORY_DB_PATH": _Spec("", str),
 
     # --- mem0-internal LLM + embedder ---------------------------------------
     # Model for mem0's own internal calls; empty = auth backend's default.
@@ -70,6 +73,9 @@ _SPECS: dict[str, _Spec] = {
     # declared 12000/6000 that never took effect; the effective values win.
     "MEM0_EXTRACT_MAX_TOKENS": _Spec(2000, int),
     "MEM0_EXTRACT_INPUT_CHARS": _Spec(2000, int),
+    "MEM0_EXTRACT_MAX_CHUNKS": _Spec(16, int),
+    "MEM0_EXTRACT_CONCURRENCY": _Spec(2, int),
+    "MEM0_EXTRACT_MAX_ATTEMPTS": _Spec(2, int),
     "MEM0_DEDUP_MAX_TOKENS": _Spec(1500, int),
     "MEM0_CONFLICT_MAX_TOKENS": _Spec(300, int),
     "MEM0_REWRITE_MAX_TOKENS": _Spec(500, int),
@@ -217,7 +223,8 @@ _SPECS: dict[str, _Spec] = {
     "MEM0_FORMAT_HEADER": _Spec("[Long-term memory — facts about this user]", str),
     "MEM0_FORMAT_LEGEND": _Spec(
         "(legend: imp=importance 1-5 / Live>Hot>Warm>Cold=freshness tier / "
-        "[date]=last confirmed / [条件: ...]=only holds under that condition)", str),
+        "dates label recorded/confirmed/recalled/effective time separately / "
+        "[条件: ...]=only holds under that condition)", str),
     "MEM0_FORMAT_FOOTER": _Spec("[End of Long-term memory]", str),
 
     # --- MCP server -------------------------------------------------------------

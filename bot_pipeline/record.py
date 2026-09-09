@@ -69,7 +69,9 @@ async def index_channel_message(
         await asyncio.to_thread(
             append_jsonl,
             message.channel.id,
-            {"role": "channel", "content": content, "author": author},
+            {"role": "channel", "content": content, "author": author,
+             "author_id": str(getattr(message.author, "id", "") or ""),
+             "source_id": f"discord:{message.id}" if getattr(message, "id", None) else ""},
         )
     except Exception as exc:
         log.debug("channel-message index failed (non-fatal): %s", exc)

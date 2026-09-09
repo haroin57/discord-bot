@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import math
 import re
+import threading
 import time
 import weakref
+import uuid
+from contextvars import ContextVar
+from datetime import datetime
+from pathlib import Path
 
 from .client import _get_mem0, mem_get_all, mem_search
 from .llm import complete_json, escape_braces
 from .settings import settings
 
 log = logging.getLogger(__name__)
+_AS_OF: ContextVar[int | None] = ContextVar("mem0_retrieval_as_of", default=None)
 
 
 # Caller-side gate for the rewrite/rerank stages. The default conversation
@@ -34,6 +42,7 @@ def should_use_memory_llm_mode(query: str, *, enabled: bool = True) -> bool:
 
 def _is_fact_valid(
     r: dict, current_channel_id=None, *, check_scope: bool = True,
+    expected_user_id: str | None = None,
 ) -> bool:
     """Phase B-2: hide facts that the conflict-detection layer
     soft-archived (valid_to <= now). The flag MEM0_HIDE_ARCHIVED is the
@@ -47,10 +56,21 @@ def _is_fact_valid(
     user 単位で channel 横断共有なので、scope 判定はキャッシュ取り出し後に
     channel 付きで行う（内側でやると会話間でキャッシュ汚染する）。
     """
+    if not isinstance(r, dict):
+        return False
     md = r.get("metadata") or {}
+    if not isinstance(md, dict):
+        return False
+    owners = [r.get("user_id"), md.get("user_id")]
+    if expected_user_id is not None and any(
+        owner is not None and str(owner) != str(expected_user_id) for owner in owners
+    ):
+        return False
     # Phase C/R: scope フィルタ（conversation 限定 fact の誤注入防止）
     if settings.MEM0_SCOPE_FILTER_ENABLED and check_scope:
         scope = md.get("scope") or "global"
+        if not isinstance(scope, str):
+            return False
         if scope.startswith("conversation"):
             want = (
                 f"conversation:{current_channel_id}"
@@ -59,15 +79,46 @@ def _is_fact_valid(
             if scope != want:
                 return False
     # Phase B-2: valid_to soft-archive
-    if not settings.MEM0_HIDE_ARCHIVED:
+    as_of = _AS_OF.get()
+    if not settings.MEM0_HIDE_ARCHIVED and as_of is None:
         return True
-    vt = md.get("valid_to")
-    if not vt:
-        return True
-    try:
-        return int(vt) > int(time.time())
-    except (TypeError, ValueError):
-        return True
+    now = int(time.time()) if as_of is None else as_of
+    for key, is_end in (("valid_from", False), ("valid_to", True)):
+        value = md.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            timestamp = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (is_end and timestamp <= now) or (not is_end and timestamp > now):
+            return False
+    return True
+
+
+def _distance(row: dict) -> float | None:
+    """Only provider evidence is a distance; auxiliary scores never are."""
+    if "vector_distance" in row:
+        value = row["vector_distance"]
+    elif row.get("_graph_expanded") or row.get("_episode_bundle") or row.get("_core") or row.get("bm25_rank") or row.get("bm25_score") is not None:
+        value = None
+    else:
+        value = row.get("score")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return float(value)
+    return None
+
+
+def _rank_key(row: dict) -> tuple:
+    distance = _distance(row)
+    ranking_distance = row.get("ranking_distance", distance)
+    fused = row.get("rrf_score")
+    if isinstance(fused, (int, float)) and math.isfinite(fused):
+        return (0, -fused, ranking_distance if ranking_distance is not None else 99, str(row.get("id") or row.get("memory") or ""))
+    if row.get("_graph_expanded"):
+        return (2, row.get("graph_distance", 99), 0, str(row.get("id") or ""))
+    value = ranking_distance
+    return (1, value if isinstance(value, (int, float)) else 99, 0, str(row.get("id") or row.get("memory") or ""))
 
 
 async def search_memories(
@@ -86,54 +137,82 @@ async def search_memories(
     channel。未指定(None)なら scope フィルタ有効時に conversation fact は
     全て除外される（安全側）。
     """
+    if not (query or "").strip() or not user_id or limit <= 0:
+        return []
     # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
     mem = await asyncio.to_thread(_get_mem0)
     if not mem:
         return []
     try:
         t0 = time.perf_counter()
-        raw = await asyncio.to_thread(
-            mem_search, mem, query=query, user_id=user_id, limit=limit)
+        requested = max(int(limit), 1)
+        max_fetch = min(max(requested * 4, requested), 200)
+        results = []
+        while True:
+            raw = await asyncio.to_thread(
+                mem_search, mem, query=query, user_id=user_id, limit=requested)
+            raw_rows = raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+            results = []
+            for row in raw_rows:
+                if not _is_fact_valid(row, current_channel_id, expected_user_id=user_id):
+                    continue
+                distance = _distance(row)
+                if row.get("score") is not None and distance is None:
+                    continue
+                if apply_distance_filter and distance is not None and distance > settings.MEM0_RELEVANCE_MAX_DISTANCE:
+                    continue
+                results.append({**row, "vector_distance": distance, "retrieval_sources": ["vector"]})
+            if len(results) >= limit or len(raw_rows) < requested or requested >= max_fetch:
+                break
+            requested = min(requested * 2, max_fetch)
         latency_ms = (time.perf_counter() - t0) * 1000.0
-        results = raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
         log.info(
             "mem0_search_latency_ms=%.1f query=%r user_id=%s limit=%d hits=%d",
             latency_ms, (query or "")[:80], user_id, limit, len(results),
         )
-        max_distance = settings.MEM0_RELEVANCE_MAX_DISTANCE
-        return [
-            r for r in results
-            if (
-                not apply_distance_filter
-                or r.get("score") is None
-                or r.get("score", 0) <= max_distance
-            )
-            and _is_fact_valid(r, current_channel_id)
-        ]
+        return sorted(results, key=_rank_key)[:limit]
     except Exception as exc:
         log.warning("Mem0 search error: %s", exc)
         return []
 
 
 def _merge_ranked_results(all_results: list, limit: int) -> list[dict]:
-    """Merge per-query result lists: dedup by id, sort ascending by score.
+    """Merge query evidence by ID, retaining fusion and best raw distance.
 
     ``score`` is *distance* — ascending = most-relevant first. Missing
     scores sink to the bottom by treating them as worst-case (large
     distance). Exceptions from ``asyncio.gather(..., return_exceptions=True)``
     are skipped. Shared by the plain and hybrid multi-query paths.
     """
-    seen_ids: set[str] = set()
-    merged: list[dict] = []
+    by_id: dict[str, dict] = {}
     for result_set in all_results:
         if isinstance(result_set, Exception):
             continue
+        if not isinstance(result_set, list):
+            continue
         for r in result_set:
-            mid = r.get("id", r.get("memory", ""))
-            if mid not in seen_ids:
-                seen_ids.add(mid)
-                merged.append(r)
-    merged.sort(key=lambda x: x.get("score") if x.get("score") is not None else 99)
+            if not isinstance(r, dict):
+                continue
+            mid = r.get("id") or r.get("memory")
+            if not mid:
+                continue
+            existing = by_id.get(mid)
+            if existing is None:
+                by_id[mid] = dict(r)
+                by_id[mid].setdefault("vector_distance", _distance(r))
+                continue
+            # Keep the best query's distance and the strongest fused evidence.
+            # Repeating a paraphrase must not manufacture additional votes.
+            old_distance, new_distance = _distance(existing), _distance(r)
+            if new_distance is not None and (old_distance is None or new_distance < old_distance):
+                existing["score"] = new_distance
+                existing["vector_distance"] = new_distance
+            if r.get("rrf_score", 0) > existing.get("rrf_score", 0):
+                existing["rrf_score"] = r["rrf_score"]
+            existing["retrieval_sources"] = sorted(set(existing.get("retrieval_sources", [])) | set(r.get("retrieval_sources", [])))
+            if not existing.get("metadata") and r.get("metadata"):
+                existing["metadata"] = r["metadata"]
+    merged = sorted(by_id.values(), key=_rank_key)
     return merged[:limit]
 
 
@@ -164,7 +243,7 @@ async def search_memories_hybrid(
     *, apply_distance_filter: bool = True,
     current_channel_id: str | None = None,
 ) -> list[dict]:
-    """Run vector search and BM25 in parallel, fuse via Reciprocal Rank Fusion.
+    """Run vector search and BM25 in parallel, validate, then fuse ranks.
 
     Falls back to vector-only on any BM25 error so this is a strict
     superset of ``search_memories`` semantics — never *fewer* hits than the
@@ -174,6 +253,8 @@ async def search_memories_hybrid(
     ``search_memories`` for that one query. This is the per-query flag we
     want; the smart-search multi-query merge sits a layer above.
     """
+    if not (query or "").strip() or not user_id or limit <= 0:
+        return []
     if not settings.MEM0_HYBRID_ENABLED:
         return await search_memories(
             query, user_id, limit=limit,
@@ -199,6 +280,29 @@ async def search_memories_hybrid(
     if isinstance(bm25_hits, Exception):
         log.warning("hybrid: bm25 search failed: %s", bm25_hits)
         bm25_hits = []
+    # FTS is a projection, never authoritative for existence/ownership/validity.
+    known = {row.get("id"): row for row in vector_hits if row.get("id")}
+    missing = [row for row in bm25_hits if row.get("id") not in known]
+    if missing:
+        mem = await asyncio.to_thread(_get_mem0)
+        slots = asyncio.Semaphore(4)
+        async def hydrate(row):
+            if mem is None or not row.get("id"):
+                return None
+            try:
+                async with slots:
+                    fact = await asyncio.to_thread(mem.get, row["id"])
+                if not _is_fact_valid(fact, current_channel_id, expected_user_id=user_id) or not fact.get("memory"):
+                    return None
+                return {**fact, "id": row["id"], "rank": row.get("rank"),
+                        "bm25_score": row.get("bm25_score"), "vector_distance": None,
+                        "score": None, "retrieval_sources": ["bm25"]}
+            except Exception:
+                return None
+        hydrated = await asyncio.gather(*(hydrate(row) for row in missing))
+        known.update({row["id"]: row for row in hydrated if row is not None})
+    bm25_hits = [{**known[row["id"]], "rank": row.get("rank"), "bm25_score": row.get("bm25_score")}
+                 for row in bm25_hits if row.get("id") in known]
     fused = bm25_index.rrf_merge(
         vector_hits, bm25_hits, k=settings.MEM0_BM25_RRF_K, limit=limit,
     )
@@ -238,6 +342,37 @@ async def _search_multi_hybrid(
     return _merge_ranked_results(all_results, limit)
 
 
+async def search_memories_at_time(
+    query: str, user_id: str, as_of: int | str, limit: int = 5,
+    *, current_channel_id: str | None = None,
+) -> list[dict]:
+    """Explicit historical/future valid-time recall, without guessing dates.
+
+    Epoch seconds or timezone-aware ISO8601 are accepted. Missing interval
+    endpoints remain unbounded for legacy facts. This API has no core-memory,
+    graph, LLM rewrite, reinforcement, or permanent configuration side effects.
+    """
+    if type(as_of) is int:
+        timestamp = as_of
+    elif isinstance(as_of, str):
+        try:
+            parsed = datetime.fromisoformat(as_of.strip().replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("as_of requires an explicit timezone")
+            timestamp = int(parsed.timestamp())
+        except (ValueError, OverflowError, OSError) as exc:
+            raise ValueError("as_of must be epoch seconds or timezone-aware ISO8601") from exc
+    else:
+        raise ValueError("as_of must be epoch seconds or timezone-aware ISO8601")
+    if timestamp < 0 or timestamp > 253402300799:
+        raise ValueError("as_of timestamp is outside the supported range")
+    token = _AS_OF.set(timestamp)
+    try:
+        return await search_memories_hybrid(query, user_id, limit=limit, current_channel_id=current_channel_id)
+    finally:
+        _AS_OF.reset(token)
+
+
 # ---------------------------------------------------------------------------
 # Search-time query rewriting + re-ranking (P3)
 # ---------------------------------------------------------------------------
@@ -263,6 +398,8 @@ _RERANK_PROMPT = """以下のMem0検索結果のうち、ユーザーの元ク�
 候補(番号: 内容):
 {candidates}
 
+関連する候補だけを最大 {top_k} 件返してください。無関係な候補で件数を補充しないでください。
+関連する候補がなければ {{"top":[]}} を返してください。番号は重複しない整数です。
 関連度高い順に番号のみ返してください(JSON、説明なし):
 {{"top":[3,1,5]}}"""
 
@@ -279,8 +416,9 @@ _HYDE_PROMPT = """ユーザーの質問に対して、Mem0 (長期記憶) に保
 - 「ユーザーは〜」「〜が好き」「〜したことがある」のような事実 statement の形
 - 固有名詞があれば質問文のものをそのまま使う
 - 知らない情報を作るのではなく、質問の意図を「答えうる fact」の形に書き換える
-  - 質問: 「ユーザーはAliceが好きだっけ?」 → 「ユーザーはAlice Smithが好き」
-  - 質問: 「Rust の話前にしたっけ?」 → 「ユーザーは Rust async について話した」
+  - 質問: 「ユーザーはAliceが好きだっけ?」 → 「ユーザーのAliceに対する好み」
+  - 質問: 「Rust の話前にしたっけ?」 → 「ユーザーとRustについて話した内容」
+- 数値・否定・条件を変更せず、質問にない名前・属性を追加しない
 - 答えにくい場合は質問の主要キーワードを並べただけの文でよい
 
 以下のJSONのみ返してください:
@@ -327,8 +465,10 @@ async def _extract_keywords_via_llm(query: str) -> str:
     )
     if not isinstance(data, dict):
         return ""
-    kws = [str(k).strip() for k in data.get("keywords", []) if str(k).strip()]
-    aliases = [str(a).strip() for a in data.get("aliases", []) if str(a).strip()]
+    def strings(value):
+        return [item.strip()[:120] for item in value[:10] if isinstance(item, str) and item.strip()] if isinstance(value, list) else []
+    kws = strings(data.get("keywords"))
+    aliases = strings(data.get("aliases"))
     # Stable de-dupe, source order, keyword + alias union
     seen: set[str] = set()
     out: list[str] = []
@@ -383,11 +523,11 @@ async def _rewrite_query(query: str) -> list[str]:
     if not isinstance(data, dict):
         return []
     out = data.get("queries", [])
-    return [q for q in out if isinstance(q, str) and q.strip()][:5]
+    return list(dict.fromkeys(q.strip()[:500] for q in out if isinstance(q, str) and q.strip()))[:5] if isinstance(out, list) else []
 
 
 def _apply_reinforcement_boost(memories: list[dict]) -> None:
-    """Hebbian-style pre-boost, applied in-place and re-sorted by score.
+    """Apply bounded ranking-only reinforcement, retaining provider scores.
 
     ``score`` is *distance* (small = relevant), so a well-reinforced fact
     (high ``mention_count`` / recent ``last_reinforced_at``) gets its distance
@@ -404,9 +544,11 @@ def _apply_reinforcement_boost(memories: list[dict]) -> None:
         for m in memories:
             boost = reinforcement_boost(m.get("metadata"))
             if boost:
-                current = m.get("score") if m.get("score") is not None else 1.0
-                m["score"] = max(0.0, current - boost)
-        memories.sort(key=lambda x: x.get("score") if x.get("score") is not None else 99)
+                current = _distance(m)
+                m["reinforcement_boost"] = boost
+                if current is not None:
+                    m["ranking_distance"] = max(0.0, current - boost)
+        memories.sort(key=_rank_key)
     except Exception as exc:
         log.warning("reinforcement_boost failed (non-fatal): %s", exc)
 
@@ -421,17 +563,25 @@ async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> 
     well-reinforced fact starts higher in the prompt's ordered list and is
     therefore more likely to be picked.
     """
-    if not memories:
+    if not memories or top_k <= 0:
         return []
 
     _apply_reinforcement_boost(memories)
 
-    if len(memories) <= top_k:
-        return memories
+    def snippet(m):
+        text = str(m.get("memory") or "")
+        if len(text) > 900:
+            words = re.findall(r"[\w]+", query)
+            positions = [text.casefold().find(word.casefold()) for word in words if len(word) >= 2]
+            middle = max(0, min((p for p in positions if p >= 0), default=0) - 80)
+            text = text[:300] + " … " + text[middle:middle + 300] + " … " + text[-300:]
+        md = m.get("metadata") or {}
+        qualifiers = {key: md[key] for key in ("condition", "scope", "valid_from", "valid_to", "created_at_unix") if key in md}
+        return escape_braces(text + (" " + str(qualifiers) if qualifiers else ""), limit=1300)
     candidates = "\n".join(
         # wrap each candidate in untrusted delimiters and escape braces
         f"{i + 1}: <untrusted_candidate>"
-        f"{escape_braces(m.get('memory', ''), limit=120)}"
+        f"{snippet(m)}"
         f"</untrusted_candidate>"
         for i, m in enumerate(memories)
     )
@@ -448,24 +598,14 @@ async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> 
         max_tokens=settings.MEM0_RERANK_MAX_TOKENS,
         caller="search.rerank",
     )
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or not isinstance(data.get("top"), list):
         return memories[:top_k]
     picked = []
-    for idx in data.get("top", []):
-        try:
-            k = int(idx) - 1
-            if 0 <= k < len(memories):
-                picked.append(memories[k])
-        except (TypeError, ValueError):
-            continue
-    # fallback fill with score-order if reranker returned fewer
-    if len(picked) < top_k:
-        seen_ids = {id(p) for p in picked}
-        for m in memories:
-            if id(m) not in seen_ids:
-                picked.append(m)
-                if len(picked) >= top_k:
-                    break
+    seen = set()
+    for idx in data["top"]:
+        if type(idx) is int and 1 <= idx <= len(memories) and idx not in seen:
+            seen.add(idx)
+            picked.append(memories[idx - 1])
     return picked[:top_k]
 
 
@@ -487,7 +627,7 @@ async def get_episode_facts(
     upgrades. The fallback is acceptable cost-wise: ~1500 facts in
     storage → a couple hundred microseconds of Python filtering.
     """
-    if not episode_id or not user_id:
+    if not episode_id or not user_id or limit <= 0:
         return []
     # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
     mem = await asyncio.to_thread(_get_mem0)
@@ -560,15 +700,24 @@ async def _expand_query_via_graph(query: str, user_id: str) -> list[str]:
         entity = await asyncio.to_thread(
             graph.find_entity, q, user_id, fuzzy=False,
         )
-        if entity is None:
+        entities = [entity] if entity is not None else await asyncio.to_thread(graph.find_entities_in_text, q, user_id)
+        if not entities:
             return []
-        aliases = await asyncio.to_thread(graph.get_aliases, entity.id)
         q_low = q.lower()
-        extras = {entity.canonical_name, *aliases}
-        return [
-            a for a in extras
-            if a and a.strip() and a.strip().lower() != q_low
-        ]
+        variants = []
+        for matched in entities:
+            aliases = await asyncio.to_thread(graph.get_aliases, matched.id)
+            forms = sorted({matched.canonical_name, *aliases})
+            if entity is not None:
+                variants.extend(a for a in forms if a and a.strip().lower() != q_low)
+            else:
+                # Preserve the surrounding question/negation instead of
+                # replacing a relation query with an isolated entity name.
+                for surface in forms:
+                    if surface and surface.casefold() in q.casefold():
+                        variants.extend(re.sub(re.escape(surface), lambda _m, a=alias: a, q, flags=re.IGNORECASE)
+                                        for alias in forms if alias.casefold() != surface.casefold())
+        return sorted(set(variants) - {q})[:10]
     except Exception as exc:
         log.warning("alias expansion failed (non-fatal): %s", exc)
         return []
@@ -578,10 +727,76 @@ async def _expand_query_via_graph(query: str, user_id: str) -> list[str]:
 # （importance=5 かつ tier Live/Hot）の常時注入枠。従来はクエリの引き次第で
 # 名前・所属・健康情報のようなコア事実が欠落していた。get_all は hot path で
 # 重いので user_id 単位の TTL キャッシュで償却する。
-_CORE_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_CORE_CACHE: dict[str, tuple[float, dict[str, list[dict]], tuple]] = {}
 _CORE_CACHE_KEEP = 10  # キャッシュに保持する上限（取り出しは max_items で切る）
 _CORE_CACHE_USERS = 256
+_CORE_CACHE_SCOPES = 64
+_CORE_CACHE_GUARD = threading.RLock()
+_CORE_GENERATION = 0
 _CORE_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+def invalidate_core_cache(user_id: str | None = None) -> None:
+    """Synchronous mutation hook. Call from a worker, not the event loop.
+
+    The generation also prevents a pre-mutation in-flight fetch from publishing
+    stale data after invalidation. It deliberately has no unbounded user map.
+    A collection-scoped atomic sidecar invalidates other processes sharing this
+    STATE_DIR. Async callers must await asyncio.to_thread(invalidate_core_cache,
+    user_id). The hook completes after the revision is visible to readers.
+    """
+    global _CORE_GENERATION
+    with _CORE_CACHE_GUARD:
+        _CORE_GENERATION += 1
+        if user_id is None:
+            _CORE_CACHE.clear()
+        else:
+            _CORE_CACHE.pop(str(user_id), None)
+    try:
+        from .atomic_write import atomic_write_text
+        atomic_write_text(_core_revision_path(), uuid.uuid4().hex)
+    except OSError as exc:
+        log.warning("core cross-process invalidation failed: %s", exc)
+
+
+def _core_revision_path() -> Path:
+    namespace = hashlib.sha256(settings.MEM0_COLLECTION_NAME.encode("utf-8")).hexdigest()[:24]
+    return Path(settings.STATE_DIR) / f"core-revision-{namespace}.txt"
+
+
+def _read_core_revision() -> str | None:
+    """Worker-only read; unavailable revision disables cache reuse."""
+    try:
+        with _core_revision_path().open("r", encoding="ascii") as stream:
+            value = stream.read(65)
+        return value if len(value) == 32 and all(c in "0123456789abcdef" for c in value) else None
+    except FileNotFoundError:
+        return ""  # no mutation has published a revision yet
+    except (OSError, UnicodeError):
+        return None
+
+
+def _core_config() -> tuple:
+    return (settings.LLM_MEM0_STATE_DIR, settings.MEM0_COLLECTION_NAME,
+            settings.MEM0_HIDE_ARCHIVED, settings.MEM0_SCOPE_FILTER_ENABLED)
+
+
+def _core_from_buckets(buckets, current_channel_id, max_items):
+    if not settings.MEM0_SCOPE_FILTER_ENABLED:
+        rows = buckets.get("*", [])
+    else:
+        rows = buckets.get("global", []) + buckets.get("meta", []) + buckets.get(f"conversation:{current_channel_id}", [])
+    return [dict(row) for row in sorted(rows, key=_core_order)
+            if _is_fact_valid(row, current_channel_id)][:max_items]
+
+
+def _core_order(row):
+    md = row.get("metadata") or {}
+    try:
+        reinforced = int(md.get("last_reinforced_at") or 0)
+    except (TypeError, ValueError, OverflowError):
+        reinforced = 0
+    return (int(md.get("tier") or 0), -reinforced, str(row.get("id") or ""))
 
 
 async def get_core_memories(
@@ -612,12 +827,15 @@ async def _get_core_memories_locked(
     if not settings.MEM0_CORE_MEMORY_ENABLED or max_items <= 0:
         return []
     now = time.monotonic()
-    hit = _CORE_CACHE.get(user_id)
-    if hit is not None and now - hit[0] < settings.MEM0_CORE_CACHE_TTL_S:
-        return [
-            dict(m) for m in hit[1]
-            if _is_fact_valid(m, current_channel_id)
-        ][:max_items]
+    revision = await asyncio.to_thread(_read_core_revision)
+    config = (*_core_config(), revision)
+    with _CORE_CACHE_GUARD:
+        generation = _CORE_GENERATION
+        hit = _CORE_CACHE.get(user_id)
+    requested_scope = f"conversation:{current_channel_id}"
+    if revision is not None and hit is not None and now - hit[0] < settings.MEM0_CORE_CACHE_TTL_S and hit[2] == config:
+        if "_complete" in hit[1] or requested_scope in hit[1] or not settings.MEM0_SCOPE_FILTER_ENABLED:
+            return _core_from_buckets(hit[1], current_channel_id, max_items)
     try:
         from .client import get_all_memories
         all_mems = await get_all_memories(user_id)
@@ -633,26 +851,30 @@ async def _get_core_memories_locked(
             if imp < 5 or md.get("tier") not in (0, 1):
                 continue
             # scope はここで判定しない（キャッシュ汚染防止）。valid_to のみ。
-            if not _is_fact_valid(m, check_scope=False):
+            if not _is_fact_valid(m, check_scope=False, expected_user_id=user_id):
                 continue
-            core.append(m)
+            core.append({**m, "metadata": dict(md), "_core": True})
         # tier 昇順（Live が先）→ 直近 reinforce 降順。importance は全件 5。
-        core.sort(
-            key=lambda m: (
-                int((m.get("metadata") or {}).get("tier") or 0),
-                -int((m.get("metadata") or {}).get("last_reinforced_at") or 0),
-            ),
-        )
-        core = core[:_CORE_CACHE_KEEP]
-        for m in core:
-            m["_core"] = True
-        if user_id not in _CORE_CACHE and len(_CORE_CACHE) >= _CORE_CACHE_USERS:
-            _CORE_CACHE.pop(min(_CORE_CACHE, key=lambda uid: _CORE_CACHE[uid][0]))
-        _CORE_CACHE[user_id] = (time.monotonic(), core)
-        return [
-            dict(m) for m in core
-            if _is_fact_valid(m, current_channel_id)
-        ][:max_items]
+        core.sort(key=_core_order)
+        buckets: dict[str, list[dict]] = {"*": core[:_CORE_CACHE_KEEP]}
+        scope_names = {str(m["metadata"].get("scope") or "global") for m in core}
+        scopes = ["global", "meta", requested_scope] + sorted(scope_names - {"global", "meta", requested_scope})
+        for scope in scopes[:_CORE_CACHE_SCOPES]:
+            buckets[scope] = [m for m in core if (m["metadata"].get("scope") or "global") == scope][:_CORE_CACHE_KEEP]
+        if len(scopes) <= _CORE_CACHE_SCOPES:
+            buckets["_complete"] = []
+        after_revision = await asyncio.to_thread(_read_core_revision)
+        with _CORE_CACHE_GUARD:
+            if generation != _CORE_GENERATION or config != (*_core_config(), after_revision):
+                # A lifecycle mutation raced the provider snapshot; don't
+                # return/cache facts whose current validity is unknown.
+                return []
+            if revision is None:
+                return _core_from_buckets(buckets, current_channel_id, max_items)
+            if user_id not in _CORE_CACHE and len(_CORE_CACHE) >= _CORE_CACHE_USERS:
+                _CORE_CACHE.pop(min(_CORE_CACHE, key=lambda uid: _CORE_CACHE[uid][0]))
+            _CORE_CACHE[user_id] = (time.monotonic(), buckets, config)
+        return _core_from_buckets(buckets, current_channel_id, max_items)
     except Exception as exc:
         log.warning("core memory fetch failed (non-fatal): %s", exc)
         return []
@@ -693,13 +915,11 @@ def assess_recall_confidence(candidates: list[dict]) -> dict:
     Returns ``{"status": "confident"|"weak"|"no_memory", "best_distance":
     float|None, "candidate_count": int}``.
     """
-    distances = [
-        c.get("score") for c in candidates
-        if isinstance(c.get("score"), (int, float))
-    ]
+    distances = [distance for c in candidates if (distance := _distance(c)) is not None]
     best_distance = min(distances) if distances else None
+    lexical_evidence = any(c.get("bm25_rank") or "bm25" in c.get("retrieval_sources", []) for c in candidates)
     if best_distance is None or best_distance >= settings.MEM0_FOK_NO_MEMORY_DISTANCE:
-        status = "no_memory"
+        status = "weak" if lexical_evidence else "no_memory"
     elif best_distance >= settings.MEM0_FOK_WEAK_DISTANCE:
         status = "weak"
     else:
@@ -708,6 +928,7 @@ def assess_recall_confidence(candidates: list[dict]) -> dict:
         "status": status,
         "best_distance": best_distance,
         "candidate_count": len(candidates),
+        "lexical_evidence": lexical_evidence,
     }
 
 
@@ -787,6 +1008,7 @@ def _merge_core_first(
     """
     if not core:
         return results
+    core = core[:max(limit, 0)]
     seen = {c.get("id") for c in core if c.get("id")}
     rest = [r for r in results if r.get("id") not in seen]
     main = [r for r in rest if not r.get("_episode_bundle")]
@@ -868,7 +1090,7 @@ async def _expand_episode_bundle(
         extras = [
             r for r in bundle
             if r.get("id") and r.get("id") not in seen
-            and _is_fact_valid(r, current_channel_id)
+            and _is_fact_valid(r, current_channel_id, expected_user_id=user_id)
         ]
         if not extras:
             return 0
@@ -876,8 +1098,7 @@ async def _expand_episode_bundle(
         # hint differently if desired.
         for e in extras:
             e["_episode_bundle"] = True
-            if e.get("score") is None:
-                e["score"] = 0.85
+            e["vector_distance"] = None
         keep = extras[: max(int(settings.MEM0_EPISODE_BUNDLE_LIMIT), 0)]
         reranked.extend(keep)
         log.info("episode_bundle: +%d facts from %s", len(keep), top_episode)
@@ -926,6 +1147,8 @@ async def search_memories_smart(
     ``include_core=True`` merges the always-inject core facts (imp=5,
     tier Live/Hot) at the head of the result, within the same ``limit``.
     """
+    if not (query or "").strip() or not user_id or limit <= 0:
+        return []
     # core memory はクエリ検索と独立なので並行に走らせる（TTL cache 命中時は即返る）。
     core_task = (
         asyncio.create_task(
@@ -1024,10 +1247,9 @@ async def _search_memories_smart_with_core(
     _apply_reinforcement_boost(candidates)
     max_distance = settings.MEM0_RELEVANCE_MAX_DISTANCE
     filtered = [
-        r for r in candidates[:limit]
-        if r.get("score") is None
-        or r.get("score", 0) <= max_distance
-    ]
+        r for r in candidates
+        if _distance(r) is None or _distance(r) <= max_distance
+    ][:limit]
     _log_smart_metrics(query, candidates, len(filtered), 0, rerank=False)
     _fire_recall_reinforcement(filtered)
     return await _finalize_smart_result(
@@ -1094,6 +1316,8 @@ async def _graph_expand_candidates(
         except Exception:
             continue
         for e in entities:
+            if getattr(e, "user_id", user_id) != user_id:
+                continue
             if seed_act > frontier.get(e.id, 0.0):
                 frontier[e.id] = seed_act
 
@@ -1133,7 +1357,10 @@ async def _graph_expand_candidates(
         primed = priming.get_primed_entities(user_id, current_channel_id)
         bonus = settings.MEM0_PRIMING_ACTIVATION_BONUS
         for eid in primed:
-            entity_activation[eid] = entity_activation.get(eid, 0.0) + bonus
+            # Priming strengthens query-connected entities; it does not
+            # inject every unrelated topic discussed within the TTL.
+            if eid in entity_activation:
+                entity_activation[eid] += bonus
         priming.touch(user_id, current_channel_id, seed_entity_ids)
     except Exception as exc:
         log.warning("priming buffer failed (non-fatal): %s", exc)
@@ -1177,10 +1404,13 @@ async def _graph_expand_candidates(
         # フィルタを通らないので、archived / 他会話 scope をここで落とす。
         if not (
             isinstance(fact, dict) and fact.get("memory")
-            and _is_fact_valid(fact, current_channel_id)
+            and _is_fact_valid(fact, current_channel_id, expected_user_id=user_id)
         ):
             continue
-        fact["score"] = max(min_distance, base_distance - activation_weight * act)
+        fact = dict(fact)
+        fact["score"] = None
+        fact["vector_distance"] = None
+        fact["graph_distance"] = max(min_distance, base_distance - activation_weight * act)
         fact["_graph_expanded"] = True
         fact["_graph_activation"] = act
         siblings.append(fact)

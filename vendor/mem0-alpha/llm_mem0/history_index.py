@@ -48,6 +48,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
     text,
     tokenize = 'unicode61 remove_diacritics 1'
 );
+CREATE TABLE IF NOT EXISTS history_line_meta (
+    row_id INTEGER PRIMARY KEY, author_id TEXT NOT NULL DEFAULT '',
+    source_id TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS replay_cursors (
+    channel_id TEXT NOT NULL, user_id TEXT NOT NULL,
+    ts TEXT NOT NULL, row_id INTEGER NOT NULL,
+    PRIMARY KEY(channel_id, user_id)
+);
 """
 
 _store = SqliteStore("history_bm25.sqlite", _SCHEMA)
@@ -68,14 +77,15 @@ def _tokenize(text: str) -> str:
     return tok or (text or "").strip()
 
 
-def index_line(channel_id: int, ts: str, role: str, text: str, author: str = "") -> bool:
+def index_line(
+    channel_id: int, ts: str, role: str, text: str, author: str = "", *,
+    author_id: str = "", source_id: str = "",
+) -> bool:
     """Insert one conversation line into the FTS5 index.
 
-    Idempotent on the exact line: a DELETE on ``(channel_id, ts, role,
-    orig_text)`` runs first, so re-indexing the same line (e.g. a backfill
-    re-run overlapping live writes) does not create duplicates, while two
-    distinct messages that happen to share a second-granularity timestamp are
-    both kept.
+    Exact redelivery retains its row ID. Different authors/message IDs
+    remain separate even when timestamp, role and text are identical.
+    ``author_id`` is a stable subject ID; display names never imply ownership.
 
     ``role`` is "user"/"assistant" for answered turns or "channel" for a
     message the app observed but did not reply to. ``author`` is the
@@ -93,16 +103,31 @@ def index_line(channel_id: int, ts: str, role: str, text: str, author: str = "")
     tokenized = _tokenize(text)
 
     def _insert(c) -> bool:
-        c.execute(
-            "DELETE FROM history_fts WHERE channel_id = ? AND ts = ? "
-            "AND role = ? AND orig_text = ?",
-            (str(channel_id), ts, role, text),
-        )
-        c.execute(
+        if source_id:
+            existing = c.execute(
+                "SELECT h.rowid FROM history_fts h JOIN history_line_meta m ON m.row_id=h.rowid "
+                "WHERE h.channel_id=? AND h.role=? AND m.author_id=? AND m.source_id=? LIMIT 1",
+                (str(channel_id), role, str(author_id or ""), str(source_id)),
+            ).fetchone()
+            if existing:
+                c.execute("UPDATE history_fts SET ts=?,author=?,orig_text=?,text=? WHERE rowid=?",
+                          (ts, author, text, tokenized, existing[0]))
+                return True
+        existing = c.execute(
+            "SELECT h.rowid FROM history_fts h LEFT JOIN history_line_meta m ON m.row_id=h.rowid "
+            "WHERE h.channel_id=? AND h.ts=? AND h.role=? AND h.orig_text=? AND h.author=? "
+            "AND COALESCE(m.author_id,'')=? AND COALESCE(m.source_id,'')=? LIMIT 1",
+            (str(channel_id), ts, role, text, author, str(author_id or ""), str(source_id or "")),
+        ).fetchone()
+        if existing:
+            return True
+        cursor = c.execute(
             "INSERT INTO history_fts(channel_id, ts, role, author, orig_text, text) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (str(channel_id), ts, role, author, text, tokenized),
         )
+        c.execute("INSERT INTO history_line_meta(row_id,author_id,source_id) VALUES (?,?,?)",
+                  (cursor.lastrowid, str(author_id or ""), str(source_id or "")))
         return True
 
     return bool(_store.write(_insert, what="index_line", default=False))
@@ -129,8 +154,10 @@ def search_history(query: str, channel_id: int, limit: int = 5) -> list[dict]:
 
     def _search(c) -> list[dict]:
         rows = c.execute(
-            "SELECT role, ts, author, orig_text, bm25(history_fts) AS score "
-            "FROM history_fts "
+            "SELECT history_fts.rowid AS row_id, role, ts, author, orig_text, "
+            "COALESCE(m.author_id,'') AS author_id, COALESCE(m.source_id,'') AS source_id, "
+            "bm25(history_fts) AS score FROM history_fts "
+            "LEFT JOIN history_line_meta m ON m.row_id=history_fts.rowid "
             "WHERE history_fts MATCH ? AND channel_id = ? "
             "ORDER BY bm25(history_fts) "
             "LIMIT ?",
@@ -141,6 +168,8 @@ def search_history(query: str, channel_id: int, limit: int = 5) -> list[dict]:
                 "role": r["role"],
                 "ts": r["ts"],
                 "author": r["author"] if "author" in r.keys() else "",
+                "id": f"history:{channel_id}:{r['row_id']}",
+                "author_id": r["author_id"], "source_id": r["source_id"],
                 # Return orig_text verbatim, never the tokenized `text` column.
                 "memory": r["orig_text"],
                 "rank": i + 1,
@@ -152,7 +181,9 @@ def search_history(query: str, channel_id: int, limit: int = 5) -> list[dict]:
     return _store.read(_search, what="search_history", default=[]) or []
 
 
-def get_lines_since(channel_id: int, since_ts: str = "", limit: int = 500) -> list[dict]:
+def get_lines_since(
+    channel_id: int, since_ts: str = "", limit: int = 500, *, since_row_id: int | None = None,
+) -> list[dict]:
     """Return raw conversation lines for one channel, oldest first, strictly
     after ``since_ts`` (lexical comparison — safe because lines are indexed
     with the ISO-8601-ish, zero-padded ``strftime`` format the JSONL writer
@@ -170,51 +201,92 @@ def get_lines_since(channel_id: int, since_ts: str = "", limit: int = 500) -> li
         return []
 
     def _fetch(c) -> list[dict]:
-        if since_ts:
-            rows = c.execute(
-                "SELECT ts, role, author, orig_text FROM history_fts "
-                "WHERE channel_id = ? AND ts > ? ORDER BY ts ASC LIMIT ?",
-                (str(channel_id), since_ts, max(int(limit), 1)),
-            ).fetchall()
-        else:
-            rows = c.execute(
-                "SELECT ts, role, author, orig_text FROM history_fts "
-                "WHERE channel_id = ? ORDER BY ts ASC LIMIT ?",
-                (str(channel_id), max(int(limit), 1)),
-            ).fetchall()
+        clause = ""
+        params: list = [str(channel_id)]
+        if since_row_id is not None:
+            clause = " AND (h.ts > ? OR (h.ts = ? AND h.rowid > ?))"
+            params.extend([since_ts, since_ts, since_row_id])
+        elif since_ts:
+            clause = " AND h.ts > ?"
+            params.append(since_ts)
+        params.append(max(int(limit), 1))
+        rows = c.execute(
+            "SELECT h.rowid AS row_id, h.ts, h.role, h.author, h.orig_text, "
+            "COALESCE(m.author_id,'') AS author_id, COALESCE(m.source_id,'') AS source_id "
+            "FROM history_fts h LEFT JOIN history_line_meta m ON m.row_id=h.rowid "
+            "WHERE h.channel_id=?" + clause + " ORDER BY h.ts ASC,h.rowid ASC LIMIT ?", params,
+        ).fetchall()
         return [
             {"ts": r["ts"], "role": r["role"], "author": r["author"],
-             "text": r["orig_text"]}
+             "text": r["orig_text"], "row_id": r["row_id"],
+             "author_id": r["author_id"], "source_id": r["source_id"]}
             for r in rows
         ]
 
     return _store.read(_fetch, what="get_lines_since", default=[]) or []
 
 
-def reindex_all(lines: Iterable[tuple[int, str, str, str, str]]) -> int:
-    """Wipe-and-rebuild the index from an iterable of
-    (channel_id, ts, role, text, author).
+def get_replay_cursor(channel_id: int, user_id: str) -> tuple[str, int]:
+    # Unlike an optional retrieval mirror, cursor failures must be visible.
+    with _store.connect() as c:
+        row = c.execute("SELECT ts,row_id FROM replay_cursors WHERE channel_id=? AND user_id=?",
+                        (str(channel_id), user_id)).fetchone()
+        return (row["ts"], row["row_id"]) if row else ("", 0)
 
-    SQLite virtual tables can't change their ``tokenize=``/column set after
-    creation, so the underlying file is replaced and the next connection
-    recreates it under the current ``_SCHEMA``. Returns the row count.
+
+def advance_replay_cursor(channel_id: int, user_id: str, ts: str, row_id: int) -> None:
+    with _store.connect() as c, _store.lock:
+        c.execute("""INSERT INTO replay_cursors VALUES (?,?,?,?)
+            ON CONFLICT(channel_id,user_id) DO UPDATE SET ts=excluded.ts,row_id=excluded.row_id
+            WHERE (excluded.ts,excluded.row_id) > (replay_cursors.ts,replay_cursors.row_id)""",
+                  (str(channel_id), user_id, ts, row_id))
+        c.commit()
+
+
+def reindex_all(lines: Iterable[tuple]) -> int:
+    """Transactionally replace indexed history; return the inserted row count.
+
+    Rows are ``(channel_id, ts, role, text[, author[, author_id[, source_id]]])``.
+    The existing 4/5-field forms remain supported; absent identity stays unknown,
+    never inferred from a display name. Explicit identity fields survive rebuild.
+
+    Prepare the iterable once before writing: a generator/tokenization failure
+    leaves the old database untouched, and SQLite lock retries cannot consume an
+    already-partially-used generator. DELETE and insertion share one transaction,
+    so database failures preserve old rows, identity metadata and replay cursors.
+    A successful rebuild resets cursors because regenerated row IDs cannot be
+    compared with old cursors. This is a data rebuild, not a schema migration;
+    changing the FTS tokenizer/schema requires a separate explicit migration.
     """
-    _store.wipe()
-
-    def _insert_all(c) -> int:
-        count = 0
+    prepared = []
+    try:
         for row in lines:
             channel_id, ts, role, text = row[0], row[1], row[2], row[3]
             author = row[4] if len(row) > 4 else ""
+            author_id = row[5] if len(row) > 5 else ""
+            source_id = row[6] if len(row) > 6 else ""
             if channel_id is None or not text or not role:
                 continue
-            c.execute(
+            prepared.append((str(channel_id), ts or "", role, author or "", text,
+                             _tokenize(text), str(author_id or ""), str(source_id or "")))
+    except Exception as exc:
+        log.warning("history reindex preparation failed; existing index retained: %s", exc)
+        return 0
+
+    def _insert_all(c) -> int:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("DELETE FROM history_fts")
+        c.execute("DELETE FROM history_line_meta")
+        c.execute("DELETE FROM replay_cursors")
+        for channel_id, ts, role, author, text, tokenized, author_id, source_id in prepared:
+            cursor = c.execute(
                 "INSERT INTO history_fts(channel_id, ts, role, author, orig_text, text) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (str(channel_id), ts or "", role, author or "", text, _tokenize(text)),
+                (channel_id, ts, role, author, text, tokenized),
             )
-            count += 1
-        return count
+            c.execute("INSERT INTO history_line_meta(row_id,author_id,source_id) VALUES (?,?,?)",
+                      (cursor.lastrowid, author_id, source_id))
+        return len(prepared)
 
     return _store.write(_insert_all, what="reindex_all", default=0) or 0
 

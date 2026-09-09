@@ -42,40 +42,67 @@ class SqliteStore:
         self._schema = schema
         self._timeout = timeout
         # Serializes writes and the one-time WAL/schema init.
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self._connections = threading.Condition(self.lock)
+        self._active_connections = 0
+        self._configured_state_dir: str | None = None
+        self._test_path = False
         self._path: str | None = None
         # Path for which journal_mode=WAL + schema have been applied. Keyed on
         # path so a test tempfile swap or a wipe() re-initialises automatically.
         self._wal_ready_path: str | None = None
+        self._wal_identity: tuple[int, int] | None = None
 
     def resolve_path(self) -> str:
+        from .settings import settings
+        state_dir = os.path.abspath(settings.STATE_DIR)
+        if not self._test_path and self._configured_state_dir not in (None, state_dir):
+            raise RuntimeError("STATE_DIR changed after SQLite initialization; restart or explicitly reset the store")
         if self._path is None:
-            from .settings import settings
-            self._path = os.path.join(settings.STATE_DIR, self._filename)
+            self._configured_state_dir = state_dir
+            self._path = os.path.join(state_dir, self._filename)
         return self._path
 
     def reset_path_for_test(self, path: str | None) -> None:
         """Test hook — pytest fixtures point the store at a tempfile."""
-        self._path = path
-        self._wal_ready_path = None  # new DB file → re-init WAL + schema
+        with self._connections:
+            while self._active_connections:
+                self._connections.wait()
+            self._path = path
+            self._test_path = path is not None
+            self._configured_state_dir = None
+            self._wal_ready_path = None
+            self._wal_identity = None
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        path = self.resolve_path()
-        c = sqlite3.connect(path, check_same_thread=False, timeout=self._timeout)
-        c.row_factory = sqlite3.Row
+        with self._connections:
+            path = self.resolve_path()
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            c = sqlite3.connect(path, check_same_thread=False, timeout=self._timeout)
+            c.row_factory = sqlite3.Row
+            try:
+                c.execute(f"PRAGMA busy_timeout={int(self._timeout * 1000)}")
+                c.execute("PRAGMA foreign_keys=ON")
+                stat = os.stat(path)
+                identity = (stat.st_dev, stat.st_ino)
+                if (self._wal_ready_path != path or self._wal_identity != identity
+                        or c.execute("PRAGMA schema_version").fetchone()[0] == 0):
+                    c.execute("PRAGMA journal_mode=WAL")
+                    c.executescript(self._schema)
+                    self._wal_ready_path = path
+                    self._wal_identity = identity
+                self._active_connections += 1
+            except BaseException:
+                c.close()
+                raise
         try:
-            c.execute(f"PRAGMA busy_timeout={int(self._timeout * 1000)}")
-            c.execute("PRAGMA foreign_keys=ON")
-            if self._wal_ready_path != path:
-                with self.lock:
-                    if self._wal_ready_path != path:
-                        c.execute("PRAGMA journal_mode=WAL")
-                        c.executescript(self._schema)
-                        self._wal_ready_path = path
             yield c
         finally:
             c.close()
+            with self._connections:
+                self._active_connections -= 1
+                self._connections.notify_all()
 
     def write(
         self,
@@ -128,8 +155,10 @@ class SqliteStore:
         Needed by reindex flows: an FTS5 virtual table can't change its
         ``tokenize=``/column set after creation, so a rebuild replaces the file.
         """
-        path = self.resolve_path()
-        with self.lock:
+        with self._connections:
+            while self._active_connections:
+                self._connections.wait()
+            path = self.resolve_path()
             for suffix in ("", "-wal", "-shm"):
                 try:
                     os.unlink(path + suffix)
@@ -139,6 +168,7 @@ class SqliteStore:
                     log.warning("%s.wipe: unlink %s%s failed: %s",
                                 self._filename, path, suffix, exc)
             self._wal_ready_path = None
+            self._wal_identity = None
 
 
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:

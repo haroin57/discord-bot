@@ -81,18 +81,30 @@ log = logging.getLogger("mem0-mcp")
 DEFAULT_USER_ID = "573489206240870410"
 
 
-def _format_for_mcp(memories: list[dict], limit: int | None = None) -> str:
+def _format_for_mcp(memories: list[dict], limit: int | None = None, *, details: bool = False) -> str:
     """MCP-safe formatter without bracketed boundary markers.
 
     The previous formatter used "[Mem0 — ...]" / "[End of Mem0 memories]"
     which Claude's CLI sometimes interpreted as a stop boundary, causing
     the assistant to halt after receiving the tool result.
     """
+    from services.mem0.format import _scrub_fact_text, _fact_meta_suffix
     lines = []
     for m in memories:
         text = m.get("memory", m.get("text", ""))
         if text:
-            lines.append(f"- {text}")
+            suffix = _fact_meta_suffix(m) if details else ""
+            if details and m.get("id"):
+                suffix += f" [id={_scrub_fact_text(str(m['id'])[:120])}]"
+            if details:
+                metadata = m.get("metadata") or {}
+                if isinstance(metadata, dict):
+                    for key in ("source", "source_timestamp", "source_message_ids", "source_quote", "derived_from"):
+                        if metadata.get(key):
+                            value = str(metadata[key])
+                            value = value[:400] + ("…" if len(value) > 400 else "")
+                            suffix += f" [{key}={_scrub_fact_text(value).replace(chr(10), ' ')}]"
+            lines.append(f"- {_scrub_fact_text(str(text))}{suffix}")
     if limit is not None and len(lines) > limit:
         truncated = len(lines) - limit
         lines = lines[:limit]
@@ -107,6 +119,7 @@ mcp = FastMCP("mem0")
 async def search(
     query: str, limit: int = 5,
     user_id: str = DEFAULT_USER_ID, smart: bool = False,
+    as_of: str = "", channel_id: str = "", details: bool = False,
 ) -> str:
     """Semantic search against the shared Mem0 long-term memory.
 
@@ -136,21 +149,35 @@ async def search(
             are shared with the Discord bot.
         smart: When True, use rewriting+reranking pipeline. Adds ~2 Haiku
             calls of latency in exchange for higher hit rate. Default: False.
+        as_of: Optional timezone-aware ISO8601 time for alpha historical/future
+            validity search. This explicit hybrid mode takes precedence over smart.
+        channel_id: Optional conversation scope, without changing user ownership.
+        details: Include memory IDs and available condition/time/source metadata.
     """
     try:
         user_id = _validated_user_id(user_id)
     except ValueError as e:
         return f"(rejected: {e})"
     limit = _clamped_limit(limit)
-    if smart:
+    scope_kwargs = {"current_channel_id": channel_id} if channel_id else {}
+    if as_of:
+        from services.mem0 import search as search_module
+        temporal_search = getattr(search_module, "search_memories_at_time", None)
+        if temporal_search is None:
+            return "(rejected: time-specific search requires Mem0 alpha)"
+        try:
+            memories = await temporal_search(query, user_id, as_of, limit=limit, **scope_kwargs)
+        except ValueError as exc:
+            return f"(rejected: {exc})"
+    elif smart:
         memories = await search_memories_smart(
-            query=query, user_id=user_id, limit=limit,
+            query=query, user_id=user_id, limit=limit, **scope_kwargs,
         )
     else:
-        memories = await search_memories(query=query, user_id=user_id, limit=limit)
+        memories = await search_memories(query=query, user_id=user_id, limit=limit, **scope_kwargs)
     if not memories:
         return f"(no memories found for query: {query!r})"
-    return _format_for_mcp(memories)
+    return _format_for_mcp(memories, details=details)
 
 
 @mcp.tool()

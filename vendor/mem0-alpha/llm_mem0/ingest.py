@@ -10,28 +10,43 @@ pipeline reads top-to-bottom instead of as one interleaved function.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager, closing
+from contextvars import ContextVar, copy_context
+from functools import partial
+import fcntl
 import hashlib
 import logging
 import time
-from collections import OrderedDict
+import json
+import os
+import sqlite3
+from pathlib import Path
 
 from .client import _get_mem0
-from .extract import extract_full_signals
+from .extract import extract_full_signals, normalize_fact
+from .attribute_registry import can_supersede, fact_metadata, same_fact_domain, validate_effective_interval
 from .search import search_memories
 from .settings import settings
 
 log = logging.getLogger(__name__)
 
-# P1 (ADR-0017): process-global guard against concurrent / short-window
-# duplicate inserts. The vector dedup only catches a same-text sibling once it
-# is COMMITTED; two concurrent add_memories calls (live turns or backfill
-# tasks) can each search-then-insert before either commits, producing exact
-# dups. This seen-set, guarded by a lock, makes the insert of an identical
-# (user_id, text) idempotent across the in-flight window. Bounded FIFO so it
-# never grows without limit. Offline hash sweep cleans any historical dups.
-_INSERT_SEEN: OrderedDict[str, str] = OrderedDict()
-_INSERT_SEEN_LOCK = asyncio.Lock()
-_INSERT_SEEN_MAX = 8000
+_INSERT_TASKS: dict[tuple, asyncio.Task] = {}
+_INGEST_JOBS: set[asyncio.Task] = set()
+_DOMAIN_WORKERS: ContextVar[list | None] = ContextVar("mem0_domain_workers", default=None)
+
+
+async def _write_thread(function, *args, **kwargs):
+    """Executor futures outlive asyncio.run's cancellation of all Tasks.
+
+    The domain owner drains these futures before releasing the file locks.
+    Never cancel the executor future merely because its waiter is cancelled.
+    """
+    future = asyncio.get_running_loop().run_in_executor(
+        None, copy_context().run, partial(function, *args, **kwargs))
+    workers = _DOMAIN_WORKERS.get()
+    if workers is not None:
+        workers.append(future)
+    return await asyncio.shield(future)
 
 # Caller-supplied metadata is allowlisted before merging so it cannot
 # overwrite trust-relevant keys (gate_version, timestamp, importance,
@@ -46,26 +61,95 @@ _ALLOWED_CALLER_META = {
     # replay/schema-abstraction provenance: comma-joined instance fact ids
     # a consolidation-derived fact was generalized from (see replay.py).
     "derived_from",
+    "request_id", "source_message_ids", "source_author_id", "source_timestamp",
+    "batch_id", "batch_size", "event_time",
+    "valid_from", "valid_to",
 }
 
 _EMPTY_SKIPPED = {"low_importance": 0, "other_speaker": 0, "near_dup": 0}
 
 
-def _fact_key(user_id: str, text: str) -> str:
-    return hashlib.md5(f"{user_id}\x00{(text or '').strip()}".encode()).hexdigest()
+def _fact_key(user_id: str, text: str, metadata: dict | None = None) -> str:
+    md = metadata or {}
+    identity = [str(user_id), text.strip(), md.get("scope") or "global",
+                md.get("attribute") or "", md.get("condition") or "",
+                md.get("valid_from"), md.get("valid_to")]
+    return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
 
 
-async def _claim_insert(user_id: str, text: str) -> bool:
-    """Return True if this (user_id, text) may be inserted now; False if a
-    concurrent/recent insert already claimed it (caller should skip)."""
-    key = _fact_key(user_id, text)
-    async with _INSERT_SEEN_LOCK:
-        if key in _INSERT_SEEN:
-            return False
-        _INSERT_SEEN[key] = "1"
-        while len(_INSERT_SEEN) > _INSERT_SEEN_MAX:
-            _INSERT_SEEN.popitem(last=False)
-    return True
+@asynccontextmanager
+async def _ingestion_domains(user_id, candidates, base_meta):
+    """Serialize decisions through commit for cooperating processes.
+
+    Single-valued attributes share a lock even when the proposed text differs.
+    Other facts lock by exact identity. Acquire stripes in one global order;
+    nonblocking flock avoids filling the executor with blocked lock waiters.
+    """
+    from .attribute_registry import get_conflict_group, is_update_cardinality
+    namespace = [settings.CHROMA_MODE, settings.CHROMA_HOST, settings.CHROMA_PORT,
+                 settings.MEM0_COLLECTION_NAME, str(user_id)]
+    stripes = set()
+    for candidate in candidates:
+        md = fact_metadata(candidate, base_meta)
+        attribute = md.get("attribute") or ""
+        identity = (["attribute", sorted(get_conflict_group(attribute)),
+                     md.get("scope") or "global", md.get("condition") or ""]
+                    if attribute and is_update_cardinality(attribute)
+                    else ["fact", _fact_key(user_id, candidate["text"], md)])
+        digest = hashlib.sha256(json.dumps([namespace, identity], ensure_ascii=False).encode()).hexdigest()
+        stripes.add(int(digest[:8], 16) % 256)
+    directory = Path(settings.STATE_DIR) / "ingest_domain_locks"
+    handles = []
+    workers = []
+    token = _DOMAIN_WORKERS.set(workers)
+    def open_lock(stripe):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return os.open(directory / f"{stripe}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        for stripe in sorted(stripes):
+            fd = await asyncio.to_thread(open_lock, stripe)
+            handles.append(fd)
+            deadline = time.monotonic() + 120
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("memory ingest domain is busy; retry retained input")
+                    await asyncio.sleep(0.02)
+        yield
+    finally:
+        # Child tasks may be cancelled at shutdown while provider threads are
+        # still committing. Keep the cross-process decision lock until those
+        # writes really finish; retained source input repairs projections.
+        for future in workers:
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not future.cancelled():
+                future.exception()
+        _DOMAIN_WORKERS.reset(token)
+        for fd in reversed(handles):
+            os.close(fd)  # closing the owning descriptor releases its flock
+
+
+async def _owned_ingest(awaitable):
+    """Cancellation of a caller cannot release a domain before its write drains."""
+    task = asyncio.create_task(awaitable)
+    _INGEST_JOBS.add(task)
+    def done(completed):
+        _INGEST_JOBS.discard(completed)
+        if not completed.cancelled():
+            completed.exception()
+    task.add_done_callback(done)
+    return await asyncio.shield(task)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +182,13 @@ async def add_memories(
         messages, user_text, assistant_text, context_hint,
     )
 
-    # 初回 init の ChromaDB heartbeat (同期 requests) でループを止めない。
-    mem = await asyncio.to_thread(_get_mem0)
-    if not mem:
-        return None
-
     try:
+        if not user_id:
+            raise ValueError("memory subject user_id is required")
+        # Initialization failures must be retryable outcomes too.
+        mem = await asyncio.to_thread(_get_mem0)
+        if not mem:
+            raise RuntimeError("memory store unavailable")
         # The auth backend refreshes access tokens internally, so no explicit
         # token refresh is needed here before touching the store.
         base_meta = _build_base_meta(metadata)
@@ -124,6 +209,7 @@ async def add_memories(
         log.warning("Mem0 add error: %s", exc, exc_info=True)
         return {
             "error": f"{type(exc).__name__}: {exc}",
+            "status": "error", "retryable": True, "failed": 1,
             "results": [], "kept": 0,
             "skipped": dict(_EMPTY_SKIPPED),
         }
@@ -137,16 +223,24 @@ def _normalize_signature(
 ) -> tuple[str, str, str]:
     """Fold the legacy ``messages`` list into (user_text, assistant_text,
     context_hint); explicit keyword args win."""
-    if messages is not None and user_text is None:
-        for m in messages or []:
-            r = m.get("role")
-            c = m.get("content", "") if isinstance(m.get("content"), str) else ""
-            if r == "user" and user_text is None:
-                user_text = c
-            elif r == "assistant" and assistant_text is None:
-                assistant_text = c
+    if messages is not None:
+        user_parts, assistant_parts = [], []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            r, c = m.get("role"), m.get("content")
+            if not isinstance(c, str):
+                continue
+            if r == "user":
+                user_parts.append(c)
+            elif r == "assistant":
+                assistant_parts.append(c)
             elif r == "system" and not context_hint:
                 context_hint = c
+        if user_text is None:
+            user_text = "\n\n".join(user_parts)
+        if assistant_text is None:
+            assistant_text = "\n\n".join(assistant_parts)
     return user_text or "", assistant_text or "", context_hint
 
 
@@ -157,9 +251,19 @@ def _build_base_meta(metadata: dict | None) -> dict:
         "gate_version": "v2" if settings.MEM0_GATE_ENABLED else "v1",
     }
     if metadata:
+        validate_effective_interval(metadata)
         for k, v in metadata.items():
             if k in _ALLOWED_CALLER_META and k not in base_meta:
-                base_meta[k] = v
+                if isinstance(v, (dict, list)):
+                    v = json.dumps(v, ensure_ascii=False, allow_nan=False)
+                if isinstance(v, (str, int, float, bool)):
+                    base_meta[k] = v
+    if "source_timestamp" not in base_meta and "event_time" in base_meta:
+        base_meta["source_timestamp"] = base_meta["event_time"]
+    if "source_timestamp" in base_meta:
+        from .attribute_registry import observation_time
+        if isinstance(base_meta["source_timestamp"], bool) or observation_time(base_meta) is None:
+            raise ValueError("source_timestamp must be finite Unix seconds or ISO datetime")
     return base_meta
 
 
@@ -167,119 +271,190 @@ def _build_base_meta(metadata: dict | None) -> dict:
 # Gate path (P2): LLM extract → filter → dedup → infer=False raw insert
 # ---------------------------------------------------------------------------
 async def _add_via_gate(
-    mem,
-    user_id,
-    user_text: str,
-    assistant_text: str,
-    context_hint: str,
-    base_meta: dict,
-    pre_extracted_facts: list[dict] | None,
+    mem, user_id, user_text: str, assistant_text: str, context_hint: str,
+    base_meta: dict, pre_extracted_facts: list[dict] | None,
 ) -> dict:
-    facts, relations = await _obtain_signals(
-        user_id, user_text, assistant_text, context_hint, pre_extracted_facts,
-    )
-
+    signals = await _obtain_signals(user_id, user_text, assistant_text, context_hint,
+                                    pre_extracted_facts)
+    # Compatibility for internal callers mocking the former tuple contract.
+    if isinstance(signals, tuple):
+        signals = {"facts": signals[0], "relations": signals[1]}
+    facts, relations = signals.get("facts", []), signals.get("relations", [])
     candidates, skip_low, skip_other, skip_dup = _filter_candidates(facts)
+    async def process():
+        async with _ingestion_domains(user_id, candidates, base_meta):
+            return await _store_candidates(mem, user_id, candidates, base_meta, signals, relations,
+                                           skip_low, skip_other, skip_dup)
+    return await _owned_ingest(process())
 
-    kept, dedup_dropped, reinforced_ids, conflict_archive = (
-        await _dedup_candidates(mem, user_id, candidates, base_meta)
-    )
-    skip_dup += dedup_dropped
 
-    # Hebbian reinforcement: bump mention_count on each existing fact that
-    # absorbed a duplicate candidate. Failures are non-fatal.
+async def _store_candidates(mem, user_id, candidates, base_meta, signals, relations,
+                            skip_low, skip_other, skip_dup):
+    kept, dropped, reinforced_ids, _ = await _dedup_candidates(mem, user_id, candidates, base_meta)
+    skip_dup += dropped
+    reinforce_outcomes = {}
     if reinforced_ids:
-        from .reinforce import reinforce_existing
-        await asyncio.gather(
-            *(reinforce_existing(mem, mid) for mid in reinforced_ids),
-            return_exceptions=True,
-        )
+        from .reinforce import reinforce_existing_sync
+        unique_ids = sorted(set(reinforced_ids))
+        bumps = await asyncio.gather(*(_write_thread(
+            reinforce_existing_sync, mem, mid, event_id=base_meta.get("request_id") or base_meta.get("batch_id"),
+            source_timestamp=base_meta.get("source_timestamp"))
+            for mid in unique_ids), return_exceptions=True)
+        reinforce_outcomes = dict(zip(unique_ids, bumps))
+    repair_errors = []
+    duplicate_support = []
+    for mid in set(reinforced_ids):
+        try:
+            existing = await asyncio.to_thread(mem.get, mid)
+            md = (existing.get("metadata") or {}) if isinstance(existing, dict) else {}
+            if not isinstance(existing, dict):
+                repair_errors.append("duplicate_target_missing")
+                continue
+            owner = existing.get("user_id") or md.get("user_id")
+            if owner is not None and str(owner) != str(user_id):
+                repair_errors.append("duplicate_target_owner_mismatch")
+                continue
+            event = base_meta.get("request_id") or base_meta.get("batch_id")
+            known_events = json.loads(md.get("reinforced_event_ids") or "[]")
+            already_counted = event and (event in known_events or event in (md.get("request_id"), md.get("batch_id")))
+            if reinforce_outcomes.get(mid) is not True and not already_counted:
+                repair_errors.append("reinforcement_failed")
+            if isinstance(existing, dict) and not md.get("valid_to"):
+                repaired_fact = {**md, "text": existing.get("memory") or existing.get("text") or "",
+                                 "entities": json.loads(md.get("entities_json") or "[]")}
+                projection_errors = await _index_side_stores(user_id, repaired_fact, md, md, [mid])
+                if isinstance(projection_errors, list) and projection_errors:
+                    repair_errors.append("projection_incomplete")
+                duplicate_support.extend((f, mid) for f in candidates
+                                         if f["text"] == repaired_fact["text"]
+                                         and same_fact_domain(fact_metadata(f, base_meta), fact_metadata(existing)))
+            pending = json.loads(md.get("pending_predecessors") or "[]")
+            if pending:
+                repaired = await _archive_outdated_facts(
+                    mem, [tuple(p) for p in pending], user_id=user_id,
+                    new_fact_id=mid, candidate_metadata=md)
+                if repaired != len(pending):
+                    repair_errors.append("archive_incomplete")
+            successor = json.loads(md.get("pending_successor") or "null")
+            if successor and not await _archive_historical_observation(mem, mid, successor, user_id):
+                repair_errors.append("historical_archive_incomplete")
+        except Exception:
+            repair_errors.append("duplicate_repair_failed")
+    if settings.MEM0_ATTRIBUTE_CONFLICT_ENABLED:
+        for f in kept:
+            predecessors = f.setdefault("_predecessors", [])
+            predecessors.extend(await _attribute_conflict_check(
+                mem, user_id, [f], exclude_ids={eid for eid, _ in predecessors},
+                base_meta=base_meta))
+    from .attribute_registry import is_update_cardinality
+    groups = {}
+    for index, f in enumerate(kept):
+        md = fact_metadata(f, base_meta)
+        attr = md.get("attribute")
+        key = (attr, md.get("scope"), md.get("condition") or "", md.get("valid_from"), md.get("valid_to")) if attr and is_update_cardinality(attr) else ("independent", index)
+        groups.setdefault(key, []).append(f)
+    semaphore = asyncio.Semaphore(4)
 
-    # Phase A-3: 決定的 conflict ルート。dedup の embedding 近傍ゲート
-    # (距離≤0.35)をすり抜けた属性更新(文面の離れた数値更新等)を、
-    # attribute 完全一致で捕捉する。dedup が既に archive 対象にした
-    # existing_id は二重に積まない。
-    if settings.MEM0_ATTRIBUTE_CONFLICT_ENABLED and kept:
-        conflict_archive.extend(await _attribute_conflict_check(
-            mem, user_id, kept,
-            exclude_ids={eid for eid, _ in conflict_archive},
-        ))
+    async def insert_group(items):
+        outcomes = []
+        committed = []
+        async with semaphore:
+            for f in sorted(items, key=lambda row: row.get("source_offset", 0)):
+                f = dict(f)
+                predecessors = list(f.get("_predecessors") or [])
+                if settings.MEM0_CONFLICT_DETECTION_ENABLED:
+                    from .conflict import classify_conflict
+                    for previous, previous_id in committed:
+                        old_md, new_md = fact_metadata(previous, base_meta), fact_metadata(f, base_meta)
+                        if can_supersede(old_md, new_md):
+                            decision = await classify_conflict(previous["text"], f["text"],
+                                existing_metadata=old_md, candidate_metadata=new_md)
+                            kind = decision.get("conflict_type")
+                            if kind in ("update", "correction"):
+                                predecessors.append((previous_id, kind))
+                f["_predecessors"] = list(dict.fromkeys(predecessors))
+                outcome = await _insert_one(mem, user_id, f, base_meta)
+                ids = _result_ids(outcome)
+                count = 0
+                if ids:
+                    committed.append((f, ids[0]))
+                    if predecessors:
+                        count = await _archive_outdated_facts(
+                            mem, f["_predecessors"], user_id=user_id, new_fact_id=ids[0],
+                            candidate_metadata=fact_metadata(f, base_meta))
+                    if f.get("_historical_successor"):
+                        retired = await _archive_historical_observation(mem, ids[0], f["_historical_successor"], user_id)
+                        if retired:
+                            count += 1
+                        else:
+                            outcome = {**outcome, "projection_errors": [*(outcome.get("projection_errors") or []),
+                                                                         "historical_archive_incomplete"]}
+                outcomes.append((f, outcome, count))
+        return outcomes
 
-    # Parallel raw insert: three ChromaDB writes in serial added ~3x
-    # latency. gather them and tolerate individual failures.
-    insert_results = (
-        await asyncio.gather(*(
-            _insert_one(mem, user_id, f, base_meta) for f in kept
-        ))
-        if kept else []
-    )
-    results = [r for r in insert_results if r is not None]
-
-    # Phase B-2: soft-archive outdated predecessors after the new fact is in
-    # storage. Errors are non-fatal — the new fact is already stored, the
-    # old one just won't be hidden.
-    archived = await _archive_outdated_facts(mem, conflict_archive)
-
-    relations_added = 0
-    if settings.MEM0_RELATION_EXTRACT_ENABLED and relations:
-        relations_added = await _ingest_relations(user_id, relations)
-
-    log.info(
-        "Mem0 gate: facts=%d kept=%d skip(low=%d,other=%d,dup=%d) "
-        "archived=%d relations=%d user=...%s",
-        len(facts), len(kept), skip_low, skip_other, skip_dup,
-        archived, relations_added, str(user_id)[-4:],
-    )
-    # Phase B-3: structured one-line metric for grep-based weekly health
-    # reports. Each key is positional so the parser stays cheap.
-    log.info(
-        "[MEM0_INGEST_METRICS extracted=%d candidates=%d kept=%d "
-        "drop_low=%d drop_other=%d drop_dup=%d archived=%d]",
-        len(facts), len(candidates), len(kept),
-        skip_low, skip_other, skip_dup, archived,
-    )
-    return {"results": results, "kept": len(kept), "skipped": {
-        "low_importance": skip_low, "other_speaker": skip_other, "near_dup": skip_dup,
-    }}
-
+    grouped = await asyncio.gather(*(insert_group(items) for items in groups.values()))
+    results, committed_facts = [], []
+    failed = archived = 0
+    errors = ([signals["error"]] if signals.get("error") else []) + repair_errors
+    for f, outcome, count in (entry for group in grouped for entry in group):
+        if not _result_ids(outcome):
+            failed += 1
+            errors.append(str(outcome.get("error") or "insert_failed_or_unconfirmed") if isinstance(outcome, dict) else "insert_failed_or_unconfirmed")
+            continue
+        results.append(outcome)
+        committed_facts.append((f, _result_ids(outcome)[0]))
+        archived += count
+        if count < len(f.get("_predecessors") or []):
+            errors.append("archive_incomplete")
+        if isinstance(outcome, dict) and outcome.get("projection_errors"):
+            errors.append("projection_incomplete")
+    # Only grounded relations supported by accepted observations are eligible.
+    # The current relation table has no scope column. Do not promote a
+    # conversation-scoped fact or a conditional observation to a global edge.
+    quotes = {}
+    if settings.MEM0_RELATION_EXTRACT_ENABLED:
+        for f, fid in committed_facts + duplicate_support:
+            if not f.get("source_quote"):
+                continue
+            source_md = fact_metadata(f, base_meta)
+            if source_md.get("scope") != "global" or source_md.get("condition"):
+                continue
+            try:
+                primary = await asyncio.to_thread(mem.get, fid)
+                md = fact_metadata(primary) if isinstance(primary, dict) else {}
+                if md.get("scope") == "global" and not md.get("condition"):
+                    quotes[f["source_quote"]] = (fid, md)
+            except Exception:
+                errors.append("relation_source_unavailable")
+    accepted_relations = [dict(r, source_fact_id=quotes[r["source_quote"]][0],
+                               valid_from=quotes[r["source_quote"]][1].get("valid_from"),
+                               valid_to=quotes[r["source_quote"]][1].get("valid_to"))
+                          for r in relations if r.get("source_quote") in quotes]
+    if settings.MEM0_RELATION_EXTRACT_ENABLED and accepted_relations:
+        added = await _ingest_relations(user_id, accepted_relations)
+        if added != len(accepted_relations):
+            errors.append("relation_projection_incomplete")
+    result = {"results": results, "kept": len(kept), "stored": len(results),
+              "failed": failed, "archived": archived, "status": "ok",
+              "skipped": {"low_importance": skip_low, "other_speaker": skip_other, "near_dup": skip_dup}}
+    if errors:
+        result.update(status="partial" if results else "error",
+                      error=";".join(sorted(set(errors))), retryable=True)
+    return result
 
 async def _obtain_signals(
-    user_id,
-    user_text: str,
-    assistant_text: str,
-    context_hint: str,
+    user_id, user_text: str, assistant_text: str, context_hint: str,
     pre_extracted_facts: list[dict] | None,
-) -> tuple[list[dict], list[dict]]:
-    """Run the extractor (or accept the caller's pre-extracted facts)."""
+) -> dict:
     if pre_extracted_facts is not None:
-        # Caller already ran the extractor and is passing facts in to avoid
-        # a duplicate LLM call. We trust the shape because the extractor and
-        # the caller share a module-internal contract. Pre-extracted path
-        # doesn't carry relations (older callers predate Phase C-2).
-        facts, relations = pre_extracted_facts, []
-    else:
-        # Phase C-2: a single LLM call extracts facts AND entity-entity
-        # relations; relations are handed to the graph layer after insert.
-        signals = await extract_full_signals(
-            user_text, assistant_text, context_hint,
-            user_id=str(user_id) if user_id else None,
-        )
-        facts = signals.get("facts", [])
-        relations = signals.get("relations") or []
-    # Diagnostic: show every extracted fact text. Helps trace why a turn
-    # produced unexpected dedup hits (candidate vs existing).
-    if facts:
-        previews = [
-            f"[{f.get('speaker', '?')}|imp={f.get('importance', '?')}] "
-            f"{(f.get('text') or '')[:120]}"
-            for f in facts
-        ]
-        log.info(
-            "Mem0 gate: extracted %d facts user=...%s | %s",
-            len(facts), str(user_id)[-4:], " || ".join(previews),
-        )
-    return facts, relations
-
+        facts = [f for raw in pre_extracted_facts if (f := normalize_fact(raw, programmatic=True)) is not None]
+        result = {"facts": facts, "relations": [], "status": "ok"}
+        if len(facts) != len(pre_extracted_facts):
+            result.update(status="partial" if facts else "error",
+                          error="invalid_pre_extracted_facts", retryable=True)
+        return result
+    return await extract_full_signals(user_text, assistant_text, context_hint,
+                                      user_id=str(user_id) if user_id else None)
 
 def _filter_candidates(facts: list[dict]) -> tuple[list[dict], int, int, int]:
     """Cheap synchronous filter pass — drops obvious non-self /
@@ -290,10 +465,17 @@ def _filter_candidates(facts: list[dict]) -> tuple[list[dict], int, int, int]:
     candidates: list[dict] = []
     skip_low = skip_other = skip_dup = 0
     for f in facts:
+        if not isinstance(f, dict):
+            skip_other += 1
+            continue
         if f.get("speaker") != "self":
             skip_other += 1
             continue
-        if int(f.get("importance", 0)) < min_importance:
+        f = normalize_fact(f, programmatic=True)
+        if f is None:
+            skip_other += 1
+            continue
+        if f["importance"] < min_importance:
             skip_low += 1
             continue
         candidates.append(f)
@@ -305,7 +487,7 @@ def _filter_candidates(facts: list[dict]) -> tuple[list[dict], int, int, int]:
     seen_texts: set[str] = set()
     deduped: list[dict] = []
     for f in candidates:
-        t = f.get("text", "")
+        t = _fact_key("", f["text"], fact_metadata(f))
         if t in seen_texts:
             skip_dup += 1
             continue
@@ -347,12 +529,13 @@ async def _dedup_candidates(
     )
 
     if settings.MEM0_DEDUP_TWO_STAGE:
-        return await _dedup_two_stage(candidates, near_results)
+        return await _dedup_two_stage(candidates, near_results, base_meta=base_meta)
     return _dedup_single_threshold(candidates, near_results)
 
 
 async def _dedup_two_stage(
     candidates: list[dict], near_results: list,
+    *, base_meta: dict | None = None,
 ) -> tuple[list[dict], int, list[str], list[tuple[str, str]]]:
     """Cosine gate + LLM judgment, with merge (止揚) and conflict routes."""
     from .dedup import check_near_dup
@@ -367,6 +550,7 @@ async def _dedup_two_stage(
             dry_run=dry_run,
             detect_conflict=settings.MEM0_CONFLICT_DETECTION_ENABLED,
             allow_merge=settings.MEM0_DEDUP_SUPERSET_MERGE,
+            candidate_metadata=fact_metadata(f, base_meta),
         )
         return (f, is_dup, existing_id, conflict_type, merged_text)
 
@@ -392,13 +576,18 @@ async def _dedup_two_stage(
         # archived below.
         if conflict_type == "merge" and merged_text and not dry_run:
             f = {**f, "text": merged_text}
+            # Merge lineage belongs to the replacement, not just the archive.
+            f["derived_from"] = str(existing_id)
         kept.append(f)
+        if conflict_type in ("historical_update", "historical_correction") and existing_id and not dry_run:
+            f["_historical_successor"] = [existing_id, conflict_type.removeprefix("historical_")]
         if (
             conflict_type in ("update", "correction", "merge")
             and existing_id
             and not dry_run
         ):
             conflict_archive.append((existing_id, conflict_type))
+            f.setdefault("_predecessors", []).append((existing_id, conflict_type))
     return kept, dropped, reinforced_ids, conflict_archive
 
 
@@ -419,6 +608,8 @@ def _dedup_single_threshold(
             continue
         if any(
             (r.get("score") if r.get("score") is not None else 99) <= threshold
+            and (r.get("memory") or r.get("text") or "").strip() == f["text"].strip()
+            and same_fact_domain(fact_metadata(r), fact_metadata(f))
             for r in near
         ):
             dropped += 1
@@ -437,6 +628,17 @@ def _build_fact_meta(f: dict, base_meta: dict) -> dict:
     stripped at the end.
     """
     fact_meta = dict(base_meta)
+    for key in ("source_quote", "source_role", "source_offset", "derived_from", "source_timestamp", "valid_from", "valid_to"):
+        value = f.get(key)
+        if isinstance(value, (str, int, float)):
+            fact_meta[key] = value
+    validate_effective_interval(fact_meta)
+    if f.get("_predecessors"):
+        fact_meta["pending_predecessors"] = json.dumps(f["_predecessors"])
+    if f.get("_historical_successor"):
+        fact_meta["pending_successor"] = json.dumps(f["_historical_successor"])
+    if f.get("entities"):
+        fact_meta["entities_json"] = json.dumps(f["entities"], ensure_ascii=False)
     imp = int(f.get("importance", 3))
     # importance=2 → force tier=Warm so weekly compact ages it out faster.
     # Otherwise default to tier=1 (Hot); the extract prompt doesn't emit
@@ -467,8 +669,7 @@ def _build_fact_meta(f: dict, base_meta: dict) -> dict:
     # 文字列で保存。読む側は json.loads。
     val = f.get("value")
     if settings.MEM0_TYPED_VALUE_ENABLED and isinstance(val, dict):
-        import json
-        fact_meta["value_json"] = json.dumps(val, ensure_ascii=False)
+        fact_meta["value_json"] = json.dumps(val, ensure_ascii=False, allow_nan=False)
     # Phase B: condition(time:/context:)を付与。
     cond = f.get("condition") or ""
     if settings.MEM0_CONDITION_ENABLED and cond:
@@ -488,47 +689,154 @@ def _build_fact_meta(f: dict, base_meta: dict) -> dict:
     return {k: v for k, v in fact_meta.items() if v is not None}
 
 
-async def _insert_one(mem, user_id, f: dict, base_meta: dict):
-    """Raw-insert one fact (infer=False) and index it into the side stores.
+def _result_ids(result) -> list[str]:
+    if not isinstance(result, dict) or result.get("error"):
+        return []
+    return [str(r["id"]) for r in result.get("results", [])
+            if isinstance(r, dict) and r.get("id")]
 
-    Side-store indexing (graph / BM25 / fact_store) is best-effort: the
-    fact is already in ChromaDB, so those errors log a WARNING and move on.
+
+def _insert_raw_sync(mem, user_id, f: dict, fact_meta: dict):
+    """Durable receipts and a shared lock protect redelivery across restarts.
+
+    A process crash between the provider commit and receipt commit remains an
+    uncertain outcome; ingest_key on the primary row allows reconciliation.
     """
-    # P1: skip insert if an identical (user_id, text) is already in-flight /
-    # recently inserted this process (defeats the parallel-ingest exact-dup
-    # race). Gated by env.
-    if settings.MEM0_INGEST_HASH_DEDUP and not await _claim_insert(
-        user_id, f.get("text", "")
-    ):
-        log.info("ingest hash-dedup: skipped in-flight dup: %r",
-                 (f.get("text") or "")[:60])
-        return None
-    fact_meta = _build_fact_meta(f, base_meta)
+    from .reinforce import memory_mutation_lock
+    from .client import _ingest_receipt_lock
+    identity = _fact_key(user_id, f["text"], fact_metadata(f, fact_meta))
+    source_id = fact_meta.get("request_id") or fact_meta.get("batch_id") or ""
+    store_identity = [settings.CHROMA_MODE, settings.CHROMA_HOST,
+                      settings.CHROMA_PORT, settings.MEM0_COLLECTION_NAME]
+    key = hashlib.sha256(json.dumps([store_identity, identity, source_id]).encode()).hexdigest()
+    canonical_key = hashlib.sha256(json.dumps([store_identity, identity]).encode()).hexdigest()
+    if not settings.MEM0_INGEST_HASH_DEDUP:
+        return mem.add([{"role": "user", "content": f["text"]}],
+                       user_id=user_id, metadata=fact_meta, infer=False)
+    directory = Path(settings.STATE_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
+    with memory_mutation_lock("ingest:" + identity), _ingest_receipt_lock(key):
+        with closing(sqlite3.connect(directory / "mem0_ingest_receipts.sqlite3", timeout=30)) as db, db:
+            db.execute("CREATE TABLE IF NOT EXISTS receipts (key TEXT PRIMARY KEY, response TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS canonical_receipts (key TEXT PRIMARY KEY, response TEXT NOT NULL)")
+            row = db.execute("SELECT response FROM receipts WHERE key=?", (key,)).fetchone()
+            if row:
+                saved = json.loads(row[0])
+                if saved.get("deleted"):
+                    return {"error": "receipt_target_deleted", "results": []}
+                if saved.get("pending"):
+                    # The provider may have committed before an exception or
+                    # process exit. Reconcile against the primary event key
+                    # before issuing another write, not an embedding search.
+                    from .client import mem_get_all
+                    recovered = mem_get_all(mem, user_id=user_id, limit=None)
+                    rows = recovered.get("results", []) if isinstance(recovered, dict) else recovered
+                    matching = [r for r in (rows or []) if isinstance(r, dict)
+                                and (r.get("metadata") or {}).get("ingest_key") == key and r.get("id")
+                                and str(r.get("user_id") or (r.get("metadata") or {}).get("user_id")) == str(user_id)]
+                    if matching:
+                        result = {"results": [{"id": r["id"]} for r in matching]}
+                        db.execute("INSERT OR REPLACE INTO receipts VALUES (?, ?)", (key, json.dumps(result)))
+                        db.execute("INSERT OR REPLACE INTO canonical_receipts VALUES (?, ?)",
+                                   (canonical_key, json.dumps({**result, "_receipt_ingest_key": key})))
+                        return result
+                # Stable source IDs identify replay of the same observation.
+                else:
+                    for fid in _result_ids(saved):
+                        existing = mem.get(fid)
+                        if not isinstance(existing, dict):
+                            return {"error": "receipt_target_missing", "results": []}
+                        md = existing.get("metadata") or {}
+                        owner = existing.get("user_id") or md.get("user_id")
+                        if str(owner) != str(user_id) or md.get("ingest_key") != saved.get("_receipt_ingest_key", key):
+                            return {"error": "receipt_target_mismatch", "results": []}
+                    if source_id or not (existing.get("metadata") or {}).get("valid_to"):
+                        return saved
+                db.execute("DELETE FROM receipts WHERE key=?", (key,))
+            # Independent source events may arrive before the vector index
+            # sees the prior write. Exact identity is checked against a durable
+            # primary-ID receipt, not eventual-consistency search results.
+            canonical = db.execute("SELECT response FROM canonical_receipts WHERE key=?", (canonical_key,)).fetchone()
+            if canonical:
+                saved = json.loads(canonical[0])
+                ids = _result_ids(saved)
+                existing = mem.get(ids[0]) if ids else None
+                md = (existing.get("metadata") or {}) if isinstance(existing, dict) else {}
+                owner = (existing.get("user_id") or md.get("user_id")) if isinstance(existing, dict) else None
+                if (str(owner) == str(user_id) and not md.get("valid_to") and not md.get("archived")
+                        and md.get("ingest_key") == saved.get("_receipt_ingest_key")):
+                    result = {**saved, "_receipt_reused": True}
+                    db.execute("INSERT OR REPLACE INTO receipts VALUES (?, ?)", (key, json.dumps(result)))
+                    return result
+            db.execute("INSERT OR REPLACE INTO receipts VALUES (?, ?)", (key, '{"pending": true}'))
+            db.commit()
+            result = mem.add([{"role": "user", "content": f["text"]}], user_id=user_id,
+                             metadata={**fact_meta, "ingest_key": key}, infer=False)
+            if _result_ids(result):
+                db.execute("INSERT OR REPLACE INTO receipts VALUES (?, ?)",
+                           (key, json.dumps(result, ensure_ascii=False, default=str)))
+                db.execute("INSERT OR REPLACE INTO canonical_receipts VALUES (?, ?)",
+                           (canonical_key, json.dumps({**result, "_receipt_ingest_key": key}, ensure_ascii=False, default=str)))
+            return result
+
+
+async def _insert_one(mem, user_id, f: dict, base_meta: dict):
+    """One owned task drains the real write even if a waiter is cancelled."""
     try:
-        res = await asyncio.to_thread(
-            mem.add,
-            [{"role": "user", "content": f["text"]}],
-            user_id=user_id, metadata=fact_meta, infer=False,
-        )
-    except Exception as e:
-        log.warning("Mem0 raw insert failed: %s", e)
-        return None
-
-    fact_ids: list[str] = []
-    if isinstance(res, dict):
-        for r in (res.get("results") or []):
-            fid = r.get("id") if isinstance(r, dict) else None
-            if fid:
-                fact_ids.append(fid)
-    if fact_ids:
-        await _index_side_stores(user_id, f, fact_meta, base_meta, fact_ids)
-    return res
-
+        fact_meta = _build_fact_meta(f, base_meta)
+    except Exception as exc:
+        return {"error": f"invalid_metadata:{type(exc).__name__}", "results": []}
+    key = (asyncio.get_running_loop(), id(mem), str(Path(settings.STATE_DIR)),
+           settings.CHROMA_MODE, settings.CHROMA_HOST, settings.CHROMA_PORT, settings.MEM0_COLLECTION_NAME,
+           _fact_key(user_id, f["text"], fact_metadata(f, fact_meta)),
+           base_meta.get("request_id") or base_meta.get("batch_id"))
+    task = _INSERT_TASKS.get(key)
+    if task is None:
+        async def insert_and_project():
+            try:
+                result = await _write_thread(_insert_raw_sync, mem, user_id, f, fact_meta)
+                ids = _result_ids(result)
+                if not ids:
+                    if isinstance(result, dict) and result.get("error"):
+                        return result
+                    return {"error": "insert_unconfirmed", "results": []}
+                projection_fact, projection_meta = f, fact_meta
+                if result.get("_receipt_reused"):
+                    event = base_meta.get("request_id") or base_meta.get("batch_id")
+                    from .reinforce import reinforce_existing_sync
+                    bumped = await _write_thread(reinforce_existing_sync, mem, ids[0], event_id=event,
+                                                 source_timestamp=fact_meta.get("source_timestamp"))
+                    existing = await asyncio.to_thread(mem.get, ids[0])
+                    projection_meta = existing.get("metadata") or {}
+                    known_events = json.loads(projection_meta.get("reinforced_event_ids") or "[]")
+                    if not bumped and not (event and (event in known_events or event in (projection_meta.get("request_id"), projection_meta.get("batch_id")))):
+                        return {**result, "projection_errors": ["reinforcement_failed"]}
+                    projection_fact = {**projection_meta, "text": existing.get("memory") or existing.get("text") or f["text"],
+                                       "entities": json.loads(projection_meta.get("entities_json") or "[]")}
+                projection_errors = await _index_side_stores(user_id, projection_fact, projection_meta, base_meta, ids)
+                from .search import invalidate_core_cache
+                await _write_thread(invalidate_core_cache, str(user_id))
+                if isinstance(projection_errors, list) and projection_errors:
+                    result = {**result, "projection_errors": projection_errors}
+                return result
+            except Exception as exc:
+                log.warning("Mem0 raw insert failed: %s", exc)
+                return {"error": f"insert_failed:{type(exc).__name__}", "results": []}
+        task = asyncio.create_task(insert_and_project())
+        _INSERT_TASKS[key] = task
+        def cleanup(done):
+            if _INSERT_TASKS.get(key) is done:
+                _INSERT_TASKS.pop(key, None)
+            if not done.cancelled():
+                done.exception()
+        task.add_done_callback(cleanup)
+    return await asyncio.shield(task)
 
 async def _index_side_stores(
     user_id, f: dict, fact_meta: dict, base_meta: dict, fact_ids: list[str],
-) -> None:
+) -> list[str]:
     """Mirror a freshly inserted fact into graph / BM25 / fact_store."""
+    errors = []
     # Graph layer: link extracted entities to the new fact.
     try:
         entities = f.get("entities") or []
@@ -542,15 +850,18 @@ async def _index_side_stores(
                 etype = ent.get("type")
                 if not name or not etype:
                     continue
-                eid = await asyncio.to_thread(
-                    graph.upsert_entity,
-                    name, etype, str(user_id),
-                    aliases=ent.get("aliases") or [],
-                )
-                if eid:
-                    linked_eids.append(eid)
-                    for fid in fact_ids:
-                        await asyncio.to_thread(graph.add_edge, fid, eid)
+                for fid in fact_ids:
+                    eid = await _write_thread(
+                        graph.upsert_entity, name, etype, str(user_id),
+                        aliases=ent.get("aliases") or [], source_fact_id=fid,
+                    )
+                    if eid:
+                        if eid not in linked_eids:
+                            linked_eids.append(eid)
+                        if not await _write_thread(graph.add_edge, fid, eid):
+                            errors.append("graph_edge")
+                    else:
+                        errors.append("graph_entity")
             # Phase ④: entities just mentioned prime this session's next
             # search (see priming.py) — ingest and search share the same
             # buffer so either side of a turn can prime the other.
@@ -561,17 +872,21 @@ async def _index_side_stores(
                 )
     except Exception as e:
         log.warning("graph update failed (non-fatal): %s", e)
+        errors.append("graph")
 
     # Phase A-1: index the new fact in the BM25 FTS5 store so hybrid
     # retrieval can rescue exact-term matches that cosine missed.
     try:
         from . import bm25_index
         for fid in fact_ids:
-            await asyncio.to_thread(
+            indexed = await _write_thread(
                 bm25_index.index_fact, fid, f["text"], str(user_id),
             )
+            if not indexed:
+                errors.append("bm25")
     except Exception as e:
         log.warning("bm25 index update failed (non-fatal): %s", e)
+        errors.append("bm25")
 
     # v5 T8a: structured fact layer への導出インデックス登録（attribute 付き
     # fact のみ）。正本は Chroma、こちらは best-effort。
@@ -580,7 +895,7 @@ async def _index_side_stores(
         if settings.MEM0_FACT_STORE_ENABLED and attr:
             from . import fact_store
             for fid in fact_ids:
-                await asyncio.to_thread(
+                indexed = await _write_thread(
                     fact_store.record_fact,
                     fid, str(user_id), attr,
                     value_text=f.get("text", ""),
@@ -592,8 +907,12 @@ async def _index_side_stores(
                         if base_meta.get("channel_id") else None
                     ),
                 )
+                if not indexed:
+                    errors.append("fact_store")
     except Exception as e:
         log.warning("fact_store record failed (non-fatal): %s", e)
+        errors.append("fact_store")
+    return errors
 
 
 async def _ingest_relations(user_id, relations: list[dict]) -> int:
@@ -622,9 +941,11 @@ async def _ingest_relations(user_id, relations: list[dict]) -> int:
             )
             if not (src_ent and dst_ent):
                 continue
-            rid = await asyncio.to_thread(
+            rid = await _write_thread(
                 graph.add_relation,
                 src_ent.id, rel_type, dst_ent.id, str(user_id),
+                source_fact_id=rel.get("source_fact_id"), valid_from=rel.get("valid_from"),
+                valid_to=rel.get("valid_to"),
             )
             if rid:
                 added += 1
@@ -686,56 +1007,83 @@ async def _add_legacy(
 # ---------------------------------------------------------------------------
 # Conflict archive + deterministic attribute route
 # ---------------------------------------------------------------------------
-async def _archive_outdated_facts(mem, archive: list[tuple[str, str]]) -> int:
-    """Soft-archive existing facts that were superseded by a new fact.
+async def _archive_historical_observation(mem, fact_id, successor, user_id):
+    """Keep a late observation as history without replacing its newer update.
 
-    Writes ``valid_to=<now>`` and ``conflict_archived_as=<update|correction>``
-    to the existing fact's metadata. Retrieval honours valid_to to hide the
-    row from candidates (see search.py). The fact is never physically
-    deleted, so flipping ``MEM0_HIDE_ARCHIVED=false`` brings them back
-    without any data restore.
-
-    Returns the count of successfully archived facts. Failures are logged
-    at WARNING and skipped — the new fact stays in storage either way;
-    archival is best-effort because we already have the new truth.
+    This is lineage/arrival reconciliation, not inferred world-valid time.
     """
-    if not archive:
-        return 0
-    now = int(time.time())
+    target, kind = successor
+    seen = {fact_id}
+    for _ in range(32):
+        if target in seen:
+            return False
+        seen.add(target)
+        row = await asyncio.to_thread(mem.get, target)
+        if not isinstance(row, dict):
+            return False
+        md = fact_metadata(row)
+        owner = row.get("user_id") or md.get("user_id")
+        if owner is not None and str(owner) != str(user_id):
+            return False
+        if md.get("valid_to"):
+            target = md.get("superseded_by")
+            if not target:
+                return False
+            continue
+        return await _archive_outdated_facts(mem, [(fact_id, kind)], user_id=user_id,
+                                             new_fact_id=target, candidate_metadata=md) == 1
+    return False
+
+
+async def _archive_outdated_facts(
+    mem, archive: list[tuple[str, str]], *, user_id=None,
+    new_fact_id: str | None = None, candidate_metadata: dict | None = None,
+) -> int:
+    """Archive only committed replacements; re-read under the shared writer lock."""
+    from .reinforce import mutate_memory_metadata_sync
     success = 0
-    for existing_id, ctype in archive:
+    for existing_id, kind in dict.fromkeys(archive):
         try:
-            existing = await asyncio.to_thread(mem.get, existing_id)
-            if not isinstance(existing, dict):
+            def mutation(existing):
+                md = fact_metadata(existing)
+                owner = existing.get("user_id") or md.get("user_id")
+                if user_id is not None and owner is not None and str(owner) != str(user_id):
+                    return None
+                if md.get("valid_to"):
+                    # This is already retired. Never overwrite its original
+                    # successor with a later concurrent writer's attribution.
+                    return None
+                if candidate_metadata is not None:
+                    eligible = can_supersede(md, candidate_metadata)
+                    if kind == "merge":
+                        eligible = same_fact_domain(md, candidate_metadata)
+                        from .attribute_registry import observation_time
+                        old_time, new_time = observation_time(md), observation_time(candidate_metadata)
+                        if old_time is not None and (new_time is None or new_time < old_time):
+                            eligible = False
+                    if not eligible:
+                        return None
+                patch = {"valid_to": int(time.time()), "conflict_archived_as": kind}
+                if new_fact_id:
+                    patch["superseded_by"] = new_fact_id
+                return patch
+            updated = await _write_thread(mutate_memory_metadata_sync, mem, existing_id, mutation)
+            if not updated:
+                # A prior retry may have completed this very archive.
+                old = await asyncio.to_thread(mem.get, existing_id)
+                md = (old.get("metadata") or {}) if isinstance(old, dict) else {}
+                if not md.get("valid_to") or (new_fact_id and md.get("superseded_by") != new_fact_id):
+                    continue
+            from . import graph
+            if not await _write_thread(graph.expire_relations_for_fact, existing_id):
                 continue
-            text = existing.get("memory") or existing.get("text") or ""
-            if not text:
-                continue
-            partial = {"valid_to": now, "conflict_archived_as": ctype}
-            await asyncio.to_thread(
-                mem.update, memory_id=existing_id,
-                data=text, metadata=partial,
-            )
-            log.info(
-                "[CONFLICT_ARCHIVE existing_id=%s conflict_type=%s valid_to=%d]",
-                existing_id, ctype, now,
-            )
-            # v5 T8a: fact_store 側も supersede（Chroma soft-archive と対）。
-            try:
-                if settings.MEM0_FACT_STORE_ENABLED:
-                    from . import fact_store
-                    await asyncio.to_thread(
-                        fact_store.supersede_fact, existing_id)
-            except Exception as exc2:  # noqa: BLE001
-                log.warning("fact_store supersede failed (non-fatal): %s", exc2)
+            if settings.MEM0_FACT_STORE_ENABLED:
+                from . import fact_store
+                await _write_thread(fact_store.supersede_fact, existing_id, new_fact_id)
             success += 1
         except Exception as exc:
-            log.warning(
-                "conflict archive (%s, %s) failed (non-fatal): %s",
-                existing_id, ctype, exc,
-            )
+            log.warning("conflict archive failed (%s): %s", existing_id, exc)
     return success
-
 
 async def _get_facts_by_attribute(mem, user_id, attribute: str) -> list[dict]:
     """Phase A-3: attribute 完全一致の valid な既存 fact を取得。
@@ -750,32 +1098,13 @@ async def _get_facts_by_attribute(mem, user_id, attribute: str) -> list[dict]:
     """
     if not attribute:
         return []
-    if settings.MEM0_FACT_STORE_ENABLED:
-        try:
-            from . import fact_store
-            rows = await asyncio.to_thread(
-                fact_store.get_active_facts, str(user_id), attribute)
-            if rows:
-                return [
-                    {
-                        "id": r.get("fact_id"),
-                        "memory": r.get("value_text") or "",
-                        "metadata": {
-                            "attribute": r.get("attribute"),
-                            "condition": r.get("condition") or "",
-                            "value_json": r.get("value_json"),
-                        },
-                    }
-                    for r in rows
-                ]
-            # store が空 → Chroma へフォールバック（backfill 前の期間の保険）
-        except Exception as exc:
-            log.warning("fact_store lookup failed, falling back: %s", exc)
+    # A partial side index cannot prove completeness. Read authoritative
+    # metadata until a durable projection watermark is available.
     from .client import _rejects_user_id_kwarg, mem_get_all
     try:
         raw = await asyncio.to_thread(
             mem.get_all, user_id=user_id,
-            filters={"attribute": attribute}, limit=50,
+            filters={"attribute": attribute}, limit=None,
         )
     except Exception as exc:
         if not (isinstance(exc, TypeError) or _rejects_user_id_kwarg(exc)):
@@ -785,7 +1114,7 @@ async def _get_facts_by_attribute(mem, user_id, attribute: str) -> list[dict]:
         # トップレベル user_id 非対応）→ user 全件 + Python フィルタ
         try:
             raw = await asyncio.to_thread(
-                mem_get_all, mem, user_id=user_id, limit=1000)
+                mem_get_all, mem, user_id=user_id, limit=None)
         except Exception as exc2:
             log.warning("attr conflict get_all fallback failed: %s", exc2)
             return []
@@ -844,6 +1173,7 @@ def _compare_typed_values_shadow(ex: dict, cand: dict, attr: str) -> None:
 
 async def _attribute_conflict_check(
     mem, user_id, kept: list[dict], *, exclude_ids: set,
+    base_meta: dict | None = None,
 ) -> list[tuple[str, str]]:
     """Phase A-3: 決定的 conflict ルート（embedding 距離に依存しない）。
 
@@ -885,6 +1215,9 @@ async def _attribute_conflict_check(
             ex_text = ex.get("memory") or ex.get("text") or ""
             if not ex_text or ex_text == cand_text:
                 continue
+            old_md, new_md = fact_metadata(ex), fact_metadata(f, base_meta)
+            if not can_supersede(old_md, new_md):
+                continue
             # Phase B+/v5: condition 互換判定。disjoint(別条件下=朝の habit vs
             # 夜の habit)なら矛盾ではないので archive しない。same/subset/
             # superset/unknown は重なりうるので conflict 判定へ進める。
@@ -897,7 +1230,9 @@ async def _attribute_conflict_check(
             # 将来 LLM 判定の置換可否を決める。今は挙動に影響させない）。
             _compare_typed_values_shadow(ex, f, attr)
             try:
-                cls = await classify_conflict(ex_text, cand_text)
+                cls = await classify_conflict(ex_text, cand_text,
+                                              existing_metadata=old_md,
+                                              candidate_metadata=new_md)
             except Exception as exc:
                 log.warning("attr conflict classify failed (non-fatal): %s", exc)
                 continue

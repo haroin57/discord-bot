@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio
+import math
 import re
 
 from .auth import get_auth_backend
@@ -220,7 +222,8 @@ _EXTRACT_PROMPT = """以下の会話ターンから、長期記憶として保�
 
 == その他のルール ==
 
-- 抽出対象は <user_text>(送信者本人の発話) と <assistant_text>(アシスタント応答内に出てくる本人状態)のみ
+- 抽出対象は <user_text>(送信者本人の発話)のみです。assistant_text は会話の参考であり、アシスタントの推測・提案・新規断定を本人の事実として保存しません。
+- 各 fact と relation に source_quote を付け、根拠となる user_text の連続した原文を引用してください。他者の引用、仮定、冗談、質問を本人の断定に変換しません。根拠がなければ出力しません。
 - <context_hint> の他者発話・参考情報は **絶対に fact 化しない**(speaker=='other' になる内容は不要)
 - **嗜好表明も拾う**: 「〜が好き」「〜をずっと聴いてる」「〜にハマってる」「〜が気になる」「〜を繰り返し見てる」等は preference fact として importance=2〜3 で抽出
 - **行動パターン・習慣も拾う**: 「最近〜してる」「毎日〜」「よく〜する」「〜を始めた」等
@@ -233,7 +236,7 @@ _EXTRACT_PROMPT = """以下の会話ターンから、長期記憶として保�
 - **記憶システム自体への自己言及は fact 化しない** (記憶グラフ / mention_count / co-occurrence weight / dedup / ベクトル検索 / FTS / BM25 / エンティティクラスタ 等、内部の記憶ストアの状態に関する記述)。これらは fact ではなくシステムのメタ情報。
    - ユーザー fact が記憶システムの言い回しで包まれている場合は、**システム言及を剥がしてユーザー fact だけ抽出する**:
      - 「AbletonでDTMしている。エンティティとして記録されており mention count 6」 → 「AbletonでDTMしている」(記憶システム部分は捨てる)
-     - 「作品Xが22件言及されており主要エンティティ」 → 「作品Xが好きでよく言及している」(weight/件数は捨てる)
+     - 「作品Xが22件言及されており主要エンティティ」だけでは好きという根拠にならないため、好みを推測して出力しない
    - 純粋にシステム状態のみ (「記憶グラフが100ノードに成長」「dedupを修正した」) なら fact ゼロで返す
 - importance < 2 は出力しない (ただし固有名詞 + 嗜好/行動/知識 はデフォルトで importance=2 以上で出すこと)
 - 1 fact は日本語 120字以内
@@ -413,7 +416,7 @@ def _normalize_value(raw) -> dict | None:
     if raw.get("type") != "quantity":
         return None
     v = raw.get("value")
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
         return None
     unit = raw.get("unit")
     if not isinstance(unit, str) or not unit.strip():
@@ -437,120 +440,201 @@ def _normalize_scope(raw) -> str:
     return s if s in _VALID_SCOPES else "global"
 
 
+def normalize_fact(raw: object, *, programmatic: bool = False) -> dict | None:
+    """Validate each item independently, including caller pre-extractions."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("text"), str):
+        return None
+    text = raw["text"].strip()
+    if not text or len(text) > 4000 or raw.get("speaker") != "self":
+        return None
+    try:
+        importance = int(raw.get("importance", 3))
+        tier = int(raw.get("tier") if raw.get("tier") is not None else 1)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not 0 <= importance <= 5 or not 0 <= tier <= 3:
+        return None
+    f = {**raw, "text": text, "importance": importance, "tier": tier}
+    if programmatic:
+        from .attribute_registry import observation_time, validate_effective_interval
+        try:
+            validate_effective_interval(f)
+            if "source_timestamp" in f and (isinstance(f["source_timestamp"], bool) or observation_time(f) is None):
+                return None
+            if "source_offset" in f and (isinstance(f["source_offset"], bool) or not isinstance(f["source_offset"], int)):
+                return None
+        except ValueError:
+            return None
+    else:
+        # LLM-generated calendar bounds are not a programmatic validity API.
+        for key in ("valid_from", "valid_to", "source_timestamp"):
+            f.pop(key, None)
+    f["attribute"] = _normalize_attribute(f.get("attribute"))
+    f["condition"] = _normalize_condition(f.get("condition"))
+    scope = f.get("scope")
+    # Explicit channel-bound scopes are valid for programmatic callers.
+    if isinstance(scope, str) and scope.startswith("conversation:"):
+        f["scope"] = scope
+    elif scope is not None and scope not in _VALID_SCOPES:
+        return None  # do not silently promote invalid scope to global
+    else:
+        f["scope"] = _normalize_scope(scope)
+    f["value"] = _normalize_value(f.get("value"))
+    tags = f.get("tags") or []
+    if isinstance(tags, str):
+        tags = tags.split(",")
+    f["tags"] = [t.strip()[:100] for t in tags if isinstance(t, str) and t.strip()][:20] if isinstance(tags, list) else []
+    entities = f.get("entities") or []
+    f["entities"] = [e for e in entities if isinstance(e, dict)
+                     and isinstance(e.get("name"), str) and e["name"].strip()
+                     and isinstance(e.get("type"), str)] if isinstance(entities, list) else []
+    return f
+
+
 async def extract_full_signals(
     user_text: str, assistant_text: str, context_hint: str = "",
     user_id: str | None = None, user_aliases: dict[str, str] | None = None,
 ) -> dict:
-    """Extract self facts AND entity-entity relations in a single LLM call.
-    Returns ``{"facts": [...], "relations": [...]}``.
+    """Bounded, grounded extraction with explicit partial/error outcomes.
 
-    ``user_aliases`` optionally maps nicknames/titles used in the caller's own
-    conversations (e.g. {"boss": "Jane Doe"}) to the canonical name the
-    extractor should use when it recognizes them — see
-    ``_format_alias_resolution``.
-
-    On any failure returns the empty shape ``{"facts": [], "relations": []}``
-    — callers (ingest, the thin extract_facts_for_self wrapper) just see
-    "nothing to insert" and move on. Relations are pre-validated against
-    a fixed rel_type vocabulary so a hallucinated edge type is dropped at
-    parse time rather than poisoning the graph.
+    Existing facts/relations consumers remain compatible. A recording caller
+    must not acknowledge status=partial/error as a successful empty extraction.
     """
-    empty = {"facts": [], "relations": []}
-    _VALID_REL_TYPES = {
-        "loves", "dislikes", "knows", "works_at", "lives_in",
-        "made_by", "is_about", "friend_of", "parent_of", "sibling_of",
-    }
+    user_text = user_text or ""
+    if not user_text.strip():
+        return {"facts": [], "relations": [], "status": "ok"}
+    budget = max(128, int(settings.MEM0_EXTRACT_INPUT_CHARS))
+    max_chunks = max(1, min(64, int(getattr(settings, "MEM0_EXTRACT_MAX_CHUNKS", 16))))
+    concurrency = max(1, min(4, int(getattr(settings, "MEM0_EXTRACT_CONCURRENCY", 2))))
+    attempts = max(1, min(3, int(getattr(settings, "MEM0_EXTRACT_MAX_ATTEMPTS", 2))))
+    # Overlap protects a fact split across a chunk boundary. Dedup below
+    # removes overlap copies without discarding distinct conditions.
+    overlap = min(200, budget // 8)
+    step = budget - overlap
+    chunks = []
+    offset = 0
+    while offset < len(user_text) and len(chunks) < max_chunks:
+        chunks.append((offset, user_text[offset:offset + budget]))
+        if offset + budget >= len(user_text):
+            break
+        offset += step
+    covered = min(len(user_text), chunks[-1][0] + len(chunks[-1][1]))
+    errors = ["input_exceeds_chunk_budget"] if covered < len(user_text) else []
     try:
         backend = get_auth_backend()
-        known_entities_body = _format_known_entities(user_id)
-        user_message = _EXTRACT_PROMPT.format(
+        known_entities = await asyncio.to_thread(_format_known_entities, user_id)
+    except Exception as exc:
+        return {"facts": [], "relations": [], "status": "error",
+                "error": f"extract_backend:{type(exc).__name__}", "retryable": True}
+    semaphore = asyncio.Semaphore(concurrency)
+    valid_rel_types = {"loves", "dislikes", "knows", "works_at", "lives_in",
+                       "made_by", "is_about", "friend_of", "parent_of", "sibling_of"}
+
+    async def one_chunk(start: int, chunk: str) -> dict:
+        prompt = _EXTRACT_PROMPT.format(
             context_hint=_strip_extract_breakout_tags(context_hint or "(none)")[:1000],
-            user_text=_strip_extract_breakout_tags(
-                user_text or "")[:settings.MEM0_EXTRACT_INPUT_CHARS],
+            user_text=_strip_extract_breakout_tags(chunk),
             assistant_text=_strip_extract_breakout_tags(assistant_text or "")[:2000],
-            known_entities=known_entities_body,
+            known_entities=known_entities,
             alias_resolution=_format_alias_resolution(user_aliases),
         )
-        task_prompt = (
-            "You extract self-attributable facts and entity-entity "
-            "relations from a conversation turn. Return JSON only."
-        )
+        fallback = None
+        retained_facts, retained_relations = {}, {}
+        failure = "extract_failed"
+        async with semaphore:
+            for _ in range(attempts):
+                try:
+                    raw = strip_json_fence(await backend.complete(
+                        system="Extract only user-grounded facts and relations. Every item needs an exact source_quote from user_text. Return JSON only.",
+                        user_message=prompt, model=settings.MEM0_GATE_MODEL,
+                        max_tokens=settings.MEM0_EXTRACT_MAX_TOKENS,
+                    ))
+                    truncated = False
+                    try:
+                        data = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        data = _salvage_facts(raw or "")
+                        truncated = True
+                    if not isinstance(data, dict) or not isinstance(data.get("facts"), list):
+                        failure = "invalid_extraction_schema"
+                        continue
+                    facts = []
+                    rejected = 0
+                    for item in data.get("facts", []):
+                        f = normalize_fact(item)
+                        if not f:
+                            rejected += 1
+                            continue
+                        quote = item.get("source_quote") or ""
+                        # A literal user fact is backwards-compatible with
+                        # older extractors; assistant-only claims cannot pass.
+                        if not quote and f["text"] in chunk:
+                            quote = f["text"]
+                        if not isinstance(quote, str) or not quote.strip() or quote not in chunk:
+                            rejected += 1
+                            continue
+                        f["source_quote"] = quote
+                        f["source_role"] = "user"
+                        f["source_offset"] = start + chunk.index(quote)
+                        facts.append(f)
+                    relations = []
+                    rels = data.get("relations") or []
+                    if isinstance(rels, list):
+                        for rel in rels[:5]:
+                            if not isinstance(rel, dict):
+                                continue
+                            src, dst, kind = (rel.get(k) for k in ("src", "dst", "rel_type"))
+                            quote = rel.get("source_quote")
+                            if (all(isinstance(v, str) and v.strip() for v in (src, dst, kind, quote))
+                                    and src != dst and kind in valid_rel_types and quote in chunk):
+                                relations.append({"src": src.strip(), "dst": dst.strip(),
+                                                  "rel_type": kind, "source_quote": quote,
+                                                  "source_role": "user"})
+                    latest_keys = {(f["text"], f.get("scope"), f.get("condition"), f.get("attribute")) for f in facts}
+                    previous_keys = set(retained_facts)
+                    for f in facts:
+                        retained_facts[f["text"], f.get("scope"), f.get("condition"), f.get("attribute")] = f
+                    for rel in relations:
+                        retained_relations[rel["src"], rel["rel_type"], rel["dst"], rel["source_quote"]] = rel
+                    result = {"facts": list(retained_facts.values()), "relations": list(retained_relations.values()), "rejected": rejected}
+                    if truncated:
+                        fallback = result
+                        failure = "truncated_extraction"
+                        continue
+                    # A schema-invalid/ungrounded output is not successful
+                    # empty extraction; retry it without losing valid siblings.
+                    if rejected:
+                        fallback = result
+                        failure = "invalid_or_ungrounded_facts"
+                        continue
+                    if previous_keys - latest_keys:
+                        result["error"] = "inconsistent_extraction_retry"
+                    return result
+                except Exception as exc:
+                    failure = f"extract_transport:{type(exc).__name__}"
+            return {**(fallback or {"facts": [], "relations": []}), "error": failure}
 
-        # The extractor occasionally returns JSON cut off mid-stream (max_tokens
-        # or a degraded-token response). Rather than drop the whole batch we
-        # (1) salvage every complete fact object from the partial JSON, and
-        # (2) if nothing is salvageable, retry once with a fresh call. Only when
-        # both fail do we give up.
-        data = None
-        _MAX_ATTEMPTS = 2
-        for attempt in range(_MAX_ATTEMPTS):
-            text = strip_json_fence(await backend.complete(
-                system=task_prompt,
-                user_message=user_message,
-                model=settings.MEM0_GATE_MODEL,
-                max_tokens=settings.MEM0_EXTRACT_MAX_TOKENS,
-            ))
-            if not text:
-                log.warning(
-                    "extract_full_signals: empty completion (attempt=%d)",
-                    attempt + 1,
-                )
-                continue  # retry on an empty response
-            try:
-                data = json.loads(text)
-                break  # clean parse — done
-            except json.JSONDecodeError as exc:
-                salvaged = _salvage_facts(text)
-                if salvaged["facts"]:
-                    log.warning(
-                        "extract_full_signals: JSON truncated (%s) — salvaged %d facts",
-                        exc, len(salvaged["facts"]),
-                    )
-                    data = salvaged
-                    break
-                log.warning(
-                    "extract_full_signals: JSON parse failed (%s, attempt=%d); text_tail=%r",
-                    exc, attempt + 1, text[-200:],
-                )
-                continue  # nothing salvageable — retry
-        if data is None:
-            return empty
-        facts_raw = data.get("facts", [])
-        if not facts_raw and (user_text or "").strip():
-            log.info(
-                "extract_full_signals: returned 0 facts "
-                "(user_text=%r, assistant_text=%r, raw_resp=%r)",
-                (user_text or "")[:160],
-                (assistant_text or "")[:160],
-                text[:400],
-            )
-        facts = []
-        for f in facts_raw:
-            if not (isinstance(f, dict) and f.get("speaker") == "self" and f.get("text")):
-                continue
-            # attribute / condition / scope / value を正規化。
-            f["attribute"] = _normalize_attribute(f.get("attribute"))
-            f["condition"] = _normalize_condition(f.get("condition"))
-            f["scope"] = _normalize_scope(f.get("scope"))
-            f["value"] = _normalize_value(f.get("value"))
-            facts.append(f)
-        relations_raw = data.get("relations") or []
-        # Validate + clamp at the caller — defense in depth.
-        relations: list[dict] = []
-        if isinstance(relations_raw, list):
-            for rel in relations_raw[:5]:  # hard cap, the prompt already says 0-3
-                if not isinstance(rel, dict):
-                    continue
-                src = (rel.get("src") or "").strip()
-                dst = (rel.get("dst") or "").strip()
-                rt = (rel.get("rel_type") or "").strip()
-                if src and dst and rt in _VALID_REL_TYPES and src != dst:
-                    relations.append({"src": src, "rel_type": rt, "dst": dst})
-        return {"facts": facts, "relations": relations}
-    except Exception as exc:
-        log.warning("extract_full_signals failed: %s", exc)
-        return empty
-
+    outcomes = await asyncio.gather(*(one_chunk(start, chunk) for start, chunk in chunks))
+    facts, relations, seen, seen_rel = [], [], set(), set()
+    for outcome in outcomes:
+        if outcome.get("error"):
+            errors.append(outcome["error"])
+        for f in outcome["facts"]:
+            key = (f["text"], f.get("scope"), f.get("condition"), f.get("attribute"))
+            if key not in seen:
+                seen.add(key)
+                facts.append(f)
+        for rel in outcome["relations"]:
+            key = (rel["src"], rel["rel_type"], rel["dst"], rel["source_quote"])
+            if key not in seen_rel:
+                seen_rel.add(key)
+                relations.append(rel)
+    result = {"facts": facts, "relations": relations, "status": "ok",
+              "chunks": len(chunks), "covered_chars": covered, "input_chars": len(user_text)}
+    if errors:
+        result.update(status="partial" if facts or relations else "error",
+                      error=";".join(sorted(set(errors))), retryable=True)
+    return result
 
 async def extract_facts_for_self(
     user_text: str, assistant_text: str, context_hint: str = "",

@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from collections import OrderedDict
 
 from config import (
@@ -300,12 +301,16 @@ def append_jsonl(channel_id: int, entry: dict) -> None:
         if role and content:
             from services.mem0 import history_index
 
+            identity = {}
+            if getattr(history_index, "__name__", "").startswith("llm_mem0."):
+                identity = {key: str(entry.get(key) or "") for key in ("author_id", "source_id")}
             history_index.index_line(
                 channel_id,
                 entry.get("timestamp", ""),
                 role,
                 content,
                 author=entry.get("author", ""),
+                **identity,
             )
     except Exception as exc:
         log.warning("history index update failed (non-fatal): %s", exc)
@@ -324,12 +329,16 @@ def append_jsonl(channel_id: int, entry: dict) -> None:
             if role and content:
                 from services.mem0 import history_embed
 
+                identity = {}
+                if getattr(history_embed, "__name__", "").startswith("llm_mem0."):
+                    identity = {key: str(entry.get(key) or "") for key in ("author_id", "source_id")}
                 history_embed.index_line(
                     channel_id,
                     entry.get("timestamp", ""),
                     role,
                     entry.get("author", ""),
                     content,
+                    **identity,
                 )
     except Exception as exc:
         log.warning("history embed update failed (non-fatal): %s", exc)
@@ -499,6 +508,8 @@ def build_compact_history_entries(
     *,
     previous_context_snapshot: str = "",
     author: str = "",
+    author_id: str = "",
+    source_id: str = "",
     api_messages: list[dict] | None = None,
 ) -> tuple[dict, dict]:
     """Build the user+assistant JSONL pair without re-saving the full prompt.
@@ -534,6 +545,12 @@ def build_compact_history_entries(
     cleaned_author = _clean_author_label(author) if author else ""
     if cleaned_author:
         user_entry["author"] = cleaned_author
+    if author_id:
+        user_entry["author_id"] = str(author_id)
+    # IDs identify local transcript evidence, not fabricated Discord message
+    # URLs. A shared turn prefix also lets replay pair concurrent speakers.
+    source_id = source_id or f"transcript:{uuid.uuid4().hex}"
+    user_entry["source_id"] = f"{source_id}:user"
     if snapshot:
         user_entry["context_snapshot"] = _compact_text(
             snapshot, COMPACT_HISTORY_CONTEXT_SNAPSHOT_CHARS
@@ -550,6 +567,7 @@ def build_compact_history_entries(
     assistant_entry: dict = {
         "role": "assistant",
         "content": _compact_text(assistant_display, COMPACT_HISTORY_ASSISTANT_CHARS),
+        "source_id": f"{source_id}:assistant",
     }
     if api_messages:
         prepared = _prepare_api_messages(api_messages)

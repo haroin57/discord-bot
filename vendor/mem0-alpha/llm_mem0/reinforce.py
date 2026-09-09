@@ -24,9 +24,8 @@ reinforcement_boost() below — importance and "familiarity" are different
 axes even in human memory (a well-rehearsed trivial fact isn't thereby
 more *important*).
 
-Concurrent reinforcement (two workers hitting the same memory simultaneously)
-may lose at most one increment; acceptable for a single-process host whose
-batch ingest path is sequential per fact.
+Metadata mutations are serialized across threads and cooperating processes
+sharing STATE_DIR. Writers must use the same mutation helper to participate.
 """
 
 from __future__ import annotations
@@ -35,6 +34,11 @@ import asyncio
 import logging
 import math
 import time
+import hashlib
+import json
+import threading
+from pathlib import Path
+from contextlib import contextmanager
 
 from .settings import settings
 
@@ -51,66 +55,106 @@ MAX_IMPORTANCE = 5
 # settings.MEM0_RECALL_REINFORCE_MIN_INTERVAL_SEC (read per call).
 RECALL_REINFORCE_MIN_INTERVAL_SEC = settings.MEM0_RECALL_REINFORCE_MIN_INTERVAL_SEC
 
+_MUTATION_LOCKS = [threading.RLock() for _ in range(128)]
 
-def reinforce_existing_sync(mem, memory_id: str) -> bool:
-    """Synchronous reinforcement. Designed to be wrapped with asyncio.to_thread.
 
-    Mem0 SDK's ``mem.update(memory_id, data, metadata=...)`` *partially*
-    updates metadata (fields not specified are preserved), but the ``data``
-    argument is required. We re-pass the existing memory text unchanged —
-    that re-embeds the fact (~1 embedding call, negligible cost) but keeps
-    the row in place.
+@contextmanager
+def memory_mutation_lock(memory_id: str):
+    """Bounded lock files; never hold this synchronous lock on the event loop."""
+    import fcntl
+    stripe = int(hashlib.sha256(str(memory_id).encode()).hexdigest()[:8], 16) % 128
+    directory = Path(settings.STATE_DIR) / "memory_mutation_locks"
+    directory.mkdir(parents=True, exist_ok=True)
+    with _MUTATION_LOCKS[stripe], (directory / f"{stripe}.lock").open("a+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
-    Returns True if metadata was updated, False on any failure (fail-open
-    means dedup still drops the candidate; we just lose the mention count
-    increment for that one occurrence).
+
+def mutate_memory_metadata_sync(mem, memory_id: str, mutation) -> bool:
+    """Fresh read + metadata-preserving update under a shared writer lock.
+
+    mutation receives the fresh row and returns a metadata patch or None.
+    The SDK may replace metadata rather than merge it, so pass the full map.
     """
-    if not memory_id:
-        return False
-    try:
+    with memory_mutation_lock(memory_id):
         existing = mem.get(memory_id)
-    except Exception as exc:
-        log.warning("reinforce: get(%s) failed: %s", memory_id, exc)
-        return False
-    if not isinstance(existing, dict):
-        return False
-
-    existing_meta = existing.get("metadata") or {}
-    existing_text = existing.get("memory") or existing.get("text") or ""
-    if not existing_text:
-        return False
-
-    now = int(time.time())
-    history = list(existing_meta.get("reinforced_at") or [])
-    history.append(now)
-    history = history[-MAX_REINFORCED_HISTORY:]
-    try:
-        cur_mention = int(existing_meta.get("mention_count", 1))
-    except (TypeError, ValueError):
-        cur_mention = 1
-
-    # Only specify the fields we're changing — Mem0 preserves the rest.
-    # importance is intentionally absent: see the module docstring for why
-    # frequency must not feed back into the LLM-assigned importance score.
-    partial = {
-        "mention_count": cur_mention + 1,
-        "reinforced_at": history,
-        "last_reinforced_at": now,
-    }
-
-    try:
-        mem.update(memory_id=memory_id, data=existing_text, metadata=partial)
+        if not isinstance(existing, dict):
+            return False
+        text = existing.get("memory") or existing.get("text") or ""
+        if not isinstance(text, str) or not text:
+            return False
+        partial = mutation(existing)
+        if partial is None:
+            return False
+        metadata = {**(existing.get("metadata") or {}), **partial}
+        mem.update(memory_id=memory_id, data=text, metadata=metadata)
+        from .search import invalidate_core_cache
+        invalidate_core_cache(existing.get("user_id") or metadata.get("user_id"))
         return True
+
+
+def _reinforce_locked(mem, memory_id: str, *, recall: bool, event_id: str | None = None,
+                      source_timestamp=None) -> bool:
+    def mutation(existing):
+        md = existing.get("metadata") or {}
+        now = int(time.time())
+        try:
+            if md.get("valid_to") is not None and float(md["valid_to"]) <= now:
+                return None
+        except (TypeError, ValueError):
+            return None
+        events = md.get("reinforced_event_ids", "[]")
+        try:
+            events = json.loads(events) if isinstance(events, str) else events
+        except (ValueError, TypeError):
+            events = []
+        events = events if isinstance(events, list) else []
+        # The origin event is already counted by the original insertion.
+        if event_id and (event_id in events or event_id in (md.get("request_id"), md.get("batch_id"))):
+            return None
+        if recall:
+            try:
+                last = int(md.get("last_recalled_at") or 0)
+            except (ValueError, TypeError):
+                last = 0
+            if last and now - last < settings.MEM0_RECALL_REINFORCE_MIN_INTERVAL_SEC:
+                return None
+        field = "recall_count" if recall else "mention_count"
+        try:
+            count = max(0, int(md.get(field, 0 if recall else 1)))
+        except (ValueError, TypeError):
+            count = 0 if recall else 1
+        history = md.get("reinforced_at")
+        history = list(history) if isinstance(history, list) else []
+        partial = {field: count + 1, "reinforced_at": (history + [now])[-MAX_REINFORCED_HISTORY:],
+                   "last_reinforced_at": now}
+        if recall:
+            partial["last_recalled_at"] = now
+        if event_id:
+            partial["reinforced_event_ids"] = json.dumps((events + [event_id])[-128:])
+        if not recall and source_timestamp is not None and not isinstance(source_timestamp, bool):
+            from .attribute_registry import observation_time
+            incoming = observation_time({"source_timestamp": source_timestamp})
+            previous = observation_time(md)
+            if incoming is not None:
+                partial["user_confirmed_at"] = max(incoming, previous) if previous is not None else incoming
+        return partial
+    try:
+        return mutate_memory_metadata_sync(mem, memory_id, mutation) if memory_id else False
     except Exception as exc:
-        log.warning("reinforce: update(%s) failed: %s", memory_id, exc)
+        log.warning("reinforcement failed (%s): %s", memory_id, exc)
         return False
 
 
-async def reinforce_existing(mem, memory_id: str) -> bool:
-    """Async wrapper around the sync helper, for ingest call sites that
-    already live in an event loop."""
-    return await asyncio.to_thread(reinforce_existing_sync, mem, memory_id)
+def reinforce_existing_sync(mem, memory_id: str, *, event_id: str | None = None, source_timestamp=None) -> bool:
+    """Serialize mention reinforcement; redelivery of an event is a no-op."""
+    return _reinforce_locked(mem, memory_id, recall=False, event_id=event_id, source_timestamp=source_timestamp)
 
+async def reinforce_existing(mem, memory_id: str, *, event_id: str | None = None, source_timestamp=None) -> bool:
+    return await asyncio.to_thread(reinforce_existing_sync, mem, memory_id, event_id=event_id, source_timestamp=source_timestamp)
 
 # ---------------------------------------------------------------------------
 # Recall-time reinforcement (testing effect) — Phase ①
@@ -125,74 +169,8 @@ async def reinforce_existing(mem, memory_id: str) -> bool:
 
 
 def reinforce_on_recall_sync(mem, memory_id: str) -> bool:
-    """Testing-effect reinforcement: bump a fact that was actually surfaced
-    to the model (present in search_memories_smart's final result set), as
-    opposed to reinforce_existing_sync above which only fires when a
-    near-duplicate is caught at *ingest* time.
-
-    In human memory, retrieval practice is itself a strengthening event —
-    often a stronger one than passive re-exposure (the "testing effect").
-    ACT-R's base-level activation formula (reinforcement_boost below) treats
-    every presentation uniformly, so recall needs to append to the same
-    reinforced_at history ingest-time reinforcement uses, or the activation
-    estimate silently ignores half of a fact's real exposure history.
-
-    Uses ``recall_count`` (not ``mention_count``) so the two exposure
-    channels — "said again" vs. "successfully retrieved" — stay
-    distinguishable for anyone inspecting metadata later.
-
-    Rate-limited via ``last_recalled_at`` /
-    ``settings.MEM0_RECALL_REINFORCE_MIN_INTERVAL_SEC`` (see module comment
-    above). Returns False (no-op) both on a too-soon call and on any
-    failure — recall reinforcement is best-effort and must never be allowed
-    to slow down or break a search request.
-    """
-    if not memory_id:
-        return False
-    try:
-        existing = mem.get(memory_id)
-    except Exception as exc:
-        log.warning("recall-reinforce: get(%s) failed: %s", memory_id, exc)
-        return False
-    if not isinstance(existing, dict):
-        return False
-    existing_meta = existing.get("metadata") or {}
-    existing_text = existing.get("memory") or existing.get("text") or ""
-    if not existing_text:
-        return False
-
-    now = int(time.time())
-    try:
-        last_recalled = int(existing_meta.get("last_recalled_at") or 0)
-    except (TypeError, ValueError):
-        last_recalled = 0
-    min_interval = settings.MEM0_RECALL_REINFORCE_MIN_INTERVAL_SEC
-    if last_recalled and (now - last_recalled) < min_interval:
-        return False
-
-    history = list(existing_meta.get("reinforced_at") or [])
-    history.append(now)
-    history = history[-MAX_REINFORCED_HISTORY:]
-    try:
-        cur_recall = int(existing_meta.get("recall_count", 0))
-    except (TypeError, ValueError):
-        cur_recall = 0
-
-    # importance is never touched here either — see reinforce_existing_sync /
-    # the module docstring.
-    partial = {
-        "recall_count": cur_recall + 1,
-        "reinforced_at": history,
-        "last_reinforced_at": now,
-        "last_recalled_at": now,
-    }
-    try:
-        mem.update(memory_id=memory_id, data=existing_text, metadata=partial)
-        return True
-    except Exception as exc:
-        log.warning("recall-reinforce: update(%s) failed: %s", memory_id, exc)
-        return False
-
+    """Atomically enforce recall spacing and preserve unrelated metadata."""
+    return _reinforce_locked(mem, memory_id, recall=True)
 
 async def reinforce_on_recall(mem, memory_id: str) -> bool:
     """Async wrapper around reinforce_on_recall_sync."""

@@ -40,8 +40,10 @@ neither can destroy information, unlike decay.py's gist compression.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import weakref
 from pathlib import Path
 
 from .atomic_write import atomic_write_json
@@ -49,6 +51,14 @@ from .llm import complete_json, escape_braces
 from .settings import settings
 
 log = logging.getLogger(__name__)
+_replay_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _ingest_complete(result) -> bool:
+    if not isinstance(result, dict) or result.get("error") or result.get("failed"):
+        return False
+    return (result.get("status") == "ok"
+            or ("status" not in result and isinstance(result.get("results"), list)))
 
 
 # ---------------------------------------------------------------------------
@@ -109,60 +119,77 @@ def _pair_turns(lines: list[dict]) -> tuple[list[tuple[str, str]], str]:
 async def replay_channel_history(
     channel_id: int, user_id: str, *, max_turns: int | None = None, dry_run: bool = True,
 ) -> dict:
-    """Re-run fact extraction over old history for one channel, walking
-    forward from a per-channel cursor (persisted in
-    ``STATE_DIR/replay_cursor.json``) so repeated nightly runs make forward
-    progress through a backlog instead of reprocessing the same window.
+    """Replay attributable turns with a durable (timestamp,row ID) cursor.
 
-    Returns ``{"turns_processed": int, "facts_kept": int, "cursor_advanced_to": str}``.
-    In dry-run the cursor is never advanced (a failed/aborted dry-run run
-    must not silently skip a window on the next real run).
+    Cursors belong to (channel,user), in the history SQLite database. Legacy
+    channel-only JSON cursors cannot establish ownership and are not imported.
+    Unknown authors are explicitly counted, never guessed from display names.
     """
     from . import history_index
     from .ingest import add_memories
 
     if max_turns is None:
         max_turns = settings.MEM0_REPLAY_MAX_TURNS_PER_RUN
-
-    cursor = _load_cursor()
-    since_ts = cursor.get(str(channel_id), "")
-    lines = await asyncio.to_thread(
-        history_index.get_lines_since, channel_id, since_ts, max(max_turns * 4, 1),
-    )
-    turns, last_ts = _pair_turns(lines)
-    turns = turns[:max_turns]
-
-    processed = 0
-    facts_kept = 0
-    for user_text, assistant_text in turns:
-        processed += 1
-        if dry_run:
-            continue
-        try:
-            result = await add_memories(
-                user_text=user_text, assistant_text=assistant_text, user_id=user_id,
-                metadata={"source": "replay", "channel_id": channel_id},
-            )
-        except Exception as exc:
-            log.warning("replay: add_memories failed (non-fatal): %s", exc)
-            continue
-        if isinstance(result, dict):
-            facts_kept += result.get("kept", 0) or 0
-
-    log.info(
-        "[REPLAY channel=%s user=...%s turns=%d kept=%d dry_run=%s]",
-        channel_id, str(user_id)[-4:], processed, facts_kept, dry_run,
-    )
-
-    if not dry_run and last_ts and last_ts != since_ts:
-        cursor[str(channel_id)] = last_ts
-        _save_cursor(cursor)
-
-    return {
-        "turns_processed": processed,
-        "facts_kept": facts_kept,
-        "cursor_advanced_to": last_ts if not dry_run else since_ts,
-    }
+    if not user_id or not isinstance(max_turns, int) or max_turns < 0:
+        raise ValueError("user_id and nonnegative max_turns are required")
+    loop = asyncio.get_running_loop()
+    locks = _replay_locks.setdefault(loop, [asyncio.Lock() for _ in range(64)])
+    key = f"{settings.STATE_DIR}:{channel_id}:{user_id}"
+    stripe = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) % len(locks)
+    async with locks[stripe]:
+        cursor = await asyncio.to_thread(history_index.get_replay_cursor, channel_id, user_id)
+        summary = {"turns_processed": 0, "facts_kept": 0, "skipped_ambiguous": 0,
+                   "skipped_other_author": 0, "failed": 0,
+                   "cursor_advanced_to": cursor[0], "cursor_row_id": cursor[1]}
+        if max_turns == 0:
+            return summary
+        lines = await asyncio.to_thread(history_index.get_lines_since, channel_id, cursor[0],
+                                        max_turns * 4 + 1, since_row_id=cursor[1])
+        i = 0
+        while i < len(lines) and summary["turns_processed"] < max_turns:
+            line = lines[i]
+            end = line
+            i += 1
+            if line["role"] == "user":
+                author_id = line.get("author_id")
+                if not author_id:
+                    summary["skipped_ambiguous"] += 1
+                elif str(author_id) != str(user_id):
+                    summary["skipped_other_author"] += 1
+                else:
+                    assistant_text = ""
+                    source_id = line.get("source_id") or ""
+                    if (i < len(lines) and lines[i]["role"] == "assistant"
+                            and source_id.endswith(":user")
+                            and lines[i].get("source_id") == source_id[:-5] + ":assistant"):
+                        end = lines[i]
+                        assistant_text = end["text"]
+                        i += 1
+                    if not dry_run:
+                        source_id = line.get("source_id") or f"history:{channel_id}:{line['row_id']}"
+                        request_id = "replay:" + hashlib.sha256(
+                            f"{channel_id}:{user_id}:{source_id}:{line['ts']}".encode()).hexdigest()
+                        try:
+                            result = await add_memories(
+                                user_text=line["text"], assistant_text=assistant_text, user_id=user_id,
+                                metadata={"source": "replay", "channel_id": channel_id,
+                                          "source_author_id": str(user_id),
+                                          "source_message_ids": json.dumps([source_id]),
+                                          "source_timestamp": line["ts"], "request_id": request_id},
+                            )
+                        except Exception as exc:
+                            log.warning("replay ingestion failed: %s", exc)
+                            result = None
+                        if not _ingest_complete(result):
+                            summary["failed"] += 1
+                            break
+                        summary["facts_kept"] += result.get("kept", 0) or 0
+                    summary["turns_processed"] += 1
+            if not dry_run:
+                await asyncio.to_thread(history_index.advance_replay_cursor, channel_id, user_id,
+                                        end["ts"], end["row_id"])
+                summary["cursor_advanced_to"], summary["cursor_row_id"] = end["ts"], end["row_id"]
+        return summary
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +219,7 @@ async def _generate_schema_facts(instance_texts: list[str]) -> list[str]:
     overgeneralization inserted into long-term memory is much harder to
     undo."""
     facts_block = "\n".join(
-        f"- {escape_braces(t, limit=200)}" for t in instance_texts
+        f"- {escape_braces(t, limit=len(t))}" for t in instance_texts
     )
     data = await complete_json(
         system=(
@@ -208,12 +235,20 @@ async def _generate_schema_facts(instance_texts: list[str]) -> list[str]:
     if not isinstance(data, dict):
         return []
     out = []
-    for item in data.get("schemas", []):
+    schemas = data.get("schemas")
+    if not isinstance(schemas, list):
+        return []
+    for item in schemas:
         if not isinstance(item, dict):
             continue
-        t = (item.get("text") or "").strip()
-        if t and item.get("confidence") in ("high", "medium"):
+        t = item.get("text")
+        if not isinstance(t, str):
+            continue
+        t = t.strip()
+        if 0 < len(t) <= 120 and t not in out and item.get("confidence") in ("high", "medium"):
             out.append(t)
+            if len(out) >= len(instance_texts):
+                break
     return out
 
 
@@ -247,7 +282,10 @@ async def abstract_schemas_for_user(
         md = r.get("metadata") or {}
         if not isinstance(md, dict):
             continue
-        if md.get("valid_to") or md.get("gist_of") or "schema" in (md.get("tags") or ""):
+        tags = md.get("tags") or ""
+        if not isinstance(tags, (str, list)):
+            continue
+        if md.get("valid_to") or md.get("gist_of") or "schema" in tags:
             continue
         fid = r.get("id")
         if not fid:
@@ -256,13 +294,19 @@ async def abstract_schemas_for_user(
         if not entities:
             continue
         key_entity = max(entities, key=lambda e: e.mention_count)
-        key = (md.get("category"), md.get("subcategory"), key_entity.type)
+        scope, condition = md.get("scope") or "global", md.get("condition") or ""
+        if not isinstance(scope, str) or not isinstance(condition, str):
+            continue
+        category, subcategory = md.get("category") or "meta", md.get("subcategory") or ""
+        if not isinstance(category, str) or not isinstance(subcategory, str):
+            continue
+        key = (category, subcategory, key_entity.type, scope, condition)
         by_entity = groups.setdefault(key, {})
         by_entity.setdefault(key_entity.id, r)
 
     result = {"groups_checked": 0, "schemas_created": 0}
     eligible = {k: v for k, v in groups.items() if len(v) >= min_entities}
-    for key, by_entity in list(eligible.items())[:max_groups]:
+    for key, by_entity in list(eligible.items())[:max(0, max_groups)]:
         result["groups_checked"] += 1
         members = list(by_entity.values())
         texts = [t for t in (m.get("memory") or m.get("text") or "" for m in members) if t]
@@ -280,13 +324,13 @@ async def abstract_schemas_for_user(
             result["schemas_created"] += len(schema_texts)
             continue
 
-        category, subcategory, _etype = key
+        category, subcategory, _etype, scope, condition = key
         for schema_text in schema_texts:
             fact = {
                 "speaker": "self", "text": schema_text, "importance": 3,
                 "category": category or "meta", "subcategory": subcategory or "",
-                "tags": ["schema"], "attribute": "", "condition": "",
-                "scope": "global", "entities": [],
+                "tags": ["schema"], "attribute": "", "condition": condition,
+                "scope": scope, "entities": [],
             }
             try:
                 res = await add_memories(
@@ -299,6 +343,6 @@ async def abstract_schemas_for_user(
             except Exception as exc:
                 log.warning("schema insert failed (non-fatal): %s", exc)
                 continue
-            if isinstance(res, dict):
+            if _ingest_complete(res):
                 result["schemas_created"] += res.get("kept", 0) or 0
     return result

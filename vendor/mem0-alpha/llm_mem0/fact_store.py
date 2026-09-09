@@ -73,7 +73,7 @@ def record_fact(
     extractor_version: str | None = None,
     supersedes: str | None = None,
 ) -> bool:
-    """attribute 付き fact を登録（INSERT OR REPLACE — 再 ingest に冪等）。
+    """attribute 付き fact を登録し、再登録時も有効期間と訂正履歴を保持する。
 
     supersedes を渡すと旧 fact 側の superseded_by / status も同時更新する。
     失敗は False（呼び元は best-effort、正本の Chroma insert は既に済んでいる）。
@@ -83,13 +83,28 @@ def record_fact(
     now = int(time.time())
 
     def _record(c) -> bool:
+        previous = c.execute("SELECT * FROM facts WHERE fact_id=?", (fact_id,)).fetchone()
+        if previous and (previous["user_id"], previous["attribute"]) != (user_id, attribute):
+            return False
+        if supersedes:
+            old = c.execute("SELECT * FROM facts WHERE fact_id=?", (supersedes,)).fetchone()
+            if supersedes == fact_id or (old and (
+                old["user_id"], old["attribute"], old["scope"] or "", old["condition"] or ""
+            ) != (user_id, attribute, scope, condition)):
+                return False
         c.execute(
-            """INSERT OR REPLACE INTO facts
+            """INSERT INTO facts
                (fact_id, user_id, attribute, value_text, value_json,
                 condition, scope, valid_from, valid_to, status,
                 source_conversation_id, extractor_version,
                 supersedes, superseded_by, created_at)
-               VALUES (?,?,?,?,?,?,?,?,NULL,'active',?,?,?,NULL,?)""",
+               VALUES (?,?,?,?,?,?,?,?,NULL,'active',?,?,?,NULL,?)
+               ON CONFLICT(fact_id) DO UPDATE SET
+                   value_text=excluded.value_text, value_json=excluded.value_json,
+                   condition=excluded.condition, scope=excluded.scope,
+                   source_conversation_id=COALESCE(excluded.source_conversation_id, facts.source_conversation_id),
+                   extractor_version=COALESCE(excluded.extractor_version, facts.extractor_version),
+                   supersedes=COALESCE(facts.supersedes, excluded.supersedes)""",
             (fact_id, user_id, attribute, value_text[:_VALUE_TEXT_MAX_CHARS],
              value_json, condition, scope, now,
              source_conversation_id, extractor_version, supersedes, now),
@@ -97,7 +112,7 @@ def record_fact(
         if supersedes:
             c.execute(
                 """UPDATE facts SET superseded_by=?, status='superseded',
-                   valid_to=? WHERE fact_id=? AND superseded_by IS NULL""",
+                   valid_to=COALESCE(valid_to, ?) WHERE fact_id=? AND superseded_by IS NULL""",
                 (fact_id, now, supersedes),
             )
         return True
@@ -115,15 +130,28 @@ def supersede_fact(old_fact_id: str, new_fact_id: str | None = None) -> bool:
     now = int(time.time())
 
     def _supersede(c) -> bool:
-        c.execute(
-            """UPDATE facts SET status='superseded', valid_to=?,
-               superseded_by=COALESCE(?, superseded_by)
+        if new_fact_id == old_fact_id:
+            return False
+        if new_fact_id:
+            rows = c.execute("SELECT user_id, attribute, scope, condition FROM facts WHERE fact_id IN (?,?)",
+                             (old_fact_id, new_fact_id)).fetchall()
+            if len(rows) == 2 and tuple(rows[0]) != tuple(rows[1]):
+                return False
+        cursor = c.execute(
+            """UPDATE facts SET status='superseded', valid_to=COALESCE(valid_to, ?),
+               superseded_by=COALESCE(superseded_by, ?)
                WHERE fact_id=?""",
             (now, new_fact_id, old_fact_id),
         )
-        return True
+        return cursor.rowcount > 0
 
     return bool(_store.write(_supersede, what="supersede_fact", default=False))
+
+
+def remove_fact(fact_id: str) -> int:
+    """Remove the derived body as part of explicit deletion of its source."""
+    return _store.write(lambda c: c.execute("DELETE FROM facts WHERE fact_id=?", (fact_id,)).rowcount,
+                        what="remove_fact", default=0) or 0
 
 
 def get_active_facts(user_id: str, attribute: str) -> list[dict]:

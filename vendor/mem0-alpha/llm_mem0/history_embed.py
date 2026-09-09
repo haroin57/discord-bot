@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import threading
 
 from .settings import settings
@@ -32,7 +31,7 @@ def _enabled() -> bool:
 
 
 def _get_collection():
-    """Lazily get/create the raw-transcript collection (cosine, OpenAI embeds).
+    """Reuse Mem0's configured server/embedded client and embedding provider.
 
     Reuses the same ChromaDB server + embedding model as Mem0 so the vectors
     are comparable. Cached for the process (double-checked lock so two
@@ -43,27 +42,33 @@ def _get_collection():
     with _state_lock:
         if _state["col"] is not None:
             return _state["col"]
-        import chromadb
-        from chromadb.utils import embedding_functions
-
-        ef = embedding_functions.OpenAIEmbeddingFunction(
-            api_key=os.environ.get("OPENAI_API_KEY"),
-            model_name=settings.MEM0_EMBEDDER_MODEL,
-        )
-        client = chromadb.HttpClient(
-            host=settings.CHROMA_HOST, port=settings.CHROMA_PORT,
-        )
-        _state["col"] = client.get_or_create_collection(
+        from .client import _get_mem0
+        mem = _get_mem0()
+        if mem is None:
+            raise RuntimeError("memory store unavailable")
+        _state["col"] = mem.vector_store.client.get_or_create_collection(
             name=_COLLECTION_NAME,
-            embedding_function=ef,
+            embedding_function=None,
             metadata={"hnsw:space": "cosine"},
         )
     return _state["col"]
 
 
-def _line_id(channel_id, ts: str, role: str, text: str) -> str:
-    h = hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:12]
+def _line_id(channel_id, ts: str, role: str, text: str, *, author: str = "",
+             author_id: str = "", source_id: str = "") -> str:
+    if source_id:
+        identity = f"{channel_id}:{role}:{author_id}:{source_id}"
+        return "source:" + hashlib.sha256(identity.encode()).hexdigest()
+    h = hashlib.sha256(f"{author_id}:{author}:{text or ''}".encode()).hexdigest()[:24]
     return f"{channel_id}:{ts}:{role}:{h}"
+
+
+def _embed(text: str, action: str):
+    from .client import _get_mem0
+    mem = _get_mem0()
+    if mem is None:
+        raise RuntimeError("memory store unavailable")
+    return mem.embedding_model.embed(text, action)
 
 
 def safe_text(text: str) -> str:
@@ -75,7 +80,8 @@ def safe_text(text: str) -> str:
     return (text or "")[:settings.MEM0_HISTORY_EMBED_MAX_CHARS]
 
 
-def index_line(channel_id, ts: str, role: str, author: str, text: str) -> None:
+def index_line(channel_id, ts: str, role: str, author: str, text: str, *,
+               author_id: str = "", source_id: str = "") -> None:
     """Embed + upsert one raw transcript line. No-op when disabled/empty.
 
     upsert (not add) so re-indexing the same line is idempotent — the id is
@@ -89,13 +95,16 @@ def index_line(channel_id, ts: str, role: str, author: str, text: str) -> None:
     try:
         col = _get_collection()
         col.upsert(
-            ids=[_line_id(channel_id, ts, role, text)],
+            ids=[_line_id(channel_id, ts, role, text, author=author,
+                          author_id=author_id, source_id=source_id)],
             documents=[safe_text(text)],
+            embeddings=[_embed(safe_text(text), "add")],
             metadatas=[{
                 "channel_id": str(channel_id),
                 "ts": ts or "",
                 "role": role or "",
                 "author": author or "",
+                "author_id": str(author_id or ""), "source_id": str(source_id or ""),
             }],
         )
     except Exception as exc:  # best-effort: never break the caller
@@ -106,15 +115,15 @@ def search_semantic(query: str, channel_id, limit: int | None = None) -> list[di
     """Cosine search over this channel's raw lines. Returns mem.get-shaped dicts
     ``{memory, ts, role, author, score}`` (score = cosine distance, lower=closer).
     Empty list when disabled or on any failure."""
-    if not _enabled():
+    if not _enabled() or not (query or "").strip():
         return []
     if limit is None:
         limit = settings.MEM0_HISTORY_EMBED_LIMIT
     try:
         col = _get_collection()
         res = col.query(
-            query_texts=[query or ""],
-            n_results=limit,
+            query_embeddings=[_embed(query, "search")],
+            n_results=max(1, min(int(limit), 100)),
             where={"channel_id": str(channel_id)},
         )
     except Exception as exc:
@@ -123,16 +132,19 @@ def search_semantic(query: str, channel_id, limit: int | None = None) -> list[di
     docs = (res.get("documents") or [[]])[0]
     metas = (res.get("metadatas") or [[]])[0]
     dists = (res.get("distances") or [[]])[0]
+    ids = (res.get("ids") or [[]])[0]
     out: list[dict] = []
     for i, doc in enumerate(docs):
         if not doc:
             continue
-        md = metas[i] if i < len(metas) else {}
+        md = metas[i] if i < len(metas) and isinstance(metas[i], dict) else {}
         out.append({
+            "id": ids[i] if i < len(ids) else "",
             "memory": doc,
             "ts": md.get("ts", ""),
             "role": md.get("role", ""),
             "author": md.get("author", ""),
+            "author_id": md.get("author_id", ""), "source_id": md.get("source_id", ""),
             "score": dists[i] if i < len(dists) else None,
         })
     return out

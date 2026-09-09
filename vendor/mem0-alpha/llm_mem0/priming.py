@@ -33,11 +33,13 @@ from .settings import settings
 
 _lock = threading.Lock()
 # (user_id, channel_id) -> {entity_id: last_touched_monotonic_seconds}
-_buffer: dict[tuple[str, str], dict[int, float]] = {}
+_buffer: dict[tuple[str, str, str, str], dict[int, float]] = {}
+_MAX_SESSIONS = 256
 
 
-def _key(user_id: str, channel_id) -> tuple[str, str]:
-    return (str(user_id), str(channel_id) if channel_id is not None else "")
+def _key(user_id: str, channel_id) -> tuple[str, str, str, str]:
+    return (settings.LLM_MEM0_STATE_DIR, settings.MEM0_COLLECTION_NAME,
+            str(user_id), str(channel_id) if channel_id is not None else "")
 
 
 def touch(user_id: str, channel_id, entity_ids) -> None:
@@ -49,6 +51,9 @@ def touch(user_id: str, channel_id, entity_ids) -> None:
     now = time.monotonic()
     max_entities = settings.MEM0_PRIMING_MAX_ENTITIES
     with _lock:
+        if key not in _buffer and len(_buffer) >= _MAX_SESSIONS:
+            oldest = min(_buffer, key=lambda item: max(_buffer[item].values(), default=0))
+            _buffer.pop(oldest, None)
         bucket = _buffer.setdefault(key, {})
         for eid in entity_ids:
             if eid:
@@ -74,7 +79,10 @@ def get_primed_entities(user_id: str, channel_id) -> set[int]:
             return set()
         live = {eid: t for eid, t in bucket.items() if now - t < ttl}
         if len(live) != len(bucket):
-            _buffer[key] = live  # opportunistic cleanup of expired entries
+            if live:
+                _buffer[key] = live
+            else:
+                _buffer.pop(key, None)
         return set(live)
 
 

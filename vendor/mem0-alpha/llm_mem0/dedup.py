@@ -188,50 +188,22 @@ async def synthesize_cluster(texts: list[str]) -> list[str] | None:
 
 
 async def partition_mergeable(texts: list[str]) -> list[list[int]]:
-    """Split a candidate cluster into sub-clusters that are safe to merge.
-
-    Over-merge guard for offline consolidation (ADR-0017 / P3): vector
-    clustering can group facts that share an entity but describe DISTINCT
-    aspects ("Rust好き" vs "Rustを業務で使ってる"). ``synthesize_cluster``
-    on its own over-merges those, so we gate it here using the validated
-    ``judge_fact_relation``: run it pairwise, treat ``paraphrase``/``mergeable``
-    as an edge, and return the Union-Find connected components. ``different``
-    pairs leave the members in separate components, so they are never fused.
-
-    Byte-identical pairs skip the LLM (trivially ``paraphrase``). Returns a
-    list of index-lists (each over the input ``texts``); singletons are
-    included so callers can decide to leave them untouched.
-    """
-    n = len(texts)
-    if n <= 1:
-        return [[i] for i in range(n)]
-    parent = list(range(n))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
-
-    norm = [(t or "").strip() for t in texts]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if norm[i] and norm[i] == norm[j]:
-                union(i, j)
-                continue
-            rel = await judge_fact_relation(norm[i], norm[j])
-            if rel in ("paraphrase", "mergeable"):
-                union(i, j)
-    groups: dict[int, list[int]] = {}
-    for i in range(n):
-        groups.setdefault(find(i), []).append(i)
-    # Stable order: by smallest member index.
-    return [groups[k] for k in sorted(groups, key=lambda r: min(groups[r]))]
+    """Complete-link groups: no explicitly different pair is ever merged."""
+    compatible = {}
+    for i in range(len(texts)):
+        for j in range(i + 1, len(texts)):
+            a, b = texts[i].strip(), texts[j].strip()
+            compatible[i, j] = bool(a and a == b) or (
+                await judge_fact_relation(a, b) in ("paraphrase", "mergeable"))
+    groups = []
+    for index in range(len(texts)):
+        for group in groups:
+            if all(compatible[min(index, member), max(index, member)] for member in group):
+                group.append(index)
+                break
+        else:
+            groups.append([index])
+    return groups
 
 
 def _log_dedup_decision(
@@ -262,120 +234,72 @@ async def check_near_dup(
     dry_run: bool = False,
     detect_conflict: bool = False,
     allow_merge: bool = True,
+    candidate_metadata: dict | None = None,
 ) -> tuple[bool, str, str | None, str | None, str | None]:
-    """Two-stage dedup with a 止揚 (aufhebung) merge path for supersets.
+    """Distance proposes candidates; identity/evidence decides destruction."""
+    import math
+    import re
+    from .attribute_registry import can_supersede, fact_metadata, same_fact_domain, observation_time
 
-    Returns ``(is_dup, reason, existing_id, conflict_type, merged_text)``.
-    - is_dup=True  → candidate is a true duplicate, should be dropped;
-      ``existing_id`` is the matched memory (caller reinforces its
-      mention_count). conflict_type/merged_text are None.
-    - is_dup=False + conflict_type="merge" + merged_text set → the candidate
-      and the existing fact overlap with complementary detail; the caller
-      inserts ``merged_text`` (not the raw candidate) and soft-archives
-      ``existing_id`` (止揚: preserve both, elevate into one richer fact).
-    - is_dup=False + conflict_type in ("update","correction") → state change /
-      fix; caller keeps the candidate as-is and archives ``existing_id``.
-    - is_dup=False + conflict_type=None → keep the candidate independently.
-
-    Relation in the gray zone:
-      paraphrase → drop (reinforce existing), mergeable → synthesize,
-      different → conflict detection then keep. Hard-drop (≤0.15) stays a
-      pure-duplicate drop — those distances are exact paraphrases.
-
-    ``dry_run=True`` computes the full decision (including the LLM calls so we
-    measure agreement) but never drops/merges; reasons are prefixed
-    ``dry_run_would_``. ``allow_merge=False`` restores the legacy behavior
-    where a mergeable superset is dropped like a paraphrase.
-    """
-    for r in near_results:
-        score = r.get("score")
-        if score is None:
-            # A scoreless neighbor (e.g. graph-expanded rows before their
-            # placeholder is set) carries no distance signal. Treating it as
-            # distance 0 would hard-drop the candidate as an exact duplicate;
-            # skip the neighbor instead (fail-open: keep the candidate).
+    candidate_md = candidate_metadata or {}
+    neighbors = []
+    for row in near_results:
+        if not isinstance(row, dict):
             continue
-        existing_text = r.get("memory", "")
-        existing_id = r.get("id")
-
-        # Category filter: skip dedup against different-category memories
-        existing_category = (r.get("metadata") or {}).get("category")
-        if candidate_category and existing_category and candidate_category != existing_category:
+        score = row.get("score")
+        text = row.get("memory") or row.get("text")
+        if not isinstance(score, (int, float)) or not math.isfinite(score) or not isinstance(text, str):
             continue
-
-        # score is *distance* (small = similar). Sort-by-distance ascending
-        # means the first iteration already has the smallest distance, but
-        # we keep iterating just in case mem0 ever changes ordering.
-        if score <= DEDUP_HARD_DROP_DISTANCE:
-            _log_dedup_decision(
-                decision="hard_drop", cand=candidate_text,
-                existing=existing_text, distance=score, dry_run=dry_run,
-            )
-            log.info(
-                "dedup HARD_DROP: cand='%s' | existing='%s' | distance=%.3f",
-                candidate_text[:100], existing_text[:100], score,
-            )
-            if dry_run:
-                return (False, f"dry_run_would_hard_drop(distance={score:.3f})", existing_id, None, None)
-            return (True, f"hard_drop(distance={score:.3f})", existing_id, None, None)
-
-        if score <= DEDUP_GRAY_HIGH_DISTANCE:
-            relation = await judge_fact_relation(existing_text, candidate_text)
-            decision = {
-                "paraphrase": "gray_paraphrase",
-                "mergeable": "gray_merge",
-                "different": "gray_kept",
-            }.get(relation, "gray_kept")
-            _log_dedup_decision(
-                decision=decision, cand=candidate_text, existing=existing_text,
-                distance=score, dry_run=dry_run,
-                llm_same=(relation != "different"),
-            )
-            log.info(
-                "dedup GRAY: cand='%s' | existing='%s' | distance=%.3f | relation=%s",
-                candidate_text[:100], existing_text[:100], score, relation,
-            )
-
-            if relation == "paraphrase":
+        md = fact_metadata(row)
+        if candidate_category and md.get("category") and candidate_category != md["category"]:
+            continue
+        if not same_fact_domain(md, candidate_md):
+            continue
+        neighbors.append((score, text, row.get("id"), md))
+    # Prefer exact equality over a earlier approximate/mergeable neighbor.
+    for score, text, fid, md in neighbors:
+        if text.strip() == candidate_text.strip():
+            return (not dry_run, "dry_run_would_exact" if dry_run else "exact", fid, None, None)
+    for score, text, fid, md in sorted(neighbors, key=lambda row: row[0]):
+        if score > DEDUP_GRAY_HIGH_DISTANCE:
+            continue
+        # Numbers/negation are cheap contradiction indicators, never proof
+        # of paraphrase. LLM judgments cannot override these safety guards.
+        numbers = lambda value: re.findall(r"[-+]?\d+(?:[.,]\d+)?", value)
+        negation = lambda value: bool(re.search(r"ない|嫌い|やめ|なく|違う|not\b|never\b|no longer", value, re.I))
+        changed = numbers(text) != numbers(candidate_text) or negation(text) != negation(candidate_text)
+        old_value, new_value = md.get("value_json") or md.get("value"), candidate_md.get("value_json") or candidate_md.get("value")
+        if old_value and new_value and old_value != new_value:
+            changed = True
+        relation = "different" if changed else await judge_fact_relation(text, candidate_text)
+        if relation == "paraphrase":
+            return (not dry_run, "dry_run_would_paraphrase" if dry_run else "paraphrase", fid, None, None)
+        if relation == "mergeable" and allow_merge:
+            # Merging typed or scoped facts must not synthesize a new text
+            # while retaining an incompatible old structured value.
+            if old_value != new_value:
+                continue
+            merged = await synthesize_facts(text, candidate_text)
+            if merged and set(numbers(text) + numbers(candidate_text)) <= set(numbers(merged)):
                 if dry_run:
-                    return (False, f"dry_run_would_llm_drop(distance={score:.3f})", existing_id, None, None)
-                return (True, f"paraphrase(distance={score:.3f})", existing_id, None, None)
-
-            if relation == "mergeable" and allow_merge:
-                if dry_run:
-                    return (False, f"dry_run_would_merge(distance={score:.3f})", existing_id, None, None)
-                merged = await synthesize_facts(existing_text, candidate_text)
-                if merged:
-                    log.info(
-                        "[DEDUP_MERGE existing_id=%s distance=%.3f merged=%r]",
-                        existing_id, score, merged[:100],
-                    )
-                    return (False, f"merged(distance={score:.3f})",
-                            existing_id, "merge", merged)
-                # synthesis failed → keep both rather than lose the candidate
-                return (False, f"merge_failed_keep_both(distance={score:.3f})", None, None, None)
-
-            if relation == "mergeable" and not allow_merge:
-                # Legacy behavior: drop the superset like a paraphrase.
-                if dry_run:
-                    return (False, f"dry_run_would_llm_drop(distance={score:.3f})", existing_id, None, None)
-                return (True, f"merge_disabled_drop(distance={score:.3f})", existing_id, None, None)
-
-            # relation == "different": gray-zone but a distinct aspect. Check
-            # whether it is actually a state change / fix of the existing fact
-            # (update / correction → archive old, keep new). First gray hit is
-            # the closest cosine match and the most likely contradiction target.
-            if detect_conflict:
+                    return (False, "dry_run_would_merge", fid, None, None)
+                return (False, "merged", fid, "merge", merged)
+            continue
+        if detect_conflict and can_supersede(md, candidate_md):
+            from .conflict import classify_conflict
+            cls = await classify_conflict(text, candidate_text, existing_metadata=md,
+                                          candidate_metadata=candidate_md)
+            kind = cls.get("conflict_type", "addition")
+            if kind in ("update", "correction"):
+                return (False, "conflict_" + kind, fid, None if dry_run else kind, None)
+        elif detect_conflict and can_supersede(candidate_md, md):
+            previous, incoming = observation_time(md), observation_time(candidate_md)
+            if previous is not None and incoming is not None and incoming < previous:
                 from .conflict import classify_conflict
-                cls = await classify_conflict(existing_text, candidate_text)
-                ctype = cls.get("conflict_type", "addition")
-                if ctype in ("update", "correction"):
-                    log.info(
-                        "[CONFLICT_GRAY conflict_type=%s reason=%r existing_id=%s "
-                        "distance=%.3f]",
-                        ctype, cls.get("reason", ""), existing_id, score,
-                    )
-                    return (False, f"conflict_{ctype}(distance={score:.3f})",
-                            existing_id, ctype, None)
-
+                cls = await classify_conflict(candidate_text, text, existing_metadata=candidate_md,
+                                              candidate_metadata=md)
+                kind = cls.get("conflict_type")
+                if kind in ("update", "correction"):
+                    return (False, "historical_" + kind, fid,
+                            None if dry_run else "historical_" + kind, None)
     return (False, "novel", None, None, None)

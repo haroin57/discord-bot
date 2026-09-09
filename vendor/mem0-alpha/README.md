@@ -1,5 +1,36 @@
 # Mem0α
 
+## Local quality build: 0.3.1+botquality.1
+
+This directory is the bot's controlled source snapshot, not an unmodified
+upstream release. Build/install it from the bot repository root with
+`pip install ./vendor/mem0-alpha`. Shared-state ingestion uses Linux/POSIX
+`flock`; all cooperating processes must use the same state directory and
+collection. This build does not change credentials, models or production data.
+
+New public APIs include `search_memories_hybrid` and
+`search_memories_at_time(query, user_id, as_of, limit=5, current_channel_id=...)`.
+`as_of` accepts Unix seconds or timezone-aware ISO8601; it does not interpret
+natural-language dates or implement full bitemporal history. MCP search also
+accepts `as_of`, `channel_id` and `details`.
+
+Extraction supports bounded chunks (`MEM0_EXTRACT_MAX_CHUNKS=16`,
+`MEM0_EXTRACT_CONCURRENCY=2`, `MEM0_EXTRACT_MAX_ATTEMPTS=2`). Partial work and
+provider failures return an explicit retryable status. Durable batches use
+claim/renew/ack rather than removing input before successful storage. Supply
+stable `request_id`, `source_message_ids`, `source_author_id` and
+`source_timestamp` metadata when available; never infer a speaker from a name.
+
+Exact lexical tokenization applies to newly indexed rows. Existing FTS rows,
+legacy replay ownership and old history-vector IDs are **not automatically
+migrated**. `MEM0_HISTORY_DB_PATH` is optional; leaving it unset preserves the
+existing SDK history location. See [PROVENANCE.md](PROVENANCE.md) and the bot's
+[quality results](../../docs/mem0-alpha-quality-results.md) for measured results,
+remaining limitations and separate rollout/migration requirements.
+
+The upstream overview below is general documentation, not the deployed bot's
+effective authentication or model configuration.
+
 English | [日本語](README.ja.md)
 
 Long-term memory for LLM agents, provider-agnostic. Mem0α is a thin layer on
@@ -98,13 +129,13 @@ export MEM0_LLM_MODEL=gpt-5-mini
 ## Install
 
 ```bash
-pip install llm-mem0
+pip install mem0-alpha
 # with the Anthropic SDK (for CLI reuse or an Anthropic API key):
-pip install "llm-mem0[anthropic]"
+pip install "mem0-alpha[anthropic]"
 # with the OpenAI SDK:
-pip install "llm-mem0[openai]"
+pip install "mem0-alpha[openai]"
 # with the Japanese tokenizer for the BM25 index (optional):
-pip install "llm-mem0[japanese]"
+pip install "mem0-alpha[japanese]"
 ```
 
 ## MCP server
