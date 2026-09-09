@@ -207,6 +207,11 @@ def upsert_entity(
     )
 
     def _upsert(c) -> int:
+        c.execute("BEGIN IMMEDIATE")
+        if source_fact_id and c.execute(
+            "SELECT 1 FROM relation_source_retirements WHERE source_fact_id=?", (str(source_fact_id),),
+        ).fetchone():
+            return 0
         matches = c.execute(
             lookup_sql, (user_id, *surface_forms, *surface_forms),
         ).fetchall()
@@ -330,6 +335,13 @@ def find_entities_in_text(query: str, user_id: str, limit: int = 5) -> list[Enti
 # ---------------------------------------------------------------------------
 # Edges
 # ---------------------------------------------------------------------------
+def is_source_retired(fact_id: str) -> bool:
+    """Distinguish a terminal projection no-op from a transient write failure."""
+    with _store.connect() as c:
+        return c.execute("SELECT 1 FROM relation_source_retirements WHERE source_fact_id=?",
+                         (str(fact_id),)).fetchone() is not None
+
+
 def add_edge(fact_id: str, entity_id: int, *, role: str | None = None) -> bool:
     """Link a Mem0 fact to an entity. Idempotent."""
     if not fact_id or not entity_id:
@@ -337,6 +349,9 @@ def add_edge(fact_id: str, entity_id: int, *, role: str | None = None) -> bool:
     now = int(time.time())
 
     def _insert(c) -> bool:
+        c.execute("BEGIN IMMEDIATE")
+        if c.execute("SELECT 1 FROM relation_source_retirements WHERE source_fact_id=?", (fact_id,)).fetchone():
+            return True  # A retired source is a durable, successfully applied no-op.
         c.execute(
             "INSERT OR IGNORE INTO fact_entity_edges(fact_id, entity_id, "
             "role, created_at) VALUES (?, ?, ?, ?)",

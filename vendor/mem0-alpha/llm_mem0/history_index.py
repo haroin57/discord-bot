@@ -31,6 +31,8 @@ retry) lives in :mod:`llm_mem0.sqlite_store`.
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 from typing import Iterable
 
 from .sqlite_store import SqliteStore, build_fts_match_query
@@ -57,6 +59,24 @@ CREATE TABLE IF NOT EXISTS replay_cursors (
     ts TEXT NOT NULL, row_id INTEGER NOT NULL,
     PRIMARY KEY(channel_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS history_row_versions (
+    row_id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL, revision INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS history_changes (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, channel_id TEXT NOT NULL,
+    row_id INTEGER NOT NULL, revision INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS history_changes_channel ON history_changes(channel_id,seq);
+CREATE INDEX IF NOT EXISTS history_meta_source ON history_line_meta(source_id,author_id);
+CREATE TABLE IF NOT EXISTS history_generation (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO history_generation VALUES (1,1);
+CREATE TABLE IF NOT EXISTS replay_checkpoints (
+    channel_id TEXT NOT NULL, user_id TEXT NOT NULL,
+    generation INTEGER NOT NULL, seq INTEGER NOT NULL,
+    PRIMARY KEY(channel_id,user_id)
+);
 """
 
 _store = SqliteStore("history_bm25.sqlite", _SCHEMA)
@@ -75,6 +95,40 @@ def _tokenize(text: str) -> str:
         log.warning("history morpho tokenize_for_index failed, raw fallback: %s", exc)
         tok = text
     return tok or (text or "").strip()
+
+
+def _fingerprint(channel_id, ts, role, author, text) -> str:
+    return hashlib.sha256(json.dumps(
+        [str(channel_id), ts, role, author, text], ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()).hexdigest()
+
+
+def _record_version(c, row_id, channel_id, ts, role, author, text) -> None:
+    old = c.execute("SELECT revision FROM history_row_versions WHERE row_id=?", (row_id,)).fetchone()
+    revision = old[0] + 1 if old else 1
+    c.execute("INSERT OR REPLACE INTO history_row_versions VALUES (?,?,?)",
+              (row_id, _fingerprint(channel_id, ts, role, author, text), revision))
+    c.execute("INSERT INTO history_changes(channel_id,row_id,revision) VALUES (?,?,?)",
+              (str(channel_id), row_id, revision))
+
+
+def _trusted_row(r) -> dict:
+    """Legacy row IDs are not identity: only a matching writer fingerprint is trusted."""
+    value = dict(r)
+    expected = _fingerprint(value["channel_id"], value["ts"], value["role"],
+                            value["author"], value["orig_text"])
+    if value.get("fingerprint") != expected:
+        value["author_id"] = value["source_id"] = ""
+    value["text"] = value["orig_text"]
+    return value
+
+
+_ROW_SELECT = ("SELECT h.rowid AS row_id,h.channel_id,h.ts,h.role,h.author,h.orig_text,"
+               "COALESCE(m.author_id,'') AS author_id,COALESCE(m.source_id,'') AS source_id,"
+               "v.fingerprint,v.revision FROM history_fts h "
+               "LEFT JOIN history_line_meta m ON m.row_id=h.rowid "
+               "LEFT JOIN history_row_versions v ON v.row_id=h.rowid ")
 
 
 def index_line(
@@ -103,15 +157,19 @@ def index_line(
     tokenized = _tokenize(text)
 
     def _insert(c) -> bool:
+        c.execute("BEGIN IMMEDIATE")
         if source_id:
-            existing = c.execute(
-                "SELECT h.rowid FROM history_fts h JOIN history_line_meta m ON m.row_id=h.rowid "
-                "WHERE h.channel_id=? AND h.role=? AND m.author_id=? AND m.source_id=? LIMIT 1",
+            candidates = c.execute(
+                _ROW_SELECT + "WHERE h.channel_id=? AND h.role=? AND m.author_id=? AND m.source_id=?",
                 (str(channel_id), role, str(author_id or ""), str(source_id)),
-            ).fetchone()
+            ).fetchall()
+            existing = next((r for r in candidates if _trusted_row(r)["source_id"] == source_id), None)
             if existing:
+                if (existing["ts"], existing["author"], existing["orig_text"]) == (ts, author, text):
+                    return True
                 c.execute("UPDATE history_fts SET ts=?,author=?,orig_text=?,text=? WHERE rowid=?",
-                          (ts, author, text, tokenized, existing[0]))
+                          (ts, author, text, tokenized, existing["row_id"]))
+                _record_version(c, existing["row_id"], channel_id, ts, role, author, text)
                 return True
         existing = c.execute(
             "SELECT h.rowid FROM history_fts h LEFT JOIN history_line_meta m ON m.row_id=h.rowid "
@@ -120,14 +178,18 @@ def index_line(
             (str(channel_id), ts, role, text, author, str(author_id or ""), str(source_id or "")),
         ).fetchone()
         if existing:
-            return True
+            version = c.execute(_ROW_SELECT + "WHERE h.rowid=?", (existing[0],)).fetchone()
+            trusted = _trusted_row(version)
+            if (trusted["author_id"], trusted["source_id"]) == (str(author_id or ""), str(source_id or "")):
+                return True
         cursor = c.execute(
             "INSERT INTO history_fts(channel_id, ts, role, author, orig_text, text) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (str(channel_id), ts, role, author, text, tokenized),
         )
-        c.execute("INSERT INTO history_line_meta(row_id,author_id,source_id) VALUES (?,?,?)",
+        c.execute("INSERT OR REPLACE INTO history_line_meta(row_id,author_id,source_id) VALUES (?,?,?)",
                   (cursor.lastrowid, str(author_id or ""), str(source_id or "")))
+        _record_version(c, cursor.lastrowid, channel_id, ts, role, author, text)
         return True
 
     return bool(_store.write(_insert, what="index_line", default=False))
@@ -154,10 +216,12 @@ def search_history(query: str, channel_id: int, limit: int = 5) -> list[dict]:
 
     def _search(c) -> list[dict]:
         rows = c.execute(
-            "SELECT history_fts.rowid AS row_id, role, ts, author, orig_text, "
+            "SELECT history_fts.rowid AS row_id, channel_id, role, ts, author, orig_text, "
             "COALESCE(m.author_id,'') AS author_id, COALESCE(m.source_id,'') AS source_id, "
+            "v.fingerprint, "
             "bm25(history_fts) AS score FROM history_fts "
             "LEFT JOIN history_line_meta m ON m.row_id=history_fts.rowid "
+            "LEFT JOIN history_row_versions v ON v.row_id=history_fts.rowid "
             "WHERE history_fts MATCH ? AND channel_id = ? "
             "ORDER BY bm25(history_fts) "
             "LIMIT ?",
@@ -175,7 +239,7 @@ def search_history(query: str, channel_id: int, limit: int = 5) -> list[dict]:
                 "rank": i + 1,
                 "bm25_score": float(r["score"]),
             }
-            for i, r in enumerate(rows)
+            for i, r in enumerate(map(_trusted_row, rows))
         ]
 
     return _store.read(_search, what="search_history", default=[]) or []
@@ -211,16 +275,13 @@ def get_lines_since(
             params.append(since_ts)
         params.append(max(int(limit), 1))
         rows = c.execute(
-            "SELECT h.rowid AS row_id, h.ts, h.role, h.author, h.orig_text, "
-            "COALESCE(m.author_id,'') AS author_id, COALESCE(m.source_id,'') AS source_id "
-            "FROM history_fts h LEFT JOIN history_line_meta m ON m.row_id=h.rowid "
-            "WHERE h.channel_id=?" + clause + " ORDER BY h.ts ASC,h.rowid ASC LIMIT ?", params,
+            _ROW_SELECT + "WHERE h.channel_id=?" + clause + " ORDER BY h.ts ASC,h.rowid ASC LIMIT ?", params,
         ).fetchall()
         return [
             {"ts": r["ts"], "role": r["role"], "author": r["author"],
              "text": r["orig_text"], "row_id": r["row_id"],
              "author_id": r["author_id"], "source_id": r["source_id"]}
-            for r in rows
+            for r in map(_trusted_row, rows)
         ]
 
     return _store.read(_fetch, what="get_lines_since", default=[]) or []
@@ -241,6 +302,71 @@ def advance_replay_cursor(channel_id: int, user_id: str, ts: str, row_id: int) -
             WHERE (excluded.ts,excluded.row_id) > (replay_cursors.ts,replay_cursors.row_id)""",
                   (str(channel_id), user_id, ts, row_id))
         c.commit()
+
+
+def get_replay_page(channel_id: int, user_id: str, limit: int = 201) -> dict:
+    """Read a change-ordered page and checkpoint in one SQLite snapshot.
+
+    Old timestamp cursors are deliberately not guessed into change cursors.
+    Old rows without a version are retained as unattributable legacy history.
+    """
+    with _store.connect() as c:
+        c.execute("BEGIN")
+        generation = c.execute("SELECT generation FROM history_generation WHERE singleton=1").fetchone()[0]
+        checkpoint = c.execute(
+            "SELECT generation,seq FROM replay_checkpoints WHERE channel_id=? AND user_id=?",
+            (str(channel_id), str(user_id)),
+        ).fetchone()
+        seq = checkpoint["seq"] if checkpoint and checkpoint["generation"] == generation else 0
+        changes = c.execute(
+            "SELECT seq,row_id,revision FROM history_changes WHERE channel_id=? AND seq>? ORDER BY seq LIMIT ?",
+            (str(channel_id), seq, max(1, min(int(limit), 20001))),
+        ).fetchall()
+        lines = []
+        for change in changes:
+            row = c.execute(_ROW_SELECT + "WHERE h.rowid=? AND h.channel_id=?",
+                            (change["row_id"], str(channel_id))).fetchone()
+            if row and row["revision"] == change["revision"]:
+                line = _trusted_row(row)
+            else:
+                line = {"row_id": change["row_id"], "ts": "", "role": "obsolete",
+                        "text": "", "source_id": "", "author_id": ""}
+            line["change_seq"] = change["seq"]
+            lines.append(line)
+        return {"generation": generation, "seq": seq, "lines": lines}
+
+
+def get_source_line(channel_id: int, source_id: str, role: str, author_id: str = "") -> dict | None:
+    """Resolve explicit source identity; never infer owner from a display name."""
+    with _store.connect() as c:
+        rows = c.execute(_ROW_SELECT + "WHERE h.channel_id=? AND h.role=? AND m.source_id=? LIMIT 20",
+                         (str(channel_id), role, source_id)).fetchall()
+        for row in rows:
+            line = _trusted_row(row)
+            if line["source_id"] == source_id and (not line["author_id"] or line["author_id"] == str(author_id)):
+                return line
+    return None
+
+
+def commit_replay_checkpoint(channel_id: int, user_id: str, generation: int, seq: int,
+                             ts: str, row_id: int) -> bool:
+    """Fence an old in-flight replay after reindex; failures must remain visible."""
+    with _store.connect() as c, _store.lock:
+        c.execute("BEGIN IMMEDIATE")
+        current = c.execute("SELECT generation FROM history_generation WHERE singleton=1").fetchone()[0]
+        if current != generation:
+            return False
+        c.execute("""INSERT INTO replay_checkpoints VALUES (?,?,?,?)
+            ON CONFLICT(channel_id,user_id) DO UPDATE SET generation=excluded.generation,seq=excluded.seq
+            WHERE replay_checkpoints.generation!=excluded.generation OR replay_checkpoints.seq<excluded.seq""",
+                  (str(channel_id), str(user_id), generation, seq))
+        # Retain old diagnostic API, but never use this timestamp for new replay.
+        if ts:
+            c.execute("""INSERT INTO replay_cursors VALUES (?,?,?,?)
+                ON CONFLICT(channel_id,user_id) DO UPDATE SET ts=excluded.ts,row_id=excluded.row_id""",
+                      (str(channel_id), str(user_id), ts, row_id))
+        c.commit()
+        return True
 
 
 def reindex_all(lines: Iterable[tuple]) -> int:
@@ -278,6 +404,10 @@ def reindex_all(lines: Iterable[tuple]) -> int:
         c.execute("DELETE FROM history_fts")
         c.execute("DELETE FROM history_line_meta")
         c.execute("DELETE FROM replay_cursors")
+        c.execute("DELETE FROM replay_checkpoints")
+        c.execute("DELETE FROM history_row_versions")
+        c.execute("DELETE FROM history_changes")
+        c.execute("UPDATE history_generation SET generation=generation+1 WHERE singleton=1")
         for channel_id, ts, role, author, text, tokenized, author_id, source_id in prepared:
             cursor = c.execute(
                 "INSERT INTO history_fts(channel_id, ts, role, author, orig_text, text) "
@@ -286,6 +416,7 @@ def reindex_all(lines: Iterable[tuple]) -> int:
             )
             c.execute("INSERT INTO history_line_meta(row_id,author_id,source_id) VALUES (?,?,?)",
                       (cursor.lastrowid, author_id, source_id))
+            _record_version(c, cursor.lastrowid, channel_id, ts, role, author, text)
         return len(prepared)
 
     return _store.write(_insert_all, what="reindex_all", default=0) or 0

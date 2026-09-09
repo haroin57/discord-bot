@@ -55,10 +55,8 @@ _replay_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def _ingest_complete(result) -> bool:
-    if not isinstance(result, dict) or result.get("error") or result.get("failed"):
-        return False
-    return (result.get("status") == "ok"
-            or ("status" not in result and isinstance(result.get("results"), list)))
+    from .api_contracts import classify_add_outcome
+    return classify_add_outcome(result).status == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +117,7 @@ def _pair_turns(lines: list[dict]) -> tuple[list[tuple[str, str]], str]:
 async def replay_channel_history(
     channel_id: int, user_id: str, *, max_turns: int | None = None, dry_run: bool = True,
 ) -> dict:
-    """Replay attributable turns with a durable (timestamp,row ID) cursor.
+    """Replay attributable revisions with a generation-fenced change cursor.
 
     Cursors belong to (channel,user), in the history SQLite database. Legacy
     channel-only JSON cursors cannot establish ownership and are not imported.
@@ -143,14 +141,26 @@ async def replay_channel_history(
                    "cursor_advanced_to": cursor[0], "cursor_row_id": cursor[1]}
         if max_turns == 0:
             return summary
-        lines = await asyncio.to_thread(history_index.get_lines_since, channel_id, cursor[0],
-                                        max_turns * 4 + 1, since_row_id=cursor[1])
+        page = await asyncio.to_thread(history_index.get_replay_page, channel_id, user_id,
+                                      max_turns * 4 + 1)
+        summary.update(generation=page["generation"], change_seq=page["seq"], stale_generation=False)
+        lines = page["lines"]
+        processed_sources = set()
         i = 0
         while i < len(lines) and summary["turns_processed"] < max_turns:
             line = lines[i]
             end = line
             i += 1
+            if line["role"] == "assistant" and (line.get("source_id") or "").endswith(":assistant"):
+                source = line["source_id"][:-10] + ":user"
+                if source not in processed_sources:
+                    paired = await asyncio.to_thread(history_index.get_source_line, channel_id,
+                                                     source, "user", user_id)
+                    if paired:
+                        line = paired
             if line["role"] == "user":
+                if line.get("source_id"):
+                    processed_sources.add(line["source_id"])
                 author_id = line.get("author_id")
                 if not author_id:
                     summary["skipped_ambiguous"] += 1
@@ -159,16 +169,20 @@ async def replay_channel_history(
                 else:
                     assistant_text = ""
                     source_id = line.get("source_id") or ""
-                    if (i < len(lines) and lines[i]["role"] == "assistant"
-                            and source_id.endswith(":user")
-                            and lines[i].get("source_id") == source_id[:-5] + ":assistant"):
-                        end = lines[i]
-                        assistant_text = end["text"]
-                        i += 1
+                    if source_id.endswith(":user"):
+                        reply = await asyncio.to_thread(history_index.get_source_line, channel_id,
+                                                        source_id[:-5] + ":assistant", "assistant", user_id)
+                        if reply:
+                            assistant_text = reply["text"]
+                            if i < len(lines) and lines[i].get("row_id") == reply["row_id"]:
+                                end = lines[i]
+                                i += 1
+                    processed_sources.add(source_id)
                     if not dry_run:
                         source_id = line.get("source_id") or f"history:{channel_id}:{line['row_id']}"
                         request_id = "replay:" + hashlib.sha256(
-                            f"{channel_id}:{user_id}:{source_id}:{line['ts']}".encode()).hexdigest()
+                            json.dumps([channel_id, user_id, source_id, line["ts"],
+                                        line["text"], assistant_text], ensure_ascii=False).encode()).hexdigest()
                         try:
                             result = await add_memories(
                                 user_text=line["text"], assistant_text=assistant_text, user_id=user_id,
@@ -186,9 +200,15 @@ async def replay_channel_history(
                         summary["facts_kept"] += result.get("kept", 0) or 0
                     summary["turns_processed"] += 1
             if not dry_run:
-                await asyncio.to_thread(history_index.advance_replay_cursor, channel_id, user_id,
-                                        end["ts"], end["row_id"])
-                summary["cursor_advanced_to"], summary["cursor_row_id"] = end["ts"], end["row_id"]
+                committed = await asyncio.to_thread(history_index.commit_replay_checkpoint, channel_id,
+                                                    user_id, page["generation"], end["change_seq"],
+                                                    end["ts"], end["row_id"])
+                if not committed:
+                    summary["stale_generation"] = True
+                    break
+                summary["change_seq"] = end["change_seq"]
+                if end["ts"]:
+                    summary["cursor_advanced_to"], summary["cursor_row_id"] = end["ts"], end["row_id"]
         return summary
 
 
@@ -270,6 +290,7 @@ async def abstract_schemas_for_user(
     """
     from . import client as client_mod
     from . import graph
+    from . import lineage
     from .ingest import add_memories
 
     if max_groups is None:
@@ -285,7 +306,7 @@ async def abstract_schemas_for_user(
         tags = md.get("tags") or ""
         if not isinstance(tags, (str, list)):
             continue
-        if md.get("valid_to") or md.get("gist_of") or "schema" in tags:
+        if not lineage.current_validity(md) or md.get("gist_of") or "schema" in tags:
             continue
         fid = r.get("id")
         if not fid:
@@ -324,6 +345,18 @@ async def abstract_schemas_for_user(
             result["schemas_created"] += len(schema_texts)
             continue
 
+        # LLM latency must not turn a corrected/deleted/future source snapshot
+        # into a current schema. The lineage tombstone also fences later races.
+        mem = await asyncio.to_thread(client_mod._get_mem0)
+        if mem is None:
+            continue
+        fresh_members = await asyncio.gather(*(asyncio.to_thread(mem.get, mid) for mid in member_ids))
+        if any(not isinstance(fresh, dict)
+               or not lineage.current_validity(fresh.get("metadata") or {})
+               or lineage.snapshot(fresh) != lineage.snapshot(original)
+               for original, fresh in zip(members, fresh_members)):
+            continue
+
         category, subcategory, _etype, scope, condition = key
         for schema_text in schema_texts:
             fact = {
@@ -331,6 +364,7 @@ async def abstract_schemas_for_user(
                 "category": category or "meta", "subcategory": subcategory or "",
                 "tags": ["schema"], "attribute": "", "condition": condition,
                 "scope": scope, "entities": [],
+                **lineage.supported_interval(members),
             }
             try:
                 res = await add_memories(
@@ -344,5 +378,16 @@ async def abstract_schemas_for_user(
                 log.warning("schema insert failed (non-fatal): %s", exc)
                 continue
             if _ingest_complete(res):
+                for outcome in res.get("results", []):
+                    nested = outcome.get("results", []) if isinstance(outcome, dict) else []
+                    saved = [outcome] if isinstance(outcome, dict) and outcome.get("id") else nested
+                    for value in saved:
+                        if isinstance(value, dict) and value.get("id"):
+                            supported = await asyncio.to_thread(lineage.register_derivation, value["id"],
+                                                                user_id, member_ids, kind="schema")
+                            if not supported:
+                                mem = await asyncio.to_thread(client_mod._get_mem0)
+                                if mem is not None:
+                                    await asyncio.to_thread(lineage.repair_dependents_sync, mem)
                 result["schemas_created"] += res.get("kept", 0) or 0
     return result

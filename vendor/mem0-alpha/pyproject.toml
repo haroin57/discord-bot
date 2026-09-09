@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mem0-alpha"
-version = "0.3.1+botquality.1"
+version = "0.3.2+botquality.2"
 description = "Mem0α — provider-agnostic long-term memory for LLM agents; reuses your Claude Code CLI session or any API key"
 readme = "README.md"
 requires-python = ">=3.10"

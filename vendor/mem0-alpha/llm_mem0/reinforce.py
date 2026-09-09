@@ -73,7 +73,7 @@ def memory_mutation_lock(memory_id: str):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def mutate_memory_metadata_sync(mem, memory_id: str, mutation) -> bool:
+def mutate_memory_metadata_sync(mem, memory_id: str, mutation, *, after_update=None) -> bool:
     """Fresh read + metadata-preserving update under a shared writer lock.
 
     mutation receives the fresh row and returns a metadata patch or None.
@@ -88,9 +88,13 @@ def mutate_memory_metadata_sync(mem, memory_id: str, mutation) -> bool:
             return False
         partial = mutation(existing)
         if partial is None:
+            if after_update is not None:
+                after_update(existing)
             return False
         metadata = {**(existing.get("metadata") or {}), **partial}
         mem.update(memory_id=memory_id, data=text, metadata=metadata)
+        if after_update is not None:
+            after_update({**existing, "metadata": metadata})
         from .search import invalidate_core_cache
         invalidate_core_cache(existing.get("user_id") or metadata.get("user_id"))
         return True
@@ -143,7 +147,58 @@ def _reinforce_locked(mem, memory_id: str, *, recall: bool, event_id: str | None
                 partial["user_confirmed_at"] = max(incoming, previous) if previous is not None else incoming
         return partial
     try:
-        return mutate_memory_metadata_sync(mem, memory_id, mutation) if memory_id else False
+        if not memory_id:
+            return False
+        from . import ingest_journal as journal
+        from .search import invalidate_core_cache
+        with memory_mutation_lock(memory_id):
+            existing = mem.get(memory_id)
+            if not isinstance(existing, dict):
+                return False
+            # Finish earlier planned confirmations before a different event
+            # can reuse the same revision. The journal is authoritative; the
+            # bounded metadata list is only recent provenance.
+            if event_id and not recall:
+                for pending_id, revision, partial in journal.pending_events(memory_id):
+                    md = existing.get("metadata") or {}
+                    if int(md.get("confirmation_revision") or 0) < revision:
+                        if int(md.get("confirmation_revision") or 0) + 1 != revision:
+                            raise RuntimeError("confirmation_revision_gap")
+                        if md.get("valid_to") is not None and float(md["valid_to"]) <= time.time():
+                            return False
+                        text = existing.get("memory") or existing.get("text") or ""
+                        mem.update(memory_id=memory_id, data=text, metadata={**md, **partial})
+                        existing = mem.get(memory_id)
+                        if not isinstance(existing, dict) or int((existing.get("metadata") or {}).get("confirmation_revision") or 0) < revision:
+                            raise RuntimeError("confirmation_update_unconfirmed")
+                    journal.finish_event(memory_id, pending_id)
+                if journal.event_recorded(memory_id, event_id):
+                    return False
+            partial = mutation(existing)
+            if partial is None:
+                if event_id and not recall:
+                    md = existing.get("metadata") or {}
+                    events = md.get("reinforced_event_ids", "[]")
+                    events = json.loads(events) if isinstance(events, str) else events
+                    if event_id in (events if isinstance(events, list) else []) or event_id in (md.get("request_id"), md.get("batch_id")):
+                        journal.plan_event(memory_id, event_id, int(md.get("confirmation_revision") or 0), {}, applied=True)
+                return False
+            text = existing.get("memory") or existing.get("text") or ""
+            if not isinstance(text, str) or not text:
+                return False
+            md = existing.get("metadata") or {}
+            if event_id and not recall:
+                revision = int(md.get("confirmation_revision") or 0) + 1
+                partial["confirmation_revision"] = revision
+                journal.plan_event(memory_id, event_id, revision, partial)
+            mem.update(memory_id=memory_id, data=text, metadata={**md, **partial})
+            if event_id and not recall:
+                confirmed = mem.get(memory_id)
+                if not isinstance(confirmed, dict) or int((confirmed.get("metadata") or {}).get("confirmation_revision") or 0) != revision:
+                    raise RuntimeError("confirmation_update_unconfirmed")
+                journal.finish_event(memory_id, event_id)
+            invalidate_core_cache(existing.get("user_id") or md.get("user_id"))
+            return True
     except Exception as exc:
         log.warning("reinforcement failed (%s): %s", memory_id, exc)
         return False

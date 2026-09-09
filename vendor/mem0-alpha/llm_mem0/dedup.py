@@ -80,14 +80,16 @@ async def judge_fact_relation(existing_text: str, candidate_text: str) -> str:
     On any error, returns ``different`` (fail-open: keep both, never drop
     or merge on a judge failure).
     """
+    if max(len(existing_text), len(candidate_text)) > 4000:
+        return "different"
     data = await complete_json(
         system=(
             "You classify the relation between two short fact statements "
             "as paraphrase / mergeable / different. Return JSON only."
         ),
         user_message=_DEDUP_RELATION_PROMPT.format(
-            existing=escape_braces(existing_text, limit=300),
-            candidate=escape_braces(candidate_text, limit=300),
+            existing=escape_braces(existing_text),
+            candidate=escape_braces(candidate_text),
         ),
         model=settings.MEM0_DEDUP_MODEL,
         max_tokens=settings.MEM0_DEDUP_MAX_TOKENS,
@@ -114,21 +116,23 @@ async def synthesize_facts(existing_text: str, candidate_text: str) -> str | Non
     Returns the synthesized fact text, or ``None`` on any error (fail-open:
     the caller keeps both facts rather than losing information).
     """
+    if max(len(existing_text), len(candidate_text)) > 4000:
+        return None
     data = await complete_json(
         system=(
             "You merge two overlapping fact statements into a single fact "
             "that preserves every concrete detail. Return JSON only."
         ),
         user_message=_DEDUP_MERGE_PROMPT.format(
-            existing=escape_braces(existing_text, limit=400),
-            candidate=escape_braces(candidate_text, limit=400),
+            existing=escape_braces(existing_text),
+            candidate=escape_braces(candidate_text),
         ),
         model=settings.MEM0_DEDUP_MERGE_MODEL,
         max_tokens=settings.MEM0_DEDUP_MAX_TOKENS,
         caller="dedup.synthesize_facts",
     )
     merged = (data or {}).get("merged") if isinstance(data, dict) else None
-    if isinstance(merged, str) and merged.strip():
+    if isinstance(merged, str) and merged.strip() and len(merged.strip()) <= 4000:
         return merged.strip()
     return None
 
@@ -164,6 +168,8 @@ async def synthesize_cluster(texts: list[str]) -> list[str] | None:
     facts = [t for t in (texts or []) if isinstance(t, str) and t.strip()]
     if len(facts) < 2:
         return None
+    if sum(map(len, facts)) > 32_000:
+        return None  # Do not destroy details omitted from a bounded prompt.
     data = await complete_json(
         system=(
             "You consolidate a cluster of redundant memory facts into "
@@ -171,7 +177,7 @@ async def synthesize_cluster(texts: list[str]) -> list[str] | None:
             "state. Return JSON only."
         ),
         user_message=_CLUSTER_CONSOLIDATE_PROMPT.format(
-            facts="\n".join(f"- {escape_braces(t, limit=300)}" for t in facts),
+            facts="\n".join(f"- {escape_braces(t)}" for t in facts),
         ),
         model=settings.MEM0_DEDUP_MERGE_MODEL,
         max_tokens=settings.MEM0_DEDUP_MAX_TOKENS,
@@ -289,6 +295,8 @@ async def check_near_dup(
             from .conflict import classify_conflict
             cls = await classify_conflict(text, candidate_text, existing_metadata=md,
                                           candidate_metadata=candidate_md)
+            if cls.get("retryable"):
+                raise RuntimeError("conflict_classification_unavailable")
             kind = cls.get("conflict_type", "addition")
             if kind in ("update", "correction"):
                 return (False, "conflict_" + kind, fid, None if dry_run else kind, None)
@@ -298,6 +306,8 @@ async def check_near_dup(
                 from .conflict import classify_conflict
                 cls = await classify_conflict(candidate_text, text, existing_metadata=candidate_md,
                                               candidate_metadata=md)
+                if cls.get("retryable"):
+                    raise RuntimeError("conflict_classification_unavailable")
                 kind = cls.get("conflict_type")
                 if kind in ("update", "correction"):
                     return (False, "historical_" + kind, fid,

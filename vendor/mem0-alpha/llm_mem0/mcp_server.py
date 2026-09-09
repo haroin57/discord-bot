@@ -33,8 +33,9 @@ from __future__ import annotations
 
 import asyncio
 import html
-import json
 import logging
+
+from pydantic import StrictFloat, StrictInt, StrictStr
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ from llm_mem0 import (
     search_memories_smart,
 )
 from llm_mem0.settings import settings
+from . import api_contracts as contracts
 
 mcp = FastMCP("mem0-alpha")
 
@@ -65,13 +67,13 @@ class _MissingUserId(ValueError):
 
 def _resolve_user_id(user_id: str) -> str:
     """Explicit argument wins; fall back to MEM0_DEFAULT_USER_ID."""
-    uid = (user_id or "").strip() or settings.MEM0_DEFAULT_USER_ID
+    uid = contracts.identifier(user_id, "user_id") or settings.MEM0_DEFAULT_USER_ID
     if not uid:
         raise _MissingUserId(
             "user_id is required: pass it as an argument or set the "
             "MEM0_DEFAULT_USER_ID env var in the MCP server config."
         )
-    return uid
+    return contracts.identifier(uid, "user_id", required=True)
 
 
 def _limit(value: int) -> int:
@@ -82,13 +84,7 @@ def _limit(value: int) -> int:
 
 def _safe_details(value):
     from .format import _scrub_fact_text
-    if isinstance(value, str):
-        return html.escape(_scrub_fact_text(value[:4000]), quote=False)
-    if isinstance(value, dict):
-        return {str(_safe_details(k)): _safe_details(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_safe_details(v) for v in value]
-    return value
+    return contracts.bounded_details(value, lambda text: html.escape(_scrub_fact_text(text), quote=False))
 
 
 @mcp.tool()
@@ -97,6 +93,14 @@ async def add_memory(
     user_id: str = "",
     assistant_text: str = "",
     context_hint: str = "",
+    request_id: str | None = None,
+    source_id: str | None = None,
+    source_message_ids: list[str] | None = None,
+    source_author_id: str | None = None,
+    source_timestamp: StrictInt | StrictFloat | StrictStr | None = None,
+    channel_id: str | None = None,
+    valid_from: StrictInt | StrictFloat | StrictStr | None = None,
+    valid_to: StrictInt | StrictFloat | StrictStr | None = None,
 ) -> str:
     """Store a conversation turn as long-term memory facts.
 
@@ -109,46 +113,49 @@ async def add_memory(
             the MEM0_DEFAULT_USER_ID env var).
         assistant_text: The assistant reply, for context (optional).
         context_hint: Extra context for the extractor (optional).
+        request_id: Stable caller event ID; reuse for retries of the same input.
+        source_id: Explicit source reference, not an authorization identity.
+        source_message_ids: Up to 100 source references of at most 256 characters.
+        source_author_id: Provenance only; never changes the memory owner.
+        source_timestamp: Original observation time, Unix seconds or timezone-aware ISO8601.
+        channel_id: Original conversation scope identifier.
+        valid_from: Explicit effective start time, Unix seconds or timezone-aware ISO8601.
+        valid_to: Explicit effective end time, not earlier than valid_from.
     """
     try:
         uid = _resolve_user_id(user_id)
-    except _MissingUserId as exc:
+        contracts.validate_input_text(user_text=user_text, assistant_text=assistant_text, context_hint=context_hint)
+        metadata = contracts.provenance_metadata(request_id=request_id, source_id=source_id,
+            source_message_ids=source_message_ids, source_author_id=source_author_id,
+            source_timestamp=source_timestamp, channel_id=channel_id, valid_from=valid_from, valid_to=valid_to)
+    except ValueError as exc:
         return f"Error: {exc}"
-    result = await add_memories(
-        user_text=user_text,
-        assistant_text=assistant_text,
-        user_id=uid,
-        context_hint=context_hint,
-    )
-    if result is None:
-        return (
-            "Error: memory store unavailable (is the ChromaDB server "
-            "running and reachable?)."
-        )
-    if isinstance(result, dict):
-        if result.get("error"):
-            return f"Error: {result['error']}"
-        if result.get("status") in {"error", "partial"} or result.get("failed"):
-            return "Error: ingestion incomplete; retry with the same source identifiers."
-        n = len(result.get("results") or [])
-        if n:
-            skipped = result.get("skipped") or {}
-            dup = skipped.get("near_dup", 0)
-            suffix = f" ({dup} duplicate(s) merged/skipped)" if dup else ""
-            return f"Stored {n} fact(s).{suffix}"
+    try:
+        result = await add_memories(user_text=user_text, assistant_text=assistant_text,
+            user_id=uid, context_hint=context_hint, **({"metadata": metadata} if metadata else {}))
+    except Exception:
+        return "Error: ingestion failed; verify the result and retry with the same request_id."
+    outcome = contracts.classify_add_outcome(result)
+    if outcome.status != "ok":
+        return "Error: " + contracts.add_failure(outcome, result, request_id)
+    if not outcome.stored:
         return "Processed (no new facts extracted or all were duplicates)."
-    return "Stored."
+    skipped = result.get("skipped") or {}
+    duplicates = skipped.get("near_dup", 0) if isinstance(skipped, dict) else 0
+    suffix = f" ({duplicates} duplicate(s) merged/skipped)" if type(duplicates) is int and duplicates > 0 else ""
+    return f"Stored {outcome.stored} fact(s).{suffix}"
 
 
 @mcp.tool()
 async def search_memory(
     query: str,
     user_id: str = "",
-    limit: int = 5,
+    limit: StrictInt = 5,
     smart: bool = False,
     channel_id: str | None = None,
-    as_of: int | str | None = None,
+    as_of: StrictInt | StrictStr | None = None,
     details: bool = False,
+    mode: str | None = None,
 ) -> str:
     """Search long-term memories; returns a prompt-ready, injection-safe block.
 
@@ -160,10 +167,15 @@ async def search_memory(
         channel_id: Conversation scope to include.
         as_of: Unix seconds or ISO8601 with timezone, for historical validity.
         details: Include IDs, provenance and retrieval evidence as untrusted JSON data.
+        mode: Explicit vector/hybrid/smart. Omitted preserves smart/default behavior; as_of takes precedence.
     """
     try:
         uid = _resolve_user_id(user_id)
         limit = _limit(limit)
+        contracts.validate_input_text(query=query)
+        selected_mode = contracts.search_mode(mode, smart)
+        if channel_id is not None:
+            channel_id = contracts.identifier(channel_id, "channel_id")
     except ValueError as exc:
         return f"Error: {exc}"
     kwargs = {"limit": limit}
@@ -176,24 +188,27 @@ async def search_memory(
         if as_of is not None:
             from .search import search_memories_at_time
             memories = await search_memories_at_time(query, uid, as_of, **kwargs)
-        elif smart:
+        elif selected_mode == "hybrid":
+            from .search import search_memories_hybrid
+            memories = await search_memories_hybrid(query, uid, **kwargs)
+        elif selected_mode == "smart":
             memories = await search_memories_smart(query, uid, **kwargs)
         else:
             memories = await search_memories(query, uid, **kwargs)
-    except (ValueError, RuntimeError):
+    except Exception:
         return "Error: search failed; check the store and temporal parameters."
     if details:
-        return json.dumps({"untrusted_memory_data": _safe_details(memories)}, ensure_ascii=False)
+        return contracts.details_json("untrusted_memory_data", memories, _safe_details)
     if not memories:
         return "(no relevant memories)"
-    return format_memories_for_prompt(memories)
+    return contracts.bound_output(format_memories_for_prompt(memories))
 
 
 @mcp.tool()
 async def list_memories(
     user_id: str = "",
-    limit: int = 50,
-    offset: int = 0,
+    limit: StrictInt = 50,
+    offset: StrictInt = 0,
     details: bool = False,
 ) -> str:
     """List stored memories with their IDs, for review and housekeeping.
@@ -205,21 +220,20 @@ async def list_memories(
         user_id: Whose memories to list (falls back to MEM0_DEFAULT_USER_ID).
         limit: Maximum number of rows to return.
         offset: Number of rows to skip (0..10000); enumeration is not a snapshot.
-        details: Include complete metadata as untrusted JSON data.
+        details: Include bounded metadata as untrusted JSON data.
     """
     try:
         uid = _resolve_user_id(user_id)
         limit = _limit(limit)
-        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 10000:
-            raise ValueError("offset must be between 0 and 10000")
+        offset = contracts.page_offset(offset)
     except ValueError as exc:
         return f"Error: {exc}"
     try:
-        rows = (await get_all_memories(uid, limit=limit + offset, strict=True))[offset:]
+        rows = (await get_all_memories(uid, limit=limit + offset, strict=True))[offset:offset + limit]
     except Exception:
         return "Error: memory store unavailable or enumeration failed."
     if details:
-        return json.dumps({"untrusted_memory_data": _safe_details(rows), "offset": offset}, ensure_ascii=False)
+        return contracts.details_json("untrusted_memory_data", rows, _safe_details, offset=offset)
     if not rows:
         return "(no memories stored for this user)"
     lines = []
@@ -235,7 +249,7 @@ async def list_memories(
         meta = f" [{' '.join(meta_bits)}]" if meta_bits else ""
         text = (r.get("memory") or r.get("text") or "").replace("\n", " ")
         lines.append(_safe_details(f"{r.get('id', '?')}{meta}  {text[:200]}"))
-    return "\n".join(lines)
+    return contracts.bound_output("\n".join(lines))
 
 
 @mcp.tool()
@@ -249,17 +263,20 @@ async def delete_memory(memory_id: str) -> str:
     Args:
         memory_id: The memory's ID as shown by list_memories.
     """
-    mid = (memory_id or "").strip()
-    if not mid:
-        return "Error: memory_id is required."
-    ok = await _delete_memory(mid)
+    try:
+        mid = contracts.identifier(memory_id, "memory_id", required=True)
+        ok = await _delete_memory(mid)
+    except ValueError:
+        return "Error: valid memory_id is required."
+    except Exception:
+        return "Error: deletion failed; verify the store before retrying."
     if not ok:
-        return f"Error: failed to delete {mid} (wrong id, or store unavailable)."
+        return "Error: failed to delete memory (wrong id, or store unavailable)."
     return f"Deleted {_safe_details(mid)}."
 
 
 @mcp.tool()
-async def fact_history(attribute: str, user_id: str = "", limit: int = 50) -> str:
+async def fact_history(attribute: str, user_id: str = "", limit: StrictInt = 50) -> str:
     """Inspect a user's derived attribute correction links and validity times.
 
     Body copies are truncated; IDs refer to the authoritative memory store.
@@ -267,11 +284,17 @@ async def fact_history(attribute: str, user_id: str = "", limit: int = 50) -> st
     try:
         uid = _resolve_user_id(user_id)
         limit = _limit(limit)
+        attribute = contracts.identifier(attribute, "attribute", required=True)
     except ValueError as exc:
         return f"Error: {exc}"
     from .fact_store import get_history
-    rows = await asyncio.to_thread(get_history, uid, attribute, limit)
-    return json.dumps({"untrusted_fact_history": _safe_details(rows)}, ensure_ascii=False)
+    if not settings.MEM0_FACT_STORE_ENABLED:
+        return "Error: fact history is disabled; absence of lineage is not absence of memories."
+    try:
+        rows = await asyncio.to_thread(get_history, uid, attribute, limit, strict=True)
+    except Exception:
+        return "Error: fact history store unavailable."
+    return contracts.details_json("untrusted_fact_history", rows, _safe_details)
 
 
 def main() -> None:

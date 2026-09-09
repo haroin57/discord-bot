@@ -242,16 +242,18 @@ class TestAddTool:
         _svc("add_memories").assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_add_result_without_results_key_returns_0(self):
+    async def test_add_result_without_results_key_is_not_success(self):
         _svc("add_memories").return_value = {"other": "data"}
         out = await _m.add(user_message="u", assistant_message="a", user_id=VALID_UID)
-        assert "stored 0 new memories" in out
+        assert "add failed" in out and "incomplete" in out
+        assert not out.startswith("stored")
 
     @pytest.mark.asyncio
-    async def test_add_non_dict_result_returns_0(self):
+    async def test_add_non_dict_result_is_not_success(self):
         _svc("add_memories").return_value = True
         out = await _m.add(user_message="u", assistant_message="a", user_id=VALID_UID)
-        assert "stored 0 new memories" in out
+        assert "add failed" in out and "incomplete" in out
+        assert not out.startswith("stored")
 
 
 # ===========================================================================

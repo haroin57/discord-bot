@@ -280,6 +280,9 @@ async def test_cancelled_awaiter_still_finishes_relation_cleanup_in_same_worker(
     try:
         assert await asyncio.to_thread(entered.wait, 3)
         task.cancel()
+        await asyncio.sleep(0.02)
+        assert not task.done(), "Cancellation must drain the real delete/repair worker"
+        release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
     finally:
@@ -435,7 +438,14 @@ async def test_tombstone_fsync_failure_prevents_provider_delete(monkeypatch, tmp
     from llm_mem0 import client
     provider, fid, key, _, _ = _receipt_insert_with_uncertain_commit(tmp_path)
     monkeypatch.setattr(client, "_get_mem0", lambda: provider)
-    monkeypatch.setattr(client.os, "fsync", Mock(side_effect=OSError("synthetic fsync failure")))
+    write_receipt = client._write_deleted_receipt
+    def fail_receipt_fsync(receipt_key):
+        # The new pre-delete intent has its own durability barrier. Inject
+        # this legacy regression at the receipt barrier, not the earlier one.
+        with monkeypatch.context() as patch:
+            patch.setattr(client.os, "fsync", Mock(side_effect=OSError("synthetic fsync failure")))
+            return write_receipt(receipt_key)
+    monkeypatch.setattr(client, "_write_deleted_receipt", fail_receipt_fsync)
     assert not await client.delete_memory(fid)
     assert provider.delete_calls == 0 and fid in provider.rows
     assert json.loads(_receipt_contents(tmp_path, key))["deleted"] is True
@@ -458,6 +468,9 @@ async def test_cancelled_delete_waiter_still_commits_tombstone_and_deletes(monke
     try:
         assert await asyncio.to_thread(entered.wait, 3)
         task.cancel()
+        await asyncio.sleep(0.02)
+        assert not task.done(), "Cancellation must drain the real delete/repair worker"
+        release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
         assert json.loads(_receipt_contents(tmp_path, key))["deleted"] is True

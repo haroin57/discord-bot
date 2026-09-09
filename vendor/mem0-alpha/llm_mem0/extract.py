@@ -9,7 +9,7 @@ import math
 import re
 
 from .auth import get_auth_backend
-from .llm import complete_json, escape_braces, strip_json_fence
+from .llm import complete_json, complete_text, escape_braces, strip_json_fence
 from .settings import settings
 
 log = logging.getLogger(__name__)
@@ -276,6 +276,13 @@ fact が「特定の時間帯・状況でのみ成り立つ」なら condition �
 - 状況: context:work(仕事中) / context:private(私的) / context:study(勉強中) など
 - 条件がなければ "" (空文字列)
 
+== 集合の個別対象の取消 ==
+
+- habit/preference/possession の追加は operation="assert" とします。別の好みを追加しただけで既存の好みを消しません。
+- 本人が特定の対象について「やめた」「もう〜ない」「手放した」等を明示した場合だけ operation="retract" とします。
+- member_key はその対象を特定する user_text の連続した原語句です。fact text と source_quote にも同じ語句を含めます。曖昧な「それ」「あれ」から対象を推測しません。
+- 肯定factにも対象が明確ならmember_keyを付けます。引用・仮定・質問は本人の取消ではありません。source_quoteは省略しません。
+
 == scope (適用範囲 / Phase C) ==
 
 その fact が「どこで言われたか(発話元)」ではなく「どこに適用されるか(適用範囲)」を scope で示してください。**発話元と適用範囲は別物です。**
@@ -454,15 +461,28 @@ def normalize_fact(raw: object, *, programmatic: bool = False) -> dict | None:
         return None
     if not 0 <= importance <= 5 or not 0 <= tier <= 3:
         return None
-    f = {**raw, "text": text, "importance": importance, "tier": tier}
+    fields = {"speaker", "text", "importance", "tier", "category", "subcategory", "tags",
+              "attribute", "condition", "scope", "value", "entities", "source_quote",
+              "operation", "member_key", "retraction_target"}
+    # Internal plans and receipt/projection markers are never LLM-controlled.
+    f = {**(raw if programmatic else {k: v for k, v in raw.items() if k in fields}),
+         "text": text, "importance": importance, "tier": tier}
     if programmatic:
         from .attribute_registry import observation_time, validate_effective_interval
         try:
             validate_effective_interval(f)
             if "source_timestamp" in f and (isinstance(f["source_timestamp"], bool) or observation_time(f) is None):
                 return None
-            if "source_offset" in f and (isinstance(f["source_offset"], bool) or not isinstance(f["source_offset"], int)):
+            if "source_offset" in f and (isinstance(f["source_offset"], bool) or not isinstance(f["source_offset"], int) or f["source_offset"] < 0):
                 return None
+            if "_predecessors" in f:
+                if not isinstance(f["_predecessors"], list) or any(
+                        not isinstance(p, (list, tuple)) or len(p) != 2
+                        or not isinstance(p[0], str) or not isinstance(p[1], str)
+                        or p[1] not in {"update", "correction", "merge"}
+                        for p in f["_predecessors"]):
+                    return None
+                f["_predecessors"] = [tuple(p) for p in f["_predecessors"]]
         except ValueError:
             return None
     else:
@@ -474,12 +494,22 @@ def normalize_fact(raw: object, *, programmatic: bool = False) -> dict | None:
     scope = f.get("scope")
     # Explicit channel-bound scopes are valid for programmatic callers.
     if isinstance(scope, str) and scope.startswith("conversation:"):
+        if not programmatic:
+            return None
         f["scope"] = scope
-    elif scope is not None and scope not in _VALID_SCOPES:
+    elif scope is not None and (not isinstance(scope, str) or scope not in _VALID_SCOPES):
         return None  # do not silently promote invalid scope to global
     else:
         f["scope"] = _normalize_scope(scope)
     f["value"] = _normalize_value(f.get("value"))
+    operation = f.get("operation", "assert")
+    if not isinstance(operation, str) or operation not in {"assert", "retract"}:
+        return None
+    f["operation"] = operation
+    member = f.get("member_key") or ""
+    if not isinstance(member, str) or len(member) > 100:
+        return None
+    f["member_key"] = member.strip()
     tags = f.get("tags") or []
     if isinstance(tags, str):
         tags = tags.split(",")
@@ -544,10 +574,11 @@ async def extract_full_signals(
         async with semaphore:
             for _ in range(attempts):
                 try:
-                    raw = strip_json_fence(await backend.complete(
+                    raw = strip_json_fence(await complete_text(
                         system="Extract only user-grounded facts and relations. Every item needs an exact source_quote from user_text. Return JSON only.",
                         user_message=prompt, model=settings.MEM0_GATE_MODEL,
                         max_tokens=settings.MEM0_EXTRACT_MAX_TOKENS,
+                        backend=backend,
                     ))
                     truncated = False
                     try:

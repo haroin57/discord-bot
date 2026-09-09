@@ -182,6 +182,32 @@ async def recompute_tiers_for_user(user_id: str, *, dry_run: bool = True) -> dic
 async def gist_compress_for_user(
     user_id: str, *, dry_run: bool = True, max_clusters: int | None = None,
 ) -> dict:
+    """Serialize durable plans; cancellation cannot release a committing worker's lease."""
+    from . import lineage
+    async def run():
+        if dry_run:
+            return await _gist_compress_for_user(user_id, dry_run=True, max_clusters=max_clusters)
+        async with lineage.consolidation_lock(user_id):
+            return await _gist_compress_for_user(user_id, dry_run=False, max_clusters=max_clusters)
+    task = asyncio.create_task(run())
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not task.cancelled():
+            task.exception()
+        raise
+
+
+async def _gist_compress_for_user(
+    user_id: str, *, dry_run: bool = True, max_clusters: int | None = None,
+) -> dict:
     """Cluster Cold-tier, non-exempt facts by shared entity and collapse
     each cluster into fewer gist facts via ``dedup.synthesize_cluster``.
 
@@ -194,6 +220,7 @@ async def gist_compress_for_user(
     """
     from . import client as client_mod
     from . import graph
+    from . import lineage
     from .dedup import synthesize_cluster
 
     if max_clusters is None:
@@ -208,7 +235,7 @@ async def gist_compress_for_user(
     candidates = []
     for r in rows:
         md = r.get("metadata") or {}
-        if not isinstance(md, dict) or md.get("valid_to"):
+        if not isinstance(md, dict) or not lineage.current_validity(md):
             continue
         try:
             tier = int(md.get("tier", 1))
@@ -241,17 +268,24 @@ async def gist_compress_for_user(
 
     result = {"clusters": 0, "compressed": 0, "archived": 0}
     now_ts = int(time.time())
-    eligible = [(key, members) for key, members in clusters.items() if len(members) >= min_cluster_size]
-    for (entity_id, scope, condition, category, subcategory), members in eligible[:max(0, max_clusters)]:
+    pending = [] if dry_run else await asyncio.to_thread(lineage.pending_jobs, user_id, max(0, max_clusters))
+    pending_members = {m["id"] for job in pending for m in job["members"]}
+    eligible = [(key, members, None) for key, members in clusters.items()
+                if len(members) >= min_cluster_size and not any(m["id"] in pending_members for m in members)]
+    work = [(job["key"], job["members"], job) for job in pending] + eligible
+    for key, members, job in work[:max(0, max_clusters)]:
+        entity_id, scope, condition, category, subcategory = key
         texts = [m.get("memory") or m.get("text") or "" for m in members]
         texts = [t for t in texts if t]
-        if len(texts) < min_cluster_size:
+        if not job and len(texts) < min_cluster_size:
             continue
         member_ids = sorted(m["id"] for m in members)
-        operation_id = hashlib.sha256(json.dumps([user_id, member_ids]).encode()).hexdigest()
+        operation_id = (job["operation_id"] if job else hashlib.sha256(json.dumps(
+            [user_id, [(m["id"], lineage.snapshot(m)) for m in sorted(members, key=lambda m: m["id"])]],
+        ).encode()).hexdigest())
         previous = [r for r in rows if (r.get("metadata") or {}).get("gist_operation_id") == operation_id
                     and not (r.get("metadata") or {}).get("valid_to")]
-        consolidated = None
+        consolidated = job["consolidated"] if job else None
         if previous:
             try:
                 consolidated = json.loads(previous[0]["metadata"]["gist_plan"])
@@ -271,6 +305,31 @@ async def gist_compress_for_user(
             result["compressed"] += len(consolidated)
             continue
 
+        # A current gist may not be created from a source that changed its
+        # meaning/validity while the model was running. Mere reheating only
+        # changes archive eligibility; it does not invalidate the summary.
+        source_changed = False
+        for original in members:
+            fresh = await asyncio.to_thread(mem.get, original["id"])
+            md = (fresh.get("metadata") or {}) if isinstance(fresh, dict) else {}
+            if md.get("gist_superseded_by") and md.get("valid_to") and job:
+                continue  # This plan already archived this historical support.
+            old_md = original.get("metadata") or {}
+            semantic_keys = ("scope", "condition", "category", "subcategory", "attribute", "valid_from", "valid_to")
+            if (not isinstance(fresh, dict) or not lineage.current_validity(md)
+                    or (fresh.get("memory") or fresh.get("text")) != (original.get("memory") or original.get("text"))
+                    or any(md.get(k) != old_md.get(k) for k in semantic_keys)):
+                source_changed = True
+                break
+        if source_changed:
+            if job is not None:
+                await asyncio.to_thread(lineage.save_job, operation_id, user_id, job, done=True)
+            continue
+
+        if job is None:
+            job = {"key": list(key), "members": members, "consolidated": consolidated, "member_status": {}}
+            await asyncio.to_thread(lineage.save_job, operation_id, user_id, job)
+
         base_meta = {
             "category": category, "subcategory": subcategory,
             "scope": scope, "condition": condition,
@@ -282,6 +341,7 @@ async def gist_compress_for_user(
             "derived_from": ",".join(member_ids), "source": "consolidation_gist",
             "gist_operation_id": operation_id, "gist_plan": json.dumps(consolidated, ensure_ascii=False),
             "timestamp": now_ts,
+            **lineage.supported_interval(members),
         }
         new_ids: list[str] = []
         complete = True
@@ -317,6 +377,14 @@ async def gist_compress_for_user(
                 complete = False
                 log.warning("gist insert failed (non-fatal): %s", exc)
         result["compressed"] += len(new_ids)
+        supported = True
+        for nid in new_ids:
+            supported = (await asyncio.to_thread(lineage.register_derivation, nid, user_id,
+                                                member_ids, kind="gist")) and supported
+        if not supported:
+            await asyncio.to_thread(lineage.repair_dependents_sync, mem)
+            await asyncio.to_thread(lineage.save_job, operation_id, user_id, job, done=True)
+            continue
         if new_ids:
             from .search import invalidate_core_cache
             await asyncio.to_thread(invalidate_core_cache, user_id)
@@ -325,19 +393,31 @@ async def gist_compress_for_user(
 
         for m in members:
             mid = m.get("id")
-            if not mid:
+            if not mid or job["member_status"].get(mid) in {"done", "skipped_changed"}:
                 continue
             try:
                 from .reinforce import mutate_memory_metadata_sync
+                disposition = "pending"
                 def archive(fresh):
+                    nonlocal disposition
                     md = fresh.get("metadata") or {}
-                    if (md.get("valid_to") or is_gist_exempt(md)
-                            or (fresh.get("memory") or fresh.get("text")) != (m.get("memory") or m.get("text"))
-                            or (md.get("scope") or "global", md.get("condition") or "") != (scope, condition)):
+                    if md.get("gist_superseded_by") == ",".join(new_ids) and md.get("valid_to"):
+                        disposition = "done"
                         return None
+                    if (not lineage.current_validity(md) or is_gist_exempt(md)
+                            or lineage.snapshot(fresh) != lineage.snapshot(m)
+                            or str(md.get("tier")) != "3"
+                            or activation_to_tier(compute_fact_activation(md)) != 3):
+                        disposition = "skipped_changed"
+                        return None
+                    disposition = "done"
                     return {"valid_to": now_ts, "gist_superseded_by": ",".join(new_ids)}
                 result["archived"] += int(await asyncio.to_thread(
                     mutate_memory_metadata_sync, mem, mid, archive))
+                job["member_status"][mid] = disposition
+                await asyncio.to_thread(lineage.save_job, operation_id, user_id, job)
             except Exception as exc:
                 log.warning("gist archive failed for %s (non-fatal): %s", mid, exc)
+        done = all(job["member_status"].get(mid) in {"done", "skipped_changed"} for mid in member_ids)
+        await asyncio.to_thread(lineage.save_job, operation_id, user_id, job, done=done)
     return result

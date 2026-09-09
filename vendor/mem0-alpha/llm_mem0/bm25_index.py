@@ -258,8 +258,16 @@ def reindex_all(facts: Iterable[tuple[str, str, str]]) -> int:
     schema change requires a separate explicit migration, not this function.
     """
     try:
+        unique: dict[str, tuple[str, str]] = {}
+        for fid, text, uid in facts:
+            if not fid or not text or not uid:
+                continue
+            value = (uid, text)
+            if fid in unique and unique[fid] != value:
+                raise ValueError("conflicting duplicate fact ID in reindex input")
+            unique[fid] = value
         prepared = [(fid, uid, text, _tokenize(text))
-                    for fid, text, uid in facts if fid and text and uid]
+                    for fid, (uid, text) in unique.items()]
     except Exception as exc:
         log.warning("reindex_all preparation failed: %s", exc)
         return 0

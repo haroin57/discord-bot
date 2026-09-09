@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 import fcntl
 import json
 import math
@@ -69,6 +70,18 @@ def _load_raw(state_dir, channel_id) -> dict:
                 or not all(isinstance(t, dict) for t in pending["turns"])
                 or not all(k in pending for k in ("user_id", "token", "extracted_facts"))):
             raise ValueError("invalid memory batch lease")
+        if (isinstance(pending["lease_until"], bool)
+                or not math.isfinite(pending["lease_until"])
+                or not isinstance(pending["user_id"], str)
+                or not isinstance(pending["token"], str)
+                or not isinstance(pending["extracted_facts"], list)):
+            raise ValueError("invalid memory batch lease values")
+        retry_at = pending.get("next_retry_at", 0)
+        count = pending.get("retry_count", 0)
+        if (isinstance(retry_at, bool) or not isinstance(retry_at, (int, float))
+                or not math.isfinite(retry_at) or retry_at < 0
+                or type(count) is not int or count < 0):
+            raise ValueError("invalid memory batch retry values")
     return data
 
 
@@ -96,7 +109,8 @@ def _all_turns(data):
 def append_turn(state_dir, channel_id, user_text: str, assistant_text: str, *,
                 request_id: str | None = None, user_id: str | None = None,
                 author_id: str | None = None, source_timestamp: str | None = None,
-                message_id: str | None = None, force_flush: bool = False) -> int:
+                message_id: str | None = None, force_flush: bool = False,
+                channel_name: str = "") -> int:
     """Persist full input; return this owner's outstanding turn count.
 
     Redelivered request IDs are ignored across pending and recently completed
@@ -109,6 +123,7 @@ def append_turn(state_dir, channel_id, user_text: str, assistant_text: str, *,
             "ts": source_timestamp or time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "user_id": owner, "author_id": str(author_id or ""),
             "message_id": str(message_id or ""),
+            "enqueued_at": time.time(), "channel_name": str(channel_name)[:200],
             "force_flush": bool(force_flush),
             "request_id": str(request_id or "")}
     with _locked(state_dir, channel_id):
@@ -170,7 +185,8 @@ def claim_batch(state_dir, channel_id, *, user_id: str | None = None,
     None means the unowned legacy queue, not every speaker. One claim per owner
     may be active; different speakers proceed separately.
     """
-    if not math.isfinite(lease_seconds) or lease_seconds <= 0 or max_turns <= 0:
+    if (isinstance(lease_seconds, bool) or not math.isfinite(lease_seconds)
+            or lease_seconds <= 0 or type(max_turns) is not int or max_turns <= 0):
         raise ValueError("lease_seconds and max_turns must be positive")
     owner, now = str(user_id or ""), time.time()
     with _locked(state_dir, channel_id):
@@ -180,6 +196,8 @@ def claim_batch(state_dir, channel_id, *, user_id: str | None = None,
             return None
         if pending:
             batch_id, payload = pending[0]
+            if payload.get("next_retry_at", 0) > now:
+                return None
         else:
             turns = [t for t in data["turns"] if _owner(t) == owner][:max_turns]
             facts = list(data["extracted_facts"]) if not owner else []
@@ -235,14 +253,23 @@ def ack_batch(state_dir, lease: BatchLease) -> bool:
         return True
 
 
-def retry_batch(state_dir, lease: BatchLease, error: str = "") -> bool:
+def retry_batch(state_dir, lease: BatchLease, error: str = "", *,
+                delay_seconds: float = 0, max_delay_seconds: float = 600,
+                made_progress: bool = False) -> bool:
     """Release a claim, retaining its stable batch ID and all source turns."""
+    if (any(isinstance(v, bool) or not isinstance(v, (int, float))
+            or not math.isfinite(v) or v < 0 for v in (delay_seconds, max_delay_seconds))
+            or max_delay_seconds < delay_seconds):
+        raise ValueError("invalid retry delay")
     with _locked(state_dir, lease.channel_id):
         data = _load_raw(state_dir, lease.channel_id)
         payload = _matches(data, lease)
         if payload is None:
             return False
-        payload.update(lease_until=0, last_error=str(error)[:300])
+        count = 0 if made_progress else payload.get("retry_count", 0) + 1
+        delay = 0 if made_progress else min(max_delay_seconds, delay_seconds * 2 ** min(count - 1, 16))
+        payload.update(lease_until=0, last_error=str(error)[:300], retry_count=count,
+                       next_retry_at=time.time() + delay)
         _save_raw(state_dir, lease.channel_id, data)
         return True
 
@@ -251,18 +278,109 @@ def has_retry_batch(state_dir, channel_id, *, user_id: str) -> bool:
     with _locked(state_dir, channel_id):
         data = _load_raw(state_dir, channel_id)
         return any(p["user_id"] == str(user_id) and p["lease_until"] <= time.time()
+                   and p.get("next_retry_at", 0) <= time.time()
                    for p in data["inflight"].values())
 
 
-def has_ready_batch(state_dir, channel_id, *, user_id: str) -> bool:
+def _enqueued_at(turn) -> float | None:
+    value = turn.get("enqueued_at")
+    if not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value):
+        return float(value)
+    # Prior quality queues did not store enqueue time. Only an explicit,
+    # timezone-aware original timestamp can serve as a conservative fallback.
+    try:
+        stamp = datetime.fromisoformat(str(turn.get("ts", "")).replace("Z", "+00:00"))
+        return stamp.timestamp() if stamp.tzinfo is not None else None
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _ready(data, owner, now, max_age_seconds=0):
+    leases = [p for p in data["inflight"].values() if p["user_id"] == owner]
+    if leases:
+        if not any(p["lease_until"] > now for p in leases):
+            return leases[0].get("next_retry_at", 0) <= now
+    turns = [t for t in data["turns"] if _owner(t) == owner]
+    times = [stamp for t in turns if (stamp := _enqueued_at(t)) is not None]
+    aged = max_age_seconds > 0 and times and min(times) + max_age_seconds <= now
+    return bool(len(turns) >= max(1, settings.MEM0_BATCH_SIZE)
+                or any(t.get("force_flush") for t in turns) or aged)
+
+
+def has_ready_batch(state_dir, channel_id, *, user_id: str,
+                    max_age_seconds: float = 0) -> bool:
     """A force-record request remains ready even while an older claim runs."""
     with _locked(state_dir, channel_id):
         data = _load_raw(state_dir, channel_id)
-        turns = [t for t in data["turns"] if _owner(t) == str(user_id)]
-        return (len(turns) >= max(1, settings.MEM0_BATCH_SIZE)
-                or any(t.get("force_flush") for t in turns)
-                or any(p["user_id"] == str(user_id) and p["lease_until"] <= time.time()
-                       for p in data["inflight"].values()))
+        return _ready(data, str(user_id), time.time(), max_age_seconds)
+
+
+def scan_ready_batches(state_dir, *, allowed_user_ids, max_age_seconds=600,
+                       max_files=100, limit=2, cursor=None) -> dict:
+    """Bounded, rotating discovery without exposing any conversation content.
+
+    The cursor is a (channel, owner) pair, not a durable claim. Actual ownership
+    is revalidated by claim_batch. Unknown/unapproved owners are never selected.
+    Invalid files are counted and left untouched, not replaced with empty data.
+    """
+    if (type(max_files) is not int or not 1 <= max_files <= 10000
+            or type(limit) is not int or not 1 <= limit <= 1000
+            or isinstance(max_age_seconds, bool) or not math.isfinite(max_age_seconds)
+            or max_age_seconds < 0):
+        raise ValueError("invalid memory recovery budget")
+    allowed = {str(value) for value in allowed_user_ids if str(value)}
+    summary = {"ready": [], "cursor": cursor, "scanned_files": 0,
+               "invalid_files": 0, "unowned_turns": 0, "pending_turns": 0,
+               "inflight_batches": 0, "backoff_batches": 0}
+    directory = Path(state_dir) / "mem0_batch"
+    if not allowed or not directory.exists():
+        return summary
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("invalid memory recovery directory")
+    files = sorted((int(p.stem), p) for p in directory.iterdir()
+                   if p.suffix == ".json" and p.stem.isascii() and p.stem.isdigit()
+                   and str(int(p.stem)) == p.stem)
+    after = (int(cursor[0]), str(cursor[1])) if cursor is not None else None
+    if after and files:
+        pivot = next((i for i, (channel, _) in enumerate(files)
+                      if channel > after[0] or (channel == after[0] and after[1] != "\uffff")), 0)
+        files = files[pivot:] + files[:pivot]
+    candidates = []
+    visited = []
+    now = time.time()
+    for channel, path in files[:max_files]:
+        summary["scanned_files"] += 1
+        visited.append((channel, "\uffff"))
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("invalid memory batch file")
+            with _locked(state_dir, channel):
+                data = _load_raw(state_dir, channel)
+            summary["pending_turns"] += len(data["turns"])
+            summary["inflight_batches"] += len(data["inflight"])
+            summary["unowned_turns"] += sum(not _owner(t) for t in _all_turns(data))
+            summary["backoff_batches"] += sum(p.get("next_retry_at", 0) > now
+                                               for p in data["inflight"].values())
+            owners = {_owner(t) for t in data["turns"]}
+            owners.update(p["user_id"] for p in data["inflight"].values())
+            for owner in sorted(owners & allowed):
+                if after and after[1] != "\uffff" and channel == after[0] and owner <= after[1]:
+                    continue  # Finish this channel before wrapping its owners.
+                active = any(p["user_id"] == owner and p["lease_until"] > now
+                             for p in data["inflight"].values())
+                if not active and _ready(data, owner, now, max_age_seconds):
+                    candidates.append((channel, owner))
+        except (OSError, ValueError, TypeError, OverflowError):
+            summary["invalid_files"] += 1
+    candidates.sort()
+    if after:
+        candidates = [key for key in candidates if key > after] + [key for key in candidates if key <= after]
+    summary["ready"] = candidates[:limit]
+    if summary["ready"]:
+        summary["cursor"] = summary["ready"][-1]
+    elif visited:
+        summary["cursor"] = visited[-1]
+    return summary
 
 
 def batch_status(state_dir, channel_id) -> dict:
@@ -273,6 +391,8 @@ def batch_status(state_dir, channel_id) -> dict:
                 "unowned_turns": sum(not _owner(t) for t in _all_turns(data)),
                 "inflight_batches": len(data["inflight"]),
                 "retry_batches": sum(p["lease_until"] <= time.time() for p in data["inflight"].values()),
+                "backoff_batches": sum(p.get("next_retry_at", 0) > time.time()
+                                         for p in data["inflight"].values()),
                 "unowned_facts": len(data["extracted_facts"])}
 
 

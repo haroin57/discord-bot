@@ -719,6 +719,9 @@ async def on_ready():
         _track_task(_periodic_memory_trim(), name="memory_trim")
         _track_task(r2_archive.archive_worker(), name="r2_archive")
         _track_task(_replay_turn_outbox(), name="turn_outbox_replay")
+        _track_task(bot_record.alpha_recovery_worker(
+            add_memories=add_memories, allowed_user_ids=ADMIN_USER_IDS,
+        ), name="mem0_batch_recovery")
 
 
 # ---------------------------------------------------------------------------

@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import json
 import threading
+from pathlib import Path
 
 from .settings import settings
 
@@ -30,6 +32,12 @@ def _enabled() -> bool:
     return settings.MEM0_HISTORY_EMBED_ENABLED
 
 
+def _namespace() -> str:
+    return hashlib.sha256(json.dumps([
+        str(Path(settings.STATE_DIR).resolve()), settings.MEM0_COLLECTION_NAME,
+    ], separators=(",", ":")).encode()).hexdigest()
+
+
 def _get_collection():
     """Reuse Mem0's configured server/embedded client and embedding provider.
 
@@ -37,10 +45,11 @@ def _get_collection():
     are comparable. Cached for the process (double-checked lock so two
     threads can't build two clients). Patched out in tests.
     """
-    if _state["col"] is not None:
+    namespace = _namespace()
+    if _state["col"] is not None and _state.get("namespace") == namespace:
         return _state["col"]
     with _state_lock:
-        if _state["col"] is not None:
+        if _state["col"] is not None and _state.get("namespace") == namespace:
             return _state["col"]
         from .client import _get_mem0
         mem = _get_mem0()
@@ -51,16 +60,17 @@ def _get_collection():
             embedding_function=None,
             metadata={"hnsw:space": "cosine"},
         )
+        _state["namespace"] = namespace
     return _state["col"]
 
 
 def _line_id(channel_id, ts: str, role: str, text: str, *, author: str = "",
              author_id: str = "", source_id: str = "") -> str:
     if source_id:
-        identity = f"{channel_id}:{role}:{author_id}:{source_id}"
+        identity = json.dumps([_namespace(), str(channel_id), role, author_id, source_id])
         return "source:" + hashlib.sha256(identity.encode()).hexdigest()
     h = hashlib.sha256(f"{author_id}:{author}:{text or ''}".encode()).hexdigest()[:24]
-    return f"{channel_id}:{ts}:{role}:{h}"
+    return f"{_namespace()}:{channel_id}:{ts}:{role}:{h}"
 
 
 def _embed(text: str, action: str):
@@ -101,6 +111,7 @@ def index_line(channel_id, ts: str, role: str, author: str, text: str, *,
             embeddings=[_embed(safe_text(text), "add")],
             metadatas=[{
                 "channel_id": str(channel_id),
+                "namespace": _namespace(),
                 "ts": ts or "",
                 "role": role or "",
                 "author": author or "",
@@ -124,7 +135,7 @@ def search_semantic(query: str, channel_id, limit: int | None = None) -> list[di
         res = col.query(
             query_embeddings=[_embed(query, "search")],
             n_results=max(1, min(int(limit), 100)),
-            where={"channel_id": str(channel_id)},
+            where={"$and": [{"channel_id": str(channel_id)}, {"namespace": _namespace()}]},
         )
     except Exception as exc:
         log.warning("history_embed.search_semantic failed (non-fatal): %s", exc)
@@ -138,6 +149,8 @@ def search_semantic(query: str, channel_id, limit: int | None = None) -> list[di
         if not doc:
             continue
         md = metas[i] if i < len(metas) and isinstance(metas[i], dict) else {}
+        if md.get("namespace") != _namespace() or str(md.get("channel_id")) != str(channel_id):
+            continue  # Unknown legacy namespace is retained, never guessed into this state.
         out.append({
             "id": ids[i] if i < len(ids) else "",
             "memory": doc,

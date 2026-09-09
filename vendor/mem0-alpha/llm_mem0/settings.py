@@ -82,6 +82,16 @@ _SPECS: dict[str, _Spec] = {
     "MEM0_HYDE_MAX_TOKENS": _Spec(200, int),
     "MEM0_KEYWORD_MAX_TOKENS": _Spec(300, int),
     "MEM0_RERANK_MAX_TOKENS": _Spec(400, int),
+    "MEM0_HELPER_TIMEOUT_S": _Spec(60.0, float),
+
+    # Cooperative bot recovery; standalone callers opt into their own worker.
+    "MEM0_BATCH_RECOVERY_ENABLED": _Spec(True, _parse_bool),
+    "MEM0_BATCH_RECOVERY_INTERVAL_S": _Spec(30.0, float),
+    "MEM0_BATCH_MAX_AGE_S": _Spec(600.0, float),
+    "MEM0_BATCH_RECOVERY_MAX_BATCHES": _Spec(2, int),
+    "MEM0_BATCH_RECOVERY_SCAN_FILES": _Spec(100, int),
+    "MEM0_BATCH_RETRY_BASE_S": _Spec(30.0, float),
+    "MEM0_BATCH_RETRY_MAX_S": _Spec(600.0, float),
 
     # --- Retrieval feature flags / knobs -------------------------------------
     # Pre-rerank gate: drop candidates physically too far before the LLM

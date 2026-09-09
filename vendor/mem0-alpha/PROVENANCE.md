@@ -47,3 +47,14 @@ root, and build immutable releases from their archived `src` directory so the
 dependency cannot resolve to mutable operator files. Pip builds and installs
 a regular wheel; runtime import must resolve inside the release virtual
 environment, never through an editable `.pth` link.
+
+The second quality patch set is `0.3.2+botquality.2`, based on bot commit
+`b42b908ce681b21ee02e37a56620c5780e042fc0` (`0.3.1+botquality.1`). It adds bounded
+idle batch recovery, durable extraction continuations and confirmation events,
+source revision replay, generation-fenced checkpoints, derived-support repair,
+bounded retrieval refill, time-bound core caching, and common MCP/helper
+contracts. The new package modules are `api_contracts.py`, `ingest_journal.py`,
+and `lineage.py`; the current package contains 34 regular Python/package-data
+files. Source changes and synthetic tests are detailed in
+`../../docs/mem0-alpha-next-plan.md` and `../../docs/mem0-alpha-next-results.md`.
+No production rollout or state migration is implied by this package version.

@@ -60,6 +60,19 @@ def _reset_for_tests(path: str | None = None) -> None:
     _store.reset_path_for_test(path)
 
 
+def _can_link(c, old_id: str, new_id: str) -> bool:
+    if old_id == new_id:
+        return False
+    old = c.execute("SELECT superseded_by FROM facts WHERE fact_id=?", (old_id,)).fetchone()
+    if old and old[0] and old[0] != new_id:
+        return False
+    cycle = c.execute("""WITH RECURSIVE successors(id) AS (
+        SELECT ? UNION SELECT f.superseded_by FROM facts f JOIN successors s ON f.fact_id=s.id
+        WHERE f.superseded_by IS NOT NULL
+    ) SELECT 1 FROM successors WHERE id=? LIMIT 1""", (new_id, old_id)).fetchone()
+    return cycle is None
+
+
 def record_fact(
     fact_id: str,
     user_id: str,
@@ -83,10 +96,15 @@ def record_fact(
     now = int(time.time())
 
     def _record(c) -> bool:
+        c.execute("BEGIN IMMEDIATE")
         previous = c.execute("SELECT * FROM facts WHERE fact_id=?", (fact_id,)).fetchone()
         if previous and (previous["user_id"], previous["attribute"]) != (user_id, attribute):
             return False
         if supersedes:
+            if not _can_link(c, supersedes, fact_id):
+                return False
+            if previous and previous["supersedes"] not in (None, supersedes):
+                return False
             old = c.execute("SELECT * FROM facts WHERE fact_id=?", (supersedes,)).fetchone()
             if supersedes == fact_id or (old and (
                 old["user_id"], old["attribute"], old["scope"] or "", old["condition"] or ""
@@ -130,9 +148,12 @@ def supersede_fact(old_fact_id: str, new_fact_id: str | None = None) -> bool:
     now = int(time.time())
 
     def _supersede(c) -> bool:
+        c.execute("BEGIN IMMEDIATE")
         if new_fact_id == old_fact_id:
             return False
         if new_fact_id:
+            if not _can_link(c, old_fact_id, new_fact_id):
+                return False
             rows = c.execute("SELECT user_id, attribute, scope, condition FROM facts WHERE fact_id IN (?,?)",
                              (old_fact_id, new_fact_id)).fetchall()
             if len(rows) == 2 and tuple(rows[0]) != tuple(rows[1]):
@@ -171,7 +192,7 @@ def get_active_facts(user_id: str, attribute: str) -> list[dict]:
     return _store.read(_fetch, what="get_active_facts", default=[]) or []
 
 
-def get_history(user_id: str, attribute: str, limit: int = 50) -> list[dict]:
+def get_history(user_id: str, attribute: str, limit: int = 50, *, strict: bool = False) -> list[dict]:
     """user × attribute の全履歴（supersede 連鎖含む、新しい順）。"""
     if not user_id or not attribute:
         return []
@@ -185,6 +206,9 @@ def get_history(user_id: str, attribute: str, limit: int = 50) -> list[dict]:
         ).fetchall()
         return [row_to_dict(r) for r in rows]
 
+    if strict:
+        with _store.connect() as c:
+            return _fetch(c)
     return _store.read(_fetch, what="get_history", default=[]) or []
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import closing, contextmanager
+from contextvars import copy_context
 import hashlib
 import json
 import logging
@@ -106,16 +107,21 @@ def _restore_deleted_receipt(key: str, previous: str | None) -> None:
         db.commit()
 
 
-def _delete_primary_with_receipt(mem, memory_id: str) -> None:
+def _delete_primary_with_receipt(mem, memory_id: str) -> dict | None:
     """Keep uncertain outcomes suppressed instead of resurrecting a deleted fact."""
     getter = getattr(mem, "get", None)
     row = getter(memory_id) if callable(getter) else None
     metadata = row.get("metadata") if isinstance(row, dict) else None
+    from . import lineage
+    owner = (row.get("user_id") or (metadata or {}).get("user_id") or "") if isinstance(row, dict) else ""
+    # Persist recovery authority before the primary can disappear. A failure
+    # here must prevent deletion, not strand unsupported derived memories.
+    lineage.prepare_source_delete(memory_id, str(owner))
     key = metadata.get("ingest_key") if isinstance(metadata, dict) else None
     if key is None or key == "":
         # Older rows have no ingest receipt. Retain the legacy delete API.
         mem.delete(memory_id)
-        return
+        return row if isinstance(row, dict) else None
     if not isinstance(key, str):
         raise ValueError("invalid memory ingest key")
     with _ingest_receipt_lock(key):
@@ -134,6 +140,7 @@ def _delete_primary_with_receipt(mem, memory_id: str) -> None:
             except Exception as exc:
                 log.warning("delete outcome uncertain; retaining ingest tombstone: %s", type(exc).__name__)
             raise
+    return row if isinstance(row, dict) else None
 
 
 def _storage_config() -> tuple:
@@ -378,7 +385,12 @@ async def get_all_memories(
         return []
     try:
         raw = await asyncio.to_thread(mem_get_all, mem, user_id=user_id, limit=limit)
-        return raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+        rows = raw.get("results") if isinstance(raw, dict) else raw
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            if strict:
+                raise RuntimeError("malformed memory enumeration")
+            return []
+        return rows
     except Exception as exc:
         if strict:
             raise
@@ -387,12 +399,20 @@ async def get_all_memories(
 
 
 def _delete_memory_sync(mem, memory_id: str) -> bool:
-    from . import bm25_index, fact_store, graph
+    from . import bm25_index, fact_store, graph, lineage
     from .reinforce import memory_mutation_lock
     from .search import invalidate_core_cache
 
     with memory_mutation_lock(memory_id):
-        _delete_primary_with_receipt(mem, memory_id)
+        row = _delete_primary_with_receipt(mem, memory_id)
+        metadata = (row.get("metadata") or {}) if isinstance(row, dict) else {}
+        owner = (row.get("user_id") or metadata.get("user_id") or "") if row else ""
+        repaired = True
+        try:
+            lineage.retire_source(memory_id, user_id=str(owner))
+        except Exception as exc:
+            repaired = False
+            log.warning("memory lineage repair incomplete: %s", type(exc).__name__)
         # Each mirror is independent; one failed cleanup must not skip the rest.
         for cleanup in (graph.delete_fact_edges, graph.expire_relations_for_fact,
                         bm25_index.remove_fact, fact_store.remove_fact):
@@ -401,7 +421,15 @@ def _delete_memory_sync(mem, memory_id: str) -> bool:
             except Exception as exc:
                 log.warning("memory side-index cleanup failed: %s", exc)
         invalidate_core_cache()
-    return True
+    # Do not acquire dependent mutation locks while holding the source lock.
+    # Cyclic/malformed legacy support must not deadlock concurrent deletions.
+    try:
+        result = lineage.repair_dependents_sync(mem, limit=100)
+        repaired = repaired and not result.get("failed") and not result.get("pending")
+    except Exception as exc:
+        repaired = False
+        log.warning("memory lineage repair incomplete: %s", type(exc).__name__)
+    return repaired
 
 
 async def delete_memory(memory_id: str) -> bool:
@@ -410,9 +438,26 @@ async def delete_memory(memory_id: str) -> bool:
     if not mem:
         return False
     try:
-        # Keep delete + cleanup in the same worker even if its awaiting task
-        # is cancelled during shutdown.
-        return await asyncio.to_thread(_delete_memory_sync, mem, memory_id)
+        # Drain the actual worker before cancellation is acknowledged. The
+        # primary write, durable intent and repair must retain their lifetime
+        # even when runtime shutdown cancels all asyncio Tasks at once.
+        worker = asyncio.get_running_loop().run_in_executor(
+            None, copy_context().run, _delete_memory_sync, mem, memory_id)
+        cancelled = None
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError as exc:
+                cancelled = cancelled or exc
+            except Exception:
+                break
+        if cancelled is not None:
+            try:
+                worker.result()
+            except Exception as exc:
+                log.warning("mem0 delete failed during cancellation: %s", type(exc).__name__)
+            raise cancelled
+        return worker.result()
     except Exception as exc:
         log.warning("mem0 delete error: %s", exc)
         return False

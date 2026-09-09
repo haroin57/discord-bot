@@ -113,14 +113,42 @@ def conditions_are_conflict_candidate(cond_a: str, cond_b: str) -> bool:
 def fact_metadata(fact: dict, base: dict | None = None) -> dict:
     """Comparable identity independent of whether a fact is stored or extracted."""
     md = {**(base or {}), **(fact.get("metadata") or {})}
-    for key in ("attribute", "condition", "scope", "value", "source_timestamp", "valid_from", "valid_to"):
+    for key in ("attribute", "condition", "scope", "value", "source_timestamp", "valid_from", "valid_to",
+                "operation", "member_key", "source_quote", "retraction_target"):
         if key in fact:
             md[key] = fact[key]
     scope = md.get("scope") or "global"
     if scope == "conversation" and md.get("channel_id") is not None:
         scope = f"conversation:{md['channel_id']}"
     md["scope"] = scope
+    md["_fact_text"] = fact.get("memory") or fact.get("text") or md.get("_fact_text") or ""
     return md
+
+
+def explicit_member_transition(old: dict, new: dict) -> bool:
+    """Propose only literal, explicitly grounded set-member state changes.
+
+    This never proves semantic contradiction; the full-text classifier must
+    still confirm update/correction. Missing or ambiguous targets keep both.
+    """
+    import re
+    import unicodedata
+    norm = lambda value: unicodedata.normalize("NFKC", str(value or "")).casefold()
+    member = norm(new.get("member_key"))
+    if not member or len(member) < 2 or len(member) > 100:
+        return False
+    quote, old_text, new_text = (norm(new.get("source_quote")), norm(old.get("_fact_text")), norm(new.get("_fact_text")))
+    if not all(member in value for value in (quote, old_text, new_text)):
+        return False
+    if re.search(r"[?？]|もし|仮に|かもしれ|らしい|と言っ|って言|かどうか|\b(?:if|maybe|perhaps|might)\b", quote):
+        return False
+    if old.get("member_key") and norm(old["member_key"]) != member:
+        return False
+    negative = bool(re.search(r"やめた|やめました|なくなった|手放した|売った|好きではない|嫌いになった|もう.{0,24}ない|no longer|stopped|sold", quote))
+    if new.get("operation") == "retract":
+        return negative
+    # A new literal affirmation can end a previously explicit retraction.
+    return old.get("operation") == "retract" and new.get("operation", "assert") == "assert" and not negative
 
 
 def same_fact_domain(old: dict, new: dict) -> bool:
@@ -174,7 +202,7 @@ def can_supersede(old: dict, new: dict) -> bool:
     if not same_fact_domain(old, new):
         return False
     attribute = old.get("attribute") or new.get("attribute") or ""
-    if not attribute or not is_update_cardinality(attribute):
+    if not attribute or (not is_update_cardinality(attribute) and not explicit_member_transition(old, new)):
         return False
     previous, current = observation_time(old), observation_time(new)
     if previous is not None and (current is None or current < previous):

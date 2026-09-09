@@ -109,6 +109,21 @@ def _distance(row: dict) -> float | None:
     return None
 
 
+async def _filter_supported_facts(rows: list[dict]) -> list[dict]:
+    """Check lineage in one worker-side batch, including cached core rows.
+
+    Read failures propagate to the recall boundary; they are not evidence
+    of support and must not be cached as a successful empty snapshot.
+    """
+    ids = {row.get("id") for row in rows
+           if isinstance(row, dict) and isinstance(row.get("id"), str) and row["id"]}
+    if not ids:
+        return rows
+    from .lineage import unsupported_fact_ids
+    unsupported = await asyncio.to_thread(unsupported_fact_ids, ids, as_of=_AS_OF.get())
+    return [row for row in rows if row.get("id") not in unsupported]
+
+
 def _rank_key(row: dict) -> tuple:
     distance = _distance(row)
     ranking_distance = row.get("ranking_distance", distance)
@@ -162,6 +177,7 @@ async def search_memories(
                 if apply_distance_filter and distance is not None and distance > settings.MEM0_RELEVANCE_MAX_DISTANCE:
                     continue
                 results.append({**row, "vector_distance": distance, "retrieval_sources": ["vector"]})
+            results = await _filter_supported_facts(results)
             if len(results) >= limit or len(raw_rows) < requested or requested >= max_fetch:
                 break
             requested = min(requested * 2, max_fetch)
@@ -268,8 +284,11 @@ async def search_memories_hybrid(
         apply_distance_filter=apply_distance_filter,
         current_channel_id=current_channel_id,
     )
+    requested = max(1, min(int(settings.MEM0_BM25_LIMIT), 200))
+    max_fetch = min(requested * 4, 200)
+    target = min(limit, requested)
     bm25_task = asyncio.to_thread(
-        bm25_index.search_bm25, query, user_id, settings.MEM0_BM25_LIMIT,
+        bm25_index.search_bm25, query, user_id, requested,
     )
     vector_hits, bm25_hits = await asyncio.gather(
         vector_task, bm25_task, return_exceptions=True,
@@ -282,27 +301,59 @@ async def search_memories_hybrid(
         bm25_hits = []
     # FTS is a projection, never authoritative for existence/ownership/validity.
     known = {row.get("id"): row for row in vector_hits if row.get("id")}
-    missing = [row for row in bm25_hits if row.get("id") not in known]
-    if missing:
-        mem = await asyncio.to_thread(_get_mem0)
-        slots = asyncio.Semaphore(4)
-        async def hydrate(row):
-            if mem is None or not row.get("id"):
+    checked = set(known)
+    lexical: dict[str, dict] = {}
+    mem = None
+    provider_loaded = False
+    slots = asyncio.Semaphore(4)
+
+    async def hydrate(row):
+        if mem is None:
+            return None
+        try:
+            async with slots:
+                fact = await asyncio.to_thread(mem.get, row["id"])
+            if not _is_fact_valid(fact, current_channel_id, expected_user_id=user_id) or not fact.get("memory"):
                 return None
+            return {**fact, "id": row["id"], "vector_distance": None,
+                    "score": None, "retrieval_sources": ["bm25"]}
+        except Exception:
+            return None
+
+    while True:
+        missing = []
+        for row in bm25_hits:
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
+                continue
+            lexical.setdefault(row["id"], row)
+            if row["id"] not in checked:
+                checked.add(row["id"])
+                missing.append(row)
+        if missing:
+            if not provider_loaded:
+                mem = await asyncio.to_thread(_get_mem0)
+                provider_loaded = True
+            hydrated = await asyncio.gather(*(hydrate(row) for row in missing))
             try:
-                async with slots:
-                    fact = await asyncio.to_thread(mem.get, row["id"])
-                if not _is_fact_valid(fact, current_channel_id, expected_user_id=user_id) or not fact.get("memory"):
-                    return None
-                return {**fact, "id": row["id"], "rank": row.get("rank"),
-                        "bm25_score": row.get("bm25_score"), "vector_distance": None,
-                        "score": None, "retrieval_sources": ["bm25"]}
-            except Exception:
-                return None
-        hydrated = await asyncio.gather(*(hydrate(row) for row in missing))
-        known.update({row["id"]: row for row in hydrated if row is not None})
-    bm25_hits = [{**known[row["id"]], "rank": row.get("rank"), "bm25_score": row.get("bm25_score")}
-                 for row in bm25_hits if row.get("id") in known]
+                supported = await _filter_supported_facts([row for row in hydrated if row is not None])
+            except Exception as exc:
+                log.warning("hybrid: lineage support lookup failed: %s", exc)
+                return []
+            known.update({row["id"]: row for row in supported})
+        valid_count = sum(fid in known for fid in lexical)
+        if (valid_count >= target or len(bm25_hits) < requested or requested >= max_fetch
+                or (provider_loaded and mem is None)):
+            break
+        requested = min(requested * 2, max_fetch)
+        try:
+            bm25_hits = await asyncio.to_thread(bm25_index.search_bm25, query, user_id, requested)
+        except Exception as exc:
+            log.warning("hybrid: bm25 refill failed: %s", exc)
+            break
+    # Preserve original lexical ranks and hydrate each ID at most once,
+    # including IDs rejected for existence, ownership, scope or validity.
+    bm25_hits = [{**known[fid], "rank": row.get("rank"), "bm25_score": row.get("bm25_score")}
+                 for fid, row in lexical.items() if fid in known]
     fused = bm25_index.rrf_merge(
         vector_hits, bm25_hits, k=settings.MEM0_BM25_RRF_K, limit=limit,
     )
@@ -311,7 +362,11 @@ async def search_memories_hybrid(
             "hybrid: q=%r vector=%d bm25=%d fused=%d",
             (query or "")[:60], len(vector_hits), len(bm25_hits), len(fused),
         )
-    return fused
+    try:
+        return await _filter_supported_facts(fused)
+    except Exception as exc:
+        log.warning("hybrid: final lineage support lookup failed: %s", exc)
+        return []
 
 
 async def _search_multi_hybrid(
@@ -568,16 +623,46 @@ async def _rerank_memories(query: str, memories: list[dict], top_k: int = 5) -> 
 
     _apply_reinforcement_boost(memories)
 
+    # Reuse the existing Japanese content-word analysis for locating evidence;
+    # the model still judges against the complete original query below.
+    keywords = await asyncio.to_thread(_expand_query_via_morpho, query)
+    words = list(dict.fromkeys(re.findall(r"[\w]+", query) + keywords.split()))
+
+    def head_tail(text, budget):
+        if len(text) <= budget:
+            return text
+        marker = " … "
+        head = (budget - len(marker)) // 2
+        return text[:head] + marker + text[-(budget - len(marker) - head):]
+
     def snippet(m):
         text = str(m.get("memory") or "")
-        if len(text) > 900:
-            words = re.findall(r"[\w]+", query)
-            positions = [text.casefold().find(word.casefold()) for word in words if len(word) >= 2]
-            middle = max(0, min((p for p in positions if p >= 0), default=0) - 80)
-            text = text[:300] + " … " + text[middle:middle + 300] + " … " + text[-300:]
         md = m.get("metadata") or {}
-        qualifiers = {key: md[key] for key in ("condition", "scope", "valid_from", "valid_to", "created_at_unix") if key in md}
-        return escape_braces(text + (" " + str(qualifiers) if qualifiers else ""), limit=1300)
+        if not isinstance(md, dict):
+            md = {}
+        # Reserve bounded slots for every qualifier before allocating the
+        # remaining candidate budget to prose. A long condition must not
+        # erase scope/time fields or its own exception clause at the tail.
+        qualifiers = []
+        for key in ("scope", "valid_from", "valid_to", "created_at_unix"):
+            if key in md:
+                qualifiers.append(f"{key!r}: {head_tail(repr(md[key]), 80)}")
+        if "condition" in md:
+            qualifiers.append(f"'condition': {head_tail(repr(md['condition']), 320)}")
+        suffix = " {" + ", ".join(qualifiers) + "}" if qualifiers else ""
+        budget = 1300 - len(suffix)
+        if len(text) > min(900, budget):
+            window = min(300, (budget - 6) // 3)
+            folded = text.casefold()
+            positions = [folded.find(word.casefold()) for word in words if word]
+            positions = [p for p in positions if p >= 0]
+            # If possible use the middle slot for evidence outside the head
+            # and tail already included, rather than repeating the prefix.
+            internal = [p for p in positions if window <= p < len(text) - window]
+            anchor = min(internal or positions, default=len(text) // 2)
+            middle = max(0, anchor - min(80, window // 3))
+            text = text[:window] + " … " + text[middle:middle + window] + " … " + text[-window:]
+        return escape_braces(text + suffix)
     candidates = "\n".join(
         # wrap each candidate in untrusted delimiters and escape braces
         f"{i + 1}: <untrusted_candidate>"
@@ -645,21 +730,32 @@ async def get_episode_facts(
         if not (isinstance(exc, TypeError) or _rejects_user_id_kwarg(exc)):
             log.warning("get_episode_facts get_all failed: %s", exc)
             return []
-        # SDK doesn't accept this call shape (no `filters` on old SDKs, no
-        # top-level user_id on new ones) — user-scoped pull + Python filter.
+        # New SDKs reject top-level owner parameters but still support the
+        # episode predicate. Preserve both filters before using the bounded
+        # fallback for old SDKs that cannot filter by metadata at all.
         try:
             raw = await asyncio.to_thread(
-                mem_get_all, mem, user_id=user_id, limit=max(limit * 10, 200),
+                mem.get_all, filters={"user_id": user_id, "episode_id": episode_id}, limit=limit,
             )
         except Exception as exc2:
-            log.warning("get_episode_facts fallback get_all failed: %s", exc2)
-            return []
+            if not isinstance(exc2, TypeError):
+                log.warning("get_episode_facts filtered get_all failed: %s", exc2)
+                return []
+            try:
+                raw = await asyncio.to_thread(
+                    mem_get_all, mem, user_id=user_id, limit=max(limit * 10, 200),
+                )
+            except Exception as exc3:
+                log.warning("get_episode_facts fallback get_all failed: %s", exc3)
+                return []
     rows = raw.get("results", []) if isinstance(raw, dict) else (raw or [])
     filtered = [
         r for r in rows
-        if (r.get("metadata") or {}).get("episode_id") == episode_id
+        if isinstance(r, dict) and isinstance(r.get("metadata"), dict)
+        and r["metadata"].get("episode_id") == episode_id
+        and _is_fact_valid(r, check_scope=False, expected_user_id=user_id)
     ]
-    return filtered[:limit]
+    return (await _filter_supported_facts(filtered))[:limit]
 
 
 def _expand_query_via_morpho(query: str) -> str:
@@ -727,7 +823,7 @@ async def _expand_query_via_graph(query: str, user_id: str) -> list[str]:
 # （importance=5 かつ tier Live/Hot）の常時注入枠。従来はクエリの引き次第で
 # 名前・所属・健康情報のようなコア事実が欠落していた。get_all は hot path で
 # 重いので user_id 単位の TTL キャッシュで償却する。
-_CORE_CACHE: dict[str, tuple[float, dict[str, list[dict]], tuple]] = {}
+_CORE_CACHE: dict[str, tuple[float, dict[str, list[dict]], tuple, int | None]] = {}
 _CORE_CACHE_KEEP = 10  # キャッシュに保持する上限（取り出しは max_items で切る）
 _CORE_CACHE_USERS = 256
 _CORE_CACHE_SCOPES = 64
@@ -781,13 +877,16 @@ def _core_config() -> tuple:
             settings.MEM0_HIDE_ARCHIVED, settings.MEM0_SCOPE_FILTER_ENABLED)
 
 
-def _core_from_buckets(buckets, current_channel_id, max_items):
+async def _core_from_buckets(buckets, current_channel_id, max_items) -> tuple[list[dict], bool]:
+    """Return visible core rows and whether durable support removed a row."""
     if not settings.MEM0_SCOPE_FILTER_ENABLED:
         rows = buckets.get("*", [])
     else:
         rows = buckets.get("global", []) + buckets.get("meta", []) + buckets.get(f"conversation:{current_channel_id}", [])
-    return [dict(row) for row in sorted(rows, key=_core_order)
-            if _is_fact_valid(row, current_channel_id)][:max_items]
+    valid = [dict(row) for row in sorted(rows, key=_core_order)
+             if _is_fact_valid(row, current_channel_id)]
+    supported = await _filter_supported_facts(valid)
+    return supported[:max_items], len(supported) < len(valid)
 
 
 def _core_order(row):
@@ -805,10 +904,14 @@ async def get_core_memories(
 ) -> list[dict]:
     # Single-flight the provider fill only; recheck scope for every caller.
     lock = _CORE_LOCKS.setdefault(user_id, asyncio.Lock())
-    async with lock:
-        return await _get_core_memories_locked(
-            user_id, max_items, current_channel_id=current_channel_id,
-        )
+    try:
+        async with lock:
+            return await _get_core_memories_locked(
+                user_id, max_items, current_channel_id=current_channel_id,
+            )
+    except Exception as exc:
+        log.warning("core memory support lookup failed: %s", exc)
+        return []
 
 
 async def _get_core_memories_locked(
@@ -833,13 +936,27 @@ async def _get_core_memories_locked(
         generation = _CORE_GENERATION
         hit = _CORE_CACHE.get(user_id)
     requested_scope = f"conversation:{current_channel_id}"
-    if revision is not None and hit is not None and now - hit[0] < settings.MEM0_CORE_CACHE_TTL_S and hit[2] == config:
+    if (revision is not None and hit is not None
+            and now - hit[0] < settings.MEM0_CORE_CACHE_TTL_S and hit[2] == config
+            and (hit[3] is None or time.time() < hit[3])):
         if "_complete" in hit[1] or requested_scope in hit[1] or not settings.MEM0_SCOPE_FILTER_ENABLED:
-            return _core_from_buckets(hit[1], current_channel_id, max_items)
+            cached, support_removed = await _core_from_buckets(hit[1], current_channel_id, max_items)
+            if not support_removed:
+                return cached
+            # A future lineage retirement can take effect without a new
+            # revision or repaired valid_to. Discard this truncated snapshot
+            # and fall through to one ordinary fill, allowing the next core
+            # fact to enter. Never recursively retry a stale provider view.
+            with _CORE_CACHE_GUARD:
+                if _CORE_CACHE.get(user_id) is hit:
+                    _CORE_CACHE.pop(user_id, None)
     try:
         from .client import get_all_memories
         all_mems = await get_all_memories(user_id)
+        all_mems = await _filter_supported_facts(all_mems)
         core: list[dict] = []
+        next_boundary: int | None = None
+        snapshot_time = int(time.time())
         for m in all_mems:
             md = m.get("metadata") or {}
             if not isinstance(md, dict):
@@ -850,6 +967,17 @@ async def _get_core_memories_locked(
                 continue
             if imp < 5 or md.get("tier") not in (0, 1):
                 continue
+            # Natural interval transitions do not write a revision. Include
+            # future starts and expirations outside the kept bucket too, so
+            # a previously hidden/eleventh core fact can enter at its boundary.
+            if settings.MEM0_HIDE_ARCHIVED:
+                for key in ("valid_from", "valid_to"):
+                    try:
+                        boundary = int(md.get(key))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if boundary > snapshot_time:
+                        next_boundary = boundary if next_boundary is None else min(next_boundary, boundary)
             # scope はここで判定しない（キャッシュ汚染防止）。valid_to のみ。
             if not _is_fact_valid(m, check_scope=False, expected_user_id=user_id):
                 continue
@@ -869,12 +997,12 @@ async def _get_core_memories_locked(
                 # A lifecycle mutation raced the provider snapshot; don't
                 # return/cache facts whose current validity is unknown.
                 return []
-            if revision is None:
-                return _core_from_buckets(buckets, current_channel_id, max_items)
-            if user_id not in _CORE_CACHE and len(_CORE_CACHE) >= _CORE_CACHE_USERS:
-                _CORE_CACHE.pop(min(_CORE_CACHE, key=lambda uid: _CORE_CACHE[uid][0]))
-            _CORE_CACHE[user_id] = (time.monotonic(), buckets, config)
-        return _core_from_buckets(buckets, current_channel_id, max_items)
+            if revision is not None:
+                if user_id not in _CORE_CACHE and len(_CORE_CACHE) >= _CORE_CACHE_USERS:
+                    _CORE_CACHE.pop(min(_CORE_CACHE, key=lambda uid: _CORE_CACHE[uid][0]))
+                _CORE_CACHE[user_id] = (time.monotonic(), buckets, config, next_boundary)
+        result, _ = await _core_from_buckets(buckets, current_channel_id, max_items)
+        return result
     except Exception as exc:
         log.warning("core memory fetch failed (non-fatal): %s", exc)
         return []
@@ -990,6 +1118,15 @@ async def _finalize_smart_result(
     result rather than a silently absent block."""
     core = await core_task if core_task is not None else []
     merged = _merge_core_first(core, query_results, limit)
+    try:
+        merged = await _filter_supported_facts(merged)
+    except Exception as exc:
+        log.warning("smart search: lineage support lookup failed: %s", exc)
+        return []
+    # Rerank, core and support reads may cross an interval boundary. Recheck
+    # time after the last awaited read, retaining an explicit as_of. Scope
+    # was already checked in retrieval with the caller's channel context.
+    merged = [row for row in merged if _is_fact_valid(row, check_scope=False)]
     if fok_block:
         merged = list(merged) + [{
             "_fok_no_memory": True,
@@ -1236,9 +1373,10 @@ async def _search_memories_smart_with_core(
         _log_smart_metrics(
             query, candidates, len(reranked), bundle_added, rerank=True,
         )
-        _fire_recall_reinforcement(reranked)
-        return await _finalize_smart_result(
+        final = await _finalize_smart_result(
             reranked, core_task, limit, confidence, fok_block=False)
+        _fire_recall_reinforcement(final)
+        return final
 
     # Per-user recency/engagement ordering on the plain path too (no LLM).
     # Re-sorts candidates by boosted distance so well-reinforced facts win
@@ -1251,9 +1389,10 @@ async def _search_memories_smart_with_core(
         if _distance(r) is None or _distance(r) <= max_distance
     ][:limit]
     _log_smart_metrics(query, candidates, len(filtered), 0, rerank=False)
-    _fire_recall_reinforcement(filtered)
-    return await _finalize_smart_result(
+    final = await _finalize_smart_result(
         filtered, core_task, limit, confidence, fok_block=False)
+    _fire_recall_reinforcement(final)
+    return final
 
 
 async def _graph_expand_candidates(
@@ -1327,10 +1466,12 @@ async def _graph_expand_candidates(
 
     # --- propagate for up to max_hops, decaying by gamma each hop -------
     entity_activation: dict[int, float] = {}
-    for _hop in range(max_hops):
+    for _hop in range(max_hops + 1):
         next_frontier: dict[int, float] = {}
         for eid, act in frontier.items():
             entity_activation[eid] = max(act, entity_activation.get(eid, 0.0))
+            if _hop == max_hops:
+                continue
             try:
                 neighbors = await asyncio.to_thread(
                     graph.get_co_occurring_entities, eid, limit=per_entity,
@@ -1366,29 +1507,8 @@ async def _graph_expand_candidates(
         log.warning("priming buffer failed (non-fatal): %s", exc)
 
     # --- pull sibling facts for every activated entity -------------------
-    fact_best_activation: dict[str, float] = {}
-    for eid, act in entity_activation.items():
-        try:
-            related = await asyncio.to_thread(
-                graph.get_related_facts, eid, limit=per_entity,
-                exclude_fact_ids=list(seen_ids),
-            )
-        except Exception:
-            continue
-        for fid in related:
-            if fid in seen_ids:
-                continue
-            if act > fact_best_activation.get(fid, 0.0):
-                fact_best_activation[fid] = act
-
-    if not fact_best_activation:
+    if per_entity <= 0:
         return candidates
-
-    base_distance = settings.MEM0_GRAPH_SIBLING_BASE_DISTANCE
-    activation_weight = settings.MEM0_GRAPH_SIBLING_ACTIVATION_WEIGHT
-    min_distance = settings.MEM0_GRAPH_SIBLING_MIN_DISTANCE
-    # Fetch independent provider documents in bounded groups. Result order,
-    # scoring, visibility, and the number of candidates remain unchanged.
     fetch_slots = asyncio.Semaphore(4)
     async def fetch_sibling(fid):
         try:
@@ -1397,9 +1517,61 @@ async def _graph_expand_candidates(
         except Exception:
             return None
 
-    fetched = await asyncio.gather(*(fetch_sibling(fid) for fid in fact_best_activation))
+    fetched: dict[str, dict | None] = {}
+    selected: dict[int, list[str]] = {}
+    pending = {eid: per_entity for eid in entity_activation}
+    max_fetch = max(per_entity, min(per_entity * 4, 200))
+    while pending:
+        windows = {}
+        missing = {}
+        for eid, requested in pending.items():
+            try:
+                related = await asyncio.to_thread(
+                    graph.get_related_facts, eid, limit=requested,
+                    exclude_fact_ids=list(seen_ids),
+                )
+            except Exception:
+                continue
+            windows[eid] = related
+            for fid in related:
+                if fid not in seen_ids and fid not in fetched:
+                    missing.setdefault(fid, None)
+        documents = await asyncio.gather(*(fetch_sibling(fid) for fid in missing))
+        for fid, doc in zip(missing, documents):
+            fetched[fid] = {**doc, "id": fid} if (
+                isinstance(doc, dict) and doc.get("memory")
+                and _is_fact_valid(doc, current_channel_id, expected_user_id=user_id)
+            ) else None
+        supported = {row["id"] for row in await _filter_supported_facts(
+            [fetched[fid] for fid in missing if fetched[fid] is not None]
+        )}
+        for fid in missing:
+            if fid not in supported:
+                fetched[fid] = None
+        next_pending = {}
+        for eid, related in windows.items():
+            valid = list(dict.fromkeys(fid for fid in related if fetched.get(fid) is not None))
+            # Keep the original window's valid candidates; refill only its
+            # deficit. Production SQLite already caps every initial window.
+            if eid not in selected:
+                selected[eid] = valid
+            else:
+                selected[eid] = valid[:per_entity]
+            requested = pending[eid]
+            if len(valid) < per_entity and len(related) >= requested and requested < max_fetch:
+                next_pending[eid] = min(requested * 2, max_fetch)
+        pending = next_pending
+
+    fact_best_activation: dict[str, float] = {}
+    for eid, ids in selected.items():
+        for fid in ids:
+            fact_best_activation[fid] = max(entity_activation[eid], fact_best_activation.get(fid, 0.0))
+    base_distance = settings.MEM0_GRAPH_SIBLING_BASE_DISTANCE
+    activation_weight = settings.MEM0_GRAPH_SIBLING_ACTIVATION_WEIGHT
+    min_distance = settings.MEM0_GRAPH_SIBLING_MIN_DISTANCE
     siblings: list[dict] = []
-    for (fid, act), fact in zip(fact_best_activation.items(), fetched):
+    for fid, act in fact_best_activation.items():
+        fact = fetched[fid]
         # Phase R: graph 経由の sibling は search_memories の validity
         # フィルタを通らないので、archived / 他会話 scope をここで落とす。
         if not (

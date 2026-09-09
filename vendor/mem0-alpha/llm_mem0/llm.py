@@ -10,11 +10,41 @@ sites used to hand-roll it; this module is the single implementation.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import math
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+
+async def complete_text(
+    *, system: str, user_message: str, model: str, max_tokens: int,
+    timeout_s: float | None = None, backend=None,
+) -> str:
+    """Bound one helper call, preserving raw output for extraction salvage.
+
+    Provider/timeout failures propagate to the stage owning its retry policy.
+    Caller cancellation is never converted into a successful empty response.
+    This helper must not wrap a provider's persistent memory commit.
+    """
+    from .settings import settings
+    budget = getattr(settings, "MEM0_HELPER_TIMEOUT_S", 60.0) if timeout_s is None else timeout_s
+    if (isinstance(budget, bool) or not isinstance(budget, (int, float))
+            or not 0 < budget <= 600 or not math.isfinite(budget)):
+        raise ValueError("helper timeout must be finite seconds in (0, 600]")
+    if backend is None:
+        from .auth import get_auth_backend
+        backend = get_auth_backend()
+    text = await asyncio.wait_for(
+        backend.complete(system=system, user_message=user_message,
+                         model=model, max_tokens=max_tokens),
+        timeout=budget,
+    )
+    if not isinstance(text, str):
+        raise TypeError("helper completion must be text")
+    return text
 
 
 def escape_braces(text: str, *, limit: int | None = None) -> str:
@@ -46,6 +76,7 @@ async def complete_json(
     model: str,
     max_tokens: int,
     caller: str = "llm",
+    timeout_s: float | None = None,
 ) -> Any:
     """One completion, parsed as JSON. Returns ``None`` on ANY failure.
 
@@ -54,18 +85,17 @@ async def complete_json(
     helper stage can take down the ingestion or recall path.
     """
     try:
-        from .auth import get_auth_backend
-        backend = get_auth_backend()
-        text = strip_json_fence(await backend.complete(
+        text = strip_json_fence(await complete_text(
             system=system,
             user_message=user_message,
             model=model,
             max_tokens=max_tokens,
+            timeout_s=timeout_s,
         ))
         if not text:
             log.warning("%s: empty completion (fail-open)", caller)
             return None
         return json.loads(text)
     except Exception as exc:
-        log.warning("%s: LLM JSON call failed (fail-open): %s", caller, exc)
+        log.warning("%s: LLM JSON call failed (fail-open): %s", caller, type(exc).__name__)
         return None

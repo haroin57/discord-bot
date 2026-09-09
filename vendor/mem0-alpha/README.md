@@ -1,6 +1,6 @@
 # Mem0α
 
-## Local quality build: 0.3.1+botquality.1
+## Local quality build: 0.3.2+botquality.2
 
 This directory is the bot's controlled source snapshot, not an unmodified
 upstream release. Build/install it from the bot repository root with
@@ -14,12 +14,30 @@ New public APIs include `search_memories_hybrid` and
 natural-language dates or implement full bitemporal history. MCP search also
 accepts `as_of`, `channel_id` and `details`.
 
+The second quality build adds explicit MCP `mode=vector|hybrid|smart`, list
+pagination and fact history, validated provenance, and honest partial-result
+responses. Helper calls use `MEM0_HELPER_TIMEOUT_S=60` (seconds); models and
+authentication are unchanged. In the bot host, a runtime-owned recovery worker
+runs every 30 seconds, handles at most 2 batches per tick, and flushes attributed
+low-volume input after 600 seconds. `MEM0_BATCH_RECOVERY_ENABLED=false` disables
+that worker; unowned legacy input is retained without guessing its author.
+
 Extraction supports bounded chunks (`MEM0_EXTRACT_MAX_CHUNKS=16`,
 `MEM0_EXTRACT_CONCURRENCY=2`, `MEM0_EXTRACT_MAX_ATTEMPTS=2`). Partial work and
 provider failures return an explicit retryable status. Durable batches use
 claim/renew/ack rather than removing input before successful storage. Supply
 stable `request_id`, `source_message_ids`, `source_author_id` and
 `source_timestamp` metadata when available; never infer a speaker from a name.
+
+An over-budget extraction returns a durable continuation instead of repeatedly
+processing the first window. Direct calls without a stable request ID return a
+`continuation_id`; retry the same input with that value as `request_id`. Do not
+change the input while reusing a continuation. New private state includes
+`mem0_quality_journal.sqlite3`, `mem0_lifecycle.sqlite`, and their lock directories.
+Source edits use revision-aware history checkpoints. Unknown old semantic-history
+namespaces are retained but excluded from new scoped searches; no bulk reindex
+is run automatically. See the [second quality results](../../docs/mem0-alpha-next-results.md)
+for acceptance tests and rollout/rollback constraints.
 
 Exact lexical tokenization applies to newly indexed rows. Existing FTS rows,
 legacy replay ownership and old history-vector IDs are **not automatically
