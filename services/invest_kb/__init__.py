@@ -15,9 +15,22 @@ Public API:
     is_investment_query — gate to avoid Haiku spend on small talk
 """
 
-from services.invest_kb.ingest import upsert_documents as add_documents
-from services.invest_kb.client import replace_document
-from services.invest_kb.search import is_investment_query, search_invest_kb
+from importlib import import_module
+
+_EXPORTS = {
+    "add_documents": ("ingest", "upsert_documents"),
+    "replace_document": ("client", "replace_document"),
+    "is_investment_query": ("search", "is_investment_query"),
+    "search_invest_kb": ("search", "search_invest_kb"),
+}
+
+
+def __getattr__(name: str):
+    """Load only the requested capability, preserving public function identity."""
+    if name not in _EXPORTS:
+        raise AttributeError(name)
+    module, attribute = _EXPORTS[name]
+    return getattr(import_module(f"{__name__}.{module}"), attribute)
 
 __all__ = [
     "add_documents",

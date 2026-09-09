@@ -372,10 +372,13 @@ async def test_vector_search_does_not_block_event_loop():
         def limit(self, _limit):
             return self
 
-        def to_pandas(self):
+        def select(self, _columns):
+            return self
+
+        def to_list(self):
             started.set()
             assert release.wait(timeout=1)
-            return pd.DataFrame()
+            return []
 
     class _Table:
         def search(self, _vec, *, vector_column_name):

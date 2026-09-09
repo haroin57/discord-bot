@@ -1,4 +1,4 @@
-"""Render LaTeX math expressions locally with KaTeX and Puppeteer."""
+"""Render LaTeX using a selected local or Cloudflare browser backend."""
 
 import asyncio
 import logging
@@ -15,6 +15,7 @@ from utils.render_store import (
     run_file_operation,
     temporary_png_path,
     write_html,
+    write_png,
 )
 
 __all__ = ["render_math_image"]
@@ -235,17 +236,33 @@ async def render_math_image(
     Returns the file path on success, or None if KaTeX is unavailable or
     rendering fails. Requires a local KaTeX install (`npm install katex`).
     """
-    if not _KATEX_AVAILABLE:
+    backend = os.environ.get("MATH_RENDER_BACKEND", "local")
+    if backend not in {"local", "cloudflare"}:
+        log.error("MATH_RENDER_BACKEND must be local or cloudflare")
+        return None
+    remote = backend == "cloudflare"
+    if not remote and not _KATEX_AVAILABLE:
         log.warning("render_math_image called without a local KaTeX installation")
         return None
     # Cache key includes display mode and a template version so a change to
     # HTML_TEMPLATE / KaTeX options (e.g. trust:true -> trust:false) busts
     # previously-cached PNGs that may have been rendered with insecure
     # settings. Bump _TEMPLATE_VERSION on every template/option change.
-    _TEMPLATE_VERSION = "4"  # local Puppeteer backend
+    _TEMPLATE_VERSION = "5" if remote else "4"
+    katex_root = KATEX_CDN
+    if remote:
+        from config import KATEX_CDN_BASE
+        from services.offload.endpoint import validate_endpoint
+        try:
+            katex_root = validate_endpoint(KATEX_CDN_BASE, name="KATEX_CDN_BASE")
+        except ValueError:
+            log.error("Remote KaTeX CDN configuration is invalid")
+            return None
     cache_key = (
         f"v{_TEMPLATE_VERSION}:{latex}:{'display' if display_mode else 'inline'}"
     )
+    if remote:
+        cache_key += f":cloudflare:{katex_root}"
     out_path, html_path = render_paths(
         output_dir,
         prefix="math",
@@ -254,12 +271,13 @@ async def render_math_image(
 
     async with render_lock(out_path):
         return await _render_math_image(
-            latex, display_mode, out_path, html_path, output_dir
+            latex, display_mode, out_path, html_path, output_dir, backend, katex_root
         )
 
 
 async def _render_math_image(
-    latex: str, display_mode: bool, out_path: str, html_path: str, output_dir: str
+    latex: str, display_mode: bool, out_path: str, html_path: str, output_dir: str,
+    backend: str, katex_root: str,
 ) -> str | None:
     await run_file_operation(prepare, output_dir)
 
@@ -269,7 +287,7 @@ async def _render_math_image(
 
     scale_params = _get_scale_params(latex, display_mode)
     full_html = HTML_TEMPLATE.format(
-        katex_cdn=KATEX_CDN,
+        katex_cdn=katex_root,
         css=_get_math_css(display_mode, latex),
         latex_json=_escape_for_json(latex),
         display_mode="true" if display_mode else "false",
@@ -279,22 +297,32 @@ async def _render_math_image(
     part_path = temporary_png_path(out_path)
 
     try:
-        await render_with_browser_daemon(
-            html_path=html_path,
-            output_path=part_path,
-            selector=".math-container",
-            pad=scale_params["screenshot_pad"],
-            viewport={"width": 800, "height": 600, "deviceScaleFactor": 2},
-        )
+        if backend == "cloudflare":
+            from utils.cf_browser import render_screenshot
+            png = await render_screenshot(
+                full_html, selector=".math-container", device_scale_factor=2,
+                wait_for_network_idle=True,
+            )
+            if not png:
+                return None
+            await run_file_operation(write_png, part_path, png)
+        else:
+            await render_with_browser_daemon(
+                html_path=html_path,
+                output_path=part_path,
+                selector=".math-container",
+                pad=scale_params["screenshot_pad"],
+                viewport={"width": 800, "height": 600, "deviceScaleFactor": 2},
+            )
         if not await publish_png_async(part_path, out_path):
             return None
     except asyncio.CancelledError:
         raise
     except TimeoutError:
-        log.error("Local math render timed out")
+        log.error("Math render timed out (backend=%s)", backend)
         return None
     except Exception as exc:
-        log.error("Local math render failed: %s", exc)
+        log.error("Math render failed (backend=%s): %s", backend, exc)
         return None
     finally:
         remove_if_exists(part_path)

@@ -653,9 +653,10 @@ RESTRICTED_CLAUDE_MAX_PARALLEL = int(
 
 # ---------------------------------------------------------------------------
 # Cloudflare Browser Rendering (Phase 2-1 — replaces local Puppeteer for the
-# table / math renderers). The REST screenshot endpoint takes an HTML string
-# and returns PNG bytes directly, so the VPS no longer spawns Chromium for
-# table/math images. (mermaid stays on the local mmdc path — the LLM invokes
+# table renderer and opt-in MATH_RENDER_BACKEND=cloudflare). Math defaults to
+# local rendering because Quick Actions rate limits previously interrupted
+# streaming replies. The endpoint returns PNG bytes without local Chromium.
+# (mermaid stays on the local mmdc path — the LLM invokes
 # it from Bash and it does not go through these renderers.)
 #
 # CF_BROWSER_RENDERING_TOKEN is an API token with the Browser Rendering scope;
@@ -1792,6 +1793,19 @@ MCP_SERVERS_INSHI: dict = {
 
 
 # Union (used as a default + by code paths that just need to know "all configured")
+# Resolve remote transports inside their original tier before constructing the
+# union, so restricted/IoT/mail authorization remains owned by the selector.
+from services.offload.mcp_config import apply_remote_overrides as _apply_mcp_remote
+
+_apply_mcp_remote(
+    [MCP_SERVERS_BASE, MCP_SERVERS_WEB, MCP_SERVERS_HEAVY, MCP_SERVERS_MEMORY,
+     MCP_SERVERS_PAPER, MCP_SERVERS_DOCS, MCP_SERVERS_REALESTATE, MCP_SERVERS_IOT,
+     MCP_SERVERS_ALARM, MCP_SERVERS_MAIL, MCP_SERVERS_INSHI],
+    os.environ.get("MCP_REMOTE_SERVERS", ""),
+    os.environ,
+    optional={"tavily": MCP_SERVERS_WEB, "brave-search": MCP_SERVERS_WEB,
+              "google-maps": MCP_SERVERS_WEB, "agentic-inbox": MCP_SERVERS_MAIL},
+)
 MCP_SERVERS: dict = {
     **MCP_SERVERS_BASE,
     **MCP_SERVERS_WEB,
@@ -1876,6 +1890,12 @@ def _bool_env(name: str, default: bool) -> bool:
 # the whole-tree disaster-recovery layer, while this layer stores individually
 # addressable history events, state files, manifests, and conversation images.
 R2_ARCHIVE_ENABLED = _bool_env("R2_ARCHIVE_ENABLED", True)
+R2_ARCHIVE_TRANSPORT = os.environ.get("R2_ARCHIVE_TRANSPORT", "wrangler").strip()
+R2_ARCHIVE_HTTP_URL = os.environ.get("R2_ARCHIVE_HTTP_URL", "").strip()
+R2_ARCHIVE_HTTP_TOKEN = os.environ.get("R2_ARCHIVE_HTTP_TOKEN", "")
+R2_ARCHIVE_HTTP_TIMEOUT_S = float(os.environ.get("R2_ARCHIVE_HTTP_TIMEOUT_S", "60"))
+# Files exceeding the Worker's bounded request size retain Wrangler transport.
+R2_ARCHIVE_HTTP_MAX_OBJECT_BYTES = 64 * 1024 * 1024
 R2_ARCHIVE_BUCKET = os.environ.get("R2_ARCHIVE_BUCKET", "kanae-state-backup")
 R2_ARCHIVE_PREFIX = os.environ.get("R2_ARCHIVE_PREFIX", "discord-bot/v1")
 R2_ARCHIVE_WRANGLER_BIN = os.environ.get(

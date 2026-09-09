@@ -54,7 +54,18 @@ files = [
     "services/correlation.py",
     "services/structured_log.py",
     "utils/atomic_write.py",
+    "services/offload/endpoint.py",
+    "services/offload/mcp_config.py",
+    "services/offload/archive_transport.py",
+    "services/offload/knowledge_client.py",
+    "services/offload/knowledge_server.py",
 ]
 ignore_missing_imports = true
 check_untyped_defs = true
 warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# Native KB internals remain outside the scoped type-check rollout; the new
+# HTTP boundary is checked without recursively adopting the entire legacy bot.
+module = ["services.invest_kb.*"]
+follow_imports = "skip"

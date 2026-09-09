@@ -1,0 +1,11 @@
+[Unit]
+Description=Run VI signal check at 18:00 JST on weekdays
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 18:00:00 Asia/Tokyo
+Unit=vi-signal-scheduler.service
+Persistent=false
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

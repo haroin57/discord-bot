@@ -61,7 +61,7 @@ DISCORD_CHANNEL_ID = os.environ.get(
 )
 DISCORD_MENTION_USER_ID = "1037285234200297522"  # b0nchichi
 
-STATE_DIR = REPO_ROOT / ".state"
+STATE_DIR = Path(os.environ.get("BOT_STATE_DIR", str(REPO_ROOT / ".state")))
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = STATE_DIR / "vi_signal_state.json"
 

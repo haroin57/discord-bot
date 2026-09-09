@@ -13,6 +13,7 @@ mcp==1.28.1                        # PR4 of claude-api-unify: direct pin so dele
                                    # Review quarterly; pre-1.0 minor releases can rename
                                    # fields like Tool.inputSchema (see test_tool_schema_shape).
 aiohttp>=3.14.1,<4.0
+httpx>=0.28.1,<1.0               # Reusable streaming R2 transport (no CLI per object).
 xxhash>=3.7,<4.0
 mem0ai>=1.0,<2.0                 # TODO: bump to >=2.0 once stable lands (fixes CVE-2026-7597, currently only in 2.0.0b2)
 ./vendor/mem0-alpha              # Source-pinned 0.3.0 snapshot; see vendor/mem0-alpha/PROVENANCE.md.

@@ -16,9 +16,10 @@ import os
 import threading
 import weakref
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-import pyarrow as pa
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +99,8 @@ def schema() -> pa.Schema:
     "tight keyword match" (summary may have abstracted away the keyword) at the
     same time.
     """
+    import pyarrow as pa
+
     return pa.schema(
         [
             pa.field("id", pa.string()),
@@ -127,6 +130,8 @@ def get_table(path: Optional[str] = None):
         if TABLE_NAME in names:
             return db.open_table(TABLE_NAME)
         log.info("Creating LanceDB table %r at %s", TABLE_NAME, _db_cache["path"])
+        import pyarrow as pa
+
         empty = pa.Table.from_pylist([], schema=schema())
         return db.create_table(TABLE_NAME, data=empty)
 
