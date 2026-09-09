@@ -1,0 +1,37 @@
+{
+  "scope": "isolated import services.invest_kb.search; not a production process memory reduction",
+  "baseline_HEAD": [
+    {
+      "seconds": 0.32044552301522344,
+      "rss_kib": 63184,
+      "pss_kib": 30478
+    },
+    {
+      "seconds": 0.31107652399805374,
+      "rss_kib": 62500,
+      "pss_kib": 29920
+    },
+    {
+      "seconds": 0.370087103015976,
+      "rss_kib": 62460,
+      "pss_kib": 29885
+    }
+  ],
+  "changed": [
+    {
+      "seconds": 0.15186605500639416,
+      "rss_kib": 20096,
+      "pss_kib": 11420
+    },
+    {
+      "seconds": 0.11066245497204363,
+      "rss_kib": 20100,
+      "pss_kib": 11430
+    },
+    {
+      "seconds": 0.13101790699874982,
+      "rss_kib": 20088,
+      "pss_kib": 11419
+    }
+  ]
+}

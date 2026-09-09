@@ -1,0 +1,51 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "discord-bot-archive",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-09",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1
+  },
+  "secrets": {
+    "required": [
+      "ARCHIVE_AUTH_TOKEN"
+    ]
+  },
+  "vars": {
+    "ARCHIVE_PREFIX": "discord-bot/v1",
+    "MAX_OBJECT_BYTES": "67108864"
+  },
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVE",
+      "bucket_name": "discord-bot-archive-staging"
+    }
+  ],
+  "env": {
+    "production": {
+      "name": "discord-bot-archive-production",
+      "secrets": {
+        "required": [
+          "ARCHIVE_AUTH_TOKEN"
+        ]
+      },
+      "vars": {
+        "ARCHIVE_PREFIX": "discord-bot/v1",
+        "MAX_OBJECT_BYTES": "67108864"
+      },
+      "r2_buckets": [
+        {
+          "binding": "ARCHIVE",
+          "bucket_name": "kanae-state-backup"
+        }
+      ],
+      "account_id": "8574821c4ec0b24f61d59c5a15dc31f4"
+    }
+  }
+}
