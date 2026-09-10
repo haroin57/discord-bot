@@ -346,10 +346,21 @@ class CodexSession:
             try:
                 result = await self._client.request(
                     "thread/resume",
-                    {"threadId": self.thread_id, **common},
-                    timeout=30,
+                    # Discord already owns its displayed history. Hydrating
+                    # every past turn can return megabytes we never consume;
+                    # excludeTurns retains Codex's durable model context.
+                    {"threadId": self.thread_id, "excludeTurns": True, **common},
+                    timeout=90,
                 )
                 self.resumed = True
+            except TimeoutError:
+                # Keep this diagnostic outside the bounded traceback so the
+                # failing method and budget survive log truncation.
+                log.warning(
+                    "Codex thread/resume timed out thread=%s timeout_s=90",
+                    str(self.thread_id)[:12],
+                )
+                raise
             except CodexAppServerError as exc:
                 if not _is_missing_thread_error(exc):
                     if _looks_like_auth_failure(exc, *self._client.stderr_tail(20)):
