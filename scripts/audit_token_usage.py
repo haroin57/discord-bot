@@ -41,6 +41,18 @@ def decode_record(line: str) -> tuple[str, str, str]:
     return str(record.get("msg", "")), timestamp or str(record.get("ts", "")), str(record.get("rid", ""))
 
 
+def log_metadata(line: str) -> tuple[str, str]:
+    try:
+        record = json.loads(line)
+        if isinstance(record, dict) and "MESSAGE" in record:
+            record = json.loads(record["MESSAGE"])
+    except (ValueError, TypeError):
+        return "", ""
+    if not isinstance(record, dict):
+        return "", ""
+    return str(record.get("logger", "")), str(record.get("level", ""))
+
+
 def summarize(rows: list[dict]) -> dict:
     totals = {field: sum(row[field] for row in rows) for field in FIELDS}
     contexts = sorted(sum(row[field] for field in FIELDS[:3]) for row in rows)
@@ -117,8 +129,20 @@ def analyze(lines) -> dict:
     incomplete_helper_rows = defaultdict(list)
     helper_failures = defaultdict(Counter)
     seen_helper_ids = set()
+    operational = Counter()
     for line in lines:
         message, timestamp, correlation = decode_record(line)
+        logger, level = log_metadata(line)
+        if logger == "services.claude_api.stall" and level == "WARNING":
+            if "stream stall: no message" in message:
+                operational["stream_stall_warnings"] += 1
+            if "stream idle for" in message:
+                operational["stream_idle_cancellations"] += 1
+        if logger == "bot_record" and level == "WARNING":
+            if message.startswith("Mem0 batch retained for retry:"):
+                operational["memory_batches_retained_for_retry"] += 1
+            if message.startswith("Mem0 retry persistence failed:"):
+                operational["memory_retry_persistence_failures"] += 1
         if message.startswith(("llm_helper_usage ", "llm_compatible_helper_usage ")):
             values = dict(PAIR.findall(message))
             request_id = values.get("request_id", "-")
@@ -237,6 +261,7 @@ def analyze(lines) -> dict:
         "incomplete_helper_usage_observations": dict(incomplete_helpers),
         "incomplete_helper_usage_by_model": {model: summarize_incomplete_helpers(group) for model, group in sorted(incomplete_helper_rows.items())},
         "helper_failure_observations": {route: dict(outcomes) for route, outcomes in sorted(helper_failures.items())},
+        "operational_observations": dict(operational),
         "compaction_observations": dict(compaction),
         "payload_observations": {
             "records": len(payloads),
@@ -248,6 +273,7 @@ def analyze(lines) -> dict:
             "Main per-request counters only; loop totals are excluded to avoid double counting.",
             "Latency covers completed main API requests, not end-to-end Discord responses or unlogged interrupted requests.",
             "Missing latency is unknown, not zero; sample percentiles are descriptive, not proof of equivalent workloads or regression.",
+            "Operational warnings are attributed diagnostic records, not failed API requests, proven regressions, or measured token consumption.",
             "The main logger can include verifier/subagent loops; correlation groups are not necessarily single conversations.",
             "Nearby small cache reads are a diagnostic pattern, not proof of a specific cache invalidation cause.",
             "Missing request IDs cannot be deduplicated; unlogged or interrupted requests are not counted.",

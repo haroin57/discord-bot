@@ -2,7 +2,7 @@
 
 ## 現在の状態
 
-2026-10-10 23時台 JST に実行環境を修復し、実API検証と最適化を再開しました。Codex sandbox 内で認証付きAPIのHTTP 200と本番journalの読み取りを確認しました。同時query共有は実API対照60件、無待機pilot15件に続き、待機なしの反復実験180件で検証しました。同時重複の入力は50%減、group待ち時間の中央値は6.4%短縮しました。履歴方式は追加18件で全入力増加と品質不通過が残ったため採用していません。ユーザーが実際に送信した本番依頼を観測中ですが、本番全体の削減率は引き続き未証明です。最新の証拠・本番状態・採否は末尾の追記を参照してください。
+2026-10-10 23時台 JST に実行環境を修復し、実API検証と最適化を再開しました。Codex sandbox 内で認証付きAPIのHTTP 200と本番journalの読み取りを確認しました。同時query共有は実API対照60件、無待機pilot15件に続き、待機なしの反復実験180件で検証しました。同時重複の入力は50%減、group待ち時間の中央値は6.4%短縮しました。しかし、ユーザーの本番テスト5応答・検索4回では重複共有0件で、この機能による削減は発生していません。ユーザーのテスト終了を確認し、2026-10-11 00:09:43 JSTに追加query共有だけを従来実装へ戻しました。履歴方式も追加18件で全入力増加と品質不通過が残ったため採用していません。実装・測定資料は `agent/token-efficiency-20261010` にpush済みです。本番全体の前後削減率は引き続き未証明です。最新の証拠・本番状態・採否は末尾の追記を参照してください。
 
 以下、末尾の再開結果までの記述は修復前の記録です。当時の実API合成対照実験は計60リクエストでした。内訳は初回のキャッシュ比較18件、記憶クエリ比較24件、複数ラウンド履歴比較18件です。未回収だった後半42件の回収・再集計では新しいAPIリクエストを送っていません。
 
@@ -330,3 +330,33 @@ systemd drop-in `90-token-efficiency.conf` は既存36個のmountのうち検索
 sessionはbaseからopt-in履歴候補の最小差分を再構成しており、別のprivacy/work機能を巻き込みません。candidate flagと履歴候補flagはコード上の既定値0です。`deploy/performance/mem0_alpha/search.py` は検証済み最小payloadを生成するためのtemplateで、ファイル全体を無条件に本番へコピーする運用ではありません。新branchのpushはmaster/default release gateを動かさず、本番の候補flagを有効化しません。
 
 push用worktreeで、helper・usage・singleflight・payload・公開品質・API互換・session・replay cap・compaction・tool-loopの回帰400件が通過しました。journal監査に追加した欠損latency・ID重複・model分離・helper除外のテストも含みます。API latencyは完了main応答だけを対象にし、欠損を0msに置き換えません。
+
+## 実テスト終了後の最終判断（2026-10-11 00:09 JST）
+
+ユーザーから「テスト終了・最後の応答も完了しました」を受領しました。00:06:30 JSTまでを固定した最終観測は、23:47:10–00:03:36 JSTのmain完了API 14件・end_turn 5件・tool_use 9件です。5つのcorrelation groupがすべてend_turnへ到達しました。ただしusageログからDiscordへの送信成功や回答内容の意味品質を全面保証することはできません。
+
+| 測定対象 | 重複除外済みAPI件数 | cacheを含む全入力 | 出力 |
+| --- | ---: | ---: | ---: |
+| main Opus 5.5 | 14 | 3,441,100 | 13,255 |
+| helper Haiku 4.5 | 13 | 23,666 | 3,502 |
+| helper Sonnet 4.6 | 18 | 75,696 | 9,705 |
+
+合計は45完了API、全入力3,540,462・出力26,462 tokensです。helperの生ログ35件から、同一応答IDの重複4件を除いた31件を計上しました。model別とtask別を追加加算していません。固定task別ではrewrite・keyword・HyDE・rerankが各4件、judge-lite 5件、出典確認付き記憶抽出10件です。query expansionの3段階は計12 provider依頼、入力7,492・出力492 tokensでした。
+
+query共有はleader 4件・joined 0件です。今回省けたquery expansion provider依頼は0件で、観測した検索4回の呼び出し削減は0/12（0%）でした。この0%は当該機能の呼び出し削減であり、異なる本番群との前後総トークン削減率ではありません。query expansionの入力＋出力は今回測定したmain/helper総量の約0.22%で、同時重複対照の50%を全体へ適用しません。
+
+完了main APIの処理時間は中央値14,721 ms・最大24,322 ms、最初の応答までの中央値3,832.5 ms・最大9,488 msでした。一方、stream stall警告2件と、記憶保存が不完全としてbatchを再試行用に保持した警告5件がありました。これらを成功・0消費と扱わず、Discord全体の待ち時間や記憶の永続化品質が問題ないとは結論しません。前の15:20–23:20 JSTのログにもstream stall警告17件、記憶batch再試行保持16件が存在しました。観測時間・依頼内容・履歴長が違うため、新旧警告率や因果関係は計算していません。
+
+証拠は `docs/2026-10-11-token-usage-before-rollback.json`、`docs/2026-10-11-token-efficiency-performance-assessment.json`、`docs/2026-10-11-token-efficiency-operational-observations.json` です。streamの未完了・記録されない再試行等のusageは不明で、完了応答のAPI durationはそれらを含む全体待ち時間ではありません。全体の前後削減率は引き続きnullです。
+
+### 追加singleflightの撤回
+
+合成同時重複の品質・速度比較は通過しましたが、今回の本番運用では対象となる重複がなく削減が出ていません。ユーザーの「効果的でなかったり実際の性能に影響をきたしている場合、前の実装に戻す」に従い、追加singleflightだけを撤回しました。少数の観測から将来の重複率や性能悪化を断定した判断ではなく、今回の代表的なテストで効果が得られなかったことに基づく保守的な採否です。
+
+最後のhelper活動00:04:19 JSTから5分以上の静穏を確認し、root所有generation・構成hash・既存mount維持のdry-run検査を通したdriverで、00:09:43 JSTに対象サービスだけをrollbackしました。稼働PIDは477943、実mount namespaceのsearch SHA-256は従来の `eacbe15dcb5a84c95feeaed50b4cbcf6f734e90125f3ae76725d1124b8e3f6e5` と一致し、`MEM0_QUERY_SINGLEFLIGHT_ENABLED=0` です。必要なDiscord/OAuth/Mem0/systemは正常で、NRestartsは0です。旧品質・性能overlay、利用者・出典識別、他サービス、認証情報、履歴方式を変更していません。
+
+実rollback証拠は `docs/2026-10-11-query-singleflight-final-rollback-verification.json` です。既存のrelease metadata未設定によるhealth degraded/503は残り、記憶保存の再試行問題とAPI遅延の根本修復もこのrollbackだけで完了とはしません。候補のgenerationと合成実験資料は再評価できるよう保持しています。本番再適用は新しい実運用証拠に基づいて判断してください。
+
+### Gitと最終回帰
+
+実装・公開実験・測定結果の初回commit `3dbd254d91f61fce99fad6f1ae69127f3ae1acd4` を `origin/agent/token-efficiency-20261010` へpushし、remote refとの一致を確認しました。masterへmergeしたり、別サービスへdeployしたりしていません。最終観測とrollbackの証拠、警告を消費量と混同しない監査・テストを追加保存します。push用worktreeの最新回帰は404件通過、Ruffとdiff whitespace検査も通過しました。元の作業ツリーのtracked statusおよび全tracked差分SHA-256は保存した修正前スナップショットと一致していました。

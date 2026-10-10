@@ -111,3 +111,35 @@ def test_latency_models_remain_separate_and_helpers_are_excluded():
 
 def test_empty_latency_has_no_denominator():
     assert analyze([])["main_per_request_latency"]["duration_ms"]["median"] is None
+
+
+def test_operational_warnings_are_separate_from_usage():
+    lines = [json.dumps({"logger": "services.claude_api.stall", "level": "WARNING",
+                        "msg": "[ch=123] stream stall: no message for 35s"}),
+             json.dumps({"logger": "bot_record", "level": "WARNING",
+                         "msg": "Mem0 batch retained for retry: channel=123 reason=private"})]
+    result = analyze(lines)
+    assert result["operational_observations"] == {"stream_stall_warnings": 1, "memory_batches_retained_for_retry": 1}
+    assert result["main"]["requests"] == 0
+    assert "private" not in json.dumps(result)
+
+
+def test_journal_operational_warnings_preserve_attribution():
+    record = {"logger": "services.claude_api.stall", "level": "WARNING",
+              "msg": "[ch=123] stream idle for 600s, cancelling"}
+    result = analyze([json.dumps({"MESSAGE": json.dumps(record)})])
+    assert result["operational_observations"] == {"stream_idle_cancellations": 1}
+
+
+def test_unattributed_or_wrong_level_markers_are_not_operational_warnings():
+    result = analyze(["Mem0 batch retained for retry: channel=123",
+                      json.dumps({"logger": "unrelated", "level": "WARNING", "msg": "stream stall: no message"}),
+                      json.dumps({"logger": "bot_record", "level": "INFO", "msg": "Mem0 retry persistence failed: private"}),
+                      json.dumps({"MESSAGE": "plain log line"})])
+    assert result["operational_observations"] == {}
+
+
+def test_retry_persistence_failure_is_not_success():
+    record = {"logger": "bot_record", "level": "WARNING", "msg": "Mem0 retry persistence failed: OSError"}
+    result = analyze([json.dumps(record)])
+    assert result["operational_observations"] == {"memory_retry_persistence_failures": 1}

@@ -1,0 +1,10 @@
+{
+  "action": "rollback",
+  "unit": "discord-bot-kanae-claude.service",
+  "pid": 477943,
+  "search_sha256": "eacbe15dcb5a84c95feeaed50b4cbcf6f734e90125f3ae76725d1124b8e3f6e5",
+  "singleflight_enabled": false,
+  "required_subsystems_ok": true,
+  "release_reason": "release_metadata_path_unset",
+  "completed_utc": "2026-10-10T15:09:43Z"
+}
