@@ -27,10 +27,14 @@ backend は bot が既に持つ認証資産を**複製せずに呼ぶだけ**で
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import time
 
 from llm_mem0.auth.base import AuthBackend
+
+from services.token_usage import log_compatible_helper_usage, log_helper_failure
 
 log = logging.getLogger(__name__)
 
@@ -49,9 +53,17 @@ class BotOAuthBackend(AuthBackend):
         from services.mem0 import client as client_mod
         llm_client = await client_mod.get_anthropic_client()
         if llm_client is None:
+            log_helper_failure(
+                route="client_selection", model=model, task_prompt=system, user_chars=len(user_message),
+                duration_ms=0, outcome="unavailable",
+            )
             return ""
+        started = time.monotonic()
+        compatible = False
+        actual_model = model
         try:
-            if hasattr(llm_client, "messages"):
+            compatible = not hasattr(llm_client, "messages")
+            if not compatible:
                 # Anthropic 経路 — CLI 指紋 + Extra Usage 課金ルーティング。
                 # system 引数は cli_compat の task_prompt スロット(system[3])
                 # に入り、CLI 身元の system[0..2] は cli_compat が透過付与。
@@ -62,18 +74,37 @@ class BotOAuthBackend(AuthBackend):
                 )
                 return extract_text(resp)
             # OpenAI 互換フォールバック (OpenRouter / OpenCode の DeepSeek)。
+            actual_model = client_mod._DEEPSEEK_V4_FLASH
             resp = await llm_client.chat.completions.create(
-                model=client_mod._DEEPSEEK_V4_FLASH,
+                model=actual_model,
                 max_tokens=max_tokens,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_message},
                 ],
             )
+            log_compatible_helper_usage(
+                resp, model=actual_model, task_prompt=system, user_chars=len(user_message),
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
             if getattr(resp, "choices", None):
                 return resp.choices[0].message.content or ""
             return ""
+        except asyncio.CancelledError as exc:
+            if compatible:
+                log_helper_failure(
+                    route="openai_compatible", model=actual_model, task_prompt=system,
+                    user_chars=len(user_message), duration_ms=int((time.monotonic() - started) * 1000),
+                    outcome="cancelled", error=exc,
+                )
+            raise
         except Exception as exc:
+            if compatible:
+                log_helper_failure(
+                    route="openai_compatible", model=actual_model, task_prompt=system,
+                    user_chars=len(user_message), duration_ms=int((time.monotonic() - started) * 1000),
+                    outcome="failed", error=exc,
+                )
             log.warning("BotOAuthBackend.complete failed (fail-open): %s", exc)
             return ""
 

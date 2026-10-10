@@ -1,0 +1,270 @@
+{
+  "synthetic": true,
+  "simulation": "saved_response_controlled_replay",
+  "new_provider_requests": 0,
+  "source": "docs/2026-10-10-memory-query-experiment.json",
+  "source_sha256": "14ba71531c74b14a0326363a5760e990f99a03a494d4a4dd52e14f727833d427",
+  "implementation_source": "/tmp/query-singleflight-payload/search.py",
+  "implementation_sha256": "8de8e0b078f51b680b0a8609d1f243374bff55ee0304b33c3d1223057c8ba157",
+  "singleflight_sha256": "2353dc641c73a3b7b5c993239a2af86290f58a1464ffa34efae003be19618f25",
+  "experiment_sha256": "f20b6ec41438523683343acea604848ded7d6c297bae71059592cbf5a175ccfe",
+  "case_manifest_sha256": "cf047a2143500e279ec00d11bd9ee52982ec69796cfc98c5099f34fed435c308",
+  "independent_saved_provider_query_samples": 6,
+  "arm_order": "alternating_by_case",
+  "quality_scope": "Exact saved-response preservation under controlled replay; not independent new model quality samples or live vector/graph recall.",
+  "counter_scope": "Replayed saved provider counters only; not current consumption, billed savings, or production duplicate frequency.",
+  "controls": {
+    "single": {
+      "baseline": {
+        "cases": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "consumers_checked": 6,
+        "simulated_provider_dispatches": 18,
+        "matched_saved_representations": 6,
+        "reference_quality_pass_count": 6,
+        "counter_replay_not_live_usage": {
+          "input_tokens": 11277,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 770
+        }
+      },
+      "singleflight": {
+        "cases": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "consumers_checked": 6,
+        "simulated_provider_dispatches": 18,
+        "matched_saved_representations": 6,
+        "reference_quality_pass_count": 6,
+        "counter_replay_not_live_usage": {
+          "input_tokens": 11277,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 770
+        }
+      }
+    },
+    "concurrent_same_query_two": {
+      "baseline": {
+        "cases": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "consumers_checked": 12,
+        "simulated_provider_dispatches": 36,
+        "matched_saved_representations": 12,
+        "reference_quality_pass_count": 12,
+        "counter_replay_not_live_usage": {
+          "input_tokens": 22554,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 1540
+        }
+      },
+      "singleflight": {
+        "cases": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "consumers_checked": 12,
+        "simulated_provider_dispatches": 18,
+        "matched_saved_representations": 12,
+        "reference_quality_pass_count": 12,
+        "counter_replay_not_live_usage": {
+          "input_tokens": 11277,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 770
+        }
+      }
+    },
+    "concurrent_same_query_four": {
+      "baseline": {
+        "cases": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "consumers_checked": 24,
+        "simulated_provider_dispatches": 72,
+        "matched_saved_representations": 24,
+        "reference_quality_pass_count": 24,
+        "counter_replay_not_live_usage": {
+          "input_tokens": 45108,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 3080
+        }
+      },
+      "singleflight": {
+        "cases": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "consumers_checked": 24,
+        "simulated_provider_dispatches": 18,
+        "matched_saved_representations": 24,
+        "reference_quality_pass_count": 24,
+        "counter_replay_not_live_usage": {
+          "input_tokens": 11277,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 770
+        }
+      }
+    },
+    "concurrent_distinct_queries": {
+      "baseline": {
+        "cases": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "consumers_checked": 24,
+        "simulated_provider_dispatches": 72,
+        "matched_saved_representations": 24,
+        "reference_quality_pass_count": 24,
+        "counter_replay_not_live_usage": {
+          "input_tokens": 45108,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 3080
+        }
+      },
+      "singleflight": {
+        "cases": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "consumers_checked": 24,
+        "simulated_provider_dispatches": 72,
+        "matched_saved_representations": 24,
+        "reference_quality_pass_count": 24,
+        "counter_replay_not_live_usage": {
+          "input_tokens": 45108,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 3080
+        }
+      }
+    },
+    "concurrent_distinct_owners": {
+      "baseline": {
+        "cases": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "consumers_checked": 24,
+        "simulated_provider_dispatches": 72,
+        "matched_saved_representations": 24,
+        "reference_quality_pass_count": 24,
+        "counter_replay_not_live_usage": {
+          "input_tokens": 45108,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 3080
+        }
+      },
+      "singleflight": {
+        "cases": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "consumers_checked": 24,
+        "simulated_provider_dispatches": 72,
+        "matched_saved_representations": 24,
+        "reference_quality_pass_count": 24,
+        "counter_replay_not_live_usage": {
+          "input_tokens": 45108,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 3080
+        }
+      }
+    },
+    "sequential_same_query": {
+      "baseline": {
+        "cases": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "consumers_checked": 24,
+        "simulated_provider_dispatches": 72,
+        "matched_saved_representations": 24,
+        "reference_quality_pass_count": 24,
+        "counter_replay_not_live_usage": {
+          "input_tokens": 45108,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 3080
+        }
+      },
+      "singleflight": {
+        "cases": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "consumers_checked": 24,
+        "simulated_provider_dispatches": 72,
+        "matched_saved_representations": 24,
+        "reference_quality_pass_count": 24,
+        "counter_replay_not_live_usage": {
+          "input_tokens": 45108,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 3080
+        }
+      }
+    }
+  }
+}

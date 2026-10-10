@@ -1,0 +1,190 @@
+{
+  "replay": {
+    "source": "docs/2026-10-10-replay-window-experiment.json",
+    "source_sha256": "69e84363c463116227deb955a6f60f1c94c53131ec23114f67a15913282f0000",
+    "started_utc": "2026-10-10T06:27:11.031653+00:00",
+    "synthetic": true,
+    "arms": {
+      "anchored": {
+        "requests": 9,
+        "input_tokens": 36,
+        "cache_read_input_tokens": 29363,
+        "cache_creation_input_tokens": 12493,
+        "output_tokens": 362,
+        "known_context_tokens": 41892,
+        "usage_complete": true,
+        "missing_counters": {
+          "input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "cache_read_fraction": 0.7009214169769884,
+        "observations": 9,
+        "quality_pass_count": 6,
+        "quality_denominator": 9,
+        "duration_median_ms": 1857,
+        "successful_duration_median_ms": 1887,
+        "refusals": 0,
+        "head_changes": 2,
+        "failure_classes": {
+          "invalid_json": 3
+        },
+        "quality_issues": []
+      },
+      "rolling": {
+        "requests": 9,
+        "input_tokens": 36,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 37116,
+        "output_tokens": 250,
+        "known_context_tokens": 37152,
+        "usage_complete": true,
+        "missing_counters": {
+          "input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "cache_read_fraction": 0,
+        "observations": 9,
+        "quality_pass_count": 5,
+        "quality_denominator": 9,
+        "duration_median_ms": 1334,
+        "successful_duration_median_ms": 2001,
+        "refusals": 3,
+        "head_changes": 8,
+        "failure_classes": {
+          "invalid_json": 1,
+          "refusal": 3
+        },
+        "quality_issues": []
+      }
+    },
+    "models": {
+      "claude-opus-5-5": {
+        "requests": 18,
+        "input_tokens": 72,
+        "cache_read_input_tokens": 29363,
+        "cache_creation_input_tokens": 49609,
+        "output_tokens": 612,
+        "known_context_tokens": 79044,
+        "usage_complete": true,
+        "missing_counters": {
+          "input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "cache_read_fraction": 0.3714766459187288
+      }
+    },
+    "quality_scope": "Original strict JSON results and recorded stop reasons; missing historical response text cannot be reassessed."
+  },
+  "memory": {
+    "source": "docs/2026-10-10-memory-query-experiment.json",
+    "source_sha256": "14ba71531c74b14a0326363a5760e990f99a03a494d4a4dd52e14f727833d427",
+    "started_utc": "2026-10-10T06:22:44.907732+00:00",
+    "synthetic": true,
+    "arms": {
+      "bundle": {
+        "requests": 6,
+        "input_tokens": 3371,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 1402,
+        "known_context_tokens": 3371,
+        "usage_complete": true,
+        "missing_counters": {
+          "input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "cache_read_fraction": 0,
+        "observations": 6,
+        "quality_pass_count": 5,
+        "quality_denominator": 6,
+        "duration_median_ms": 5508,
+        "successful_duration_median_ms": 5661,
+        "refusals": 0,
+        "head_changes": 0,
+        "failure_classes": {},
+        "quality_issues": [
+          {
+            "case": 3,
+            "missing_terms": [],
+            "unsupported_hypothesis_terms": [
+              "Drop",
+              "CancelledError"
+            ],
+            "representation_shape_valid": true,
+            "quality_pass": false
+          }
+        ],
+        "legacy_lexical_pass_count": 6
+      },
+      "parallel": {
+        "requests": 18,
+        "input_tokens": 11277,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 770,
+        "known_context_tokens": 11277,
+        "usage_complete": true,
+        "missing_counters": {
+          "input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "cache_read_fraction": 0,
+        "observations": 6,
+        "quality_pass_count": 6,
+        "quality_denominator": 6,
+        "duration_median_ms": 1606.5,
+        "successful_duration_median_ms": 1606.5,
+        "refusals": 0,
+        "head_changes": 0,
+        "failure_classes": {},
+        "quality_issues": [],
+        "legacy_lexical_pass_count": 6
+      }
+    },
+    "models": {
+      "claude-haiku-4-5-20251001": {
+        "requests": 12,
+        "input_tokens": 7922,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 619,
+        "known_context_tokens": 7922,
+        "usage_complete": true,
+        "missing_counters": {
+          "input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "cache_read_fraction": 0
+      },
+      "claude-sonnet-4-6": {
+        "requests": 12,
+        "input_tokens": 6726,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 1553,
+        "known_context_tokens": 6726,
+        "usage_complete": true,
+        "missing_counters": {
+          "input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "output_tokens": 0
+        },
+        "cache_read_fraction": 0
+      }
+    },
+    "quality_scope": "Post-hoc required-term, lexical-recall, and targeted unsupported-hypothesis checks; not production semantic recall accuracy."
+  }
+}

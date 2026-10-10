@@ -1,0 +1,10 @@
+{
+  "action": "activate",
+  "unit": "discord-bot-kanae-claude.service",
+  "pid": 465430,
+  "search_sha256": "8de8e0b078f51b680b0a8609d1f243374bff55ee0304b33c3d1223057c8ba157",
+  "singleflight_enabled": true,
+  "required_subsystems_ok": true,
+  "release_reason": "release_metadata_path_unset",
+  "completed_utc": "2026-10-10T14:20:50Z"
+}

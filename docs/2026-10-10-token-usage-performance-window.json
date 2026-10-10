@@ -1,0 +1,226 @@
+{
+  "first_record": "2026-10-10T14:47:10.765985+00:00",
+  "last_record": "2026-10-10T14:50:59.861220+00:00",
+  "main": {
+    "requests": 4,
+    "input_tokens": 12,
+    "cache_read_input_tokens": 453438,
+    "cache_creation_input_tokens": 397335,
+    "output_tokens": 3916,
+    "context_tokens": 850785,
+    "cache_read_fraction": 0.533,
+    "context_median": 211106.0,
+    "context_max": 247496,
+    "stop_reasons": {
+      "tool_use": 2,
+      "end_turn": 2
+    }
+  },
+  "models": {
+    "claude-opus-5-5": {
+      "requests": 4,
+      "input_tokens": 12,
+      "cache_read_input_tokens": 453438,
+      "cache_creation_input_tokens": 397335,
+      "output_tokens": 3916,
+      "context_tokens": 850785,
+      "cache_read_fraction": 0.533,
+      "context_median": 211106.0,
+      "context_max": 247496,
+      "stop_reasons": {
+        "tool_use": 2,
+        "end_turn": 2
+      }
+    }
+  },
+  "history_cohorts": {
+    "history_under_250": {
+      "requests": 4,
+      "input_tokens": 12,
+      "cache_read_input_tokens": 453438,
+      "cache_creation_input_tokens": 397335,
+      "output_tokens": 3916,
+      "context_tokens": 850785,
+      "cache_read_fraction": 0.533,
+      "context_median": 211106.0,
+      "context_max": 247496,
+      "stop_reasons": {
+        "tool_use": 2,
+        "end_turn": 2
+      }
+    }
+  },
+  "correlated_request_counts": {
+    "2": 2
+  },
+  "nearby_small_cache_read_observations": {
+    "requests": 1,
+    "cache_creation_input_tokens": 207697
+  },
+  "memory_search_observations": {
+    "searches": 1,
+    "rerank_on": 1,
+    "zero_kept": 1
+  },
+  "memory_query_singleflight_observations": {
+    "leader": 1
+  },
+  "memory_query_singleflight_bypass_reasons": {},
+  "auxiliary_observations": {
+    "delib_judge_lite_log_records": 2
+  },
+  "measured_helpers_by_model": {
+    "claude-haiku-4-5-20251001": {
+      "requests": 4,
+      "input_tokens": 5164,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "output_tokens": 1303,
+      "context_tokens": 5164,
+      "cache_read_fraction": 0.0,
+      "context_median": 1172.0,
+      "context_max": 2216,
+      "stop_reasons": {
+        "end_turn": 4
+      }
+    },
+    "claude-sonnet-4-6": {
+      "requests": 5,
+      "input_tokens": 22364,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "output_tokens": 3012,
+      "context_tokens": 22364,
+      "cache_read_fraction": 0.0,
+      "context_median": 6687,
+      "context_max": 6687,
+      "stop_reasons": {
+        "end_turn": 5
+      }
+    }
+  },
+  "measured_helpers_by_task": {
+    "078fe0f8d751f87d": {
+      "claude-sonnet-4-6": {
+        "requests": 1,
+        "input_tokens": 552,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 20,
+        "context_tokens": 552,
+        "cache_read_fraction": 0.0,
+        "context_median": 552,
+        "context_max": 552,
+        "stop_reasons": {
+          "end_turn": 1
+        }
+      }
+    },
+    "0995a59da68c3192": {
+      "claude-haiku-4-5-20251001": {
+        "requests": 1,
+        "input_tokens": 702,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 39,
+        "context_tokens": 702,
+        "cache_read_fraction": 0.0,
+        "context_median": 702,
+        "context_max": 702,
+        "stop_reasons": {
+          "end_turn": 1
+        }
+      }
+    },
+    "659230095c46e788": {
+      "claude-haiku-4-5-20251001": {
+        "requests": 1,
+        "input_tokens": 604,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 47,
+        "context_tokens": 604,
+        "cache_read_fraction": 0.0,
+        "context_median": 604,
+        "context_max": 604,
+        "stop_reasons": {
+          "end_turn": 1
+        }
+      }
+    },
+    "c0146a77eea75ce8": {
+      "claude-sonnet-4-6": {
+        "requests": 3,
+        "input_tokens": 20061,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 2984,
+        "context_tokens": 20061,
+        "cache_read_fraction": 0.0,
+        "context_median": 6687,
+        "context_max": 6687,
+        "stop_reasons": {
+          "end_turn": 3
+        }
+      }
+    },
+    "f377e8c1a14d49a9": {
+      "claude-sonnet-4-6": {
+        "requests": 1,
+        "input_tokens": 1751,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 8,
+        "context_tokens": 1751,
+        "cache_read_fraction": 0.0,
+        "context_median": 1751,
+        "context_max": 1751,
+        "stop_reasons": {
+          "end_turn": 1
+        }
+      }
+    },
+    "f7eb3d9a66329ee6": {
+      "claude-haiku-4-5-20251001": {
+        "requests": 2,
+        "input_tokens": 3858,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 1217,
+        "context_tokens": 3858,
+        "cache_read_fraction": 0.0,
+        "context_median": 1929.0,
+        "context_max": 2216,
+        "stop_reasons": {
+          "end_turn": 2
+        }
+      }
+    }
+  },
+  "compatible_helpers_by_model": {},
+  "incomplete_helper_usage_observations": {},
+  "incomplete_helper_usage_by_model": {},
+  "helper_failure_observations": {},
+  "compaction_observations": {},
+  "payload_observations": {
+    "records": 2,
+    "tools_min": 91,
+    "tools_max": 91,
+    "system_chars_max": 13372
+  },
+  "limitations": [
+    "Main per-request counters only; loop totals are excluded to avoid double counting.",
+    "The main logger can include verifier/subagent loops; correlation groups are not necessarily single conversations.",
+    "Nearby small cache reads are a diagnostic pattern, not proof of a specific cache invalidation cause.",
+    "Missing request IDs cannot be deduplicated; unlogged or interrupted requests are not counted.",
+    "Auxiliary log records and memory searches are not token measurements or exact API call counts.",
+    "Single-flight observations describe dispatch decisions; saved tokens are not inferred from joined consumers.",
+    "Compatible-helper prompt totals already include cached tokens; optional cache/reasoning subsets are not added again.",
+    "Helper failures, cancellations, unavailable clients, and incomplete usage are observations, not zero-consumption measurements.",
+    "Helper response IDs deduplicate repeated records when present; SDK retries and unreported partial consumption remain unknown.",
+    "Task and model breakdowns describe the same helper responses; never add both breakdowns together.",
+    "Compaction logs omit cache counters; these partial totals are separate from main usage.",
+    "Cached input is context volume, not equivalent billing cost; no price estimate is made.",
+    "Application-only timestamps lack a timezone; journal input supplies authoritative UTC timestamps."
+  ]
+}

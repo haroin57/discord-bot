@@ -1,0 +1,2129 @@
+{
+  "started_utc": "2026-10-10T14:42:59.422628+00:00",
+  "synthetic": true,
+  "live_provider_usage": true,
+  "request_ceiling": 60,
+  "requests_attempted": 60,
+  "max_retries": 0,
+  "status": "complete",
+  "results": [
+    {
+      "case": 0,
+      "arm": "baseline",
+      "control": "concurrent_same_query_two",
+      "consumers": 2,
+      "requests_attempted": 6,
+      "expected_requests": 6,
+      "dispatch_count_pass": true,
+      "provider_calls_complete": true,
+      "shared_outputs_equal": false,
+      "independent_result_lists": true,
+      "duration_ms": 2482,
+      "consumer_quality": [
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        },
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        }
+      ],
+      "calls": [
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 1173,
+          "queue_wait_ms": 2,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 710,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 54
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 1162,
+          "queue_wait_ms": 16,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 612,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 40
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 1326,
+          "queue_wait_ms": 13,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 710,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 57
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1329,
+          "queue_wait_ms": 12,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 560,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 20
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1502,
+          "queue_wait_ms": 0,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 560,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 29
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 2477,
+          "queue_wait_ms": 3,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 612,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 53
+          }
+        }
+      ]
+    },
+    {
+      "case": 0,
+      "arm": "singleflight",
+      "control": "concurrent_same_query_two",
+      "consumers": 2,
+      "requests_attempted": 3,
+      "expected_requests": 3,
+      "dispatch_count_pass": true,
+      "provider_calls_complete": true,
+      "shared_outputs_equal": true,
+      "independent_result_lists": true,
+      "duration_ms": 1239,
+      "consumer_quality": [
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        },
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        }
+      ],
+      "calls": [
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 986,
+          "queue_wait_ms": 3,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 612,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 43
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 989,
+          "queue_wait_ms": 1,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 710,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 54
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1238,
+          "queue_wait_ms": 0,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 560,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 20
+          }
+        }
+      ]
+    },
+    {
+      "case": 1,
+      "arm": "singleflight",
+      "control": "concurrent_same_query_two",
+      "consumers": 2,
+      "requests_attempted": 3,
+      "expected_requests": 3,
+      "dispatch_count_pass": true,
+      "provider_calls_complete": true,
+      "shared_outputs_equal": true,
+      "independent_result_lists": true,
+      "duration_ms": 1173,
+      "consumer_quality": [
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        },
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        }
+      ],
+      "calls": [
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 912,
+          "queue_wait_ms": 1,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 704,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 45
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 1115,
+          "queue_wait_ms": 2,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 606,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 70
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1172,
+          "queue_wait_ms": 0,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 554,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 24
+          }
+        }
+      ]
+    },
+    {
+      "case": 1,
+      "arm": "baseline",
+      "control": "concurrent_same_query_two",
+      "consumers": 2,
+      "requests_attempted": 6,
+      "expected_requests": 6,
+      "dispatch_count_pass": true,
+      "provider_calls_complete": true,
+      "shared_outputs_equal": false,
+      "independent_result_lists": true,
+      "duration_ms": 1187,
+      "consumer_quality": [
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        },
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        }
+      ],
+      "calls": [
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 827,
+          "queue_wait_ms": 7,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 704,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 46
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 877,
+          "queue_wait_ms": 1,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 704,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 45
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 975,
+          "queue_wait_ms": 10,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 606,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 57
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 985,
+          "queue_wait_ms": 3,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 606,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 50
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1089,
+          "queue_wait_ms": 5,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 554,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 24
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1187,
+          "queue_wait_ms": 0,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 554,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 24
+          }
+        }
+      ]
+    },
+    {
+      "case": 2,
+      "arm": "baseline",
+      "control": "concurrent_same_query_two",
+      "consumers": 2,
+      "requests_attempted": 6,
+      "expected_requests": 6,
+      "dispatch_count_pass": true,
+      "provider_calls_complete": true,
+      "shared_outputs_equal": false,
+      "independent_result_lists": true,
+      "duration_ms": 1198,
+      "consumer_quality": [
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        },
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        }
+      ],
+      "calls": [
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 962,
+          "queue_wait_ms": 3,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 612,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 49
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 957,
+          "queue_wait_ms": 8,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 710,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 49
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 1005,
+          "queue_wait_ms": 11,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 612,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 49
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 1061,
+          "queue_wait_ms": 1,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 710,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 49
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1188,
+          "queue_wait_ms": 0,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 560,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 18
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1192,
+          "queue_wait_ms": 5,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 560,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 18
+          }
+        }
+      ]
+    },
+    {
+      "case": 2,
+      "arm": "singleflight",
+      "control": "concurrent_same_query_two",
+      "consumers": 2,
+      "requests_attempted": 3,
+      "expected_requests": 3,
+      "dispatch_count_pass": true,
+      "provider_calls_complete": true,
+      "shared_outputs_equal": true,
+      "independent_result_lists": true,
+      "duration_ms": 1731,
+      "consumer_quality": [
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        },
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        }
+      ],
+      "calls": [
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 965,
+          "queue_wait_ms": 3,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 612,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 52
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 968,
+          "queue_wait_ms": 1,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 710,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 49
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1730,
+          "queue_wait_ms": 0,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 560,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 28
+          }
+        }
+      ]
+    },
+    {
+      "case": 3,
+      "arm": "singleflight",
+      "control": "concurrent_same_query_two",
+      "consumers": 2,
+      "requests_attempted": 3,
+      "expected_requests": 3,
+      "dispatch_count_pass": true,
+      "provider_calls_complete": true,
+      "shared_outputs_equal": true,
+      "independent_result_lists": true,
+      "duration_ms": 1186,
+      "consumer_quality": [
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        },
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        }
+      ],
+      "calls": [
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 884,
+          "queue_wait_ms": 1,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 707,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 44
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 1077,
+          "queue_wait_ms": 3,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 609,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 58
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1185,
+          "queue_wait_ms": 0,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 557,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 30
+          }
+        }
+      ]
+    },
+    {
+      "case": 3,
+      "arm": "baseline",
+      "control": "concurrent_same_query_two",
+      "consumers": 2,
+      "requests_attempted": 6,
+      "expected_requests": 6,
+      "dispatch_count_pass": true,
+      "provider_calls_complete": true,
+      "shared_outputs_equal": false,
+      "independent_result_lists": true,
+      "duration_ms": 1337,
+      "consumer_quality": [
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        },
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        }
+      ],
+      "calls": [
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 945,
+          "queue_wait_ms": 7,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 707,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 45
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 1001,
+          "queue_wait_ms": 1,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 707,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 52
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 996,
+          "queue_wait_ms": 9,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 609,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 71
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 1202,
+          "queue_wait_ms": 3,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 609,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 67
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1217,
+          "queue_wait_ms": 0,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 557,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 30
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1331,
+          "queue_wait_ms": 5,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 557,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 31
+          }
+        }
+      ]
+    },
+    {
+      "case": 4,
+      "arm": "baseline",
+      "control": "concurrent_same_query_two",
+      "consumers": 2,
+      "requests_attempted": 6,
+      "expected_requests": 6,
+      "dispatch_count_pass": true,
+      "provider_calls_complete": true,
+      "shared_outputs_equal": false,
+      "independent_result_lists": true,
+      "duration_ms": 1471,
+      "consumer_quality": [
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        },
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        }
+      ],
+      "calls": [
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 822,
+          "queue_wait_ms": 10,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 615,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 47
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 1008,
+          "queue_wait_ms": 2,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 713,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 53
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 1003,
+          "queue_wait_ms": 8,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 713,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 55
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 1089,
+          "queue_wait_ms": 3,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 615,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 80
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1342,
+          "queue_wait_ms": 0,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 563,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 26
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1464,
+          "queue_wait_ms": 6,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 563,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 36
+          }
+        }
+      ]
+    },
+    {
+      "case": 4,
+      "arm": "singleflight",
+      "control": "concurrent_same_query_two",
+      "consumers": 2,
+      "requests_attempted": 3,
+      "expected_requests": 3,
+      "dispatch_count_pass": true,
+      "provider_calls_complete": true,
+      "shared_outputs_equal": true,
+      "independent_result_lists": true,
+      "duration_ms": 1511,
+      "consumer_quality": [
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        },
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        }
+      ],
+      "calls": [
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 826,
+          "queue_wait_ms": 1,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 713,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 42
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 847,
+          "queue_wait_ms": 3,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 615,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 51
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1510,
+          "queue_wait_ms": 0,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 563,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 39
+          }
+        }
+      ]
+    },
+    {
+      "case": 5,
+      "arm": "singleflight",
+      "control": "concurrent_same_query_two",
+      "consumers": 2,
+      "requests_attempted": 3,
+      "expected_requests": 3,
+      "dispatch_count_pass": true,
+      "provider_calls_complete": true,
+      "shared_outputs_equal": true,
+      "independent_result_lists": true,
+      "duration_ms": 1261,
+      "consumer_quality": [
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        },
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        }
+      ],
+      "calls": [
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 880,
+          "queue_wait_ms": 2,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 613,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 58
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 970,
+          "queue_wait_ms": 1,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 711,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 56
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1260,
+          "queue_wait_ms": 0,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 561,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 26
+          }
+        }
+      ]
+    },
+    {
+      "case": 5,
+      "arm": "baseline",
+      "control": "concurrent_same_query_two",
+      "consumers": 2,
+      "requests_attempted": 6,
+      "expected_requests": 6,
+      "dispatch_count_pass": true,
+      "provider_calls_complete": true,
+      "shared_outputs_equal": false,
+      "independent_result_lists": true,
+      "duration_ms": 1272,
+      "consumer_quality": [
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        },
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        }
+      ],
+      "calls": [
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 878,
+          "queue_wait_ms": 2,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 613,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 54
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 934,
+          "queue_wait_ms": 8,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 711,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 52
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 1070,
+          "queue_wait_ms": 1,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 711,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 51
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 1062,
+          "queue_wait_ms": 10,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 613,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 63
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1204,
+          "queue_wait_ms": 6,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 561,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 20
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1271,
+          "queue_wait_ms": 0,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 561,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 25
+          }
+        }
+      ]
+    },
+    {
+      "case": 0,
+      "arm": "singleflight",
+      "control": "sequential_same_query_two",
+      "consumers": 2,
+      "requests_attempted": 6,
+      "expected_requests": 6,
+      "dispatch_count_pass": true,
+      "provider_calls_complete": true,
+      "consumer_quality": [
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        },
+        {
+          "missing_terms": [],
+          "unsupported_hypothesis_terms": [],
+          "representation_shape_valid": true,
+          "quality_pass": true
+        }
+      ],
+      "calls": [
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 866,
+          "queue_wait_ms": 3,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 612,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 55
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 986,
+          "queue_wait_ms": 1,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 710,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 53
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1553,
+          "queue_wait_ms": 0,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 560,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 34
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 854,
+          "queue_wait_ms": 2,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 612,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 40
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "duration_ms": 960,
+          "queue_wait_ms": 1,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 710,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 55
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "duration_ms": 1125,
+          "queue_wait_ms": 0,
+          "valid_json": true,
+          "usage": {
+            "input_tokens": 560,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 20
+          }
+        }
+      ]
+    }
+  ],
+  "failed_attempts": [],
+  "completed_provider_calls": [
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 1173,
+      "queue_wait_ms": 2,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 710,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 54
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 1162,
+      "queue_wait_ms": 16,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 612,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 40
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 1326,
+      "queue_wait_ms": 13,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 710,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 57
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1329,
+      "queue_wait_ms": 12,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 560,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 20
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1502,
+      "queue_wait_ms": 0,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 560,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 29
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 2477,
+      "queue_wait_ms": 3,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 612,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 53
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 986,
+      "queue_wait_ms": 3,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 612,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 43
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 989,
+      "queue_wait_ms": 1,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 710,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 54
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1238,
+      "queue_wait_ms": 0,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 560,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 20
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 912,
+      "queue_wait_ms": 1,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 704,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 45
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 1115,
+      "queue_wait_ms": 2,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 606,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 70
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1172,
+      "queue_wait_ms": 0,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 554,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 24
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 827,
+      "queue_wait_ms": 7,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 704,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 46
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 877,
+      "queue_wait_ms": 1,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 704,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 45
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 975,
+      "queue_wait_ms": 10,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 606,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 57
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 985,
+      "queue_wait_ms": 3,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 606,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 50
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1089,
+      "queue_wait_ms": 5,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 554,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 24
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1187,
+      "queue_wait_ms": 0,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 554,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 24
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 962,
+      "queue_wait_ms": 3,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 612,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 49
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 957,
+      "queue_wait_ms": 8,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 710,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 49
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 1005,
+      "queue_wait_ms": 11,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 612,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 49
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 1061,
+      "queue_wait_ms": 1,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 710,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 49
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1188,
+      "queue_wait_ms": 0,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 560,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 18
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1192,
+      "queue_wait_ms": 5,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 560,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 18
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 965,
+      "queue_wait_ms": 3,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 612,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 52
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 968,
+      "queue_wait_ms": 1,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 710,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 49
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1730,
+      "queue_wait_ms": 0,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 560,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 28
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 884,
+      "queue_wait_ms": 1,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 707,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 44
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 1077,
+      "queue_wait_ms": 3,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 609,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 58
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1185,
+      "queue_wait_ms": 0,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 557,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 30
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 945,
+      "queue_wait_ms": 7,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 707,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 45
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 1001,
+      "queue_wait_ms": 1,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 707,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 52
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 996,
+      "queue_wait_ms": 9,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 609,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 71
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 1202,
+      "queue_wait_ms": 3,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 609,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 67
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1217,
+      "queue_wait_ms": 0,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 557,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 30
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1331,
+      "queue_wait_ms": 5,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 557,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 31
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 822,
+      "queue_wait_ms": 10,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 615,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 47
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 1008,
+      "queue_wait_ms": 2,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 713,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 53
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 1003,
+      "queue_wait_ms": 8,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 713,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 55
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 1089,
+      "queue_wait_ms": 3,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 615,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 80
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1342,
+      "queue_wait_ms": 0,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 563,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 26
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1464,
+      "queue_wait_ms": 6,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 563,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 36
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 826,
+      "queue_wait_ms": 1,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 713,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 42
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 847,
+      "queue_wait_ms": 3,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 615,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 51
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1510,
+      "queue_wait_ms": 0,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 563,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 39
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 880,
+      "queue_wait_ms": 2,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 613,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 58
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 970,
+      "queue_wait_ms": 1,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 711,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 56
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1260,
+      "queue_wait_ms": 0,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 561,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 26
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 878,
+      "queue_wait_ms": 2,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 613,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 54
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 934,
+      "queue_wait_ms": 8,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 711,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 52
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 1070,
+      "queue_wait_ms": 1,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 711,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 51
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 1062,
+      "queue_wait_ms": 10,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 613,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 63
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1204,
+      "queue_wait_ms": 6,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 561,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 20
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1271,
+      "queue_wait_ms": 0,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 561,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 25
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 866,
+      "queue_wait_ms": 3,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 612,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 55
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 986,
+      "queue_wait_ms": 1,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 710,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 53
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1553,
+      "queue_wait_ms": 0,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 560,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 34
+      }
+    },
+    {
+      "stage": "search.keyword_extract",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 854,
+      "queue_wait_ms": 2,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 612,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 40
+      }
+    },
+    {
+      "stage": "search.hyde",
+      "model": "claude-haiku-4-5-20251001",
+      "stop_reason": "end_turn",
+      "duration_ms": 960,
+      "queue_wait_ms": 1,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 710,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 55
+      }
+    },
+    {
+      "stage": "search.rewrite_query",
+      "model": "claude-sonnet-4-6",
+      "stop_reason": "end_turn",
+      "duration_ms": 1125,
+      "queue_wait_ms": 0,
+      "valid_json": true,
+      "usage": {
+        "input_tokens": 560,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 20
+      }
+    }
+  ],
+  "request_gap_seconds": 0.0,
+  "max_provider_concurrency": 6,
+  "latency_scope": "Group duration includes experimental pacing; provider duration excludes queueing. No production database or graph latency is measured.",
+  "arm_order": "alternating_by_case",
+  "cases": [
+    {
+      "query": "前に話した青葉プロジェクトは再試行7回のままで、9回にしない条件を覚えている。",
+      "required": [
+        "青葉",
+        "7"
+      ],
+      "fact": "青葉プロジェクトは再試行7回、9回への変更は禁止です。"
+    },
+    {
+      "query": "森川あかりと上原みなとの好きな映画について以前の記憶を検索したい。",
+      "required": [
+        "森川あかり",
+        "上原みなと"
+      ],
+      "fact": "森川あかりと上原みなとが好きな映画を記録しています。"
+    },
+    {
+      "query": "NVX-24を100mgから50mgにしたという架空設定で、夜には使わない条件の記憶を探す。",
+      "required": [
+        "NVX-24",
+        "50"
+      ],
+      "fact": "架空のNVX-24設定は100mgから50mgへ変更し、夜には使いません。"
+    },
+    {
+      "query": "Rust asyncのキャンセル伝播とPython asyncioの差を比較した前の議論を思い出したい。",
+      "required": [
+        "Rust",
+        "asyncio"
+      ],
+      "fact": "Rust asyncとPython asyncioのキャンセル伝播を比較しました。",
+      "forbidden_hypothesis": [
+        "Drop",
+        "CancelledError"
+      ]
+    },
+    {
+      "query": "Silver Finchをシルバーフィンチとも呼ぶ創作作品のタイトルについて記憶を探したい。",
+      "required": [
+        "Silver Finch"
+      ],
+      "fact": "創作作品Silver Finchはシルバーフィンチとも呼ばれています。"
+    },
+    {
+      "query": "ブルーコーヒーと甘くない紅茶、朝食はトーストと卵という好みを前に話した。",
+      "required": [
+        "ブルーコーヒー",
+        "紅茶"
+      ],
+      "fact": "ブルーコーヒーと甘くない紅茶が好みで、朝食はトーストと卵です。"
+    }
+  ],
+  "implementation_sha256": "8de8e0b078f51b680b0a8609d1f243374bff55ee0304b33c3d1223057c8ba157",
+  "singleflight_sha256": "2353dc641c73a3b7b5c993239a2af86290f58a1464ffa34efae003be19618f25",
+  "quality_scope": "Required terms, public synthetic lexical retrieval, targeted unsupported hypotheses, and unchanged shared responses; not production semantic recall accuracy.",
+  "production_state_modified": false
+}

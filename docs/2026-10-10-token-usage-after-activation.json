@@ -1,0 +1,52 @@
+{
+  "first_record": "",
+  "last_record": "",
+  "main": {
+    "requests": 0,
+    "input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "output_tokens": 0,
+    "context_tokens": 0,
+    "cache_read_fraction": 0,
+    "context_median": 0,
+    "context_max": 0,
+    "stop_reasons": {}
+  },
+  "models": {},
+  "history_cohorts": {},
+  "correlated_request_counts": {},
+  "nearby_small_cache_read_observations": {},
+  "memory_search_observations": {},
+  "memory_query_singleflight_observations": {},
+  "memory_query_singleflight_bypass_reasons": {},
+  "auxiliary_observations": {},
+  "measured_helpers_by_model": {},
+  "measured_helpers_by_task": {},
+  "compatible_helpers_by_model": {},
+  "incomplete_helper_usage_observations": {},
+  "incomplete_helper_usage_by_model": {},
+  "helper_failure_observations": {},
+  "compaction_observations": {},
+  "payload_observations": {
+    "records": 0,
+    "tools_min": 0,
+    "tools_max": 0,
+    "system_chars_max": 0
+  },
+  "limitations": [
+    "Main per-request counters only; loop totals are excluded to avoid double counting.",
+    "The main logger can include verifier/subagent loops; correlation groups are not necessarily single conversations.",
+    "Nearby small cache reads are a diagnostic pattern, not proof of a specific cache invalidation cause.",
+    "Missing request IDs cannot be deduplicated; unlogged or interrupted requests are not counted.",
+    "Auxiliary log records and memory searches are not token measurements or exact API call counts.",
+    "Single-flight observations describe dispatch decisions; saved tokens are not inferred from joined consumers.",
+    "Compatible-helper prompt totals already include cached tokens; optional cache/reasoning subsets are not added again.",
+    "Helper failures, cancellations, unavailable clients, and incomplete usage are observations, not zero-consumption measurements.",
+    "Helper response IDs deduplicate repeated records when present; SDK retries and unreported partial consumption remain unknown.",
+    "Task and model breakdowns describe the same helper responses; never add both breakdowns together.",
+    "Compaction logs omit cache counters; these partial totals are separate from main usage.",
+    "Cached input is context volume, not equivalent billing cost; no price estimate is made.",
+    "Application-only timestamps lack a timezone; journal input supplies authoritative UTC timestamps."
+  ]
+}

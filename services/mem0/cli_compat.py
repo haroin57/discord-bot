@@ -16,9 +16,13 @@ main bot path uses (see services/claude_api/client.py + entry.py).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 import uuid as _uuid
 
+from services.claude_api.client_factory import build_cli_headers
+from services.token_usage import log_helper_failure, log_helper_usage
 from services.claude_api.client import (
     CLI_DEFAULT_SYSTEM_PROMPT,
     CLI_IDENTITY_TEXT,
@@ -57,21 +61,7 @@ def cli_system(task_prompt: str) -> list[dict]:
 
 def cli_headers() -> dict:
     """The X-Stainless / x-app / User-Agent set the live CLI attaches."""
-    return {
-        "x-app": "cli",
-        "User-Agent": USER_AGENT,
-        "X-Claude-Code-Session-Id": _session_id,
-        "X-Stainless-Lang": "js",
-        "X-Stainless-Package-Version": "0.80.0",
-        "X-Stainless-Runtime": "node",
-        "X-Stainless-Runtime-Version": "v24.14.1",
-        "X-Stainless-OS": "Linux",
-        "X-Stainless-Arch": "x64",
-        "X-Stainless-Timeout": "600",
-        "accept-language": "*",
-        "sec-fetch-mode": "cors",
-        "x-client-request-id": str(_uuid.uuid4()),
-    }
+    return build_cli_headers()
 
 
 async def cli_messages_create(
@@ -123,7 +113,21 @@ async def cli_messages_create(
     # "rerank_memories failed" / "rewrite_query failed" warnings after
     # MEM0_RERANK_MODEL/MEM0_REWRITE_MODEL were switched to claude-sonnet-4-6).
     # These are small classify/extract/rerank tasks — none need thinking.
-    return await client.messages.create(**kwargs)
+    started = time.monotonic()
+    try:
+        response = await client.messages.create(**kwargs)
+    except (Exception, asyncio.CancelledError) as error:
+        log_helper_failure(
+            route="anthropic_cli", model=model, task_prompt=task_prompt, user_chars=len(user_message),
+            duration_ms=int((time.monotonic() - started) * 1000),
+            outcome="cancelled" if isinstance(error, asyncio.CancelledError) else "failed", error=error,
+        )
+        raise
+    log_helper_usage(
+        response, model=model, task_prompt=task_prompt, user_chars=len(user_message),
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+    return response
 
 
 def extract_text(resp) -> str:

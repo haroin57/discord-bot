@@ -1,0 +1,116 @@
+{
+  "first_record": "2026-10-06T15:03:24.060376+00:00",
+  "last_record": "2026-10-10T05:57:32.956225+00:00",
+  "main": {
+    "requests": 56,
+    "input_tokens": 114,
+    "cache_read_input_tokens": 3066084,
+    "cache_creation_input_tokens": 4620486,
+    "output_tokens": 84216,
+    "context_tokens": 7686684,
+    "cache_read_fraction": 0.3989,
+    "context_median": 158420.0,
+    "context_max": 198044,
+    "stop_reasons": {
+      "end_turn": 45,
+      "tool_use": 11
+    }
+  },
+  "models": {
+    "claude-opus-5": {
+      "requests": 55,
+      "input_tokens": 110,
+      "cache_read_input_tokens": 3066084,
+      "cache_creation_input_tokens": 4513180,
+      "output_tokens": 79075,
+      "context_tokens": 7579374,
+      "cache_read_fraction": 0.4045,
+      "context_median": 172199,
+      "context_max": 198044,
+      "stop_reasons": {
+        "end_turn": 44,
+        "tool_use": 11
+      }
+    },
+    "claude-opus-5-5": {
+      "requests": 1,
+      "input_tokens": 4,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 107306,
+      "output_tokens": 5141,
+      "context_tokens": 107310,
+      "cache_read_fraction": 0.0,
+      "context_median": 107310,
+      "context_max": 107310,
+      "stop_reasons": {
+        "end_turn": 1
+      }
+    }
+  },
+  "history_cohorts": {
+    "history_250_plus": {
+      "requests": 28,
+      "input_tokens": 56,
+      "cache_read_input_tokens": 1222687,
+      "cache_creation_input_tokens": 3871188,
+      "output_tokens": 29482,
+      "context_tokens": 5093931,
+      "cache_read_fraction": 0.24,
+      "context_median": 179643.5,
+      "context_max": 198044,
+      "stop_reasons": {
+        "end_turn": 24,
+        "tool_use": 4
+      }
+    },
+    "history_under_250": {
+      "requests": 28,
+      "input_tokens": 58,
+      "cache_read_input_tokens": 1843397,
+      "cache_creation_input_tokens": 749298,
+      "output_tokens": 54734,
+      "context_tokens": 2592753,
+      "cache_read_fraction": 0.711,
+      "context_median": 101784.0,
+      "context_max": 144641,
+      "stop_reasons": {
+        "tool_use": 7,
+        "end_turn": 21
+      }
+    }
+  },
+  "correlated_request_counts": {
+    "1": 40,
+    "2": 4,
+    "4": 2
+  },
+  "nearby_small_cache_read_observations": {
+    "requests": 19,
+    "cache_creation_input_tokens": 2770293
+  },
+  "memory_search_observations": {
+    "searches": 44,
+    "rerank_on": 44,
+    "zero_kept": 10
+  },
+  "auxiliary_observations": {
+    "delib_judge_lite_log_records": 6
+  },
+  "compaction_observations": {},
+  "payload_observations": {
+    "records": 48,
+    "tools_min": 84,
+    "tools_max": 95,
+    "system_chars_max": 13372
+  },
+  "limitations": [
+    "Main per-request counters only; loop totals are excluded to avoid double counting.",
+    "The main logger can include verifier/subagent loops; correlation groups are not necessarily single conversations.",
+    "Nearby small cache reads are a diagnostic pattern, not proof of a specific cache invalidation cause.",
+    "Missing request IDs cannot be deduplicated; unlogged or interrupted requests are not counted.",
+    "Auxiliary log records and memory searches are not token measurements or exact API call counts.",
+    "Compaction logs omit cache counters; these partial totals are separate from main usage.",
+    "Cached input is context volume, not equivalent billing cost; no price estimate is made.",
+    "Application-only timestamps lack a timezone; journal input supplies authoritative UTC timestamps."
+  ]
+}

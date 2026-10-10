@@ -1,0 +1,38 @@
+{
+  "synthetic": true,
+  "model": "claude-opus-5-5",
+  "quality_version": 2,
+  "arm_order": "alternating_by_round",
+  "update_density": "same_calibration_template",
+  "minimum_rows": 24,
+  "extra_rows": 6,
+  "max_requests": 20,
+  "requests_attempted": 3,
+  "failed_attempts": [
+    {
+      "arm": "rolling",
+      "step": 0,
+      "error_type": "RateLimitError",
+      "status_code": 429,
+      "usage": "unknown"
+    },
+    {
+      "arm": "rolling",
+      "step": 0,
+      "error_type": "RateLimitError",
+      "status_code": 429,
+      "usage": "unknown"
+    },
+    {
+      "arm": "rolling",
+      "step": 0,
+      "error_type": "RateLimitError",
+      "status_code": 429,
+      "usage": "unknown"
+    }
+  ],
+  "status": "failed",
+  "results": [],
+  "started_utc": "2026-10-10T09:43:38.887771+00:00",
+  "error_type": "RateLimitError"
+}

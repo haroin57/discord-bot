@@ -7,6 +7,7 @@ import re
 import time
 
 from services.mem0.format import strip_json_fence
+from services.query_expansion import QueryExpansionSingleFlight
 
 from services.mem0.client import (
     MEM0_RELEVANCE_MAX_DISTANCE,
@@ -20,6 +21,7 @@ from services.oauth_manager import (
 )
 
 log = logging.getLogger(__name__)
+_QUERY_SINGLEFLIGHT = QueryExpansionSingleFlight()
 
 
 # Caller-side gate for the Haiku rewrite/rerank stages. The default Discord
@@ -1003,6 +1005,42 @@ async def _finalize_smart_result(
     return merged
 
 
+async def _query_representations(query: str) -> tuple[list[str], str, str]:
+    tasks = [asyncio.create_task(stage(query)) for stage in (
+        _rewrite_query, _generate_hypothetical_fact, _extract_keywords_via_llm,
+    )]
+    try:
+        result = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    return result[0], result[1], result[2]
+
+
+async def _shared_query_representations(query: str, user_id: str) -> tuple[list[str], str, str]:
+    if os.environ.get("MEM0_QUERY_SINGLEFLIGHT_ENABLED", "0").lower() not in {"1", "true", "yes"}:
+        return await _query_representations(query)
+    from config import MEM0_HYDE_ENABLED
+
+    configuration = {
+        "implementation": "legacy",
+        "settings": {name: os.environ.get(name) for name in (
+            "MEM0_REWRITE_MODEL", "MEM0_REWRITE_MAX_TOKENS", "MEM0_HYDE_MODEL",
+            "MEM0_HYDE_MAX_TOKENS", "MEM0_KEYWORD_MODEL", "MEM0_KEYWORD_MAX_TOKENS",
+        )},
+        "hyde_enabled": MEM0_HYDE_ENABLED,
+        "prompts": [_REWRITE_PROMPT, _HYDE_PROMPT, _KEYWORD_EXTRACT_PROMPT],
+        "completion": id(_query_representations),
+    }
+    return await _QUERY_SINGLEFLIGHT.run(
+        user_id=user_id, query=query, configuration=configuration,
+        factory=lambda: _query_representations(query),
+    )
+
+
 async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[str]:
     """Phase A-1/B-1: build the multi-query set from one user query.
 
@@ -1034,11 +1072,7 @@ async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[st
         log.info("morpho_expand: %r → %r", (query or "")[:60], morpho_variant)
         queries.append(morpho_variant)
     if rewrite:
-        variants, hyde, llm_keywords = await asyncio.gather(
-            _rewrite_query(query),
-            _generate_hypothetical_fact(query),
-            _extract_keywords_via_llm(query),
-        )
+        variants, hyde, llm_keywords = await _shared_query_representations(query, user_id)
         for v in variants:
             if v and v not in queries:
                 queries.append(v)

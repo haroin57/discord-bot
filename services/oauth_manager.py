@@ -23,6 +23,7 @@ import stat
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -726,9 +727,10 @@ async def _sanitize_outgoing_request(request) -> None:
                                     x-stainless-timeout)
 
     Also collapse the duplicated x-stainless-timeout to the single CLI
-    value and pretend we accept brotli (the real CLI does).
+    value. Keep the transport's supported response encodings.
     """
     h = request.headers
+    h["x-client-request-id"] = str(uuid.uuid4())
     for k in (
         "x-stainless-async",
         "x-stainless-helper-method",
@@ -741,8 +743,6 @@ async def _sanitize_outgoing_request(request) -> None:
     if len(timeouts) > 1 or (timeouts and "NOT_GIVEN" in timeouts[0]):
         del h["x-stainless-timeout"]
         h["x-stainless-timeout"] = "600"
-    # The Node SDK advertises brotli; httpx omits it by default.
-    h["accept-encoding"] = "br, gzip, deflate"
 
 
 # Node.js v24's tls.DEFAULT_CIPHERS list (BoringSSL preference order). Used by
@@ -833,7 +833,6 @@ async def prime_subscriber_session() -> None:
         "Accept": "application/json, text/plain, */*",
         "Authorization": f"Bearer {acct.access_token}",
         "User-Agent": "axios/1.13.6",
-        "Accept-Encoding": "gzip, compress, deflate, br",
     }
     urls = [
         "https://api.anthropic.com/api/oauth/profile",

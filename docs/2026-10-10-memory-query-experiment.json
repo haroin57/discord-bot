@@ -1,0 +1,477 @@
+{
+  "started_utc": "2026-10-10T06:22:44.907732+00:00",
+  "synthetic": true,
+  "request_ceiling": 36,
+  "quality_scope": "Required terms and synthetic lexical retrieval; not semantic production recall accuracy.",
+  "results": [
+    {
+      "case": 0,
+      "arm": "parallel",
+      "duration_ms": 1571,
+      "missing_terms": [],
+      "lexical_top2_recall": true,
+      "representations": [
+        "side-project",
+        "retry-logic",
+        "config-constraints",
+        "ユーザーは青葉プロジェクトの再試行回数を7回のままにしておく条件を記憶している。",
+        "青葉プロジェクト 再試行 7回 9回 条件 retry count retry times"
+      ],
+      "calls": [
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 710,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 51
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 612,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 46
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 560,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 20
+          }
+        }
+      ]
+    },
+    {
+      "case": 0,
+      "arm": "bundle",
+      "duration_ms": 5661,
+      "missing_terms": [],
+      "lexical_top2_recall": true,
+      "representations": [
+        "青葉プロジェクトの再試行回数が7回のまま維持される条件",
+        "青葉プロジェクトで再試行を9回にしない理由または条件",
+        "青葉プロジェクト リトライ回数7回 変更しない条件",
+        "前回話した青葉プロジェクトの再試行設定7回と9回にしない制約",
+        "青葉プロジェクト 再試行7回 9回へ変更しない条件・制限",
+        "青葉プロジェクトでは再試行回数を7回に設定し、9回にしない特定の条件が存在する。",
+        "青葉プロジェクト 再試行 7回 9回 条件 リトライ retry 試行回数 再実行"
+      ],
+      "calls": [
+        {
+          "stage": "search.query_bundle",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 562,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 240
+          }
+        }
+      ]
+    },
+    {
+      "case": 1,
+      "arm": "bundle",
+      "duration_ms": 3671,
+      "missing_terms": [],
+      "lexical_top2_recall": true,
+      "representations": [
+        "森川あかりの好きな映画",
+        "上原みなとの好きな映画",
+        "森川あかりと上原みなとが好きな映画について話した記憶",
+        "森川あかりまたは上原みなとのお気に入りの映画",
+        "森川あかり・上原みなとの映画の好み",
+        "森川あかりと上原みなとがそれぞれ好きな映画を述べた。",
+        "森川あかり 上原みなと 好きな映画 映画 あかり みなと"
+      ],
+      "calls": [
+        {
+          "stage": "search.query_bundle",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 556,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 171
+          }
+        }
+      ]
+    },
+    {
+      "case": 1,
+      "arm": "parallel",
+      "duration_ms": 1597,
+      "missing_terms": [],
+      "lexical_top2_recall": true,
+      "representations": [
+        "movie-favorites",
+        "森川あかり",
+        "上原みなと",
+        "森川あかりと上原みなとの好きな映画について以前話した内容",
+        "森川あかり 上原みなと 好きな映画 記憶 検索 映画の好み 映画の嗜好"
+      ],
+      "calls": [
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 704,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 37
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 606,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 67
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 554,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 24
+          }
+        }
+      ]
+    },
+    {
+      "case": 2,
+      "arm": "parallel",
+      "duration_ms": 1534,
+      "missing_terms": [],
+      "lexical_top2_recall": true,
+      "representations": [
+        "health",
+        "medication-dosage",
+        "sleep-routine",
+        "ユーザーはNVX-24の用量を100mgから50mgに変更し、夜間の使用を避けている。",
+        "NVX-24 100mg 50mg 夜 条件 記憶 用量変更 夜間使用禁止"
+      ],
+      "calls": [
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 710,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 49
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 612,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 53
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 560,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 19
+          }
+        }
+      ]
+    },
+    {
+      "case": 2,
+      "arm": "bundle",
+      "duration_ms": 7374,
+      "missing_terms": [],
+      "lexical_top2_recall": true,
+      "representations": [
+        "NVX-24を100mgから50mgに減量した架空設定",
+        "NVX-24 50mg 夜間使用しない条件の設定",
+        "NVX-24用量変更 100mg→50mg 夜は使わない",
+        "架空設定 NVX-24 減量 夜間不使用の記憶",
+        "NVX-24 50mg 朝または昼のみ使用という設定",
+        "架空設定としてNVX-24を100mgから50mgに変更し夜には使用しないという条件が記録されている。",
+        "NVX-24 100mg 50mg 減量 夜間不使用 架空設定 用量変更 条件 NVX24 NVX 24"
+      ],
+      "calls": [
+        {
+          "stage": "search.query_bundle",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 563,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 237
+          }
+        }
+      ]
+    },
+    {
+      "case": 3,
+      "arm": "bundle",
+      "duration_ms": 5355,
+      "missing_terms": [],
+      "lexical_top2_recall": true,
+      "representations": [
+        "Rust asyncのキャンセル伝播とPython asyncioのキャンセル伝播の違いについての議論",
+        "RustとPythonにおける非同期処理のキャンセル機構の比較",
+        "Rust async cancellation propagation vs Python asyncio cancellation",
+        "Rustの非同期タスクキャンセルとasyncioのCancelledErrorの差異",
+        "Rust futureのドロップベースキャンセルとasyncioのキャンセル伝播の比較議論",
+        "RustのasyncキャンセルはDropベースで伝播し、Python asyncioはCancelledError例外で伝播するという違いを議論した。",
+        "Rust async キャンセル伝播 Python asyncio 非同期処理 cancellation Future 非同期 キャンセル"
+      ],
+      "calls": [
+        {
+          "stage": "search.query_bundle",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 560,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 256
+          }
+        }
+      ]
+    },
+    {
+      "case": 3,
+      "arm": "parallel",
+      "duration_ms": 1616,
+      "missing_terms": [],
+      "lexical_top2_recall": true,
+      "representations": [
+        "rust-async",
+        "python-asyncio",
+        "cancellation-propagation",
+        "async-comparison",
+        "systems-arch",
+        "ユーザーはRust asyncのキャンセル伝播とPython asyncioの差について前に議論した",
+        "Rust async キャンセル 伝播 Python asyncio 差 比較 議論 Rust async"
+      ],
+      "calls": [
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 707,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 44
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 609,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 62
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 557,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 31
+          }
+        }
+      ]
+    },
+    {
+      "case": 4,
+      "arm": "parallel",
+      "duration_ms": 1752,
+      "missing_terms": [],
+      "lexical_top2_recall": true,
+      "representations": [
+        "Silver Finch creative work title",
+        "シルバーフィンチ 創作作品",
+        "movie-favorites fiction title",
+        "ユーザーはSilver Finch（シルバーフィンチ）という創作作品のタイトルについて関心がある。",
+        "Silver Finch シルバーフィンチ 創作作品 タイトル"
+      ],
+      "calls": [
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 713,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 53
+          }
+        },
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 615,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 57
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 563,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 37
+          }
+        }
+      ]
+    },
+    {
+      "case": 4,
+      "arm": "bundle",
+      "duration_ms": 4901,
+      "missing_terms": [],
+      "lexical_top2_recall": true,
+      "representations": [
+        "Silver Finchを「シルバーフィンチ」とも呼ぶ創作作品のタイトル",
+        "シルバーフィンチという名称が登場する小説・漫画・映画などの作品名",
+        "Silver Finch / シルバーフィンチを題材または名称に用いた創作物",
+        "「シルバーフィンチ」と「Silver Finch」を併用している作品のタイトル",
+        "「Silver Finch」はシルバーフィンチとも呼ばれる創作作品のタイトルである。",
+        "Silver Finch シルバーフィンチ 創作作品 タイトル"
+      ],
+      "calls": [
+        {
+          "stage": "search.query_bundle",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 566,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 219
+          }
+        }
+      ]
+    },
+    {
+      "case": 5,
+      "arm": "bundle",
+      "duration_ms": 5928,
+      "missing_terms": [],
+      "lexical_top2_recall": true,
+      "representations": [
+        "ブルーコーヒーと甘くない紅茶の飲み物の好み",
+        "朝食にトーストと卵を食べる習慣",
+        "コーヒーは砂糖なし・ブラック系、紅茶も無糖の嗜好",
+        "朝食の好み：トースト・卵・ブルーコーヒー・無糖紅茶",
+        "飲み物と朝食に関するユーザーの食の好み",
+        "ユーザーはブルーコーヒーと甘くない紅茶を好み、朝食はトーストと卵と述べた。",
+        "ブルーコーヒー 紅茶 甘くない トースト 卵 朝食 飲み物 好み 無糖紅茶 アンシュガー紅茶"
+      ],
+      "calls": [
+        {
+          "stage": "search.query_bundle",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 564,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 279
+          }
+        }
+      ]
+    },
+    {
+      "case": 5,
+      "arm": "parallel",
+      "duration_ms": 1862,
+      "missing_terms": [],
+      "lexical_top2_recall": true,
+      "representations": [
+        "coffee-preferences",
+        "tea-preferences",
+        "breakfast-habits",
+        "ユーザーはブルーコーヒー、甘くない紅茶、トーストと卵の朝食を好む。",
+        "ブルーコーヒー 紅茶 朝食 トースト 卵 好み blue coffee"
+      ],
+      "calls": [
+        {
+          "stage": "search.keyword_extract",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 613,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 49
+          }
+        },
+        {
+          "stage": "search.hyde",
+          "model": "claude-haiku-4-5-20251001",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 711,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 51
+          }
+        },
+        {
+          "stage": "search.rewrite_query",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "end_turn",
+          "usage": {
+            "input_tokens": 561,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 20
+          }
+        }
+      ]
+    }
+  ]
+}

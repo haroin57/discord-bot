@@ -1,0 +1,249 @@
+{
+  "first_record": "2026-10-10T06:20:49.835230+00:00",
+  "last_record": "2026-10-10T08:35:51.398396+00:00",
+  "main": {
+    "requests": 196,
+    "input_tokens": 428,
+    "cache_read_input_tokens": 33668120,
+    "cache_creation_input_tokens": 1068193,
+    "output_tokens": 179929,
+    "context_tokens": 34736741,
+    "cache_read_fraction": 0.9692,
+    "context_median": 176865.5,
+    "context_max": 263556,
+    "stop_reasons": {
+      "end_turn": 18,
+      "tool_use": 178
+    }
+  },
+  "models": {
+    "claude-opus-5-5": {
+      "requests": 196,
+      "input_tokens": 428,
+      "cache_read_input_tokens": 33668120,
+      "cache_creation_input_tokens": 1068193,
+      "output_tokens": 179929,
+      "context_tokens": 34736741,
+      "cache_read_fraction": 0.9692,
+      "context_median": 176865.5,
+      "context_max": 263556,
+      "stop_reasons": {
+        "end_turn": 18,
+        "tool_use": 178
+      }
+    }
+  },
+  "history_cohorts": {
+    "history_250_plus": {
+      "requests": 10,
+      "input_tokens": 20,
+      "cache_read_input_tokens": 2571859,
+      "cache_creation_input_tokens": 8524,
+      "output_tokens": 7507,
+      "context_tokens": 2580403,
+      "cache_read_fraction": 0.9967,
+      "context_median": 258560.0,
+      "context_max": 261130,
+      "stop_reasons": {
+        "tool_use": 9,
+        "end_turn": 1
+      }
+    },
+    "history_under_250": {
+      "requests": 186,
+      "input_tokens": 408,
+      "cache_read_input_tokens": 31096261,
+      "cache_creation_input_tokens": 1059669,
+      "output_tokens": 172422,
+      "context_tokens": 32156338,
+      "cache_read_fraction": 0.967,
+      "context_median": 174558.5,
+      "context_max": 263556,
+      "stop_reasons": {
+        "end_turn": 17,
+        "tool_use": 169
+      }
+    }
+  },
+  "correlated_request_counts": {
+    "1": 3,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "9": 1,
+    "11": 2,
+    "12": 1,
+    "16": 1,
+    "17": 1,
+    "18": 1,
+    "41": 1,
+    "49": 1
+  },
+  "nearby_small_cache_read_observations": {},
+  "memory_search_observations": {
+    "searches": 11,
+    "rerank_on": 11,
+    "zero_kept": 9
+  },
+  "memory_query_singleflight_observations": {},
+  "memory_query_singleflight_bypass_reasons": {},
+  "auxiliary_observations": {
+    "delib_judge_lite_log_records": 12
+  },
+  "measured_helpers_by_model": {
+    "claude-haiku-4-5-20251001": {
+      "requests": 34,
+      "input_tokens": 56031,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "output_tokens": 8651,
+      "context_tokens": 56031,
+      "cache_read_fraction": 0.0,
+      "context_median": 711.5,
+      "context_max": 4218,
+      "stop_reasons": {
+        "end_turn": 30,
+        "max_tokens": 4
+      }
+    },
+    "claude-sonnet-4-6": {
+      "requests": 48,
+      "input_tokens": 198602,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "output_tokens": 24851,
+      "context_tokens": 198602,
+      "cache_read_fraction": 0.0,
+      "context_median": 6687.0,
+      "context_max": 6687,
+      "stop_reasons": {
+        "end_turn": 48
+      }
+    }
+  },
+  "measured_helpers_by_task": {
+    "078fe0f8d751f87d": {
+      "claude-sonnet-4-6": {
+        "requests": 11,
+        "input_tokens": 6142,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 257,
+        "context_tokens": 6142,
+        "cache_read_fraction": 0.0,
+        "context_median": 561,
+        "context_max": 586,
+        "stop_reasons": {
+          "end_turn": 11
+        }
+      }
+    },
+    "0995a59da68c3192": {
+      "claude-haiku-4-5-20251001": {
+        "requests": 11,
+        "input_tokens": 7792,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 551,
+        "context_tokens": 7792,
+        "cache_read_fraction": 0.0,
+        "context_median": 711,
+        "context_max": 736,
+        "stop_reasons": {
+          "end_turn": 11
+        }
+      }
+    },
+    "659230095c46e788": {
+      "claude-haiku-4-5-20251001": {
+        "requests": 11,
+        "input_tokens": 6714,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 534,
+        "context_tokens": 6714,
+        "cache_read_fraction": 0.0,
+        "context_median": 613,
+        "context_max": 638,
+        "stop_reasons": {
+          "end_turn": 11
+        }
+      }
+    },
+    "c0146a77eea75ce8": {
+      "claude-sonnet-4-6": {
+        "requests": 26,
+        "input_tokens": 173862,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 24462,
+        "context_tokens": 173862,
+        "cache_read_fraction": 0.0,
+        "context_median": 6687.0,
+        "context_max": 6687,
+        "stop_reasons": {
+          "end_turn": 26
+        }
+      }
+    },
+    "f377e8c1a14d49a9": {
+      "claude-sonnet-4-6": {
+        "requests": 11,
+        "input_tokens": 18598,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 132,
+        "context_tokens": 18598,
+        "cache_read_fraction": 0.0,
+        "context_median": 1693,
+        "context_max": 1856,
+        "stop_reasons": {
+          "end_turn": 11
+        }
+      }
+    },
+    "f7eb3d9a66329ee6": {
+      "claude-haiku-4-5-20251001": {
+        "requests": 12,
+        "input_tokens": 41525,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 7566,
+        "context_tokens": 41525,
+        "cache_read_fraction": 0.0,
+        "context_median": 3931.5,
+        "context_max": 4218,
+        "stop_reasons": {
+          "end_turn": 8,
+          "max_tokens": 4
+        }
+      }
+    }
+  },
+  "compatible_helpers_by_model": {},
+  "incomplete_helper_usage_observations": {},
+  "incomplete_helper_usage_by_model": {},
+  "helper_failure_observations": {},
+  "compaction_observations": {},
+  "payload_observations": {
+    "records": 15,
+    "tools_min": 91,
+    "tools_max": 91,
+    "system_chars_max": 13372
+  },
+  "limitations": [
+    "Main per-request counters only; loop totals are excluded to avoid double counting.",
+    "The main logger can include verifier/subagent loops; correlation groups are not necessarily single conversations.",
+    "Nearby small cache reads are a diagnostic pattern, not proof of a specific cache invalidation cause.",
+    "Missing request IDs cannot be deduplicated; unlogged or interrupted requests are not counted.",
+    "Auxiliary log records and memory searches are not token measurements or exact API call counts.",
+    "Single-flight observations describe dispatch decisions; saved tokens are not inferred from joined consumers.",
+    "Compatible-helper prompt totals already include cached tokens; optional cache/reasoning subsets are not added again.",
+    "Helper failures, cancellations, unavailable clients, and incomplete usage are observations, not zero-consumption measurements.",
+    "Helper response IDs deduplicate repeated records when present; SDK retries and unreported partial consumption remain unknown.",
+    "Task and model breakdowns describe the same helper responses; never add both breakdowns together.",
+    "Compaction logs omit cache counters; these partial totals are separate from main usage.",
+    "Cached input is context volume, not equivalent billing cost; no price estimate is made.",
+    "Application-only timestamps lack a timezone; journal input supplies authoritative UTC timestamps."
+  ]
+}

@@ -66,6 +66,11 @@ from services.claude_api.client import (
     get_attribution_header_value,
     get_metadata,
 )
+from services.claude_api.model_settings import (
+    model_betas,
+    model_thinking,
+    requires_adaptive_thinking,
+)
 from services.claude_api.status import _safe_status
 from services.session import (
     append_jsonl,
@@ -764,9 +769,11 @@ async def _compact_channel_history(
                     max_tokens=MAX_SUMMARY_OUTPUT_TOKENS,
                     system=compact_system,
                     messages=compact_messages,
-                    betas=MODEL_BETAS,
+                    betas=model_betas(HISTORY_COMPACT_MODEL, MODEL_BETAS),
                     metadata=get_metadata(),
-                    thinking={"type": "disabled"},
+                    thinking=model_thinking(HISTORY_COMPACT_MODEL, disable=True),
+                    **({"output_config": {"effort": "low"}}
+                       if requires_adaptive_thinking(HISTORY_COMPACT_MODEL) else {}),
                 )
                 break
             except Exception as _exc:  # noqa: BLE001

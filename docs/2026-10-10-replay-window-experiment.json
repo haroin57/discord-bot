@@ -1,0 +1,298 @@
+{
+  "started_utc": "2026-10-10T06:27:11.031653+00:00",
+  "synthetic": true,
+  "model": "claude-opus-5-5",
+  "minimum_rows": 24,
+  "extra_rows": 6,
+  "max_requests": 18,
+  "results": [
+    {
+      "arm": "rolling",
+      "step": 0,
+      "history_messages": 24,
+      "head_changed": false,
+      "quality_pass": false,
+      "failure_class": "invalid_json",
+      "stop_reason": "end_turn",
+      "duration_ms": 3001,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 5828,
+        "output_tokens": 52
+      }
+    },
+    {
+      "arm": "rolling",
+      "step": 1,
+      "history_messages": 24,
+      "head_changed": true,
+      "quality_pass": false,
+      "failure_class": "invalid_json",
+      "stop_reason": "refusal",
+      "duration_ms": 1148,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 5402,
+        "output_tokens": 0
+      }
+    },
+    {
+      "arm": "rolling",
+      "step": 2,
+      "history_messages": 24,
+      "head_changed": true,
+      "quality_pass": true,
+      "failure_class": "",
+      "stop_reason": "end_turn",
+      "duration_ms": 1315,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 4976,
+        "output_tokens": 24
+      }
+    },
+    {
+      "arm": "rolling",
+      "step": 3,
+      "history_messages": 24,
+      "head_changed": true,
+      "quality_pass": true,
+      "failure_class": "",
+      "stop_reason": "end_turn",
+      "duration_ms": 2223,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 4550,
+        "output_tokens": 49
+      }
+    },
+    {
+      "arm": "rolling",
+      "step": 4,
+      "history_messages": 24,
+      "head_changed": true,
+      "quality_pass": false,
+      "failure_class": "invalid_json",
+      "stop_reason": "refusal",
+      "duration_ms": 1051,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 4124,
+        "output_tokens": 0
+      }
+    },
+    {
+      "arm": "rolling",
+      "step": 5,
+      "history_messages": 24,
+      "head_changed": true,
+      "quality_pass": true,
+      "failure_class": "",
+      "stop_reason": "end_turn",
+      "duration_ms": 1334,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 3698,
+        "output_tokens": 24
+      }
+    },
+    {
+      "arm": "rolling",
+      "step": 6,
+      "history_messages": 24,
+      "head_changed": true,
+      "quality_pass": true,
+      "failure_class": "",
+      "stop_reason": "end_turn",
+      "duration_ms": 2209,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 3272,
+        "output_tokens": 45
+      }
+    },
+    {
+      "arm": "rolling",
+      "step": 7,
+      "history_messages": 24,
+      "head_changed": true,
+      "quality_pass": false,
+      "failure_class": "invalid_json",
+      "stop_reason": "refusal",
+      "duration_ms": 1103,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 2846,
+        "output_tokens": 0
+      }
+    },
+    {
+      "arm": "rolling",
+      "step": 8,
+      "history_messages": 24,
+      "head_changed": true,
+      "quality_pass": true,
+      "failure_class": "",
+      "stop_reason": "end_turn",
+      "duration_ms": 2001,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 2420,
+        "output_tokens": 56
+      }
+    },
+    {
+      "arm": "anchored",
+      "step": 0,
+      "history_messages": 24,
+      "head_changed": false,
+      "quality_pass": true,
+      "failure_class": "",
+      "stop_reason": "end_turn",
+      "duration_ms": 1567,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 5744,
+        "output_tokens": 24
+      }
+    },
+    {
+      "arm": "anchored",
+      "step": 1,
+      "history_messages": 26,
+      "head_changed": false,
+      "quality_pass": false,
+      "failure_class": "invalid_json",
+      "stop_reason": "end_turn",
+      "duration_ms": 1843,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 5708,
+        "cache_creation_input_tokens": 54,
+        "output_tokens": 29
+      }
+    },
+    {
+      "arm": "anchored",
+      "step": 2,
+      "history_messages": 28,
+      "head_changed": false,
+      "quality_pass": false,
+      "failure_class": "invalid_json",
+      "stop_reason": "end_turn",
+      "duration_ms": 1857,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 5733,
+        "cache_creation_input_tokens": 47,
+        "output_tokens": 29
+      }
+    },
+    {
+      "arm": "anchored",
+      "step": 3,
+      "history_messages": 30,
+      "head_changed": false,
+      "quality_pass": true,
+      "failure_class": "",
+      "stop_reason": "end_turn",
+      "duration_ms": 1593,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 5751,
+        "cache_creation_input_tokens": 47,
+        "output_tokens": 24
+      }
+    },
+    {
+      "arm": "anchored",
+      "step": 4,
+      "history_messages": 24,
+      "head_changed": true,
+      "quality_pass": false,
+      "failure_class": "invalid_json",
+      "stop_reason": "end_turn",
+      "duration_ms": 2530,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 4068,
+        "output_tokens": 65
+      }
+    },
+    {
+      "arm": "anchored",
+      "step": 5,
+      "history_messages": 26,
+      "head_changed": false,
+      "quality_pass": true,
+      "failure_class": "",
+      "stop_reason": "end_turn",
+      "duration_ms": 2448,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 4039,
+        "cache_creation_input_tokens": 47,
+        "output_tokens": 56
+      }
+    },
+    {
+      "arm": "anchored",
+      "step": 6,
+      "history_messages": 28,
+      "head_changed": false,
+      "quality_pass": true,
+      "failure_class": "",
+      "stop_reason": "end_turn",
+      "duration_ms": 1380,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 4057,
+        "cache_creation_input_tokens": 47,
+        "output_tokens": 24
+      }
+    },
+    {
+      "arm": "anchored",
+      "step": 7,
+      "history_messages": 30,
+      "head_changed": false,
+      "quality_pass": true,
+      "failure_class": "",
+      "stop_reason": "end_turn",
+      "duration_ms": 2181,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 4075,
+        "cache_creation_input_tokens": 47,
+        "output_tokens": 58
+      }
+    },
+    {
+      "arm": "anchored",
+      "step": 8,
+      "history_messages": 24,
+      "head_changed": true,
+      "quality_pass": true,
+      "failure_class": "",
+      "stop_reason": "end_turn",
+      "duration_ms": 2227,
+      "usage": {
+        "input_tokens": 4,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 2392,
+        "output_tokens": 53
+      }
+    }
+  ]
+}

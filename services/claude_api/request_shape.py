@@ -11,6 +11,7 @@ from services.claude_api.client import (
     get_attribution_header_value,
     get_metadata,
 )
+from services.claude_api.model_settings import model_betas, model_thinking
 
 
 REFUSAL_FALLBACK_HEADER = "x-is-refusal-fallback"
@@ -99,9 +100,9 @@ def _build_stream_kwargs_impl(
         max_tokens=max_tokens,
         system=cached_system,
         messages=messages,
-        betas=extra_betas,
+        betas=model_betas(current_model, extra_betas),
         metadata=get_metadata(),
-        thinking=THINKING_CONFIG,
+        thinking=model_thinking(current_model),
         output_config=output_config_override or OUTPUT_CONFIG,
         extra_body={"context_management": CONTEXT_MANAGEMENT_CONFIG},
     )
@@ -110,7 +111,7 @@ def _build_stream_kwargs_impl(
             {"model": refusal_fallback_model}
         ]
     if tools_for_api:
-        stream_kwargs["tools"] = tools_for_api
+        stream_kwargs["tools"] = sorted(tools_for_api, key=lambda tool: tool.get("name", ""))
     merged_headers = dict(extra_headers or {})
     if fallback_used:
         merged_headers[refusal_fallback_header] = "true"

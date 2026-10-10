@@ -1,0 +1,209 @@
+{
+  "source_sha256": {
+    "docs/2026-10-10-query-singleflight-live.json": "338016e84d8e7a0bd88944f0fcbf317ba792a669f7932ddb5e51c5fe8e1afa90",
+    "docs/2026-10-10-query-singleflight-live-unpaced.json": "d4bb5a56991817c8cf4272491945aa7ae8e8b11bdc84bbe7443ebab86e0693f8",
+    "docs/2026-10-10-replay-window-live-complete.json": "877a53fb3e738b66f9242e451a3c98e2362ac9a32d6ac1f925701f2a7450df3d"
+  },
+  "query": {
+    "status": "complete",
+    "requests_attempted": 60,
+    "completed_usage": {
+      "completed_requests": 60,
+      "input_tokens": 37595,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "output_tokens": 2651,
+      "context_tokens": 37595,
+      "context_plus_output_tokens": 40246
+    },
+    "failed_attempts": [],
+    "request_gap_seconds": 1.0,
+    "max_provider_concurrency": 6,
+    "concurrent_arms": {
+      "baseline": {
+        "completed_requests": 36,
+        "input_tokens": 22554,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 1575,
+        "context_tokens": 22554,
+        "context_plus_output_tokens": 24129,
+        "cases": 6,
+        "consumers": 12,
+        "consumer_quality_passes": 12,
+        "all_dispatch_counts_pass": true,
+        "all_provider_calls_complete": true,
+        "all_shared_outputs_equal": null,
+        "all_independent_result_lists": true,
+        "group_duration_median_ms": 5960.0,
+        "provider_duration_median_ms": 976.5,
+        "stop_reasons": {
+          "end_turn": 36
+        }
+      },
+      "singleflight": {
+        "completed_requests": 18,
+        "input_tokens": 11277,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 799,
+        "context_tokens": 11277,
+        "context_plus_output_tokens": 12076,
+        "cases": 6,
+        "consumers": 12,
+        "consumer_quality_passes": 12,
+        "all_dispatch_counts_pass": true,
+        "all_provider_calls_complete": true,
+        "all_shared_outputs_equal": true,
+        "all_independent_result_lists": true,
+        "group_duration_median_ms": 3035.5,
+        "provider_duration_median_ms": 1001.5,
+        "stop_reasons": {
+          "end_turn": 18
+        }
+      }
+    },
+    "sequential_control": [
+      {
+        "requests_attempted": 6,
+        "dispatch_count_pass": true,
+        "consumer_quality_passes": 2,
+        "completed_requests": 6,
+        "input_tokens": 3764,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 277,
+        "context_tokens": 3764,
+        "context_plus_output_tokens": 4041
+      }
+    ]
+  },
+  "unpaced_query": {
+    "status": "complete",
+    "requests_attempted": 15,
+    "completed_usage": {
+      "completed_requests": 15,
+      "input_tokens": 9410,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "output_tokens": 624,
+      "context_tokens": 9410,
+      "context_plus_output_tokens": 10034
+    },
+    "failed_attempts": [],
+    "request_gap_seconds": 0.0,
+    "max_provider_concurrency": 6,
+    "concurrent_arms": {
+      "baseline": {
+        "completed_requests": 6,
+        "input_tokens": 3764,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 238,
+        "context_tokens": 3764,
+        "context_plus_output_tokens": 4002,
+        "cases": 1,
+        "consumers": 2,
+        "consumer_quality_passes": 2,
+        "all_dispatch_counts_pass": true,
+        "all_provider_calls_complete": true,
+        "all_shared_outputs_equal": null,
+        "all_independent_result_lists": true,
+        "group_duration_median_ms": 1199,
+        "provider_duration_median_ms": 1077.0,
+        "stop_reasons": {
+          "end_turn": 6
+        }
+      },
+      "singleflight": {
+        "completed_requests": 3,
+        "input_tokens": 1882,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 129,
+        "context_tokens": 1882,
+        "context_plus_output_tokens": 2011,
+        "cases": 1,
+        "consumers": 2,
+        "consumer_quality_passes": 2,
+        "all_dispatch_counts_pass": true,
+        "all_provider_calls_complete": true,
+        "all_shared_outputs_equal": true,
+        "all_independent_result_lists": true,
+        "group_duration_median_ms": 1277,
+        "provider_duration_median_ms": 1150,
+        "stop_reasons": {
+          "end_turn": 3
+        }
+      }
+    },
+    "sequential_control": [
+      {
+        "requests_attempted": 6,
+        "dispatch_count_pass": true,
+        "consumer_quality_passes": 2,
+        "completed_requests": 6,
+        "input_tokens": 3764,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "output_tokens": 257,
+        "context_tokens": 3764,
+        "context_plus_output_tokens": 4021
+      }
+    ]
+  },
+  "replay": {
+    "status": "complete",
+    "requests_attempted": 18,
+    "completed_usage": {
+      "completed_requests": 18,
+      "input_tokens": 72,
+      "cache_read_input_tokens": 37176,
+      "cache_creation_input_tokens": 72432,
+      "output_tokens": 412,
+      "context_tokens": 109680,
+      "context_plus_output_tokens": 110092
+    },
+    "failed_attempts": [],
+    "arms": {
+      "rolling": {
+        "completed_requests": 9,
+        "input_tokens": 36,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 52164,
+        "output_tokens": 178,
+        "context_tokens": 52200,
+        "context_plus_output_tokens": 52378,
+        "strict_quality_passes": 5,
+        "semantic_quality_passes": 7,
+        "failures": {
+          "refusal": 2,
+          "json_code_fence": 2
+        },
+        "head_changes": 8
+      },
+      "anchored": {
+        "completed_requests": 9,
+        "input_tokens": 36,
+        "cache_read_input_tokens": 37176,
+        "cache_creation_input_tokens": 20268,
+        "output_tokens": 234,
+        "context_tokens": 57480,
+        "context_plus_output_tokens": 57714,
+        "strict_quality_passes": 6,
+        "semantic_quality_passes": 8,
+        "failures": {
+          "json_code_fence": 2,
+          "refusal": 1
+        },
+        "head_changes": 2
+      }
+    }
+  },
+  "scope": [
+    "Public synthetic trials; no production-wide reduction rate or billing estimate.",
+    "Each completed provider response is counted once, despite duplicate checkpoint lists.",
+    "Paced group durations are not production latency; the unpaced pilot has one case only.",
+    "Failed attempts have unknown consumption, not zero consumption."
+  ]
+}

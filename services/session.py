@@ -28,7 +28,10 @@ from services.session_registry import (
     SessionRepository,
 )
 
+from services.stable_replay import StableReplayWindow
+
 log = logging.getLogger(__name__)
+_stable_api_replay_window = StableReplayWindow(max_channels=MAX_SESSIONS)
 
 # ---------------------------------------------------------------------------
 # SDK session IDs (channel_id -> SessionInfo for --resume)
@@ -938,12 +941,18 @@ def load_api_replay_channel(channel_id: int) -> tuple[list[dict], str, str]:
     from config import HISTORY_MAX_AGE_DAYS
 
     _validate_channel_id(channel_id)
+    extra_rows = max(0, min(MAX_MESSAGES_PER_CHANNEL, int(os.environ.get("CLAUDE_API_REPLAY_EXTRA_ROWS", "0"))))
+    minimum_rows = MAX_MESSAGES_PER_CHANNEL * 2
     rows = _tail_jsonl(
         _history_file(channel_id),
-        MAX_MESSAGES_PER_CHANNEL * 2,
+        minimum_rows + extra_rows + (1 if extra_rows else 0),
         include_context_snapshot=True,
         max_age_days=HISTORY_MAX_AGE_DAYS,
     )
+    if extra_rows:
+        rows = _stable_api_replay_window.select(
+            channel_id, rows, minimum_rows=minimum_rows, extra_rows=extra_rows,
+        )
     # Self-heal channels already poisoned by persisted sentinel/error replies:
     # drop assistant rows whose content is "(no response)" or an error message.
     # Replaying them primes the model to keep refusing (ADR-0008). New writes are

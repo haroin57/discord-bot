@@ -30,21 +30,16 @@ __all__ = ["build_cli_headers", "make_api_client"]
 def build_cli_headers() -> dict[str, str]:
     """Return the default headers an AsyncAnthropic client should send.
 
-    Includes a fresh ``x-client-request-id`` UUID — the real CLI rotates
-    this per /v1/messages POST. We can only set it once at client
-    construction time (anthropic SDK ``default_headers``); a tool_loop
-    with multiple turns reuses it. Servers accept that today, but if
-    429 reasoning ever pins client-id reuse as a discriminator, hoist
-    this into a httpx request hook for true per-request rotation.
+    The OAuth transport refreshes ``x-client-request-id`` on every request.
     """
     return {
         "x-app": "cli",
         "User-Agent": USER_AGENT,
         "X-Claude-Code-Session-Id": _session_id,
         "X-Stainless-Lang": "js",
-        "X-Stainless-Package-Version": "0.80.0",
+        "X-Stainless-Package-Version": "0.128.0",
         "X-Stainless-Runtime": "node",
-        "X-Stainless-Runtime-Version": "v24.14.1",
+        "X-Stainless-Runtime-Version": "v26.3.0",
         "X-Stainless-OS": "Linux",
         "X-Stainless-Arch": "x64",
         "X-Stainless-Timeout": "600",

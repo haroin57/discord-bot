@@ -1,0 +1,54 @@
+{
+  "implementation_sha256": "8de8e0b078f51b680b0a8609d1f243374bff55ee0304b33c3d1223057c8ba157",
+  "repetitions": 3,
+  "paired_groups": 18,
+  "live_requests_attempted": 180,
+  "all_quality_dispatch_and_completion_checks_pass": true,
+  "concurrent_duplicate_arms": {
+    "baseline": {
+      "requests": 108,
+      "context_tokens": 67662,
+      "output_tokens": 4753,
+      "quality_passes": 36,
+      "consumers": 36,
+      "latency_median_ms": 1352.5,
+      "latency_p95_ms": 2019.5999999999992,
+      "context_plus_output_tokens": 72415
+    },
+    "singleflight": {
+      "requests": 54,
+      "context_tokens": 33831,
+      "output_tokens": 2320,
+      "quality_passes": 36,
+      "consumers": 36,
+      "latency_median_ms": 1266.0,
+      "latency_p95_ms": 1732.95,
+      "context_plus_output_tokens": 36151
+    }
+  },
+  "duplicate_context_reduction_percent": 50.0,
+  "duplicate_context_plus_output_reduction_percent": 50.078,
+  "median_latency_change_percent": -6.3956,
+  "median_paired_latency_ratio": 0.9350850948464502,
+  "production": {
+    "main_requests_observed": 9,
+    "helper_requests_observed": 24,
+    "dispatch_decisions": {
+      "leader": 3
+    },
+    "whole_production_reduction_percent": null,
+    "rate_status": "no_normalized_comparable_cohort"
+  },
+  "scope": [
+    "Latency is public synthetic query expansion with real HTTP requests, not Discord end-to-end latency.",
+    "Six query cases repeated three times are 18 pairs, not 18 independent query populations.",
+    "Synthetic duplicate reduction is not a production-wide reduction or a billing reduction.",
+    "A favorable sample median does not establish equivalence or exclude future tail-latency regressions."
+  ],
+  "source_sha256": {
+    "docs/2026-10-10-query-singleflight-performance-1.json": "80ef6edaa67fc54aa30de8c7a9a46b41870c43da4120efd1423c1846d035a9ca",
+    "docs/2026-10-10-query-singleflight-performance-2.json": "0686b387e282392ae563ed07b58836fd5beaeb1e70a0ab1620a6e50b1dd31a03",
+    "docs/2026-10-10-query-singleflight-performance-3.json": "66b745c73c613086484b6941ad78bafee8acab5376617ca3001a5ed18d2e45cf",
+    "docs/2026-10-10-token-usage-user-production.json": "8331e1e5269989abfecb491d64416188f00b2371292947cefbb5236ad6514ee6"
+  }
+}
