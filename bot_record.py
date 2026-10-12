@@ -269,6 +269,12 @@ async def _drain_alpha_owner(*, batch, state_dir, channel_id, user_id, add_memor
                                  and type(result.get("total_chars")) is int
                                  and 0 < result["next_offset"] < result["total_chars"])
                 error = "continuation_required" if made_progress else "memory provider reported incomplete ingestion"
+                if isinstance(result, dict) and not made_progress:
+                    # The provider's own reason (e.g. "projection_incomplete")
+                    # is the only thing that distinguishes a transient outage
+                    # from a deterministic poison batch.
+                    detail = " ".join(str(result.get("error") or "").split())[:200]
+                    error += f" (status={result.get('status')} error={detail or '-'})"
                 return
             if lost_lease.is_set():
                 error = "batch lease ownership lost"

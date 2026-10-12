@@ -539,3 +539,45 @@ async def test_missing_persisted_thread_injects_fallback_context_once() -> None:
     }]
     assert result.final_text == "recovered"
     await session.close()
+
+
+def _error_turn(message: str) -> list[dict[str, Any]]:
+    return [{"method": "error",
+             "params": {"threadId": "thread-1", "turnId": "turn-1",
+                        "error": {"message": message}}}]
+
+
+@pytest.mark.asyncio
+async def test_unsupported_model_is_not_reported_as_auth_failure(monkeypatch) -> None:
+    # 2026-10-10: this exact 400 contains "ChatGPT account" and used to become
+    # "Codex OAuth failed; run codex login" while also poisoning auth readiness.
+    from services.codex_app_server import readiness
+    from services.codex_app_server.session import CodexModelUnavailableError
+    recorded: list[bool] = []
+    monkeypatch.setattr(readiness, "record_auth_result", recorded.append)
+    client = _ScriptedClient(events=_error_turn(
+        "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."))
+    session = _session_for(client)
+
+    with pytest.raises(CodexModelUnavailableError, match="gpt-6-astra"):
+        await session.run_turn("hi", model="gpt-5.6-sol", effort="low",
+                               developer_instructions="system contract")
+
+    assert recorded == []
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_real_auth_failure_still_records_and_keeps_cause(monkeypatch) -> None:
+    from services.codex_app_server import readiness
+    recorded: list[bool] = []
+    monkeypatch.setattr(readiness, "record_auth_result", recorded.append)
+    client = _ScriptedClient(events=_error_turn("401 Unauthorized: refresh token expired"))
+    session = _session_for(client)
+
+    with pytest.raises(CodexAuthError, match="codex login.*refresh token expired"):
+        await session.run_turn("hi", model="gpt-5.6-sol", effort="low",
+                               developer_instructions="system contract")
+
+    assert recorded == [False]
+    await session.close()

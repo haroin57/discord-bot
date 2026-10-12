@@ -559,8 +559,8 @@ async def _store_candidates(mem, user_id, candidates, base_meta, signals, relati
                                valid_to=quotes[r["source_quote"]][1].get("valid_to"))
                           for r in relations if r.get("source_quote") in quotes]
     if settings.MEM0_RELATION_EXTRACT_ENABLED and accepted_relations:
-        added = await _ingest_relations(user_id, accepted_relations)
-        if added != len(accepted_relations):
+        _added, failed_relations = await _ingest_relations(user_id, accepted_relations)
+        if failed_relations:
             errors.append("relation_projection_incomplete")
     result = {"results": results, "kept": len(kept), "stored": len(results),
               "failed": failed, "archived": archived, "status": "ok",
@@ -1014,8 +1014,8 @@ async def _index_side_stores(
                 if not name or not etype:
                     continue
                 for fid in fact_ids:
-                    eid = await _write_thread(
-                        graph.upsert_entity, name, etype, str(user_id),
+                    eid, status = await _write_thread(
+                        graph.upsert_entity_outcome, name, etype, str(user_id),
                         aliases=ent.get("aliases") or [], source_fact_id=fid,
                     )
                     if eid:
@@ -1023,8 +1023,12 @@ async def _index_side_stores(
                             linked_eids.append(eid)
                         if not await _write_thread(graph.add_edge, fid, eid):
                             errors.append("graph_edge")
-                    else:
+                    elif status == "failed":
                         errors.append("graph_entity")
+                    # refused/retired/invalid are deterministic policy
+                    # outcomes: the fact itself is stored, the entity link is
+                    # intentionally absent. Reporting them as errors kept the
+                    # batch partial and retried it forever (2026-10 livelock).
             # Phase ④: entities just mentioned prime this session's next
             # search (see priming.py) — ingest and search share the same
             # buffer so either side of a turn can prime the other.
@@ -1078,16 +1082,18 @@ async def _index_side_stores(
     return errors
 
 
-async def _ingest_relations(user_id, relations: list[dict]) -> int:
+async def _ingest_relations(user_id, relations: list[dict]) -> tuple[int, int]:
     """Phase C-2: ingest entity-entity relations into the graph layer.
 
     Resolves src/dst canonical names via graph.find_entity (which knows
     about aliases & appellations) — only inserts a relation when both
     endpoints already exist as entities. We don't auto-create endpoints
     from relations to avoid letting a hallucinated edge spawn ghost
-    entities. Returns the number of relations added; non-fatal on failure.
+    entities. Returns ``(added, failed)``: a relation whose endpoints are not
+    known entities is a designed skip and counts as neither. ``failed``
+    counts resolvable relations that could not be written; non-fatal.
     """
-    added = 0
+    added = failed = 0
     try:
         from . import graph
         for rel in relations:
@@ -1112,11 +1118,14 @@ async def _ingest_relations(user_id, relations: list[dict]) -> int:
             )
             if rid:
                 added += 1
+            else:
+                failed += 1
         if added:
             log.info("[REL_ADDED count=%d user=...%s]", added, str(user_id)[-4:])
     except Exception as exc:
         log.warning("relation ingest failed (non-fatal): %s", exc)
-    return added
+        failed += 1
+    return added, failed
 
 
 # ---------------------------------------------------------------------------

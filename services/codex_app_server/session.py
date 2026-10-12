@@ -54,6 +54,14 @@ class CodexTurnError(RuntimeError):
     """A Codex turn reached a failed terminal state."""
 
 
+class CodexModelUnavailableError(CodexTurnError):
+    """The requested model is not offered to this account (retired/plan-gated).
+
+    Distinct from auth: the OAuth session is healthy, so this must never
+    poison auth readiness or tell the operator to re-run ``codex login``.
+    """
+
+
 @dataclass
 class CodexTurnResult:
     final_text: str
@@ -91,9 +99,38 @@ _AUTH_HINTS = (
 )
 
 
+# "The 'X' model is not supported when using Codex with a ChatGPT account."
+# also contains "chatgpt account"; model checks must run before auth checks.
+_MODEL_UNAVAILABLE_HINTS = (
+    "model is not supported",
+    "model_not_found",
+    "does not exist or you do not have access",
+)
+
+
 def _looks_like_auth_failure(*parts: object) -> bool:
     text = "\n".join(str(part or "") for part in parts).lower()
     return any(hint in text for hint in _AUTH_HINTS)
+
+
+def _looks_like_model_unavailable(*parts: object) -> bool:
+    text = "\n".join(str(part or "") for part in parts).lower()
+    return any(hint in text for hint in _MODEL_UNAVAILABLE_HINTS)
+
+
+def _classified_failure(auth_message: str, *parts: object) -> Exception | None:
+    """Map a Codex failure to model-unavailable or auth, else ``None``.
+
+    ``parts[0]`` is the primary error; only it is echoed (stderr tails stay
+    out of the message). Echoing keeps the real cause visible instead of
+    collapsing every hint match into "run codex login".
+    """
+    detail = " ".join(str(parts[0] if parts else "").split())[:200]
+    if _looks_like_model_unavailable(*parts):
+        return CodexModelUnavailableError(f"Codex model unavailable: {detail}")
+    if _looks_like_auth_failure(*parts):
+        return _auth_failure(f"{auth_message} ({detail})" if detail else auth_message)
+    return None
 
 
 def _thread_id_from_result(result: dict[str, Any]) -> str:
@@ -363,10 +400,12 @@ class CodexSession:
                 raise
             except CodexAppServerError as exc:
                 if not _is_missing_thread_error(exc):
-                    if _looks_like_auth_failure(exc, *self._client.stderr_tail(20)):
-                        raise _auth_failure(
-                            "Codex OAuth session refresh failed; run `codex login`."
-                        ) from exc
+                    failure = _classified_failure(
+                        "Codex OAuth session refresh failed; run `codex login`.",
+                        exc, *self._client.stderr_tail(20),
+                    )
+                    if failure is not None:
+                        raise failure from exc
                     raise
                 log.warning(
                     "Persisted Codex thread is unavailable; starting fresh: %s",
@@ -386,8 +425,12 @@ class CodexSession:
                     timeout=30,
                 )
             except (CodexAppServerError, CodexProcessError, TimeoutError) as exc:
-                if _looks_like_auth_failure(exc, *self._client.stderr_tail(20)):
-                    raise _auth_failure("Codex OAuth thread startup failed; run `codex login`.") from exc
+                failure = _classified_failure(
+                    "Codex OAuth thread startup failed; run `codex login`.",
+                    exc, *self._client.stderr_tail(20),
+                )
+                if failure is not None:
+                    raise failure from exc
                 raise
             self.resumed = False
 
@@ -482,10 +525,12 @@ class CodexSession:
         try:
             started = await self._client.request("turn/start", params, timeout=30)
         except (CodexAppServerError, CodexProcessError, TimeoutError) as exc:
-            if _looks_like_auth_failure(exc, *self._client.stderr_tail(30)):
-                raise _auth_failure(
-                    "Codex OAuth request failed; run `codex login` and retry."
-                ) from exc
+            failure = _classified_failure(
+                "Codex OAuth request failed; run `codex login` and retry.",
+                exc, *self._client.stderr_tail(30),
+            )
+            if failure is not None:
+                raise failure from exc
             raise CodexTurnError(f"Codex turn/start failed: {exc}") from exc
 
         turn_id = str((started.get("turn") or {}).get("id") or "")
@@ -736,10 +781,11 @@ class CodexSession:
                     if event_params.get("willRetry") is True:
                         await _invoke(status_callback, "Codex が接続を再試行中")
                         continue
-                    if _looks_like_auth_failure(message):
-                        raise _auth_failure(
-                            "Codex OAuth failed; run `codex login` and retry."
-                        )
+                    failure = _classified_failure(
+                        "Codex OAuth failed; run `codex login` and retry.", message,
+                    )
+                    if failure is not None:
+                        raise failure
                     raise CodexTurnError(message)
 
                 if method == "turn/completed":
@@ -761,10 +807,11 @@ class CodexSession:
                     if status not in {"completed", "interrupted"}:
                         error = turn.get("error") or {}
                         message = str(error.get("message") or f"turn status={status}")
-                        if _looks_like_auth_failure(message):
-                            raise _auth_failure(
-                                "Codex OAuth failed; run `codex login` and retry."
-                            )
+                        failure = _classified_failure(
+                            "Codex OAuth failed; run `codex login` and retry.", message,
+                        )
+                        if failure is not None:
+                            raise failure
                         raise CodexTurnError(message)
                     if status == "interrupted":
                         raise asyncio.CancelledError

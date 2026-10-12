@@ -71,13 +71,58 @@ def isolated(monkeypatch, tmp_path):
 async def test_false_projection_return_is_not_success(monkeypatch, failed):
     from llm_mem0 import bm25_index, fact_store, graph, ingest, priming
     monkeypatch.setenv("MEM0_FACT_STORE_ENABLED", "1")
-    monkeypatch.setattr(graph, "upsert_entity", lambda *a, **kw: 0 if failed == "graph_entity" else 1)
+    monkeypatch.setattr(graph, "upsert_entity_outcome",
+                        lambda *a, **kw: (0, "failed") if failed == "graph_entity" else (1, "linked"))
     monkeypatch.setattr(graph, "add_edge", lambda *a, **kw: failed != "graph_edge")
     monkeypatch.setattr(bm25_index, "index_fact", lambda *a, **kw: failed != "bm25")
     monkeypatch.setattr(fact_store, "record_fact", lambda *a, **kw: failed != "fact_store")
     monkeypatch.setattr(priming, "touch", lambda *a, **kw: None)
     errors = await ingest._index_side_stores("u", fact(entities=[{"name": "Alice", "type": "person"}]), {}, {}, ["f"])
     assert errors, "False/0 from side-store APIs must make the operation retryable"
+
+
+@pytest.mark.parametrize("status", ["refused", "retired", "invalid"])
+@pytest.mark.asyncio
+async def test_deliberate_entity_refusal_is_not_a_retryable_error(monkeypatch, status):
+    # 2026-10 livelock: a homonym/ambiguous-alias refusal is deterministic, so
+    # reporting it kept the Discord batch partial and retried it forever.
+    from llm_mem0 import bm25_index, fact_store, graph, ingest, priming
+    monkeypatch.setenv("MEM0_FACT_STORE_ENABLED", "1")
+    monkeypatch.setattr(graph, "upsert_entity_outcome", lambda *a, **kw: (0, status))
+    add_edge = Mock(return_value=True)
+    monkeypatch.setattr(graph, "add_edge", add_edge)
+    monkeypatch.setattr(bm25_index, "index_fact", lambda *a, **kw: True)
+    monkeypatch.setattr(fact_store, "record_fact", lambda *a, **kw: True)
+    monkeypatch.setattr(priming, "touch", lambda *a, **kw: None)
+    errors = await ingest._index_side_stores("u", fact(entities=[{"name": "Alice", "type": "person"}]), {}, {}, ["f"])
+    assert errors == []
+    add_edge.assert_not_called()
+
+
+def test_upsert_entity_outcome_distinguishes_refusal_from_failure(monkeypatch):
+    from llm_mem0 import graph
+    eid, status = graph.upsert_entity_outcome("Mercury", "person", "u")
+    assert eid and status == "linked"
+    assert graph.upsert_entity_outcome("Mercury", "tech", "u") == (0, "refused")
+    assert graph.upsert_entity_outcome("", "tech", "u") == (0, "invalid")
+    assert graph.upsert_entity("Mercury", "person", "u") == eid
+    monkeypatch.setattr(graph._store, "write", lambda *a, **kw: kw.get("default"))
+    assert graph.upsert_entity_outcome("Venus", "person", "u") == (0, "failed")
+    assert graph.upsert_entity("Venus", "person", "u") == 0
+
+
+@pytest.mark.asyncio
+async def test_relation_with_unknown_endpoint_is_a_designed_skip(monkeypatch):
+    from llm_mem0 import graph, ingest
+    monkeypatch.setattr(graph, "find_entity", lambda name, *a, **kw: NS(id=1) if name == "A" else None)
+    add_relation = Mock(return_value=7)
+    monkeypatch.setattr(graph, "add_relation", add_relation)
+    relations = [{"src": "A", "rel_type": "knows", "dst": "Ghost"}]
+    assert await ingest._ingest_relations("u", relations) == (0, 0)
+    add_relation.assert_not_called()
+    monkeypatch.setattr(graph, "find_entity", lambda *a, **kw: NS(id=1))
+    add_relation.return_value = 0
+    assert await ingest._ingest_relations("u", relations) == (0, 1)
 
 
 @pytest.mark.parametrize("exists", [False, True])
@@ -269,7 +314,7 @@ async def test_relation_projection_failure_repaired_after_exact_duplicate(monkey
     monkeypatch.setattr(ingest, "_index_side_stores", AsyncMock(return_value=[]))
     monkeypatch.setattr(ingest, "_obtain_signals", AsyncMock(return_value={"facts": [fact()], "relations": [
         {"src": "A", "rel_type": "knows", "dst": "B", "source_quote": text}]}))
-    relation = AsyncMock(side_effect=[0, 1])
+    relation = AsyncMock(side_effect=[(0, 1), (1, 0)])
     monkeypatch.setattr(ingest, "_ingest_relations", relation)
     async def near(*args, **kwargs):
         return [{**row, "score": .1} for row in mem.rows.values()]

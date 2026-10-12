@@ -8,14 +8,22 @@ host allowlist. No Anthropic or usage-billed OpenAI API client is created.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from services.codex_app_server.session import CodexSession
+from services.codex_app_server.session import CodexModelUnavailableError, CodexSession
 
+log = logging.getLogger(__name__)
+
+# ChatGPT-plan model lineups change underneath us (2026-10-10: gpt-6-astra and
+# gpt-5.6-sol became "not supported" overnight and every Mem0 extraction
+# failed). Background helpers walk this chain instead of hard-failing.
+_DEFAULT_FALLBACK_MODELS = 'gpt-5.6-terra,gpt-5.6-luna'
+_sticky_model: str | None = None
 _SEMAPHORES: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
 _DISABLED_FEATURES = (
     'shell_tool', 'view_image', 'browser_use', 'browser_use_external',
@@ -28,6 +36,16 @@ _DISABLED_FEATURES = (
 
 def enabled() -> bool:
     return os.environ.get('BOT_AUX_LLM_PROVIDER', '').lower() == 'codex'
+
+
+def model_candidates() -> list[str]:
+    from config import CODEX_APP_SERVER_MODEL
+    primary = os.environ.get('CODEX_AUX_MODEL', '').strip() or CODEX_APP_SERVER_MODEL
+    fallbacks = os.environ.get('CODEX_AUX_FALLBACK_MODELS', _DEFAULT_FALLBACK_MODELS)
+    ordered = [primary, *(m.strip() for m in fallbacks.split(','))]
+    if _sticky_model in ordered:
+        ordered.insert(0, _sticky_model)
+    return list(dict.fromkeys(m for m in ordered if m))
 
 
 def _semaphore() -> asyncio.Semaphore:
@@ -71,7 +89,7 @@ async def run_task(*, prompt: str, instructions: str, tools: list[dict] | None =
                    execute_tool=None, effort: str = 'low', timeout_s: float = 120,
                    max_tool_calls: int = 20, text_stream_callback=None,
                    thinking_stream_callback=None, thinking_finalize_callback=None):
-    from config import CODEX_BIN, CODEX_APP_SERVER_MODEL, CODEX_APP_SERVER_PATH, STATE_DIR
+    from config import CODEX_BIN, CODEX_APP_SERVER_PATH, STATE_DIR
     cwd = Path(STATE_DIR) / 'codex_auxiliary'
     cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
     dynamic = [{'name': tool['name'], 'description': tool.get('description', ''),
@@ -82,24 +100,41 @@ async def run_task(*, prompt: str, instructions: str, tools: list[dict] | None =
         # GPT-6 dispatches dynamic tools through its isolated code-mode host.
         # Native filesystem/network tools remain disabled above.
         args.extend(['-c', 'features.code_mode_host=true'])
-    session = CodexSession(cwd=str(cwd), codex_bin=CODEX_BIN,
-                           extra_args=args, sandbox='read-only', approval_policy='never',
-                           child_env={'PATH': CODEX_APP_SERVER_PATH}, dynamic_tools=dynamic,
-                           tool_executor=execute_tool, ephemeral=True, max_tool_calls=max_tool_calls,
-                           allow_host_approvals=False, allow_local_images=False,
-                           turn_timeout_s=timeout_s, post_tool_timeout_s=min(180, timeout_s))
+    global _sticky_model
     async with _semaphore():
-        try:
-            async with asyncio.timeout(timeout_s):
-                return await session.run_turn(
-                    prompt, model=CODEX_APP_SERVER_MODEL, effort=effort,
-                    developer_instructions=instructions,
-                    text_stream_callback=text_stream_callback,
-                    thinking_stream_callback=thinking_stream_callback,
-                    thinking_finalize_callback=thinking_finalize_callback,
-                )
-        finally:
-            await session.close()
+        # One deadline for the whole chain: a model rejection is a fast 400,
+        # so walking the chain must not multiply the caller's budget.
+        async with asyncio.timeout(timeout_s):
+            candidates = model_candidates()
+            for index, model in enumerate(candidates):
+                session = CodexSession(cwd=str(cwd), codex_bin=CODEX_BIN,
+                                       extra_args=args, sandbox='read-only', approval_policy='never',
+                                       child_env={'PATH': CODEX_APP_SERVER_PATH}, dynamic_tools=dynamic,
+                                       tool_executor=execute_tool, ephemeral=True, max_tool_calls=max_tool_calls,
+                                       allow_host_approvals=False, allow_local_images=False,
+                                       turn_timeout_s=timeout_s, post_tool_timeout_s=min(180, timeout_s))
+                try:
+                    result = await session.run_turn(
+                        prompt, model=model, effort=effort,
+                        developer_instructions=instructions,
+                        text_stream_callback=text_stream_callback,
+                        thinking_stream_callback=thinking_stream_callback,
+                        thinking_finalize_callback=thinking_finalize_callback,
+                    )
+                except CodexModelUnavailableError as exc:
+                    if index == len(candidates) - 1:
+                        raise
+                    log.warning('Codex auxiliary model %s unavailable, trying %s: %s',
+                                model, candidates[index + 1], exc)
+                    continue
+                finally:
+                    await session.close()
+                if _sticky_model != model:
+                    if index:
+                        log.warning('Codex auxiliary model pinned to %s for this process', model)
+                    _sticky_model = model
+                return result
+    raise RuntimeError('no Codex auxiliary model configured')
 
 
 class CodexTextClient:

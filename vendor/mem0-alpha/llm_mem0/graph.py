@@ -172,7 +172,28 @@ def upsert_entity(
     name: str, type: str, user_id: str, *, aliases: Iterable[str] = (),
     source_fact_id: str | None = None,
 ) -> int:
-    """Insert-or-update an entity. Returns the entity id (0 on failure).
+    """Insert-or-update an entity. Returns the entity id (0 when not linked).
+
+    Thin wrapper over :func:`upsert_entity_outcome` for callers that only
+    need the id.
+    """
+    return upsert_entity_outcome(
+        name, type, user_id, aliases=aliases, source_fact_id=source_fact_id,
+    )[0]
+
+
+def upsert_entity_outcome(
+    name: str, type: str, user_id: str, *, aliases: Iterable[str] = (),
+    source_fact_id: str | None = None,
+) -> tuple[int, str]:
+    """Insert-or-update an entity. Returns ``(entity_id, status)``.
+
+    ``status`` is ``linked`` (id > 0), or with id 0: ``invalid`` (empty
+    input), ``retired`` (source fact already retired), ``refused`` (a
+    deliberate integrity refusal: homonym of another type or ambiguous
+    alias), or ``failed`` (the store write itself failed). Only ``failed`` is
+    a retryable outage; the others are terminal and deterministic, so
+    treating them as errors makes an ingest retry forever.
 
     Alias-aware lookup order (§1 of docs/mem0-dedup-issues.md):
       1. Resolve explicitly configured user-scoped appellations, if any.
@@ -185,7 +206,7 @@ def upsert_entity(
     """
     name = _normalize_name(name)
     if not name or not type or not user_id:
-        return 0
+        return 0, "invalid"
     name, appellation_aliases = _resolve_appellation(name, user_id)
     norm_aliases: list[str] = []
     seen: set[str] = {name}
@@ -206,25 +227,25 @@ def upsert_entity(
         f") ORDER BY id"
     )
 
-    def _upsert(c) -> int:
+    def _upsert(c) -> int | str:
         c.execute("BEGIN IMMEDIATE")
         if source_fact_id and c.execute(
             "SELECT 1 FROM relation_source_retirements WHERE source_fact_id=?", (str(source_fact_id),),
         ).fetchone():
-            return 0
+            return "retired"
         matches = c.execute(
             lookup_sql, (user_id, *surface_forms, *surface_forms),
         ).fetchall()
         compatible = [row for row in matches if row["type"] == type]
         if len(compatible) > 1:
             log.warning("graph ambiguous alias merge refused")
-            return 0
+            return "refused"
         row = compatible[0] if compatible else None
         if matches and row is None:
             # The legacy unique(name,user) schema cannot represent homonyms.
             # Refuse corruption instead of merging food/person/org silently.
             log.warning("graph incompatible entity type merge refused")
-            return 0
+            return "refused"
         created = row is None
         if row:
             eid = row["id"]
@@ -262,10 +283,16 @@ def upsert_entity(
                 )
         return int(eid)
 
-    eid = _store.write(_upsert, what="upsert_entity", default=0) or 0
-    if eid:
-        _invalidate_top_entities_cache(user_id)
-    return eid
+    result = _store.write(_upsert, what="upsert_entity", default=None)
+    if result is None:
+        return 0, "failed"
+    if isinstance(result, str):
+        return 0, result
+    eid = int(result)
+    if not eid:
+        return 0, "failed"
+    _invalidate_top_entities_cache(user_id)
+    return eid, "linked"
 
 
 def find_entity(query: str, user_id: str, *, fuzzy: bool = True) -> Entity | None:

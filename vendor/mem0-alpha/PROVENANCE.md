@@ -58,3 +58,12 @@ and `lineage.py`; the current package contains 34 regular Python/package-data
 files. Source changes and synthetic tests are detailed in
 `../../docs/mem0-alpha-next-plan.md` and `../../docs/mem0-alpha-next-results.md`.
 No production rollout or state migration is implied by this package version.
+
+The third quality patch set is `0.3.2+botquality.3` (2026-10-12). Deliberate
+graph refusals are no longer reported as projection failures:
+`graph.upsert_entity_outcome()` returns `(id, status)` so ingest can tell an
+integrity refusal (`refused` / `retired` / `invalid`) from a failed store
+write (`failed`), and `_ingest_relations()` returns `(added, failed)` so that
+skipping an unknown endpoint is not counted as a failure. Before this, a single
+homonym refusal kept a Discord batch `partial` and retried it forever (see
+ADR-0053). `upsert_entity()` keeps its int contract.
