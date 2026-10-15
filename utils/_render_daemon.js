@@ -41,12 +41,20 @@ async function getBrowser() {
 
   const launchOpts = {
     headless: 'new',
+    // CDP over a pipe instead of a WebSocket: when this daemon dies (even by
+    // SIGKILL) the pipe closes and Chrome exits on its own. With the default
+    // WebSocket transport Chrome survives as a PPID=1 orphan because it is
+    // launched detached and moves itself into its own systemd scope, so
+    // neither process-group kills nor the service cgroup reach it.
+    pipe: true,
     args: [
       ...(config.args || []),
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-gpu',
       '--disable-dev-shm-usage',
+      '--disable-component-update',
+      '--disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,OptimizationTargetPrediction,OnDeviceModelService',
     ],
   };
   if (chromePath) {
@@ -57,6 +65,9 @@ async function getBrowser() {
   browser.on('disconnected', () => {
     browser = null;
   });
+  const child = browser.process();
+  // Let the owner kill Chrome directly if this daemon becomes unresponsive.
+  send({ id: null, event: 'browser', pid: child ? child.pid : null });
   return browser;
 }
 

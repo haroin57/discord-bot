@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily ChromaDB restart at a quiet hour (05:30 JST)
+
+[Timer]
+OnCalendar=*-*-* 05:30:00
+RandomizedDelaySec=0
+Persistent=false
+
+[Install]
+WantedBy=timers.target

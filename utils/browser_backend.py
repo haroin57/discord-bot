@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 from collections import deque
 from itertools import count
 from pathlib import Path
@@ -55,6 +56,29 @@ def _idle_timeout_seconds() -> float:
             DEFAULT_IDLE_TIMEOUT,
         )
         return DEFAULT_IDLE_TIMEOUT
+
+
+def _kill_owned_browser(pid: int | None) -> None:
+    """SIGKILL the Chrome launched by our daemon if it outlived the daemon.
+
+    The pipe transport makes Chrome exit when the daemon dies, so this is a
+    backstop. Chrome runs in its own session and systemd scope, so killing the
+    daemon's process group does not reach it. The cmdline check guards against
+    PID reuse.
+    """
+    if not pid:
+        return
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return
+    if b"chrome" not in cmdline or b"--user-data-dir=" not in cmdline:
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+        log.warning("Killed render-daemon Chrome pid=%s left behind by its owner", pid)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 async def _cancel_and_await(task: asyncio.Task[Any] | None) -> None:
@@ -158,6 +182,7 @@ class BrowserDaemon:
         )
         self.render_timeout = render_timeout
         self._proc: asyncio.subprocess.Process | None = None
+        self._browser_pid: int | None = None
         self._lock = asyncio.Lock()
         self._ids = count(1)
         self._stderr_tail: deque[str] = deque(maxlen=80)
@@ -273,6 +298,8 @@ class BrowserDaemon:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # Own process group so a kill reaches node and anything it forks.
+            start_new_session=True,
         )
         self._stderr_task = asyncio.create_task(
             self._capture_stderr(self._proc),
@@ -297,6 +324,10 @@ class BrowserDaemon:
                 response = json.loads(line.decode())
             except json.JSONDecodeError:
                 log.warning("Ignoring non-JSON render daemon stdout: %r", line[:300])
+                continue
+            if response.get("event") == "browser":
+                pid = response.get("pid")
+                self._browser_pid = pid if isinstance(pid, int) and pid > 0 else None
                 continue
             if response.get("id") == request_id:
                 return response
@@ -339,7 +370,10 @@ class BrowserDaemon:
     async def _kill_process(self) -> None:
         proc = self._proc
         if proc and proc.returncode is None:
-            proc.kill()
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
             try:
                 await proc.wait()
             except Exception:
@@ -351,6 +385,8 @@ class BrowserDaemon:
         self._stderr_task = None
         await _cancel_and_await(stderr_task)
         self._proc = None
+        _kill_owned_browser(self._browser_pid)
+        self._browser_pid = None
 
     def _schedule_idle_shutdown(self) -> None:
         if self.idle_timeout > 0 and not self._closed:

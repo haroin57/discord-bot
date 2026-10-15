@@ -54,9 +54,54 @@ while read -r pid ppid pgid etimes cmd; do
     reaped=$((reaped + 1))
 done < <(ps -eo pid=,ppid=,pgid=,etimes=,args=)
 
+# --- headless Chrome orphans (2026-10-16 memory-diet) ---------------------
+# puppeteer は Chrome を detached で起動し、Chrome は自力で
+# app-org.chromium.Chromium-<pid>.scope へ移るため、親（render daemon /
+# mmdc / テスト）が異常終了すると PPid==1 のまま誰にも回収されない（実測 7 個
+# 1.6GB PSS）。render daemon は pipe 接続化で自己終了するようにしたが、旧コードや
+# 手動実行の取りこぼしをここで回収する。対象は「PPid==1」かつ「puppeteer 既定
+# プロファイルを使う top-level Chrome」かつ「CHROME_MIN_AGE 以上」のみ。
+# 親が生きている Chrome（PPid!=1）は絶対に触らない。
+CHROME_MIN_AGE="${CHROME_MIN_AGE:-300}"
+CHROME_PROFILE_RE='--user-data-dir=/tmp/puppeteer_dev_chrome_profile-[A-Za-z0-9]+'
+chrome_reaped=0
+while read -r pid ppid etimes cmd; do
+    [[ "$ppid" == "1" ]] || continue
+    [[ "$etimes" =~ ^[0-9]+$ ]] || continue
+    (( etimes >= CHROME_MIN_AGE )) || continue
+    [[ "$cmd" == *chrome* ]] || continue
+    [[ "$cmd" == *--type=* ]] && continue      # 子プロセスは本体と一緒に消える
+    grep -qE -- "$CHROME_PROFILE_RE" <<<"$cmd" || continue
+    if (( DRY_RUN )); then
+        echo "[dry-run] would reap orphan chrome pid=$pid age=${etimes}s"
+    else
+        kill -TERM "$pid" 2>/dev/null || true
+        echo "$(now_iso) reaped orphan chrome pid=$pid age=${etimes}s" >> "$LOG"
+        ( sleep "$SIGKILL_DELAY"; kill -KILL "$pid" 2>/dev/null || true ) &
+    fi
+    chrome_reaped=$((chrome_reaped + 1))
+done < <(ps -eo pid=,ppid=,etimes=,args=)
+
+# 使用中でない古い puppeteer プロファイル（tmpfs = RAM）を削除する。
+CHROME_PROFILE_MAX_AGE_MIN="${CHROME_PROFILE_MAX_AGE_MIN:-60}"
+in_use=$(ps -eo args= | grep -oE -- "$CHROME_PROFILE_RE" | sed 's/^--user-data-dir=//' | sort -u)
+profiles_removed=0
+while IFS= read -r -d '' dir; do
+    grep -qxF -- "$dir" <<<"$in_use" && continue
+    if (( DRY_RUN )); then
+        echo "[dry-run] would remove stale chrome profile $dir"
+    else
+        rm -rf --one-file-system -- "$dir" && profiles_removed=$((profiles_removed + 1))
+    fi
+done < <(find /tmp -maxdepth 1 -type d -name 'puppeteer_dev_chrome_profile-*' -user "$(id -u)" -mmin "+$CHROME_PROFILE_MAX_AGE_MIN" -print0 2>/dev/null)
+
 if (( DRY_RUN )); then
     echo "[dry-run] 対象孤児グループ数: $reaped"
-elif (( reaped > 0 )); then
-    echo "$(now_iso) reaper: killed $reaped orphan group(s)" >> "$LOG"
+    echo "[dry-run] 対象孤児 Chrome 数: $chrome_reaped"
+else
+    (( reaped > 0 )) && echo "$(now_iso) reaper: killed $reaped orphan group(s)" >> "$LOG"
+    (( chrome_reaped > 0 )) && echo "$(now_iso) reaper: killed $chrome_reaped orphan chrome(s)" >> "$LOG"
+    (( profiles_removed > 0 )) && echo "$(now_iso) reaper: removed $profiles_removed stale chrome profile(s)" >> "$LOG"
 fi
+# 子 subshell（SIGKILL 猶予）を待たずに cron を終わらせる
 exit 0
