@@ -27,10 +27,29 @@ jobs:
         # No patched stable release exists within the supported major version
         # for these advisories. Keep each temporary exception explicit so any
         # newly discovered vulnerability still fails the job.
+        # 2026-10-15 batch: everything fixable by a patch/minor bump was taken
+        # into requirements.lock (aiohttp, anyio, PyJWT, urllib3, pip, datasets,
+        # fsspec, h2, hpack, multidict). What stays listed here needs a major
+        # bump or has no fix at all, so each one is a deliberate, separately
+        # tracked exception rather than a blanket mute:
+        #   PYSEC-2026-4114  oauthlib 3.3.1  -> 4.0.0 (major). Transitive via
+        #     requests-oauthlib 2.0.0, never imported here.
+        #   PYSEC-2026-3813/3814/3815  chromadb 1.5.9 -> NO fixed release
+        #     exists; chromadb is pinned by the Mem0 vector store.
+        #   PYSEC-2026-3552/3553/3554  cryptography 48.0.1 -> 49/50 (two major
+        #     bumps). It underpins TLS, OAuth and JWT paths, so the upgrade
+        #     needs its own verification pass instead of riding a bugfix PR.
         run: >-
           python -m pip_audit -r requirements.lock --strict
           --ignore-vuln PYSEC-2026-311
           --ignore-vuln PYSEC-2026-2636
+          --ignore-vuln PYSEC-2026-4114
+          --ignore-vuln PYSEC-2026-3813
+          --ignore-vuln PYSEC-2026-3814
+          --ignore-vuln PYSEC-2026-3815
+          --ignore-vuln PYSEC-2026-3552
+          --ignore-vuln PYSEC-2026-3553
+          --ignore-vuln PYSEC-2026-3554
       - name: Bandit static scan
         # Fixed /tmp paths are an intentional deployment convention and are
         # separately constrained by attachment and render-store policies.
