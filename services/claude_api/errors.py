@@ -237,15 +237,26 @@ NON_PERSISTABLE_REPLIES: frozenset[str] = frozenset(
     | set(_ERROR_MESSAGE_TABLE.values())
 )
 
+# The refusal notice (2026-10-15) replaces the bare "(no response)" when a turn
+# ends at stop_reason=refusal. It carries a request_id, so it cannot be matched
+# exactly — it is recognised by this prefix instead. Persisting it would replay
+# "my own last answer was refused" into the next resume, which is exactly the
+# ADR-0008 poison loop.
+REFUSAL_NOTICE_PREFIX = "> ⚠️ **応答が安全フィルタで停止されました**"
+
 
 def is_non_persistable_reply(text: str) -> bool:
     """True if ``text`` is a sentinel/error reply that must not enter history.
 
-    Exact-match only — a real model reply that merely *mentions* an error
-    string is still persisted. Whitespace is stripped so trailing newlines
-    from the delivery layer don't defeat the check.
+    Exact-match (plus the refusal-notice prefix) — a real model reply that
+    merely *mentions* an error string is still persisted. Whitespace is
+    stripped so trailing newlines from the delivery layer don't defeat the
+    check.
     """
-    return (text or "").strip() in NON_PERSISTABLE_REPLIES
+    stripped = (text or "").strip()
+    if stripped.startswith(REFUSAL_NOTICE_PREFIX):
+        return True
+    return stripped in NON_PERSISTABLE_REPLIES
 
 
 def _error_message(error_type: str) -> str:

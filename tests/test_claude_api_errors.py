@@ -603,3 +603,27 @@ class TestAuditClassifications:
     def test_new_categories_have_messages(self):
         assert "モデル" in _error_message("model_not_found")
         assert "リセット" in _error_message("tool_use_mismatch")
+
+
+class TestRefusalNoticeNotPersisted:
+    """ADR-0008: the refusal notice carries a request_id so it cannot be
+    matched exactly, but replaying "my last answer was refused" into a resumed
+    transcript is exactly the poison loop the sentinel list exists to stop."""
+
+    def test_refusal_notice_is_non_persistable(self):
+        from services.claude_api.errors import is_non_persistable_reply
+        from services.claude_api.loop_contracts import _refusal_notice
+
+        notice = _refusal_notice(
+            model="claude-opus-5-5", request_id="req_011Cg46dcVdTNfQSJ8bn3V17",
+        )
+        assert is_non_persistable_reply(notice)
+        assert "req_011Cg46dcVdTNfQSJ8bn3V17" in notice
+        assert "Opus 5.5" in notice
+
+    def test_real_reply_mentioning_refusal_is_still_persisted(self):
+        from services.claude_api.errors import is_non_persistable_reply
+
+        assert not is_non_persistable_reply(
+            "stop_reason=refusal で止まってたのが原因でした"
+        )
