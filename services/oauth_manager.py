@@ -207,14 +207,40 @@ def _record_refresh_success(account: _AccountState) -> None:
 
 
 def is_oauth_healthy() -> bool:
-    """Return True when the credential serving the active account is ready.
+    """Return True when the active account can serve or recover a token.
+
+    ADR-0041 (Fix A) の供給ベース意味論。health は「トークンを供給できるか」で
+    あって「disk の access token が今この瞬間フレッシュか」ではない。idle 中の
+    自然な期限切れは refresh 一発で回復するので degraded ではない
+    （2026-07-21 の 10 時間偽 DOWN の再発防止 —
+    docs/2026-07-21-health-api-inspection.md）。
 
     Standby health is redundancy information, not a serving-readiness gate.  A
     broken standby must remain visible in ``oauth_status_detail()`` without
     taking a healthy active account out of service.
     """
-    ok, _ = _credential_readiness(_acct())
-    return ok
+    acct = _acct()
+    # 1. 有効な in-memory token を保持中は無条件で健全（過去の失敗 count に依らない）。
+    if acct.access_token and not _is_expired(acct):
+        return True
+    disk_ok, disk_reason = _credential_readiness(acct)
+    # 2. disk に fresh な credential がある = 別プロセスが rotate 済みでも
+    #    次の reload（_load_account_from_disk）が拾って stale 失敗状態を解除する。
+    if disk_ok:
+        return True
+    # 3. refresh 経路の健全性: invalid_grant 判明済み / 連続失敗閾値超えは
+    #    refresh しても回復しないので本当の degraded。
+    if acct.refresh_permanent:
+        return False
+    if acct.refresh_failure_count >= _REFRESH_FAILURE_ALERT_THRESHOLD:
+        return False
+    # 4. 期限切れなだけの credential（refresh token は disk に有効な形で存在）は
+    #    次回利用時の refresh で回復する。構造的に壊れた credential
+    #    （missing / insecure / unreadable / invalid）は in-memory に refresh
+    #    材料がある場合のみ回復可能。
+    if disk_reason == "access_token_expired":
+        return True
+    return bool(acct.refresh_token)
 
 
 def _credential_readiness(account: _AccountState) -> tuple[bool, str | None]:
@@ -251,8 +277,18 @@ def oauth_status_detail() -> dict:
     acct = _acct()
     credential_ok, credential_reason = _credential_readiness(acct)
     standby_name = "failover" if _active == "primary" else "primary"
-    standby_ok, standby_reason = _credential_readiness(_accounts[standby_name])
-    redundancy_ok = not OAUTH_FAILOVER_ENABLED or standby_ok
+    standby_acct = _accounts[standby_name]
+    standby_ok, standby_reason = _credential_readiness(standby_acct)
+    # 期限切れなだけの standby は切替時に refresh して使う設計
+    # (prepare_and_failover_to_secondary) なので冗長性喪失とは扱わない。
+    # invalid_grant 判明済み (refresh_permanent) は refresh でも回復しない。
+    if standby_acct.refresh_permanent:
+        standby_usable, redundancy_reason = False, "refresh_permanent"
+    elif standby_ok or standby_reason == "access_token_expired":
+        standby_usable, redundancy_reason = True, None
+    else:
+        standby_usable, redundancy_reason = False, standby_reason
+    redundancy_ok = not OAUTH_FAILOVER_ENABLED or standby_usable
     return {
         "active": _active,
         "credential_ok": credential_ok,
@@ -262,7 +298,7 @@ def oauth_status_detail() -> dict:
         "standby_credential_ok": standby_ok,
         "standby_credential_reason": standby_reason,
         "redundancy_ok": redundancy_ok,
-        "redundancy_reason": standby_reason if not redundancy_ok else None,
+        "redundancy_reason": redundancy_reason if not redundancy_ok else None,
         "token_expired": _is_expired(acct),
         "refresh_failures": acct.refresh_failure_count,
         "refresh_permanent": acct.refresh_permanent,
