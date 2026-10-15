@@ -237,21 +237,76 @@ CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
 # one line back to claude-fable-5 to revert when Fable returns; the fable
 # refusal-fallback machinery below is kept intact for exactly that.
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-8")
-# Refusal fallback (KEPT for one-line Fable revert — do not delete). Fable 5 has
-# a content classifier (stop_reason=refusal, category=None) that fires on some
-# conversation content even though it is not a real safety stop for this private
-# 1:1 deployment, and it is NOT overridable by the system prompt (verified by
-# ablation). Opus 4.8 does not share that classifier, so this leg is
-# INTENTIONALLY DORMANT while opus is primary — the `"fable" in model` guards in
-# entry.py keep it off for opus and auto-reactivate it the moment CLAUDE_MODEL
-# is set back to a fable model. The fallback target stays Opus 4.8. Set
-# FABLE_REFUSAL_FALLBACK_ENABLED=0 to disable.
+# Refusal fallback. A content classifier can end a stream with
+# stop_reason=refusal / category=None on conversation content that is not a real
+# safety stop for this private 1:1 deployment, and it is NOT overridable by the
+# system prompt (verified by ablation on Fable 5). Originally a Fable-only leg,
+# now MODEL-AGNOSTIC: Opus 5.5 refuses too (2026-10-15,
+# ch=1498907350755708968 req_011Cg46dcVdTNfQSJ8bn3V17 — a security-review reply
+# quoted back as `replied_to_trusted_message` context). The old `"fable" in
+# model` guards in entry.py kept this leg dormant for opus, so such a refusal
+# fell straight through to the bare "(no response)" sentinel: no retry, no
+# explanation. The only hard constraint is "never fall a model back onto
+# itself", which `refusal_fallback_target()` enforces. The fallback target stays
+# Opus 4.8. Set FABLE_REFUSAL_FALLBACK_ENABLED=0 to disable.
 FABLE_REFUSAL_FALLBACK_MODEL = os.environ.get(
     "FABLE_REFUSAL_FALLBACK_MODEL", "claude-opus-4-8"
 )
 FABLE_REFUSAL_FALLBACK_ENABLED = os.environ.get(
     "FABLE_REFUSAL_FALLBACK_ENABLED", "1"
 ) not in ("0", "false", "False", "")
+
+
+def models_equivalent(a: str | None, b: str | None) -> bool:
+    """True when two model ids name the same model.
+
+    Tolerates alias vs dated-snapshot ids (``claude-opus-4-8`` against
+    ``claude-opus-4-8-20260115``) so the API echoing a resolved snapshot id in
+    ``message.model`` is never mistaken for a different model.
+    """
+    x = (a or "").strip().lower()
+    y = (b or "").strip().lower()
+    if not x or not y:
+        return False
+    return x == y or x.startswith(y) or y.startswith(x)
+
+
+def refusal_fallback_target(model: str | None) -> str | None:
+    """The model to retry on when ``model`` ends a turn with a refusal.
+
+    Returns None when the fallback is disabled, unconfigured, or would retry
+    the same model (the Opus-4.8-onto-Opus-4.8 no-op).
+    """
+    if not FABLE_REFUSAL_FALLBACK_ENABLED:
+        return None
+    target = (FABLE_REFUSAL_FALLBACK_MODEL or "").strip()
+    if not target or models_equivalent(model, target):
+        return None
+    return target
+
+
+# Which model families accept the server-side `fallbacks` body field (ADR-0015).
+# This is NOT universal: Opus 4.8 rejects it with 400 invalid_request, which hung
+# tool turns at "整形中" (2026-07-14), and it is unverified on Opus 5.5 —
+# declaring it on every production request to find out would break all traffic if
+# rejected. So the body field stays opt-in per family while the client-side retry
+# (which costs nothing until a refusal actually happens) covers everyone else.
+# Comma-separated id prefixes.
+SERVER_SIDE_FALLBACK_MODEL_PREFIXES = tuple(
+    p.strip().lower()
+    for p in os.environ.get(
+        "SERVER_SIDE_FALLBACK_MODEL_PREFIXES", "claude-fable"
+    ).split(",")
+    if p.strip()
+)
+
+
+def server_side_fallback_supported(model: str | None) -> bool:
+    """True when ``model`` is known to accept the `fallbacks` body field."""
+    ml = (model or "").strip().lower()
+    return bool(ml) and bool(SERVER_SIDE_FALLBACK_MODEL_PREFIXES) and ml.startswith(
+        SERVER_SIDE_FALLBACK_MODEL_PREFIXES
+    )
 # Token-exhaustion model fallback (2026-07-20). When the primary model is a
 # Fable model and it runs OUT OF USAGE BUDGET — a rate_limit (429) that survives
 # Fable's transient retries, or a hard billing/credit exhaustion — escape to the

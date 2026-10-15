@@ -36,6 +36,7 @@ from config import (
     FABLE_REFUSAL_FALLBACK_ENABLED,
     FABLE_REFUSAL_FALLBACK_MODEL,
     FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED,
+    refusal_fallback_target,
     HISTORY_COMPACT_TRIGGER_TOKENS,
     MICROCOMPACT_ENABLED,
     MICROCOMPACT_GAP_MIN,
@@ -1121,17 +1122,13 @@ async def call_with_tools(
                             active_mcp_keys=sorted(
                                 chosen_mcp_keys | always_advertised_mcp_keys
                             ),
-                            # On a Fable 5 refusal (content classifier, not a
-                            # real safety stop here), retry once on Opus 4.8 and
-                            # surface the switch. Only when the primary model is
-                            # actually Fable — never fall Opus back onto Opus.
-                            refusal_fallback_model=(
-                                FABLE_REFUSAL_FALLBACK_MODEL
-                                if (
-                                    FABLE_REFUSAL_FALLBACK_ENABLED
-                                    and "fable" in (effective_model or "").lower()
-                                )
-                                else None
+                            # On a refusal (content classifier, not a real
+                            # safety stop here), retry once on the fallback
+                            # model and surface the switch. Model-agnostic:
+                            # Opus 5.5 refuses too (2026-10-15). The helper
+                            # declines when that would fall a model onto itself.
+                            refusal_fallback_model=refusal_fallback_target(
+                                effective_model
                             ),
                             # A sticky pin means a refusal fallback already
                             # happened in this session — mark every subsequent
@@ -1569,16 +1566,8 @@ async def call_with_tools(
                     ),
                     evidence=evidence,
                     proactive_compact=(_proactive_compact if not restricted else None),
-                    refusal_fallback_model=(
-                        FABLE_REFUSAL_FALLBACK_MODEL
-                        if (
-                            FABLE_REFUSAL_FALLBACK_ENABLED
-                            and "fable"
-                            in (
-                                (result.fallback_model or effective_model) or ""
-                            ).lower()
-                        )
-                        else None
+                    refusal_fallback_model=refusal_fallback_target(
+                        result.fallback_model or effective_model
                     ),
                     output_config_override=(
                         {"effort": forced_effort_override}
