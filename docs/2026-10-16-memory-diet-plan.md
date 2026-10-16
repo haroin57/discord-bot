@@ -133,6 +133,9 @@ Phase 0 の見込み: 定常で **−5GB 以上**（Chroma 3.3G + Chrome 1.6G + 
 - available: 3,517MB → 4,784MB
 - /tmp: 2.5GB → 511MB
 - Chroma: swap 3.5GB → 0、RAM 75MB
+- Chroma のその後: 初回クエリで index を読み込み、約 15 分で RAM 419MB + swap 95MB の高原に達した（11:15〜11:20 で横ばい）。
+  最初に設定した MemoryHigh=400M は定常の working set（約 510MB）を下回っていたので、600M / Max 900M に直した。
+  長期の増加（約 400MB/日）は毎日の再起動で吸収する。
 - 孤児 Chrome: 7 → 0、プロファイル残骸 48 個を削除
 - hook daemon の proxy 化はコードのデプロイ後に効く（−約 300MB 見込み）
 
