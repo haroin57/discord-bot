@@ -128,6 +128,14 @@ Vectorize は「VPS 全損時の耐久性」を主目的にするなら再検討
 
 Phase 0 の見込み: 定常で **−5GB 以上**（Chroma 3.3G + Chrome 1.6G + /tmp 1.6G + hook 0.3G の大半）。
 
+**本番適用の実測（2026-10-16 10:59 JST、`apply_memory_diet_host.sh --with-pnpm`）**:
+- swap: 7,825MB → 2,083MB
+- available: 3,517MB → 4,784MB
+- /tmp: 2.5GB → 511MB
+- Chroma: swap 3.5GB → 0、RAM 75MB
+- 孤児 Chrome: 7 → 0、プロファイル残骸 48 個を削除
+- hook daemon の proxy 化はコードのデプロイ後に効く（−約 300MB 見込み）
+
 ### Phase 1 — 上限のない構造を潰す（1〜2 週間）
 
 1. **kanae-memory サービス化**
@@ -188,7 +196,9 @@ Phase 0 の見込み: 定常で **−5GB 以上**（Chroma 3.3G + Chrome 1.6G + 
 
 ## 6. リスクと対策
 
-- **Chroma の毎日再起動で数秒間 Mem0 検索が失敗する**: 既存の init cooldown と空結果フォールバックがある。
+- **Chroma の毎日再起動で Mem0 検索が一時的に失敗する**: 2026-10-16 11:00 の本番適用で実測したところ、
+  heartbeat 復帰は約 3 秒だったが、in-process で Mem0 を持つ旧 hook daemon は再接続まで約 1〜2 分 timeout（空ブロック）が続いた。
+  bot 側は既存の init cooldown と空結果フォールバックで吸収し、エラーログは出なかった。
   時刻は 05:30（就寝誘導ルールにより haroin の利用が最も少ない帯）に置く。
 - **hook proxy 化で MCP サーバーの負荷と RSS が増える**: v1 index は既に MCP 側でも構築済みなので増分は小さい。
   MemoryMax 450M は据え置き、超えたら Phase 1 の予算に従って引き上げる。
