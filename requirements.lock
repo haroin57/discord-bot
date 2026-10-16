@@ -72,7 +72,7 @@ license-expression==30.4.4
 Markdown==3.10.2
 markdown-it-py==4.0.0
 matplotlib==3.10.9
-mcp==1.28.1
+mcp==1.30.0
 mdurl==0.1.2
 mem0ai==1.0.11
 mmh3==5.2.1
