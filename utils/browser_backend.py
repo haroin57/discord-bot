@@ -6,7 +6,10 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import signal
+import tempfile
+import time
 from collections import deque
 from itertools import count
 from pathlib import Path
@@ -79,6 +82,38 @@ def _kill_owned_browser(pid: int | None) -> None:
         log.warning("Killed render-daemon Chrome pid=%s left behind by its owner", pid)
     except (ProcessLookupError, PermissionError):
         pass
+
+
+def _remove_temp_profile(profile: str | None, pid: int | None) -> None:
+    """Delete puppeteer's temp profile after its Chrome is gone.
+
+    puppeteer removes the profile only on a clean ``browser.close()``. When
+    node is SIGKILLed (timeout, cancel, slow shutdown) the directory stays
+    behind, and on tmpfs that costs RAM. Only puppeteer's own temp profiles
+    are touched, and only after the owning Chrome has exited.
+    """
+    if not profile:
+        return
+    path = Path(profile)
+    if not path.name.startswith("puppeteer_dev_chrome_profile-"):
+        return
+    if path.parent.resolve() != Path(tempfile.gettempdir()).resolve():
+        return
+    # SIGKILL delivery is asynchronous; give Chrome up to 100ms (kill path
+    # only) and leave the directory to the cron reaper if it is still alive.
+    for _ in range(10):
+        if not (pid and _pid_running(pid)):
+            shutil.rmtree(path, ignore_errors=True)
+            return
+        time.sleep(0.01)
+
+
+def _pid_running(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
 async def _cancel_and_await(task: asyncio.Task[Any] | None) -> None:
@@ -183,6 +218,7 @@ class BrowserDaemon:
         self.render_timeout = render_timeout
         self._proc: asyncio.subprocess.Process | None = None
         self._browser_pid: int | None = None
+        self._browser_profile: str | None = None
         self._lock = asyncio.Lock()
         self._ids = count(1)
         self._stderr_tail: deque[str] = deque(maxlen=80)
@@ -328,6 +364,8 @@ class BrowserDaemon:
             if response.get("event") == "browser":
                 pid = response.get("pid")
                 self._browser_pid = pid if isinstance(pid, int) and pid > 0 else None
+                profile = response.get("userDataDir")
+                self._browser_profile = profile if isinstance(profile, str) else None
                 continue
             if response.get("id") == request_id:
                 return response
@@ -386,7 +424,9 @@ class BrowserDaemon:
         await _cancel_and_await(stderr_task)
         self._proc = None
         _kill_owned_browser(self._browser_pid)
+        _remove_temp_profile(self._browser_profile, self._browser_pid)
         self._browser_pid = None
+        self._browser_profile = None
 
     def _schedule_idle_shutdown(self) -> None:
         if self.idle_timeout > 0 and not self._closed:

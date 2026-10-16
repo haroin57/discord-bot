@@ -66,8 +66,15 @@ async function getBrowser() {
     browser = null;
   });
   const child = browser.process();
-  // Let the owner kill Chrome directly if this daemon becomes unresponsive.
-  send({ id: null, event: 'browser', pid: child ? child.pid : null });
+  const profileArg = child && (child.spawnargs || []).find((a) => a.startsWith('--user-data-dir='));
+  // Let the owner kill Chrome directly if this daemon becomes unresponsive and
+  // remove the temp profile that puppeteer only deletes on a clean close.
+  send({
+    id: null,
+    event: 'browser',
+    pid: child ? child.pid : null,
+    userDataDir: profileArg ? profileArg.slice('--user-data-dir='.length) : null,
+  });
   return browser;
 }
 

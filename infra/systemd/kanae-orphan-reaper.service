@@ -1,0 +1,22 @@
+[Unit]
+Description=Reap orphaned headless Chrome, Codex sandboxes and MCP backends (memory-diet 2026-10-16)
+Documentation=file:///usr/local/libexec/kanae/reap_mcp_orphans.sh
+
+[Service]
+Type=oneshot
+# Runs as root so it can reap orphans from every account (ubuntu dev
+# sessions, kanae-bot). It only touches PPID=1 processes matching strict
+# patterns and age gates. Filesystem access is limited to /tmp (stale
+# puppeteer profiles) and its own state directory.
+# Installed copy, refreshed by scripts/apply_memory_diet_host.sh. It does not
+# depend on any git checkout being at a particular revision.
+ExecStart=/usr/local/libexec/kanae/reap_mcp_orphans.sh
+StateDirectory=kanae-orphan-reaper
+Environment=XDG_STATE_HOME=/var/lib/kanae-orphan-reaper
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp
+PrivateTmp=no
+NoNewPrivileges=yes
+Nice=10
+IOSchedulingClass=idle

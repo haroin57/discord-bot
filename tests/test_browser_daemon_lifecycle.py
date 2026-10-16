@@ -69,10 +69,13 @@ async def test_render_reports_browser_pid_and_close_leaves_no_chrome(tmp_path):
         out = await _render_once(daemon, tmp_path)
         assert out.stat().st_size > 0
         chrome_pid = daemon._browser_pid
+        profile = daemon._browser_profile
         assert chrome_pid and _alive(chrome_pid)
+        assert profile and Path(profile).is_dir()
     finally:
         await daemon.close()
     assert await _wait_gone(chrome_pid)
+    assert not Path(profile).exists()
 
 
 @pytest.mark.asyncio
@@ -82,6 +85,7 @@ async def test_chrome_exits_when_daemon_is_sigkilled(tmp_path):
     try:
         await _render_once(daemon, tmp_path)
         chrome_pid = daemon._browser_pid
+        profile = daemon._browser_profile
         assert chrome_pid
         node = daemon._proc
         assert node is not None
@@ -91,6 +95,8 @@ async def test_chrome_exits_when_daemon_is_sigkilled(tmp_path):
         assert await _wait_gone(chrome_pid), "Chrome orphaned after node SIGKILL"
     finally:
         await daemon.close()
+    # close() notices the dead daemon and removes the profile puppeteer left.
+    assert not Path(profile).exists()
 
 
 @pytest.mark.asyncio
@@ -102,10 +108,12 @@ async def test_kill_process_reaps_chrome_even_if_it_ignores_the_pipe(tmp_path):
         assert chrome_pid
         # Freeze Chrome so it cannot react to the pipe closing; only the
         # owner's SIGKILL backstop can remove it now.
+        profile = daemon._browser_profile
         os.kill(chrome_pid, signal.SIGSTOP)
         await daemon._kill_process()
         assert await _wait_gone(chrome_pid)
         assert daemon._browser_pid is None
+        assert not Path(profile).exists()
     finally:
         await daemon.close()
 
@@ -116,8 +124,10 @@ async def test_daemon_restarts_cleanly_after_kill(tmp_path):
     try:
         await _render_once(daemon, tmp_path)
         first = daemon._browser_pid
+        first_profile = daemon._browser_profile
         await daemon._kill_process()
         assert await _wait_gone(first)
+        assert not Path(first_profile).exists()
         out = await _render_once(daemon, tmp_path)
         assert out.stat().st_size > 0
         assert daemon._browser_pid and daemon._browser_pid != first

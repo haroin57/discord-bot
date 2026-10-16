@@ -24,6 +24,8 @@
 | 7 | `mcp-mem0-shared` | 266MB | — | 同上（Mem0 スタックの重複） |
 | 8 | 共有 MCP 群（oracle / papermcp / second-opinion / x-scraper / inshi-vault） | 計 約 130MB | 計 約 270MB | 小粒だがランタイムごとに固定費 |
 
+追記（レビューで発見）: PPID=1 になった codex-linux-sandbox の中で、5 日以上止まった pytest が 7 個あり、swap を約 690MB 保持していた。これも同じ「所有者なし」の類型。
+
 「漏れ」（1〜3）だけで **約 7.4GB**。正規の常駐（4〜8）より大きい。
 つまり問題の本質は「処理が重い」ことより、**所有者のいない資源が上限なしに積み上がる**ことにある。
 
@@ -119,12 +121,12 @@ Vectorize は「VPS 全損時の耐久性」を主目的にするなら再検討
 
 | # | 変更 | ファイル | 検証 |
 |---|---|---|---|
-| 0-1 | render daemon を `pipe: true` に変更。Chrome PID を Python に通知し、異常系では node の process group と Chrome PID を両方 kill する。node は `start_new_session=True` で起動。OptimizationGuide / OnDeviceModel を無効化 | `utils/_render_daemon.js`, `utils/browser_backend.py` | 実 Chrome の結合テスト（node を SIGKILL → Chrome が消えること、正常 render → close で 0 個） |
-| 0-2 | 孤児 Chrome reaper。PPID=1、`puppeteer_dev_chrome_profile-`、経過 5 分以上を TERM → KILL。生存プロセスが使っていない 1 時間超のプロファイルディレクトリも削除 | `scripts/reap_mcp_orphans.sh`（既存 cron */10 に相乗り） | `--dry-run` で 7 個を検出、本実行で 0 個 |
-| 0-3 | Mermaid の安全ラッパー。最新 Chrome を自動解決、`pipe: true`、timeout + kill-after、プロファイル後始末。CLAUDE.md の案内を差し替え | `scripts/mmdc_safe.sh`, `config/puppeteer-mmdc.json`, `CLAUDE.md` | 実レンダリング成功、timeout 時に Chrome 残存 0 |
-| 0-4 | hook daemon を stdlib のみの proxy に置き換え、検索は `mcp-mem0-shared` の `/hook/search` に寄せる（同一引数・同一フォーマット） | `services/mem0/hook_http.py`（新規）, `mcp_mem0_server.py`（登録 2 行）, `mem0_hook_daemon.py` | 単体テスト + 実 HTTP 往復で出力一致 |
-| 0-5 | Chroma の swap 上限と毎日 05:30 の再起動 | `infra/systemd/chromadb-server.service.d/memory-guard.conf`, `infra/systemd/chromadb-restart.{service,timer}` | 適用後の MemorySwapCurrent を観察 |
-| 0-6 | /tmp の衛生。puppeteer プロファイルの aging、pnpm store の移設手順 | `deploy/tmpfiles.d/discord-bot-tmp-hygiene.conf`, `scripts/host_tmpfs_hygiene.sh` | `systemd-tmpfiles --clean` dry-run |
+| 0-1 | render daemon を `pipe: true` に変更。Chrome の PID とプロファイルを Python に通知し、異常系では node の process group と Chrome PID を両方 kill して、puppeteer が残した temp プロファイルも消す。node は `start_new_session=True` で起動。OptimizationGuide / OnDeviceModel を無効化 | `utils/_render_daemon.js`, `utils/browser_backend.py` | 実 Chrome の結合テスト 4 本（node を SIGKILL → Chrome もプロファイルも消える。正常 close / kill / 再起動でも残らない） |
+| 0-2 | 孤児 reaper。対象は次の 3 つ。① PPID=1 の puppeteer Chrome（5 分以上）、② PPID=1 の codex-linux-sandbox の process group（6 時間以上。実測で 5 日止まった pytest 7 個が swap 690MB）、③ 生存プロセスが使っていない 1 時間超のプロファイル。ps の取得に失敗したら sweep しない。cron の旧エントリは別 checkout（CD で更新されない）を指すので、`/usr/local/libexec/kanae/` の配置コピーを `kanae-orphan-reaper.timer`（10 分毎）で回す | `scripts/reap_mcp_orphans.sh`, `infra/systemd/kanae-orphan-reaper.{service,timer}` | `--dry-run` で対象を確認（Chrome 7 → 0、sandbox 7） |
+| 0-3 | Mermaid の安全ラッパー `mmdc-safe`。Chrome は `$PUPPETEER_EXECUTABLE_PATH` → `$HOME` の puppeteer cache → system Chrome の順に解決する（kanae-bot は cache を持たない）。pipe 接続の設定は一時生成し、timeout + kill-after を付ける。`/usr/local/bin` に配置し、CLAUDE.md の案内を差し替え | `scripts/mmdc_safe.sh`, `CLAUDE.md` | ubuntu と kanae-bot の両方で生成成功。mmdc を SIGKILL しても孤児 0（旧設定では 1） |
+| 0-4 | hook daemon を stdlib のみの proxy に置き換え、検索は `mcp-mem0-shared` の `/hook/search` に寄せる（同一引数・同一フォーマット）。route は FastMCP の DNS rebinding 保護の外にあるので、自前で検査する（loopback Host、Origin なし、`X-Kanae-Hook: 1` 必須）。失敗はレート制限付きで stderr に出し、unit は mcp-mem0-shared の後に起動する | `services/mem0/hook_http.py`（新規）, `mcp_mem0_server.py`（登録 4 行）, `mem0_hook_daemon.py`, `infra/systemd/mem0-hook-daemon.service.d/` | 単体 13 本 + 実 HTTP 往復で出力がバイト一致 |
+| 0-5 | Chroma の swap 上限と毎日 05:30 の再起動。MemoryHigh は設定しない（throttle 帯を作らず、上限で OOM → Restart=on-failure） | `infra/systemd/chromadb-server.service.d/60-memory-guard.conf`, `infra/systemd/chromadb-restart.{service,timer}` | 適用後の memory.current / swap.current / memory.events を観察 |
+| 0-6 | /tmp の衛生。pnpm の store-dir を disk に固定して `/tmp/.pnpm-store` を削除する。削除は稼働検知（shim 対応、fuser）の後に rename してから行う。puppeteer プロファイルの aging は 0-2 の reaper が担う（tmpfiles.d は使わない） | `scripts/apply_memory_diet_host.sh --with-pnpm` | /tmp 2.5G → 511M |
 
 Phase 0 の見込み: 定常で **−5GB 以上**（Chroma 3.3G + Chrome 1.6G + /tmp 1.6G + hook 0.3G の大半）。
 

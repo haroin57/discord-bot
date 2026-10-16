@@ -42,10 +42,41 @@ def _app():
     return mcp.streamable_http_app()
 
 
-async def _post(body: bytes) -> httpx.Response:
+async def _post(
+    body: bytes,
+    headers: dict[str, str] | None = None,
+    base_url: str = "http://127.0.0.1:8013",
+) -> httpx.Response:
     transport = httpx.ASGITransport(app=_app())
-    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as c:
-        return await c.post(hook_http.HOOK_ROUTE, content=body)
+    hdrs = {"X-Kanae-Hook": "1"} if headers is None else headers
+    async with httpx.AsyncClient(transport=transport, base_url=base_url) as c:
+        return await c.post(hook_http.HOOK_ROUTE, content=body, headers=hdrs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "base_url"),
+    [
+        ({}, "http://127.0.0.1:8013"),  # no hook header (CORS-simple POST)
+        (
+            {"X-Kanae-Hook": "1", "Origin": "http://evil.example"},
+            "http://127.0.0.1:8013",
+        ),
+        ({"X-Kanae-Hook": "1"}, "http://evil.example:8013"),  # DNS rebinding Host
+        ({"X-Kanae-Hook": "1"}, "http://127.0.0.1.evil.example:8013"),
+    ],
+)
+async def test_route_rejects_untrusted_requests(fake_search, headers, base_url):
+    resp = await _post(b"secret", headers=headers, base_url=base_url)
+    assert resp.status_code == 403
+    assert fake_search == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("base_url", ["http://localhost:8013", "http://[::1]:8013"])
+async def test_route_accepts_loopback_aliases(fake_search, base_url):
+    resp = await _post(b"q", base_url=base_url)
+    assert resp.status_code == 200 and resp.text == "hit:q"
 
 
 @pytest.mark.asyncio
@@ -109,7 +140,11 @@ def http_echo():
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"]))
-            out = b"block:" + body
+            out = (
+                b"block:" + body
+                if self.headers.get("X-Kanae-Hook") == "1"
+                else b"no-header"
+            )
             self.send_response(200)
             self.send_header("Content-Length", str(len(out)))
             self.end_headers()
@@ -136,12 +171,16 @@ async def test_daemon_proxies_socket_query_to_http(tmp_path, monkeypatch, http_e
 
 
 @pytest.mark.asyncio
-async def test_daemon_returns_empty_when_backend_is_down(tmp_path, monkeypatch):
+async def test_daemon_returns_empty_when_backend_is_down(tmp_path, monkeypatch, capsys):
     sock = tmp_path / "hook.sock"
     mod = _daemon_module(monkeypatch, sock, "http://127.0.0.1:9/hook/search")
     server = await asyncio.start_unix_server(mod.handle, path=str(sock))
     async with server:
         assert await _ask(sock, b"q") == b""
+        assert await _ask(sock, b"q2") == b""
+    err = capsys.readouterr().err
+    # The failure is visible in the journal, rate-limited to one line.
+    assert err.count("backend failed") == 1
 
 
 def test_daemon_stays_stdlib_only_and_small():
