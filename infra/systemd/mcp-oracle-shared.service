@@ -17,7 +17,7 @@ WorkingDirectory=/var/lib/discord-bot-releases/prod/current/src
 EnvironmentFile=/etc/discord-bot/credentials/mcp-oracle.env
 Environment=HOME=/var/lib/kanae-oracle
 # volta node bin first so supergateway + the wrapped oracle-mcp resolve.
-Environment=PATH=/home/ubuntu/.volta/tools/image/node/24.14.1/bin:/home/ubuntu/.volta/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/home/ubuntu/.volta/tools/image/node/24.22.1/bin:/home/ubuntu/.volta/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHON_DOTENV_DISABLED=1
 StateDirectory=kanae-oracle
 StateDirectoryMode=0700
