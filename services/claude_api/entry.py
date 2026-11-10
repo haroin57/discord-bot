@@ -93,6 +93,7 @@ from services.claude_api.client import (
 )
 from services.claude_api.errors import (
     _error_message,
+    append_auth_details,
     _is_transient,
     classify_anthropic_error,
     is_non_persistable_reply,
@@ -124,6 +125,7 @@ from services.oauth_manager import (
     OAuthRefreshFailed,
     failback_to_primary as oauth_failback_to_primary,
     get_active_account as oauth_get_active_account,
+    oauth_status_detail,
     maybe_restore_primary as oauth_maybe_restore_primary,
     prepare_and_failover_to_secondary as oauth_prepare_and_failover,
     rollback_failed_failover as oauth_rollback_failed_failover,
@@ -292,6 +294,16 @@ def _classified_error_message(category: str, exc: BaseException | None = None) -
     message = _error_message(category)
     if category == "rate_limit" and exc is not None:
         return append_rate_limit_details(message, _anthropic_error_headers(exc))
+    if category == "auth":
+        # "contact the administrator" used to be the whole message, which told
+        # the owner (who IS the administrator) nothing. Attach the OAuth state
+        # so the reply itself says whether to re-login, fix permissions, or
+        # look elsewhere (2026-11-10 incident).
+        try:
+            return append_auth_details(message, oauth_status_detail())
+        except Exception as detail_exc:  # never let diagnostics eat the error
+            log.warning("auth detail build failed: %s", detail_exc)
+            return message
     return message
 
 
@@ -796,7 +808,7 @@ async def call_with_tools(
                     exc,
                 )
                 if restricted or not await _try_failover("auth", None):
-                    return _error_message("auth"), None, resumable
+                    return _classified_error_message("auth", exc), None, resumable
             _agent_dispatch["api_client"] = api_client
 
             # 7b. History compaction (ADR-0010 phase 3): when the replay
