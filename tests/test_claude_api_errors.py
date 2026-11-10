@@ -627,3 +627,97 @@ class TestRefusalNoticeNotPersisted:
         assert not is_non_persistable_reply(
             "stop_reason=refusal で止まってたのが原因でした"
         )
+
+
+class TestAuthErrorDetails:
+    """2026-11-10 incident: the auth message was a fixed "contact the
+    administrator", which told the owner — who IS the administrator — nothing.
+    A refresh-token rotation collision looked identical to a missing
+    credential or a permissions problem, so every case meant digging through
+    journalctl. The message now carries the OAuth state."""
+
+    @staticmethod
+    def _detail(**over):
+        detail = {
+            "active": "primary",
+            "credential_ok": False,
+            "credential_reason": "access_token_expired",
+            "failover_enabled": False,
+            "standby": "failover",
+            "standby_credential_ok": False,
+            "standby_credential_reason": "access_token_expired",
+            "redundancy_ok": True,
+            "redundancy_reason": None,
+            "token_expired": True,
+            "refresh_failures": 1,
+            "refresh_permanent": True,
+        }
+        detail.update(over)
+        return detail
+
+    def test_rotation_collision_is_named_with_the_recovery_action(self):
+        from services.claude_api.errors import append_auth_details, _error_message
+
+        text = append_auth_details(_error_message("auth"), self._detail())
+        assert "primary" in text
+        assert "期限切れ" in text
+        assert "refresh token が無効化されています" in text
+        assert "rotation 衝突" in text
+        assert "claude /login" in text
+        # failover off -> say so instead of implying a switch target exists
+        assert "切替は無効化されています" in text
+
+    def test_missing_credential_reason_is_translated(self):
+        from services.claude_api.errors import append_auth_details, _error_message
+
+        text = append_auth_details(
+            _error_message("auth"),
+            self._detail(credential_reason="credentials_missing",
+                         refresh_permanent=False, refresh_failures=0),
+        )
+        assert "credential ファイルが存在しません" in text
+        assert "refresh token が無効化" not in text
+        assert "refresh 連続失敗" not in text
+
+    def test_unknown_reason_is_printed_raw_rather_than_dropped(self):
+        from services.claude_api.errors import format_auth_details
+
+        text = format_auth_details(self._detail(credential_reason="brand_new_code"))
+        assert "brand_new_code" in text
+
+    def test_usable_standby_is_reported_when_failover_is_on(self):
+        from services.claude_api.errors import format_auth_details
+
+        text = format_auth_details(
+            self._detail(failover_enabled=True, standby_credential_ok=True)
+        )
+        assert "切替先の failover は使用可能です" in text
+
+    def test_no_detail_leaves_the_message_untouched(self):
+        from services.claude_api.errors import append_auth_details, _error_message
+
+        base = _error_message("auth")
+        assert append_auth_details(base, None) == base
+        assert append_auth_details(base, {}) == base
+
+    def test_detailed_auth_message_is_never_persisted(self):
+        from services.claude_api.errors import (
+            append_auth_details,
+            is_non_persistable_reply,
+            _error_message,
+        )
+
+        # The detail block makes the string variable, so the exact-match set
+        # cannot catch it — the prefix check must (ADR-0008 poison loop).
+        text = append_auth_details(_error_message("auth"), self._detail())
+        assert text != _error_message("auth")
+        assert is_non_persistable_reply(text)
+
+    def test_secrets_never_reach_the_message(self):
+        from services.claude_api.errors import format_auth_details
+
+        text = format_auth_details(
+            self._detail(access_token="sk-ant-secret", refresh_token="rt-secret")
+        )
+        assert "sk-ant-secret" not in text
+        assert "rt-secret" not in text
