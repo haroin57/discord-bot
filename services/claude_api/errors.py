@@ -210,11 +210,96 @@ def classify_anthropic_error(exc: BaseException) -> ErrorCategory:
     return "unknown"
 
 
+# Opening span of every auth message. The detailed variant appends a state
+# block, so the full string is no longer a fixed value — everything that used
+# to match the table entry exactly (the non-persistable check below) keys off
+# this prefix instead.
+AUTH_ERROR_PREFIX = "🔑 認証エラー"
+
+# Human-readable causes for the readiness reasons `oauth_manager` reports, so
+# the Discord message says what broke instead of "contact the administrator".
+# A reason absent from this map is printed raw — an unknown code is still more
+# diagnostic than no code.
+_AUTH_REASON_TEXT = {
+    "credentials_missing": "credential ファイルが存在しません",
+    "credentials_unreadable": "credential ファイルが読めません（壊れている可能性）",
+    "credentials_directory_missing": "credential ディレクトリがありません",
+    "credentials_directory_insecure": "credential ディレクトリの権限が不正です",
+    "credentials_file_insecure": "credential ファイルの権限が不正です",
+    "access_token_invalid": "access token が壊れています",
+    "refresh_token_invalid": "refresh token が壊れています",
+    "token_expiry_invalid": "credential の有効期限が壊れています",
+    "access_token_expired": "access token が期限切れです",
+}
+
+
+def format_auth_details(detail: "dict | None") -> str:
+    """Render `oauth_manager.oauth_status_detail()` as a diagnostic block.
+
+    Secrets never enter this string: only account names, boolean state and
+    readiness reason codes. The goal is that the person reading the Discord
+    message knows whether to re-login, fix permissions, or look elsewhere —
+    the old fixed message sent them to journalctl for all three.
+    """
+    if not isinstance(detail, dict) or not detail:
+        return ""
+    lines = []
+    active = detail.get("active")
+    token_expired = detail.get("token_expired")
+    if active:
+        state = "期限切れ" if token_expired else "有効"
+        lines.append(f"- 使用中のアカウント: {active}（access token は{state}）")
+    reason = detail.get("credential_reason")
+    if reason:
+        lines.append(f"- credential: {_AUTH_REASON_TEXT.get(reason, reason)}")
+    if detail.get("refresh_permanent"):
+        lines.append(
+            "- refresh token が無効化されています"
+            "（他プロセスとの rotation 衝突が典型的な原因）"
+        )
+    failures = detail.get("refresh_failures")
+    if isinstance(failures, int) and failures > 0:
+        lines.append(f"- refresh 連続失敗: {failures} 回")
+    if detail.get("failover_enabled"):
+        standby = detail.get("standby") or "standby"
+        if detail.get("standby_credential_ok"):
+            lines.append(f"- 切替先の {standby} は使用可能です")
+        else:
+            standby_reason = detail.get("standby_credential_reason")
+            lines.append(
+                f"- 切替先の {standby} も使えません"
+                + (
+                    f"（{_AUTH_REASON_TEXT.get(standby_reason, standby_reason)}）"
+                    if standby_reason
+                    else ""
+                )
+            )
+    else:
+        lines.append("- アカウント切替は無効化されています（単一アカウント運用）")
+    if not lines:
+        return ""
+    lines.append(
+        "-# ホストで `claude /login` を実行すれば復帰します"
+        "（新しい credential をディスクに検出した時点で自動的に再開します）"
+    )
+    return "\n".join(lines)
+
+
+def append_auth_details(message: str, detail: "dict | None") -> str:
+    """Attach the OAuth state block to an auth error message."""
+    details = format_auth_details(detail)
+    if not details:
+        return message
+    return f"{message}\n{details}"
+
+
 _ERROR_MESSAGE_TABLE = {
     "rate_limit": "⏳ APIのレート制限に達しました。少し待ってから再試行してください。",
     "overloaded": "🔄 サーバーが混雑しています。しばらく待ってから再試行してください。",
     "billing": "⚠️ APIのクレジット枠を使い切ったか、課金が必要なリクエストです（長コンテキスト等）。`/effort` で effort を下げる、枠の回復を待つ、または管理者に課金確認を依頼してください。リトライしても直りません。",
-    "auth": "🔑 認証エラーが発生しました。管理者に連絡してください。",
+    # No "contact the administrator": the owner reading this IS the
+    # administrator, and the detail block below states the actual fix.
+    "auth": AUTH_ERROR_PREFIX + "が発生しました。OAuth の再認証が必要です。",
     "context_overflow": "📝 メッセージが長すぎます。短くして送り直してください。",
     "max_turns": "🔄 ターン上限に達しました。もう一度話しかけてください。",
     "invalid_request": "⚠️ リクエストの形式に問題があり処理できませんでした。もう一度試しても直らない場合は管理者に連絡してください。",
@@ -237,15 +322,30 @@ NON_PERSISTABLE_REPLIES: frozenset[str] = frozenset(
     | set(_ERROR_MESSAGE_TABLE.values())
 )
 
+# The refusal notice (2026-10-15) replaces the bare "(no response)" when a turn
+# ends at stop_reason=refusal. It carries a request_id, so it cannot be matched
+# exactly — it is recognised by this prefix instead. Persisting it would replay
+# "my own last answer was refused" into the next resume, which is exactly the
+# ADR-0008 poison loop.
+REFUSAL_NOTICE_PREFIX = "> ⚠️ **応答が安全フィルタで停止されました**"
+
 
 def is_non_persistable_reply(text: str) -> bool:
     """True if ``text`` is a sentinel/error reply that must not enter history.
 
-    Exact-match only — a real model reply that merely *mentions* an error
-    string is still persisted. Whitespace is stripped so trailing newlines
-    from the delivery layer don't defeat the check.
+    Exact-match, plus two prefix families whose messages carry variable
+    diagnostic detail and therefore cannot match a fixed string: the refusal
+    notice (request_id) and the auth error (OAuth state block). A real model
+    reply that merely *mentions* an error string is still persisted.
+    Whitespace is stripped so trailing newlines from the delivery layer don't
+    defeat the check.
     """
-    return (text or "").strip() in NON_PERSISTABLE_REPLIES
+    stripped = (text or "").strip()
+    if stripped.startswith(REFUSAL_NOTICE_PREFIX):
+        return True
+    if stripped.startswith(AUTH_ERROR_PREFIX):
+        return True
+    return stripped in NON_PERSISTABLE_REPLIES
 
 
 def _error_message(error_type: str) -> str:

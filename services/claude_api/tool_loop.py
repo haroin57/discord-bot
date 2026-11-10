@@ -29,6 +29,7 @@ import httpx
 
 from config import (
     DELIB_DISTILL_ENABLED,
+    models_equivalent,
     MAX_CONSECUTIVE_EMPTY_TURNS,
     MAX_FINAL_EMPTY_NUDGES,
     MAX_PAUSE_TURN_CONTINUES,
@@ -85,6 +86,7 @@ from services.claude_api.loop_contracts import (
     _build_checkpoint_result,
     _fallback_alert,
     _model_display,
+    _refusal_notice,
 )
 from services.claude_api.loop_observability import (
     _HALLUC_MAX_DISTANCE,
@@ -555,6 +557,9 @@ async def run_agent_loop(
     history.append({"role": "user", "content": prompt})
     active_mcp_keys = list(active_mcp_keys or [])
     last_text = ""
+    # request-id of the most recent API turn — surfaced in the refusal notice
+    # so a classifier stop can be traced back to the exact request.
+    last_request_id = ""
     # Accumulator for text blocks emitted across *all* turns when no
     # incremental callback is wired. The model often interleaves narration
     # with tool_use blocks — e.g. it writes its full review of an image
@@ -942,6 +947,7 @@ async def run_agent_loop(
                         request_id = _hdrs.get("request-id", "") or ""
                 except Exception:
                     pass
+                last_request_id = request_id or last_request_id
                 _log_turn_usage(
                     channel_id, turn, final_msg, usage_totals,
                     # current_model, not the request arg: a mid-loop refusal
@@ -992,11 +998,17 @@ async def run_agent_loop(
                 if not fallback_used and refusal_fallback_model:
                     detected = server_fallback_to
                     final_model = getattr(final_msg, "model", None)
+                    # Divergence counts only when the answering model IS the
+                    # declared fallback target. Plain `!= current_model` also
+                    # fires when the API echoes a dated snapshot id for the
+                    # SAME model (claude-opus-5-5 → claude-opus-5-5-2026xxxx),
+                    # which would announce a fallback that never happened.
                     if (
                         not detected
                         and isinstance(final_model, str)
                         and final_model
-                        and final_model != current_model
+                        and not models_equivalent(final_model, current_model)
+                        and models_equivalent(final_model, refusal_fallback_model)
                     ):
                         detected = final_model
                     if not detected:
@@ -1312,15 +1324,16 @@ async def run_agent_loop(
 
         stop_reason = getattr(final_msg, "stop_reason", None)
 
-        # Refusal fallback: Fable 5's content classifier (stop_reason=refusal,
-        # category=None) does not fire on Opus 4.8. Retry the SAME request once
-        # on the fallback model. The refused assistant turn was just appended
-        # above — pop it so the retry re-sends the identical pre-turn context.
+        # Refusal fallback: a content classifier ended the turn
+        # (stop_reason=refusal, category=None) and the fallback model may not
+        # share it. Retry the SAME request once on the fallback model. The
+        # refused assistant turn was just appended above — pop it so the retry
+        # re-sends the identical pre-turn context.
         if (
             stop_reason == "refusal"
             and refusal_fallback_model
             and not fallback_used
-            and current_model != refusal_fallback_model
+            and not models_equivalent(current_model, refusal_fallback_model)
         ):
             if history and history[-1].get("role") == "assistant":
                 history.pop()
@@ -1429,6 +1442,28 @@ async def run_agent_loop(
                     _fallback_alert(current_model) + "\n\n"
                     + last_text
                 )
+            # A refusal that reached this point was NOT recoverable (no
+            # fallback target, or the fallback refused too). Say so instead of
+            # returning the bare "(no response)" sentinel, which is
+            # indistinguishable from a dropped message or a bot crash.
+            if stop_reason == "refusal":
+                notice = _refusal_notice(
+                    model=current_model, request_id=last_request_id,
+                )
+                if last_text.strip():
+                    # Prose was already streamed live; append the notice
+                    # through the same channel so it isn't duplicated.
+                    if incremental_text_callback is not None:
+                        try:
+                            await incremental_text_callback(notice)
+                        except Exception as exc:
+                            log.warning("refusal notice callback failed: %s", exc)
+                        else:
+                            notice = ""
+                    if notice:
+                        last_text = last_text + "\n\n" + notice
+                else:
+                    last_text = notice
             _log_total_usage(channel_id, usage_totals)
             return AgentLoopResult(
                 text=last_text or "(no response)",

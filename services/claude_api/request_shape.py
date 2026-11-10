@@ -1,6 +1,6 @@
 """Anthropic request-shape helpers shared by the direct API tool loop."""
 
-from config import CLAUDE_MAX_TOKENS
+from config import CLAUDE_MAX_TOKENS, server_side_fallback_supported
 from services.claude_api.client import (
     CLAUDE_MAX_TOKENS_OPUS,
     CLI_DEFAULT_SYSTEM_PROMPT,
@@ -105,7 +105,15 @@ def _build_stream_kwargs_impl(
         output_config=output_config_override or OUTPUT_CONFIG,
         extra_body={"context_management": CONTEXT_MANAGEMENT_CONFIG},
     )
-    if server_side_fallback_enabled and refusal_fallback_model:
+    # Server-side fallback is declared only for model families verified to
+    # accept the body field — an unsupported `fallbacks` is a 400 on EVERY
+    # request, not just on a refusal. Unsupported families still get the
+    # client-side retry in tool_loop.
+    if (
+        server_side_fallback_enabled
+        and refusal_fallback_model
+        and server_side_fallback_supported(current_model)
+    ):
         stream_kwargs["extra_body"]["fallbacks"] = [
             {"model": refusal_fallback_model}
         ]

@@ -36,6 +36,7 @@ from config import (
     FABLE_REFUSAL_FALLBACK_ENABLED,
     FABLE_REFUSAL_FALLBACK_MODEL,
     FABLE_TOKEN_EXHAUSTION_FALLBACK_ENABLED,
+    refusal_fallback_target,
     HISTORY_COMPACT_TRIGGER_TOKENS,
     MICROCOMPACT_ENABLED,
     MICROCOMPACT_GAP_MIN,
@@ -92,6 +93,7 @@ from services.claude_api.client import (
 )
 from services.claude_api.errors import (
     _error_message,
+    append_auth_details,
     _is_transient,
     classify_anthropic_error,
     is_non_persistable_reply,
@@ -123,6 +125,7 @@ from services.oauth_manager import (
     OAuthRefreshFailed,
     failback_to_primary as oauth_failback_to_primary,
     get_active_account as oauth_get_active_account,
+    oauth_status_detail,
     maybe_restore_primary as oauth_maybe_restore_primary,
     prepare_and_failover_to_secondary as oauth_prepare_and_failover,
     rollback_failed_failover as oauth_rollback_failed_failover,
@@ -291,6 +294,16 @@ def _classified_error_message(category: str, exc: BaseException | None = None) -
     message = _error_message(category)
     if category == "rate_limit" and exc is not None:
         return append_rate_limit_details(message, _anthropic_error_headers(exc))
+    if category == "auth":
+        # "contact the administrator" used to be the whole message, which told
+        # the owner (who IS the administrator) nothing. Attach the OAuth state
+        # so the reply itself says whether to re-login, fix permissions, or
+        # look elsewhere (2026-11-10 incident).
+        try:
+            return append_auth_details(message, oauth_status_detail())
+        except Exception as detail_exc:  # never let diagnostics eat the error
+            log.warning("auth detail build failed: %s", detail_exc)
+            return message
     return message
 
 
@@ -795,7 +808,7 @@ async def call_with_tools(
                     exc,
                 )
                 if restricted or not await _try_failover("auth", None):
-                    return _error_message("auth"), None, resumable
+                    return _classified_error_message("auth", exc), None, resumable
             _agent_dispatch["api_client"] = api_client
 
             # 7b. History compaction (ADR-0010 phase 3): when the replay
@@ -1121,17 +1134,13 @@ async def call_with_tools(
                             active_mcp_keys=sorted(
                                 chosen_mcp_keys | always_advertised_mcp_keys
                             ),
-                            # On a Fable 5 refusal (content classifier, not a
-                            # real safety stop here), retry once on Opus 4.8 and
-                            # surface the switch. Only when the primary model is
-                            # actually Fable — never fall Opus back onto Opus.
-                            refusal_fallback_model=(
-                                FABLE_REFUSAL_FALLBACK_MODEL
-                                if (
-                                    FABLE_REFUSAL_FALLBACK_ENABLED
-                                    and "fable" in (effective_model or "").lower()
-                                )
-                                else None
+                            # On a refusal (content classifier, not a real
+                            # safety stop here), retry once on the fallback
+                            # model and surface the switch. Model-agnostic:
+                            # Opus 5.5 refuses too (2026-10-15). The helper
+                            # declines when that would fall a model onto itself.
+                            refusal_fallback_model=refusal_fallback_target(
+                                effective_model
                             ),
                             # A sticky pin means a refusal fallback already
                             # happened in this session — mark every subsequent
@@ -1569,16 +1578,8 @@ async def call_with_tools(
                     ),
                     evidence=evidence,
                     proactive_compact=(_proactive_compact if not restricted else None),
-                    refusal_fallback_model=(
-                        FABLE_REFUSAL_FALLBACK_MODEL
-                        if (
-                            FABLE_REFUSAL_FALLBACK_ENABLED
-                            and "fable"
-                            in (
-                                (result.fallback_model or effective_model) or ""
-                            ).lower()
-                        )
-                        else None
+                    refusal_fallback_model=refusal_fallback_target(
+                        result.fallback_model or effective_model
                     ),
                     output_config_override=(
                         {"effort": forced_effort_override}

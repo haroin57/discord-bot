@@ -3,6 +3,8 @@
 import uuid
 from dataclasses import dataclass
 
+from services.claude_api.errors import REFUSAL_NOTICE_PREFIX
+
 
 @dataclass
 class AgentLoopResult:
@@ -35,11 +37,38 @@ def _model_display(m: str) -> str:
     ml = (m or "").lower()
     if "opus-4-8" in ml:
         return "Opus 4.8"
+    if "opus-5-5" in ml:
+        return "Opus 5.5"
     if "opus" in ml:
         return "Opus"
     if "fable" in ml:
         return "Fable 5"
     return m or "?"
+
+
+def _refusal_notice(*, model: str = "", request_id: str = "") -> str:
+    """The user-facing note for a turn that ended at stop_reason=refusal.
+
+    Replaces the bare "(no response)" sentinel, which looked like a bot bug or
+    a dropped message: a refusal is a content classifier ending the stream, so
+    retrying the same text verbatim stops at the same place. The request id is
+    included because it is the only handle for diagnosing it afterwards.
+    """
+    note = (
+        f"{REFUSAL_NOTICE_PREFIX}（stop_reason=refusal）。"
+        "同じ文面を送り直しても同じところで止まります。"
+    )
+    detail = " ・ ".join(
+        part
+        for part in (
+            f"model={_model_display(model)}" if model else "",
+            f"request_id={request_id}" if request_id else "",
+        )
+        if part
+    )
+    if detail:
+        note += f"\n-# {detail}"
+    return note
 
 
 def _fallback_alert(model: str) -> str:
@@ -50,7 +79,7 @@ def _fallback_alert(model: str) -> str:
     (streaming) and the text prepend (non-streaming).
     """
     return (
-        f"> ⚠️ **Fable 5 が応答を拒否したため {_model_display(model)} に"
+        f"> ⚠️ **応答が拒否されたため {_model_display(model)} に"
         "フォールバックしました**"
     )
 

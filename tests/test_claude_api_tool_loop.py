@@ -1285,7 +1285,9 @@ class TestRefusalLogging:
 
 
 class TestRefusalFallback:
-    """Fable 5 refusal -> Opus 4.8 fallback, surfaced (not silent)."""
+    """Refusal -> Opus 4.8 fallback, surfaced (not silent). Model-agnostic
+    since 2026-10-15: Opus 5.5 refuses too, so the leg is driven purely by
+    "a different fallback target exists"."""
 
     @staticmethod
     def _client(*responses):
@@ -1317,7 +1319,7 @@ class TestRefusalFallback:
         assert result.fallback_model == "claude-opus-4-8"
         assert "opus answer" in result.text
         # non-streaming -> note prepended into the returned text
-        assert "Fable 5 が応答を拒否" in result.text
+        assert "応答が拒否されたため Opus 4.8" in result.text
         # the retry used the fallback model
         assert models == ["claude-fable-5", "claude-opus-4-8"]
 
@@ -1332,7 +1334,10 @@ class TestRefusalFallback:
             refusal_fallback_model=None,
         )
         assert result.fallback_model is None
-        assert result.text == "(no response)"
+        # No target to retry on, but the user still gets told WHY (2026-10-15):
+        # the bare "(no response)" sentinel was indistinguishable from a bug.
+        assert "stop_reason=refusal" in result.text
+        assert result.text != "(no response)"
         assert models == ["claude-fable-5"]  # no retry
 
     @pytest.mark.asyncio
@@ -1355,9 +1360,9 @@ class TestRefusalFallback:
             refusal_fallback_model="claude-opus-4-8",
         )
         # note delivered live; NOT duplicated into the returned text
-        assert any("Fable 5 が応答を拒否" in s for s in sent)
+        assert any("応答が拒否されたため Opus 4.8" in s for s in sent)
         assert "opus answer" in result.text
-        assert "Fable 5 が応答を拒否" not in result.text
+        assert "応答が拒否されたため Opus 4.8" not in result.text
         assert result.fallback_model == "claude-opus-4-8"
 
     @pytest.mark.asyncio
@@ -1375,8 +1380,104 @@ class TestRefusalFallback:
         )
         # one fallback only — no infinite loop
         assert models == ["claude-fable-5", "claude-opus-4-8"]
-        assert result.text == "(no response)"
+        assert "stop_reason=refusal" in result.text
+        assert "Opus 4.8" in result.text  # names the model that refused last
         assert result.fallback_model == "claude-opus-4-8"
+
+
+class TestRefusalNotice:
+    """2026-10-15: an unrecoverable refusal must say so. It used to return the
+    bare "(no response)" sentinel, which is indistinguishable from a dropped
+    message or a crashed bot — the real incident (ch=1498907350755708968) took
+    a journal dig to explain."""
+
+    @staticmethod
+    def _client(*responses):
+        it = iter(responses)
+        client = MagicMock()
+
+        def factory(**kwargs):
+            events, final = next(it)
+            return _FakeStream(events, final)
+
+        client.beta.messages.stream = factory
+        return client
+
+    @pytest.mark.asyncio
+    async def test_notice_replaces_no_response_sentinel(self, watchdog):
+        client = self._client(([], _final_msg([], "refusal")))
+        result = await run_agent_loop(
+            "hi", channel_id=1, history=[], system_prompt="sys", tools_for_api=[],
+            can_use_tool=_allow_all, execute_tool=AsyncMock(),
+            status_callback=_noop_status, max_turns=5, stall_watchdog=watchdog,
+            api_client=client, model="claude-opus-5-5", extra_betas=[],
+            refusal_fallback_model=None,
+        )
+        assert "stop_reason=refusal" in result.text
+        assert "Opus 5.5" in result.text
+        assert result.text != "(no response)"
+
+    @pytest.mark.asyncio
+    async def test_partial_prose_is_kept_and_notice_sent_live(self, watchdog):
+        sent = []
+
+        async def inc(text):
+            sent.append(text)
+
+        client = self._client(
+            ([], _final_msg([_block("text", text="ここまでは答えました")], "refusal")),
+        )
+        result = await run_agent_loop(
+            "hi", channel_id=1, history=[], system_prompt="sys", tools_for_api=[],
+            can_use_tool=_allow_all, execute_tool=AsyncMock(),
+            status_callback=_noop_status, incremental_text_callback=inc,
+            max_turns=5, stall_watchdog=watchdog, api_client=client,
+            model="claude-opus-5-5", extra_betas=[], refusal_fallback_model=None,
+        )
+        # the prose survives, and the notice goes out through the live channel
+        # instead of being duplicated into the returned text
+        assert "ここまでは答えました" in result.text
+        assert any("stop_reason=refusal" in text for text in sent)
+        assert "stop_reason=refusal" not in result.text
+
+    @pytest.mark.asyncio
+    async def test_max_tokens_stop_is_not_labelled_a_refusal(self, watchdog):
+        client = self._client(([], _final_msg([], "max_tokens")))
+        result = await run_agent_loop(
+            "hi", channel_id=1, history=[], system_prompt="sys", tools_for_api=[],
+            can_use_tool=_allow_all, execute_tool=AsyncMock(),
+            status_callback=_noop_status, max_turns=5, stall_watchdog=watchdog,
+            api_client=client, model="claude-opus-5-5", extra_betas=[],
+            refusal_fallback_model=None,
+        )
+        assert result.text == "(no response)"
+
+
+class TestSnapshotModelIdIsNotAFallback:
+    """The server-side fallback detector used to treat any `message.model`
+    differing from the requested id as a fallback. With the refusal leg now
+    active on Opus, an API that echoes a dated snapshot id for the SAME model
+    would announce a fallback that never happened."""
+
+    @pytest.mark.asyncio
+    async def test_dated_snapshot_of_same_model_is_not_a_fallback(self, watchdog):
+        final = SimpleNamespace(
+            content=[_block("text", text="answer")],
+            stop_reason="end_turn",
+            model="claude-opus-5-5-20260601",
+        )
+        client = MagicMock()
+        client.beta.messages.stream = lambda **kw: _FakeStream([], final)
+        result = await run_agent_loop(
+            "hi", channel_id=1, history=[], system_prompt="sys", tools_for_api=[],
+            can_use_tool=_allow_all, execute_tool=AsyncMock(),
+            status_callback=_noop_status, max_turns=1, stall_watchdog=watchdog,
+            api_client=client, model="claude-opus-5-5", extra_betas=[],
+            refusal_fallback_model="claude-opus-4-8",
+        )
+        assert result.fallback_model is None
+        assert "フォールバック" not in result.text
+        assert "answer" in result.text
 
 
 class TestTextInvokeCorrection:

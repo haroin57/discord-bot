@@ -1067,7 +1067,10 @@ def test_release_consumer_units_share_generation_and_health_ports_are_unique():
         ports.append(expected)
         assert "OAUTH_PRIMARY_CREDENTIALS_PATH=" in text
         assert "OAUTH_FAILOVER_CREDENTIALS_PATH=" in text
-        assert "Environment=OAUTH_FAILOVER_ENABLED=true" in text
+        # Failover is off by default since 2026-11-10: the standby credential
+        # sat expired for four months, so the leg promised a switch target it
+        # could not deliver (ADR-0055).
+        assert "Environment=OAUTH_FAILOVER_ENABLED=false" in text
         assert text.index("EnvironmentFile=") < text.index(
             f"Environment=WEB_API_PORT={expected}"
         )

@@ -96,9 +96,16 @@ FAILOVER_CREDENTIALS_PATH = os.environ.get(
 )
 # 切替機能のフラグ（OAUTH_NO_REFRESH と同じく env 直読み — config より前に
 # import されるモジュールなので config 依存を作らない）
+#
+# 既定 false（2026-11-10）。failover credential は 2026-07-18 から期限切れのまま
+# 4 ヶ月放置され、誰も気付かなかった。更新されない待機アカウントは「切替先がある」
+# という誤った安心を与えるだけで、実際の障害（11/09 の refresh token rotation 衝突）
+# では一切役に立たない。機構そのものは残す（別契約アカウントを用意して
+# OAUTH_FAILOVER_ENABLED=true を渡せば即復活する）が、既定では使わない。
+# 切替の代わりに、認証が死んだ事実と対処を auth エラーメッセージで明示する。
 OAUTH_FAILOVER_ENABLED = os.environ.get(
     "OAUTH_FAILOVER_ENABLED",
-    "true",
+    "false",
 ).lower() not in ("0", "false", "no", "off", "")
 # 切替状態の永続先。checkout は read-only のため、必ず外部 state root を使う。
 _OAUTH_STATE_DIR = os.environ.get(
@@ -270,6 +277,23 @@ def _credential_readiness(account: _AccountState) -> tuple[bool, str | None]:
     if expires_at <= int(time.time() * 1000) + EXPIRY_BUFFER_MS:
         return False, "access_token_expired"
     return True, None
+
+
+def _failover_log_state(loaded_ok: bool) -> str:
+    """Describe the failover leg for the init log.
+
+    The old log printed ``failover_available=<file was readable>``, which read
+    as "a switch target exists" even when the credential had been expired for
+    months (2026-07-18 → 2026-11-10, nobody noticed). Report what actually
+    decides a switch: whether the leg is enabled at all, and whether the
+    credential would pass the readiness check.
+    """
+    if not OAUTH_FAILOVER_ENABLED:
+        return "disabled"
+    if not loaded_ok:
+        return "unreadable"
+    ready, reason = _credential_readiness(_accounts["failover"])
+    return "ready" if ready else f"unusable({reason})"
 
 
 def oauth_status_detail() -> dict:
@@ -1021,11 +1045,11 @@ def init() -> bool:
     acct = _acct()
     expired_str = "EXPIRED" if _is_expired(acct) else "valid"
     log.info(
-        "OAuth loaded — active=%s token %s, expires_at=%d, failover_available=%s",
+        "OAuth loaded — active=%s token %s, expires_at=%d, failover=%s",
         _active,
         expired_str,
         acct.expires_at,
-        failover_ok,
+        _failover_log_state(failover_ok),
     )
 
     return True

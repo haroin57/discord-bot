@@ -414,3 +414,61 @@ class TestSpeakerLabels:
         finally:
             monkeypatch.delenv("SPEAKER_LABELS", raising=False)
             importlib.reload(config)
+
+
+class TestRefusalFallbackTarget:
+    """2026-10-15: the refusal fallback is model-agnostic. Opus 5.5 also ends
+    turns at stop_reason=refusal, and the old `"fable" in model` guard made
+    those refusals silent ("(no response)", no retry)."""
+
+    def test_opus_primary_gets_a_target(self):
+        from config import refusal_fallback_target
+
+        assert refusal_fallback_target("claude-opus-5-5") == "claude-opus-4-8"
+        assert refusal_fallback_target("claude-fable-5-1") == "claude-opus-4-8"
+
+    def test_never_falls_a_model_onto_itself(self):
+        from config import refusal_fallback_target
+
+        assert refusal_fallback_target("claude-opus-4-8") is None
+        # dated snapshot of the same model is still the same model
+        assert refusal_fallback_target("claude-opus-4-8-20260115") is None
+
+    def test_disabled_or_unset_yields_no_target(self, monkeypatch):
+        import config
+
+        monkeypatch.setattr(config, "FABLE_REFUSAL_FALLBACK_ENABLED", False)
+        assert config.refusal_fallback_target("claude-opus-5-5") is None
+        monkeypatch.setattr(config, "FABLE_REFUSAL_FALLBACK_ENABLED", True)
+        monkeypatch.setattr(config, "FABLE_REFUSAL_FALLBACK_MODEL", "")
+        assert config.refusal_fallback_target("claude-opus-5-5") is None
+
+    def test_models_equivalent_tolerates_snapshot_ids(self):
+        from config import models_equivalent
+
+        assert models_equivalent("claude-opus-5-5", "claude-opus-5-5-20260601")
+        assert not models_equivalent("claude-opus-5-5", "claude-opus-4-8")
+        assert not models_equivalent("", "claude-opus-4-8")
+
+
+class TestServerSideFallbackSupport:
+    """The `fallbacks` body field is per-family: Opus 4.8 400s on it, Opus 5.5
+    is unverified, so only verified families declare it (the client-side retry
+    covers the rest)."""
+
+    def test_only_verified_families_declare_fallbacks(self):
+        from config import server_side_fallback_supported
+
+        assert server_side_fallback_supported("claude-fable-5-1") is True
+        assert server_side_fallback_supported("claude-opus-5-5") is False
+        assert server_side_fallback_supported("claude-opus-4-8") is False
+        assert server_side_fallback_supported("") is False
+
+    def test_prefix_list_is_configurable(self, monkeypatch):
+        import config
+
+        monkeypatch.setattr(
+            config, "SERVER_SIDE_FALLBACK_MODEL_PREFIXES", ("claude-opus-5-5",)
+        )
+        assert config.server_side_fallback_supported("claude-opus-5-5") is True
+        assert config.server_side_fallback_supported("claude-fable-5-1") is False
