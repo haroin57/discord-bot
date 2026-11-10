@@ -24,13 +24,30 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-tests
       - name: Audit locked Python dependencies
-        # No patched stable release exists within the supported major version
-        # for these advisories. Keep each temporary exception explicit so any
-        # newly discovered vulnerability still fails the job.
+        # Keep each exception explicit so a newly discovered vulnerability
+        # still fails the job. Anything with an installable fix is taken into
+        # requirements.lock instead of being listed here.
+        # 2026-11-10 batch: aiohttp 3.14.4 (+ yarl 1.25.1, which it requires),
+        # certifi, msgpack, mcp 1.30.0, pillow 13, filelock 4, oauthlib 4.0.1
+        # and the opentelemetry set realigned on 1.45.1 / semconv 0.66b1.
+        # oauthlib no longer needs an exception. What remains has no
+        # installable fix at all:
+        #   PYSEC-2026-311, PYSEC-2026-3813/3814/3815  chromadb 1.5.9 -> NO
+        #     fixed release exists; chromadb is pinned by the Mem0 vector store.
+        #   PYSEC-2026-2636  mem0ai 1.0.11 -> only 2.0.0b2, a pre-release.
+        #   PYSEC-2026-3552/3553/3554  cryptography 48.0.1 -> 49/50 (two major
+        #     bumps). It underpins TLS, OAuth and JWT paths, so the upgrade
+        #     needs its own verification pass instead of riding a bugfix PR.
         run: >-
           python -m pip_audit -r requirements.lock --strict
           --ignore-vuln PYSEC-2026-311
           --ignore-vuln PYSEC-2026-2636
+          --ignore-vuln PYSEC-2026-3813
+          --ignore-vuln PYSEC-2026-3814
+          --ignore-vuln PYSEC-2026-3815
+          --ignore-vuln PYSEC-2026-3552
+          --ignore-vuln PYSEC-2026-3553
+          --ignore-vuln PYSEC-2026-3554
       - name: Bandit static scan
         # Fixed /tmp paths are an intentional deployment convention and are
         # separately constrained by attachment and render-store policies.
