@@ -128,6 +128,8 @@ if _alpha_enabled():
         format_history_for_prompt,
         format_memories_for_prompt,
         search_memories,
+        search_memories_at_time,
+        search_memories_hybrid,
         search_memories_multi,
         search_memories_smart,
         should_use_memory_llm_mode,
@@ -188,3 +190,6 @@ __all__ = [
     "search_memories_smart",
     "should_use_memory_llm_mode",
 ]
+
+if _alpha_enabled():
+    __all__ += ["search_memories_at_time", "search_memories_hybrid"]

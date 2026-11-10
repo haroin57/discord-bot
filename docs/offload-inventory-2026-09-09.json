@@ -1,0 +1,8426 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-09T13:36:07.628024+00:00",
+  "method": "Python AST inventory; flags require manual review; no runtime attribution inferred",
+  "counts": {
+    "application": 210,
+    "script": 54,
+    "test": 157
+  },
+  "python_lines": 140719,
+  "other_code_and_deploy_files": [
+    ".github/actions/setup-tests/action.yml",
+    ".github/workflows/lint.yml",
+    ".github/workflows/notify-ci-failure.yml",
+    ".github/workflows/notify-push.yml",
+    ".github/workflows/offload.yml",
+    ".github/workflows/release.yml",
+    ".github/workflows/security.yml",
+    ".github/workflows/test.yml",
+    "deploy/offload/intervention-scheduler.timer",
+    "deploy/offload/knowledge.service",
+    "deploy/offload/vi-signal-scheduler.timer",
+    "deploy/systemd/discord-bot-dev.service",
+    "deploy/systemd/discord-bot-kanae-claude.service",
+    "deploy/systemd/discord-bot.service",
+    "deploy/systemd/hermes-discord-codex.service",
+    "deploy/systemd/intervention-scheduler.service",
+    "deploy/systemd/remote-opencode.service",
+    "deploy/systemd/vi-signal-scheduler.service",
+    "infra/oracle-patches/0.15.0/files/dist/src/mcp/tools/consult.js",
+    "infra/oracle-patches/0.15.0/files/dist/src/mcp/types.js",
+    "infra/oracle-patches/0.15.0/files/dist/src/mcp/utils.js",
+    "infra/oracle-patches/0.15.0/files/dist/src/oracle/run.js",
+    "infra/oracle-patches/0.15.0/files/dist/src/sessionManager.js",
+    "infra/supergateway-patches/3.4.3/files/dist/gateways/stdioToSse.js",
+    "infra/supergateway-patches/3.4.3/files/dist/gateways/stdioToStatefulStreamableHttp.js",
+    "infra/supergateway-patches/3.4.3/files/dist/gateways/stdioToStatelessStreamableHttp.js",
+    "infra/systemd/chromadb-server.service",
+    "infra/systemd/discord-bot-autodeploy.service",
+    "infra/systemd/discord-bot-autodeploy.timer",
+    "infra/systemd/discord-bot-dev-autodeploy.service",
+    "infra/systemd/discord-bot-dev-autodeploy.timer",
+    "infra/systemd/kanae-mcp-forward.service",
+    "infra/systemd/kanae-systemd-forward.service",
+    "infra/systemd/mcp-mem0-shared.service",
+    "infra/systemd/mcp-oracle-shared.service",
+    "infra/systemd/mcp-second-opinion-shared.service",
+    "infra/systemd/mcp-x-scraper-shared.service",
+    "pyproject.toml",
+    "scripts/auto_deploy.sh",
+    "scripts/backup_state.sh",
+    "scripts/bot-deploy.sh",
+    "scripts/bot-rollback.sh",
+    "scripts/error_rate_monitor.sh",
+    "scripts/install-hooks.sh",
+    "scripts/mem0_oracle_watch.sh",
+    "scripts/mem_pressure_alert.sh",
+    "scripts/monthly_kanae_audit.sh",
+    "scripts/oracle_apply_patches.sh",
+    "scripts/oracle_mcp_launch.sh",
+    "scripts/oracle_supergateway_launch.sh",
+    "scripts/reap_mcp_orphans.sh",
+    "scripts/refresh_cli_identity.sh",
+    "scripts/release_artifact_lib.sh",
+    "scripts/release_gate.sh",
+    "scripts/release_publisher.sh",
+    "scripts/smoke_bot.sh",
+    "scripts/snapshot_client.sh",
+    "scripts/snapshot_helper.sh",
+    "scripts/snapshot_state.sh",
+    "scripts/supergateway_apply_patches.sh",
+    "tests/taxonomy.toml",
+    "utils/_render_daemon.js",
+    "workers/archive/src/index.ts",
+    "workers/archive/test/archive.test.mjs",
+    "workers/archive/wrangler.jsonc"
+  ],
+  "files": [
+    {
+      "path": "bot.py",
+      "lines": 1559,
+      "imports": [
+        "aiohttp",
+        "asyncio",
+        "bot_commands",
+        "bot_pipeline",
+        "bot_pipeline.fifo",
+        "bot_pipeline.runtime",
+        "bot_pipeline.turn_outbox",
+        "bot_preprocess",
+        "bot_record",
+        "bot_ui",
+        "collections",
+        "config",
+        "ctypes",
+        "ctypes.util",
+        "discord",
+        "discord.ext",
+        "gc",
+        "io",
+        "logging",
+        "os",
+        "re",
+        "services",
+        "services.claude_api",
+        "services.codex_app_server",
+        "services.correlation",
+        "services.job_state",
+        "services.mem0",
+        "services.oauth_manager",
+        "services.prompt_builder",
+        "services.provider_router",
+        "services.rate_limit",
+        "services.sentinel",
+        "services.session",
+        "services.skills",
+        "time",
+        "types",
+        "utils.attachments",
+        "utils.browser_pool",
+        "utils.discord_helpers",
+        "utils.markdown_parser",
+        "utils.math_presentation",
+        "utils.math_renderer",
+        "utils.response_sanitizer",
+        "utils.table_renderer",
+        "uuid"
+      ],
+      "signals": {
+        "background_or_thread": [
+          385,
+          395,
+          406,
+          712,
+          1080,
+          1549
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/__init__.py",
+      "lines": 37,
+      "imports": [
+        "__future__",
+        "bot_commands",
+        "bot_commands._deps"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/_deps.py",
+      "lines": 57,
+      "imports": [
+        "__future__",
+        "bot_commands.services",
+        "bot_commands.state",
+        "dataclasses",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/archive.py",
+      "lines": 134,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "bot_commands._deps",
+        "bot_commands.guards",
+        "bot_commands.responses",
+        "config",
+        "discord",
+        "os",
+        "pathlib",
+        "services",
+        "tempfile"
+      ],
+      "signals": {
+        "background_or_thread": [
+          35,
+          81,
+          121,
+          122
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/btw.py",
+      "lines": 140,
+      "imports": [
+        "__future__",
+        "bot_commands._deps",
+        "bot_commands.guards",
+        "bot_commands.responses",
+        "bot_commands.services",
+        "bot_commands.state",
+        "discord",
+        "logging"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/free_code_slash.py",
+      "lines": 225,
+      "imports": [
+        "__future__",
+        "bot_commands._deps",
+        "bot_commands.state",
+        "discord",
+        "free_code_commands",
+        "logging",
+        "services.free_code_bridge",
+        "services.provider_router",
+        "services.session",
+        "services.skills"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/guards.py",
+      "lines": 39,
+      "imports": [
+        "__future__",
+        "bot_commands.responses",
+        "dataclasses",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/mcp.py",
+      "lines": 413,
+      "imports": [
+        "__future__",
+        "bot_commands._deps",
+        "bot_commands.guards",
+        "bot_commands.responses",
+        "discord",
+        "free_code_commands",
+        "free_code_commands.runtime",
+        "free_code_commands.types",
+        "logging",
+        "services.mcp_control",
+        "services.session",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/memory.py",
+      "lines": 172,
+      "imports": [
+        "__future__",
+        "bot_commands._deps",
+        "discord",
+        "services.mem0",
+        "utils.discord_helpers"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/misc.py",
+      "lines": 105,
+      "imports": [
+        "__future__",
+        "bot_commands._deps",
+        "config",
+        "discord",
+        "services",
+        "services.job_state"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/model_cmds.py",
+      "lines": 225,
+      "imports": [
+        "__future__",
+        "bot_commands._deps",
+        "bot_commands.state",
+        "discord"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/prefix.py",
+      "lines": 212,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "datetime",
+        "discord",
+        "logging"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/responses.py",
+      "lines": 56,
+      "imports": [
+        "__future__",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/services.py",
+      "lines": 89,
+      "imports": [
+        "__future__",
+        "dataclasses",
+        "services.claude_api.client_factory",
+        "services.claude_api.side_question",
+        "services.provider_router",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/session_cmds.py",
+      "lines": 218,
+      "imports": [
+        "__future__",
+        "bot_commands._deps",
+        "bot_commands.guards",
+        "bot_commands.responses",
+        "bot_commands.state",
+        "config",
+        "discord",
+        "logging",
+        "os",
+        "services.claude_api.client_factory",
+        "services.claude_api.compaction",
+        "services.codex_app_server.manager",
+        "services.provider_router",
+        "services.session"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/skills.py",
+      "lines": 326,
+      "imports": [
+        "__future__",
+        "bot_commands._deps",
+        "bot_commands.state",
+        "discord",
+        "logging",
+        "services.skills"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_commands/state.py",
+      "lines": 124,
+      "imports": [
+        "__future__",
+        "collections.abc",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_pipeline/__init__.py",
+      "lines": 1,
+      "imports": [],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_pipeline/admission.py",
+      "lines": 293,
+      "imports": [
+        "__future__",
+        "dataclasses",
+        "logging",
+        "re",
+        "time",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_pipeline/attachment_types.py",
+      "lines": 42,
+      "imports": [
+        "__future__",
+        "dataclasses"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_pipeline/context.py",
+      "lines": 351,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "bot_pipeline.admission",
+        "bot_pipeline.attachment_types",
+        "dataclasses",
+        "logging",
+        "typing"
+      ],
+      "signals": {
+        "background_or_thread": [
+          268
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "bot_pipeline/fifo.py",
+      "lines": 115,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "collections",
+        "dataclasses"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_pipeline/model.py",
+      "lines": 287,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "dataclasses",
+        "logging",
+        "services.claude_api.ask_bridge",
+        "services.claude_api.router",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "bot_pipeline/prompt.py",
+      "lines": 679,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "bot_pipeline.attachment_types",
+        "config",
+        "dataclasses",
+        "logging",
+        "services.invest_kb.search",
+        "typing",
+        "utils.context_gateway"
+      ],
+      "signals": {
+        "background_or_thread": [
+          315
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "bot_pipeline/publish.py",
+      "lines": 585,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "dataclasses",
+        "discord",
+        "inspect",
+        "io",
+        "logging",
+        "os",
+        "typing",
+        "utils.markdown_parser",
+        "utils.math_presentation"
+      ],
+      "signals": {
+        "background_or_thread": [
+          170,
+          434,
+          445,
+          557
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "bot_pipeline/record.py",
+      "lines": 109,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "logging",
+        "re",
+        "time",
+        "typing"
+      ],
+      "signals": {
+        "background_or_thread": [
+          69
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "bot_pipeline/runtime.py",
+      "lines": 268,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "collections.abc",
+        "os",
+        "typing"
+      ],
+      "signals": {
+        "background_or_thread": [
+          117,
+          249
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "bot_pipeline/turn_outbox.py",
+      "lines": 447,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "collections.abc",
+        "copy",
+        "hashlib",
+        "json",
+        "logging",
+        "os",
+        "shutil",
+        "threading",
+        "time",
+        "typing",
+        "utils.atomic_write"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          63
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "bot_preprocess.py",
+      "lines": 366,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "dataclasses",
+        "discord",
+        "logging",
+        "services.invest_kb",
+        "services.mem0",
+        "typing"
+      ],
+      "signals": {
+        "background_or_thread": [
+          329,
+          345
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "bot_record.py",
+      "lines": 129,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "discord",
+        "logging",
+        "services.mem0.batch",
+        "typing"
+      ],
+      "signals": {
+        "background_or_thread": [
+          58,
+          75,
+          86
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "bot_ui.py",
+      "lines": 974,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "discord",
+        "inspect",
+        "logging",
+        "os",
+        "services.claude_api.progress",
+        "services.claude_api.spinner_gif",
+        "services.claude_api.status",
+        "services.correlation",
+        "services.job_state",
+        "time",
+        "utils.markdown_parser",
+        "utils.math_presentation",
+        "utils.math_renderer",
+        "utils.response_sanitizer",
+        "utils.table_renderer"
+      ],
+      "signals": {
+        "background_or_thread": [
+          378,
+          619,
+          713
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "config/__init__.py",
+      "lines": 2129,
+      "imports": [
+        "config.paths",
+        "os",
+        "re",
+        "services.offload.mcp_config",
+        "warnings"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "config/paths.py",
+      "lines": 205,
+      "imports": [
+        "dataclasses",
+        "os",
+        "pathlib",
+        "services.runtime_bootstrap",
+        "tempfile",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "free_code_commands/__init__.py",
+      "lines": 70,
+      "imports": [
+        "_all",
+        "registry",
+        "runtime",
+        "shell",
+        "types"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "free_code_commands/_all.py",
+      "lines": 61,
+      "imports": [
+        "__future__",
+        "commands",
+        "registry"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "free_code_commands/commands/__init__.py",
+      "lines": 10,
+      "imports": [],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "free_code_commands/commands/feature_gated.py",
+      "lines": 121,
+      "imports": [
+        "__future__",
+        "registry",
+        "runtime",
+        "types"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "free_code_commands/commands/internal_commands.py",
+      "lines": 84,
+      "imports": [
+        "__future__",
+        "registry",
+        "runtime",
+        "types"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "free_code_commands/commands/jsx_commands.py",
+      "lines": 465,
+      "imports": [
+        "__future__",
+        "registry",
+        "runtime",
+        "types"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "free_code_commands/commands/local_commands.py",
+      "lines": 752,
+      "imports": [
+        "__future__",
+        "re",
+        "registry",
+        "runtime",
+        "types"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "free_code_commands/commands/prompt_commands.py",
+      "lines": 606,
+      "imports": [
+        "__future__",
+        "frontmatter",
+        "pathlib",
+        "registry",
+        "runtime",
+        "shell",
+        "types",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "free_code_commands/frontmatter.py",
+      "lines": 69,
+      "imports": [
+        "__future__",
+        "re",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "free_code_commands/registry.py",
+      "lines": 482,
+      "imports": [
+        "__future__",
+        "collections",
+        "collections.abc",
+        "dataclasses",
+        "inspect",
+        "runtime",
+        "types",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "free_code_commands/runtime.py",
+      "lines": 718,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "dataclasses",
+        "os",
+        "platform",
+        "services.mcp_control",
+        "shutil",
+        "sys",
+        "typing"
+      ],
+      "signals": {
+        "process_spawn": [
+          164
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "free_code_commands/shell.py",
+      "lines": 136,
+      "imports": [
+        "__future__",
+        "re",
+        "runtime",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "free_code_commands/types.py",
+      "lines": 185,
+      "imports": [
+        "__future__",
+        "dataclasses",
+        "enum",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "main.py",
+      "lines": 224,
+      "imports": [
+        "bot",
+        "logging",
+        "logging.handlers",
+        "os",
+        "queue",
+        "services.runtime_bootstrap"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "main_async.py",
+      "lines": 588,
+      "imports": [
+        "asyncio",
+        "bot",
+        "logging",
+        "logging.handlers",
+        "os",
+        "queue",
+        "services",
+        "services.health_server",
+        "services.runtime_bootstrap",
+        "services.runtime_state",
+        "services.structured_log",
+        "signal",
+        "typing"
+      ],
+      "signals": {
+        "background_or_thread": [
+          232,
+          307,
+          328,
+          345,
+          346,
+          347,
+          365
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "mcp_mem0_server.py",
+      "lines": 276,
+      "imports": [
+        "asyncio",
+        "dotenv",
+        "logging",
+        "mcp.server.fastmcp",
+        "os",
+        "re",
+        "services.mem0",
+        "sys"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "mem0_hook_daemon.py",
+      "lines": 49,
+      "imports": [
+        "asyncio",
+        "os",
+        "services.mem0.format",
+        "services.mem0.search",
+        "sys"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "mem0_hook_search.py",
+      "lines": 35,
+      "imports": [
+        "socket",
+        "sys"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          15
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "scripts/apply_cli_identity.py",
+      "lines": 173,
+      "imports": [
+        "__future__",
+        "json",
+        "mitmproxy",
+        "pathlib",
+        "re",
+        "sys"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          129,
+          160
+        ],
+        "whole_object_materialization": [
+          119,
+          158
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/audit_kanae_facts.py",
+      "lines": 359,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "dataclasses",
+        "discord",
+        "dotenv",
+        "json",
+        "logging",
+        "numpy",
+        "openai",
+        "os",
+        "pathlib",
+        "services.mem0",
+        "services.mem0.cli_compat",
+        "services.mem0.client",
+        "sys"
+      ],
+      "signals": {
+        "background_or_thread": [
+          265,
+          268,
+          332
+        ],
+        "native_or_heavy_import": [
+          46
+        ],
+        "storage_or_native_io": [
+          312
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/audit_offload.py",
+      "lines": 127,
+      "imports": [
+        "__future__",
+        "argparse",
+        "ast",
+        "collections",
+        "datetime",
+        "json",
+        "pathlib",
+        "subprocess"
+      ],
+      "signals": {
+        "process_spawn": [
+          76,
+          104
+        ],
+        "storage_or_native_io": [
+          120
+        ],
+        "whole_object_materialization": [
+          69
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/build_history_bm25_index.py",
+      "lines": 98,
+      "imports": [
+        "__future__",
+        "argparse",
+        "config",
+        "json",
+        "logging",
+        "os",
+        "services.mem0",
+        "sys"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/build_mem0_bm25_index.py",
+      "lines": 117,
+      "imports": [
+        "__future__",
+        "argparse",
+        "config",
+        "logging",
+        "os",
+        "services.mem0",
+        "services.mem0.client",
+        "sys"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/check_release_gate.py",
+      "lines": 866,
+      "imports": [
+        "__future__",
+        "argparse",
+        "dataclasses",
+        "decimal",
+        "hashlib",
+        "hmac",
+        "json",
+        "os",
+        "pathlib",
+        "re",
+        "sqlite3",
+        "subprocess",
+        "tempfile",
+        "typing",
+        "urllib.parse",
+        "urllib.request"
+      ],
+      "signals": {
+        "process_spawn": [
+          170,
+          624,
+          663
+        ],
+        "storage_or_native_io": [
+          584,
+          609,
+          611,
+          612,
+          653,
+          658,
+          773
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/check_test_isolation.py",
+      "lines": 1106,
+      "imports": [
+        "__future__",
+        "ast",
+        "dataclasses",
+        "pathlib"
+      ],
+      "signals": {
+        "whole_object_materialization": [
+          1067
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/codex_app_server_canary.py",
+      "lines": 373,
+      "imports": [
+        "__future__",
+        "aiohttp",
+        "argparse",
+        "asyncio",
+        "config",
+        "json",
+        "os",
+        "pathlib",
+        "re",
+        "services.claude_api.ask_bridge",
+        "services.codex_app_server.manager",
+        "services.provider_router",
+        "shlex",
+        "sys",
+        "time",
+        "typing"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/codex_mcp_status.py",
+      "lines": 116,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "json",
+        "pathlib",
+        "services.codex_app_server.client",
+        "services.codex_app_server.manager",
+        "sys",
+        "typing"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/codex_tex_render_canary.py",
+      "lines": 136,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "json",
+        "pathlib",
+        "shutil",
+        "struct",
+        "sys",
+        "tempfile",
+        "typing",
+        "utils.browser_pool",
+        "utils.markdown_parser",
+        "utils.math_presentation",
+        "utils.math_renderer"
+      ],
+      "signals": {
+        "whole_object_materialization": [
+          38,
+          77
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/dump_mcp_tool_schemas.py",
+      "lines": 196,
+      "imports": [
+        "asyncio",
+        "config",
+        "contextlib",
+        "json",
+        "mcp",
+        "mcp.client.stdio",
+        "os",
+        "pathlib",
+        "pprint",
+        "sys"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          164
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/dynam_ueda_parser.py",
+      "lines": 366,
+      "imports": [
+        "__future__",
+        "argparse",
+        "csv",
+        "datetime",
+        "pathlib",
+        "re",
+        "requests",
+        "sys",
+        "time",
+        "typing"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/eval_case_worker.py",
+      "lines": 121,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "json",
+        "os",
+        "random",
+        "services.claude_api.entry",
+        "services.claude_api.router",
+        "services.session",
+        "sys",
+        "time"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/eval_invest_kb.py",
+      "lines": 207,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "datetime",
+        "json",
+        "logging",
+        "os",
+        "pathlib",
+        "services.invest_kb_eval.citation",
+        "services.invest_kb_eval.gate",
+        "services.invest_kb_eval.mcq",
+        "sys"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          196,
+          198
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/eval_invest_kb_e2e.py",
+      "lines": 332,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "datetime",
+        "json",
+        "logging",
+        "os",
+        "pathlib",
+        "re",
+        "services.invest_kb",
+        "services.invest_kb.search",
+        "services.mem0.cli_compat",
+        "services.mem0.client",
+        "sys"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/eval_mem0_memory.py",
+      "lines": 121,
+      "imports": [
+        "argparse",
+        "asyncio",
+        "collections",
+        "config",
+        "dotenv",
+        "json",
+        "os",
+        "services.mem0",
+        "services.mem0.search",
+        "sys",
+        "unittest"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/eval_mem0_recall_fixed.py",
+      "lines": 121,
+      "imports": [
+        "argparse",
+        "asyncio",
+        "dotenv",
+        "json",
+        "os",
+        "services.mem0",
+        "services.mem0.search",
+        "sys"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/eval_tool_loop.py",
+      "lines": 318,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "json",
+        "os",
+        "pathlib",
+        "re",
+        "services.mem0.cli_compat",
+        "services.mem0.client",
+        "subprocess",
+        "sys",
+        "time",
+        "yaml"
+      ],
+      "signals": {
+        "process_spawn": [
+          204
+        ],
+        "storage_or_native_io": [
+          203
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/ingest_channel_history.py",
+      "lines": 369,
+      "imports": [
+        "argparse",
+        "asyncio",
+        "datetime",
+        "discord",
+        "dotenv",
+        "logging",
+        "os",
+        "services.mem0.ingest",
+        "sys",
+        "time"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/ingest_invest_kb.py",
+      "lines": 640,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "datasets",
+        "datetime",
+        "html",
+        "json",
+        "logging",
+        "nbformat",
+        "os",
+        "pathlib",
+        "re",
+        "services.invest_kb.client",
+        "services.invest_kb.ingest",
+        "sys",
+        "time",
+        "urllib.parse",
+        "urllib.request"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/intervention_alert.py",
+      "lines": 172,
+      "imports": [
+        "__future__",
+        "argparse",
+        "datetime",
+        "dotenv",
+        "jpholiday",
+        "json",
+        "os",
+        "pathlib",
+        "requests",
+        "sys",
+        "warnings",
+        "yfinance"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/intraday_data.py",
+      "lines": 216,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "fisco_news",
+        "httpx",
+        "json",
+        "logging",
+        "sys",
+        "time",
+        "urllib.parse",
+        "yfj_parser"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/journal_forward.py",
+      "lines": 118,
+      "imports": [
+        "json",
+        "os",
+        "queue",
+        "subprocess",
+        "sys",
+        "threading",
+        "time",
+        "urllib.request"
+      ],
+      "signals": {
+        "process_spawn": [
+          80
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/mcp_log_forward.py",
+      "lines": 159,
+      "imports": [
+        "json",
+        "os",
+        "queue",
+        "re",
+        "subprocess",
+        "sys",
+        "threading",
+        "time",
+        "urllib.request"
+      ],
+      "signals": {
+        "process_spawn": [
+          118
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/measure_edit_ratelimit.py",
+      "lines": 73,
+      "imports": [
+        "aiohttp",
+        "asyncio",
+        "os",
+        "sys",
+        "time"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/mem0_backfill_attributes.py",
+      "lines": 198,
+      "imports": [
+        "argparse",
+        "asyncio",
+        "config",
+        "dotenv",
+        "json",
+        "logging",
+        "os",
+        "services.mem0",
+        "services.mem0.cli_compat",
+        "services.mem0.client",
+        "services.mem0.extract",
+        "sys"
+      ],
+      "signals": {
+        "background_or_thread": [
+          149,
+          165
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/mem0_backfill_taxonomy.py",
+      "lines": 146,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "dotenv",
+        "os",
+        "services.mem0.client",
+        "services.mem0.extract",
+        "services.oauth_manager",
+        "sys"
+      ],
+      "signals": {
+        "background_or_thread": [
+          131
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/mem0_consolidate.py",
+      "lines": 408,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "collections",
+        "config",
+        "datetime",
+        "dotenv",
+        "logging",
+        "numpy",
+        "openai",
+        "os",
+        "pathlib",
+        "services.mem0",
+        "services.mem0.client",
+        "services.mem0.dedup",
+        "services.mem0.reinforce",
+        "sys",
+        "time"
+      ],
+      "signals": {
+        "background_or_thread": [
+          149,
+          215,
+          333,
+          357
+        ],
+        "native_or_heavy_import": [
+          37
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/mem0_maintenance.py",
+      "lines": 109,
+      "imports": [
+        "__future__",
+        "argparse",
+        "datetime",
+        "os",
+        "subprocess",
+        "sys"
+      ],
+      "signals": {
+        "process_spawn": [
+          56
+        ],
+        "storage_or_native_io": [
+          99
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/mem0_replay.py",
+      "lines": 85,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "dotenv",
+        "logging",
+        "pathlib",
+        "services.mem0.replay",
+        "sys"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/mem0_tier_decay.py",
+      "lines": 65,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "dotenv",
+        "logging",
+        "pathlib",
+        "services.mem0.decay",
+        "sys"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/merge_entities.py",
+      "lines": 432,
+      "imports": [
+        "__future__",
+        "argparse",
+        "difflib",
+        "dotenv",
+        "json",
+        "logging",
+        "pathlib",
+        "services.mem0",
+        "services.mem0.graph",
+        "sys",
+        "time"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          55,
+          65,
+          190,
+          197,
+          211,
+          218,
+          229,
+          235,
+          241,
+          247,
+          275,
+          279,
+          292,
+          293,
+          295,
+          297,
+          298,
+          320,
+          337
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/monthly_nikkei_vi_proxy.py",
+      "lines": 173,
+      "imports": [
+        "datetime",
+        "japanize_matplotlib",
+        "matplotlib.collections",
+        "matplotlib.pyplot",
+        "numpy",
+        "pandas",
+        "pathlib",
+        "yfinance"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          17,
+          18,
+          19,
+          21
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/orderbook_monitor.py",
+      "lines": 248,
+      "imports": [
+        "datetime",
+        "json",
+        "os",
+        "pathlib",
+        "requests",
+        "sys",
+        "zoneinfo"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          242
+        ],
+        "whole_object_materialization": [
+          46,
+          224
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/probe_advisor.py",
+      "lines": 96,
+      "imports": [
+        "asyncio",
+        "config",
+        "services.claude_api.client",
+        "services.claude_api.client_factory",
+        "services.claude_api.tool_catalog",
+        "services.claude_api.tool_loop",
+        "sys"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/probe_agy.py",
+      "lines": 94,
+      "imports": [
+        "asyncio",
+        "config",
+        "os",
+        "services.claude_api.agy_runner",
+        "shutil",
+        "sys"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/probe_tool_search.py",
+      "lines": 98,
+      "imports": [
+        "asyncio",
+        "config",
+        "services.claude_api.client",
+        "services.claude_api.client_factory",
+        "services.claude_api.entry",
+        "services.claude_api.errors",
+        "services.claude_api.tool_catalog",
+        "services.claude_api.tool_loop",
+        "sys"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/r2_archive.py",
+      "lines": 53,
+      "imports": [
+        "__future__",
+        "argparse",
+        "json",
+        "os",
+        "pathlib",
+        "services",
+        "sys"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/reingest_from_jsonl.py",
+      "lines": 184,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "datetime",
+        "dotenv",
+        "json",
+        "logging",
+        "os",
+        "services.mem0.ingest",
+        "sys"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/run_test_lane.py",
+      "lines": 87,
+      "imports": [
+        "__future__",
+        "argparse",
+        "dataclasses",
+        "pathlib",
+        "re",
+        "subprocess",
+        "sys"
+      ],
+      "signals": {
+        "process_spawn": [
+          46
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/save_failover_credentials.py",
+      "lines": 103,
+      "imports": [
+        "argparse",
+        "json",
+        "os",
+        "shutil",
+        "sys"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          87
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/search_history.py",
+      "lines": 209,
+      "imports": [
+        "argparse",
+        "asyncio",
+        "collections",
+        "datetime",
+        "discord",
+        "dotenv",
+        "logging",
+        "os",
+        "re",
+        "sys"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/systemd_forward.py",
+      "lines": 139,
+      "imports": [
+        "json",
+        "os",
+        "queue",
+        "re",
+        "subprocess",
+        "sys",
+        "threading",
+        "time",
+        "urllib.request"
+      ],
+      "signals": {
+        "process_spawn": [
+          105
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/validate_kanae_audit.py",
+      "lines": 315,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "dotenv",
+        "json",
+        "logging",
+        "numpy",
+        "pathlib",
+        "re",
+        "scripts.audit_kanae_facts",
+        "services.mem0",
+        "services.mem0.cli_compat",
+        "services.mem0.client",
+        "sys"
+      ],
+      "signals": {
+        "background_or_thread": [
+          186,
+          273,
+          274
+        ],
+        "native_or_heavy_import": [
+          35
+        ],
+        "storage_or_native_io": [
+          310
+        ],
+        "whole_object_materialization": [
+          92
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/verify_cli_identity.py",
+      "lines": 157,
+      "imports": [
+        "__future__",
+        "anthropic",
+        "asyncio",
+        "config",
+        "json",
+        "pathlib",
+        "services.claude_api.client",
+        "services.oauth_manager",
+        "sys"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/verify_failover.py",
+      "lines": 78,
+      "imports": [
+        "aiohttp",
+        "asyncio",
+        "json",
+        "services.oauth_manager",
+        "sys"
+      ],
+      "signals": {},
+      "role": "script"
+    },
+    {
+      "path": "scripts/vi_fwd_record.py",
+      "lines": 171,
+      "imports": [
+        "__future__",
+        "argparse",
+        "datetime",
+        "io",
+        "jpholiday",
+        "json",
+        "pandas",
+        "pathlib",
+        "requests",
+        "sys",
+        "warnings",
+        "yfinance"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          28
+        ],
+        "storage_or_native_io": [
+          163
+        ],
+        "whole_object_materialization": [
+          109
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/vi_intraday_backtest.py",
+      "lines": 189,
+      "imports": [
+        "__future__",
+        "japanize_matplotlib",
+        "matplotlib",
+        "matplotlib.pyplot",
+        "numpy",
+        "pandas",
+        "pathlib",
+        "warnings",
+        "yfinance"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          37,
+          38,
+          137,
+          140
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/vi_intraday_real_backtest.py",
+      "lines": 103,
+      "imports": [
+        "__future__",
+        "io",
+        "numpy",
+        "pandas",
+        "urllib.request",
+        "warnings"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          36,
+          37
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/vi_proxy_backtest_check.py",
+      "lines": 83,
+      "imports": [
+        "__future__",
+        "numpy",
+        "pandas",
+        "warnings",
+        "yfinance"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          25,
+          26
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/vi_proxy_strategy_charts.py",
+      "lines": 127,
+      "imports": [
+        "japanize_matplotlib",
+        "matplotlib",
+        "matplotlib.collections",
+        "matplotlib.pyplot",
+        "numpy",
+        "pandas",
+        "pathlib",
+        "warnings",
+        "yfinance"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          18,
+          19,
+          21,
+          22,
+          49
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/vi_signal_alert.py",
+      "lines": 377,
+      "imports": [
+        "__future__",
+        "argparse",
+        "datetime",
+        "dotenv",
+        "io",
+        "jpholiday",
+        "json",
+        "os",
+        "pandas",
+        "pathlib",
+        "requests",
+        "sys",
+        "warnings",
+        "yfinance"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          42
+        ],
+        "storage_or_native_io": [
+          159
+        ],
+        "whole_object_materialization": [
+          154
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/vi_signal_check.py",
+      "lines": 77,
+      "imports": [
+        "__future__",
+        "io",
+        "pandas",
+        "requests",
+        "warnings",
+        "yfinance"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          21
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "scripts/weekly_mem0_compact.py",
+      "lines": 277,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "collections",
+        "datetime",
+        "difflib",
+        "dotenv",
+        "os",
+        "re",
+        "services.mem0.client",
+        "services.oauth_manager",
+        "sys"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          255
+        ]
+      },
+      "role": "script"
+    },
+    {
+      "path": "second_opinion_mcp_server.py",
+      "lines": 122,
+      "imports": [
+        "dotenv",
+        "logging",
+        "mcp.server.fastmcp",
+        "os",
+        "services.claude_api.second_opinion",
+        "sys"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/__init__.py",
+      "lines": 0,
+      "imports": [],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/__init__.py",
+      "lines": 478,
+      "imports": [
+        "anthropic",
+        "asyncio",
+        "config",
+        "hashlib",
+        "json",
+        "logging",
+        "os",
+        "services.claude_api.client",
+        "services.claude_api.entry",
+        "services.claude_api.errors",
+        "services.claude_api.mcp_client",
+        "services.claude_api.ratelimit",
+        "services.claude_api.restricted",
+        "services.claude_api.retry",
+        "services.claude_api.session_store",
+        "services.claude_api.stall",
+        "services.claude_api.status",
+        "services.claude_api.tool_loop",
+        "services.claude_api.tools",
+        "services.oauth_manager",
+        "services.session",
+        "time",
+        "uuid"
+      ],
+      "signals": {
+        "background_or_thread": [
+          429,
+          440,
+          453
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/_cli_runner.py",
+      "lines": 77,
+      "imports": [
+        "__future__",
+        "collections.abc",
+        "services.claude_api.subprocess_runner",
+        "time"
+      ],
+      "signals": {
+        "process_spawn": [
+          68
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/agent_tool.py",
+      "lines": 261,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "dataclasses",
+        "logging",
+        "services.claude_api.capabilities",
+        "services.deep_research.registry",
+        "services.deep_research.types",
+        "typing"
+      ],
+      "signals": {
+        "background_or_thread": [
+          225
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/agy_runner.py",
+      "lines": 170,
+      "imports": [
+        "__future__",
+        "config",
+        "json",
+        "logging",
+        "os",
+        "services.claude_api._cli_runner",
+        "shutil"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/ask_bridge.py",
+      "lines": 109,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "contextvars",
+        "logging",
+        "services.mem0.cli_compat",
+        "services.mem0.client",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/attestation.py",
+      "lines": 52,
+      "imports": [
+        "logging",
+        "xxhash"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/capabilities.py",
+      "lines": 46,
+      "imports": [
+        "__future__",
+        "collections.abc",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/client.py",
+      "lines": 312,
+      "imports": [
+        "config",
+        "hashlib",
+        "json",
+        "logging",
+        "os",
+        "services.oauth_manager",
+        "uuid"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/client_factory.py",
+      "lines": 78,
+      "imports": [
+        "__future__",
+        "anthropic",
+        "services.claude_api.client",
+        "services.oauth_manager",
+        "uuid"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/codex_runner.py",
+      "lines": 125,
+      "imports": [
+        "__future__",
+        "config",
+        "json",
+        "logging",
+        "os",
+        "services.claude_api._cli_runner",
+        "shutil",
+        "tempfile"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/compaction.py",
+      "lines": 920,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "dataclasses",
+        "json",
+        "logging",
+        "re",
+        "services.claude_api.client",
+        "services.claude_api.status",
+        "services.session",
+        "time"
+      ],
+      "signals": {
+        "background_or_thread": [
+          595,
+          658,
+          860,
+          900
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/distill.py",
+      "lines": 137,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "logging",
+        "re",
+        "services.mem0.cli_compat",
+        "services.mem0.client"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/entry.py",
+      "lines": 1953,
+      "imports": [
+        "anthropic",
+        "asyncio",
+        "config",
+        "contextlib",
+        "datetime",
+        "httpx",
+        "logging",
+        "os",
+        "services.claude_api.agent_tool",
+        "services.claude_api.client",
+        "services.claude_api.client_factory",
+        "services.claude_api.compaction",
+        "services.claude_api.errors",
+        "services.claude_api.evidence",
+        "services.claude_api.image_processor",
+        "services.claude_api.magi_lite",
+        "services.claude_api.mcp_client",
+        "services.claude_api.microcompact",
+        "services.claude_api.permissions",
+        "services.claude_api.planner",
+        "services.claude_api.ratelimit",
+        "services.claude_api.restricted",
+        "services.claude_api.retry",
+        "services.claude_api.session_store",
+        "services.claude_api.stall",
+        "services.claude_api.status",
+        "services.claude_api.tool_catalog",
+        "services.claude_api.tool_loop",
+        "services.claude_api.tools",
+        "services.claude_api.verifier",
+        "services.mcp_control",
+        "services.mcp_selector",
+        "services.oauth_manager",
+        "services.session",
+        "time"
+      ],
+      "signals": {
+        "background_or_thread": [
+          541,
+          957,
+          1944,
+          1945
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/errors.py",
+      "lines": 491,
+      "imports": [
+        "anthropic",
+        "json",
+        "re",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/evidence.py",
+      "lines": 207,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "dataclasses",
+        "json",
+        "logging",
+        "os",
+        "re",
+        "time",
+        "uuid"
+      ],
+      "signals": {
+        "background_or_thread": [
+          119,
+          204
+        ],
+        "storage_or_native_io": [
+          57
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/image_processor.py",
+      "lines": 132,
+      "imports": [
+        "__future__",
+        "base64",
+        "config",
+        "logging",
+        "os",
+        "re",
+        "services.claude_api.tools",
+        "utils.image_validator"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/loop_contracts.py",
+      "lines": 108,
+      "imports": [
+        "dataclasses",
+        "uuid"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/loop_guard.py",
+      "lines": 233,
+      "imports": [
+        "__future__",
+        "collections",
+        "config",
+        "dataclasses",
+        "hashlib",
+        "json",
+        "time"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/loop_observability.py",
+      "lines": 185,
+      "imports": [
+        "logging",
+        "re",
+        "services.claude_api.ratelimit"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/magi_lite.py",
+      "lines": 180,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "dataclasses",
+        "json",
+        "logging",
+        "re",
+        "services.deep_research.magi",
+        "services.deep_research.prompts",
+        "services.deep_research.types",
+        "services.mem0.cli_compat",
+        "services.mem0.client"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/mcp_client.py",
+      "lines": 493,
+      "imports": [
+        "asyncio",
+        "contextlib",
+        "dataclasses",
+        "json",
+        "logging",
+        "mcp",
+        "mcp.client.sse",
+        "mcp.client.streamable_http",
+        "pathlib",
+        "services.claude_api.mcp_transport",
+        "services.claude_api.subprocess_runner",
+        "services.mcp_control",
+        "typing"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          315
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/mcp_transport.py",
+      "lines": 191,
+      "imports": [
+        "__future__",
+        "anyio",
+        "asyncio",
+        "collections.abc",
+        "contextlib",
+        "inspect",
+        "logging",
+        "mcp.shared.message",
+        "mcp.types",
+        "services.claude_api.subprocess_runner"
+      ],
+      "signals": {
+        "background_or_thread": [
+          133,
+          137
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/message_codec.py",
+      "lines": 252,
+      "imports": [],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/microcompact.py",
+      "lines": 122,
+      "imports": [
+        "__future__"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/permissions.py",
+      "lines": 180,
+      "imports": [
+        "__future__",
+        "fnmatch",
+        "json",
+        "logging",
+        "os",
+        "re",
+        "services.claude_api.ask_bridge",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/planner.py",
+      "lines": 129,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "dataclasses",
+        "json",
+        "logging",
+        "re",
+        "services.mem0.cli_compat",
+        "services.mem0.client"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/progress.py",
+      "lines": 154,
+      "imports": [
+        "__future__",
+        "config",
+        "os",
+        "random"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/ratelimit.py",
+      "lines": 406,
+      "imports": [
+        "asyncio",
+        "dataclasses",
+        "datetime",
+        "email.utils",
+        "logging",
+        "time",
+        "zoneinfo"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/request_shape.py",
+      "lines": 119,
+      "imports": [
+        "config",
+        "services.claude_api.client"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/restricted.py",
+      "lines": 61,
+      "imports": [
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/retry.py",
+      "lines": 92,
+      "imports": [
+        "config",
+        "random",
+        "services.claude_api.ratelimit",
+        "time"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/router.py",
+      "lines": 130,
+      "imports": [
+        "__future__",
+        "config",
+        "dataclasses",
+        "logging",
+        "re"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/second_opinion.py",
+      "lines": 273,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "logging",
+        "openai",
+        "os",
+        "re",
+        "services.claude_api.agy_runner",
+        "services.claude_api.codex_runner"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/session_store.py",
+      "lines": 124,
+      "imports": [
+        "config",
+        "time"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/side_question.py",
+      "lines": 187,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "dataclasses",
+        "logging",
+        "services.claude_api.client",
+        "services.claude_api.stall",
+        "services.claude_api.tool_loop",
+        "services.session",
+        "time"
+      ],
+      "signals": {
+        "background_or_thread": [
+          140
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/skills.py",
+      "lines": 23,
+      "imports": [
+        "__future__",
+        "services.skills"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/spinner_gif.py",
+      "lines": 118,
+      "imports": [
+        "PIL",
+        "__future__",
+        "os",
+        "services.claude_api.progress",
+        "tempfile"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          24
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/stall.py",
+      "lines": 147,
+      "imports": [
+        "asyncio",
+        "config",
+        "logging",
+        "services.claude_api.status",
+        "time"
+      ],
+      "signals": {
+        "background_or_thread": [
+          80
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/status.py",
+      "lines": 98,
+      "imports": [
+        "logging"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/subprocess_runner.py",
+      "lines": 547,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "collections.abc",
+        "dataclasses",
+        "os",
+        "pathlib",
+        "signal",
+        "typing",
+        "weakref"
+      ],
+      "signals": {
+        "background_or_thread": [
+          281,
+          414,
+          479
+        ],
+        "process_spawn": [
+          247
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/tool_catalog.py",
+      "lines": 195,
+      "imports": [
+        "__future__",
+        "config",
+        "logging",
+        "services.claude_api.mcp_client",
+        "services.claude_api.tools",
+        "services.mcp_control"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/tool_display.py",
+      "lines": 107,
+      "imports": [
+        "json"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/tool_execution.py",
+      "lines": 182,
+      "imports": [
+        "asyncio",
+        "config",
+        "dataclasses",
+        "inspect",
+        "jsonschema",
+        "logging",
+        "services.claude_api.status",
+        "time"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/tool_loop.py",
+      "lines": 1694,
+      "imports": [
+        "anthropic",
+        "asyncio",
+        "config",
+        "httpx",
+        "json",
+        "logging",
+        "os",
+        "services.claude_api.compaction",
+        "services.claude_api.distill",
+        "services.claude_api.errors",
+        "services.claude_api.loop_contracts",
+        "services.claude_api.loop_guard",
+        "services.claude_api.loop_observability",
+        "services.claude_api.mcp_client",
+        "services.claude_api.message_codec",
+        "services.claude_api.ratelimit",
+        "services.claude_api.request_shape",
+        "services.claude_api.stall",
+        "services.claude_api.status",
+        "services.claude_api.tool_display",
+        "services.claude_api.tool_execution",
+        "time",
+        "uuid"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/tools.py",
+      "lines": 1476,
+      "imports": [
+        "PIL",
+        "asyncio",
+        "base64",
+        "config",
+        "dataclasses",
+        "glob",
+        "io",
+        "logging",
+        "os",
+        "pathlib",
+        "re",
+        "services.claude_api.second_opinion",
+        "services.claude_api.skills",
+        "shutil",
+        "signal",
+        "typing"
+      ],
+      "signals": {
+        "background_or_thread": [
+          444,
+          445,
+          497,
+          519,
+          529,
+          752,
+          863,
+          870,
+          881,
+          938,
+          1036
+        ],
+        "native_or_heavy_import": [
+          49,
+          354
+        ],
+        "process_spawn": [
+          837,
+          974
+        ],
+        "storage_or_native_io": [
+          182,
+          220,
+          290,
+          359,
+          470
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/claude_api/verifier.py",
+      "lines": 284,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "contextlib",
+        "dataclasses",
+        "json",
+        "logging",
+        "re",
+        "services.claude_api.restricted",
+        "services.claude_api.stall",
+        "services.claude_api.tool_loop",
+        "services.claude_api.tools",
+        "services.mem0.cli_compat",
+        "services.mem0.client"
+      ],
+      "signals": {
+        "background_or_thread": [
+          174
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/claude_tag.py",
+      "lines": 501,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "dataclasses",
+        "discord",
+        "logging",
+        "services",
+        "services.claude_api",
+        "services.claude_api.progress",
+        "services.correlation",
+        "services.job_state",
+        "services.prompt_builder",
+        "services.sentinel",
+        "time",
+        "typing",
+        "utils.attachments",
+        "utils.discord_helpers"
+      ],
+      "signals": {
+        "background_or_thread": [
+          200,
+          337
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/codex_app_server/__init__.py",
+      "lines": 27,
+      "imports": [
+        "services.codex_app_server.manager",
+        "services.codex_app_server.session"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/codex_app_server/client.py",
+      "lines": 715,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "collections",
+        "collections.abc",
+        "json",
+        "os",
+        "typing"
+      ],
+      "signals": {
+        "background_or_thread": [
+          272,
+          275,
+          278
+        ],
+        "process_spawn": [
+          246
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/codex_app_server/entry.py",
+      "lines": 223,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "json",
+        "logging",
+        "services.codex_app_server.manager",
+        "services.codex_app_server.session",
+        "services.correlation",
+        "services.session",
+        "typing"
+      ],
+      "signals": {
+        "background_or_thread": [
+          160,
+          204,
+          205
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/codex_app_server/manager.py",
+      "lines": 446,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "collections",
+        "config",
+        "copy",
+        "hashlib",
+        "json",
+        "logging",
+        "os",
+        "pathlib",
+        "re",
+        "services.codex_app_server.session",
+        "time",
+        "tomllib",
+        "typing",
+        "urllib.parse",
+        "utils.atomic_write"
+      ],
+      "signals": {
+        "background_or_thread": [
+          216
+        ],
+        "whole_object_materialization": [
+          91
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/codex_app_server/session.py",
+      "lines": 910,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "dataclasses",
+        "hashlib",
+        "inspect",
+        "logging",
+        "os",
+        "pathlib",
+        "re",
+        "services.claude_api.ask_bridge",
+        "services.claude_api.permissions",
+        "services.codex_app_server.client",
+        "services.codex_app_server.turn_hooks",
+        "time",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/codex_app_server/turn_hooks.py",
+      "lines": 160,
+      "imports": [
+        "__future__",
+        "collections",
+        "hashlib",
+        "json",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/correlation.py",
+      "lines": 39,
+      "imports": [
+        "contextvars",
+        "uuid"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/deep_research/__init__.py",
+      "lines": 20,
+      "imports": [
+        "orchestrator"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/deep_research/agent_runner.py",
+      "lines": 41,
+      "imports": [
+        "__future__",
+        "dataclasses",
+        "registry",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/deep_research/discord_adapter.py",
+      "lines": 165,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "discord",
+        "run_state",
+        "services.claude_api.status"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/deep_research/evidence_registry.py",
+      "lines": 1028,
+      "imports": [
+        "__future__",
+        "dataclasses",
+        "re",
+        "types"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/deep_research/magi.py",
+      "lines": 315,
+      "imports": [
+        "__future__",
+        "agent_runner",
+        "asyncio",
+        "config",
+        "logging",
+        "prompts",
+        "random",
+        "re",
+        "sources",
+        "types"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/deep_research/magi_scheduler.py",
+      "lines": 73,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "dataclasses",
+        "discord",
+        "types",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/deep_research/orchestrator.py",
+      "lines": 1146,
+      "imports": [
+        "__future__",
+        "agent_runner",
+        "asyncio",
+        "config",
+        "contextlib",
+        "dataclasses",
+        "discord",
+        "discord_adapter",
+        "evidence_registry",
+        "logging",
+        "magi",
+        "magi_scheduler",
+        "os",
+        "prompts",
+        "run_state",
+        "services.claude_api.client",
+        "services.claude_api.client_factory",
+        "services.claude_api.mcp_client",
+        "services.claude_api.stall",
+        "services.claude_api.tool_loop",
+        "services.correlation",
+        "services.job_state",
+        "services.mcp_control",
+        "services.mem0.format",
+        "services.mem0.search",
+        "sources",
+        "types",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/deep_research/prompts.py",
+      "lines": 633,
+      "imports": [
+        "__future__",
+        "config"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/deep_research/registry.py",
+      "lines": 352,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "dataclasses",
+        "json",
+        "logging",
+        "re",
+        "services.claude_api.client",
+        "services.claude_api.mcp_client",
+        "services.claude_api.stall",
+        "services.claude_api.tool_loop",
+        "services.oauth_manager",
+        "sources",
+        "types"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/deep_research/run_state.py",
+      "lines": 302,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "collections.abc",
+        "dataclasses",
+        "services.claude_api.subprocess_runner",
+        "time",
+        "types",
+        "typing",
+        "uuid"
+      ],
+      "signals": {
+        "background_or_thread": [
+          229,
+          251
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/deep_research/sources.py",
+      "lines": 253,
+      "imports": [
+        "__future__",
+        "evidence_registry",
+        "json",
+        "logging",
+        "re",
+        "types"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/deep_research/types.py",
+      "lines": 129,
+      "imports": [
+        "__future__",
+        "dataclasses",
+        "time"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/free_code_bridge.py",
+      "lines": 243,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "dataclasses",
+        "free_code_commands.runtime",
+        "free_code_commands.types",
+        "os",
+        "typing"
+      ],
+      "signals": {
+        "process_spawn": [
+          126
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/health.py",
+      "lines": 434,
+      "imports": [
+        "config",
+        "hashlib",
+        "json",
+        "logging",
+        "os",
+        "pathlib",
+        "psutil",
+        "pwd",
+        "re",
+        "services.oauth_manager",
+        "stat",
+        "threading",
+        "time",
+        "typing",
+        "urllib.error",
+        "urllib.request"
+      ],
+      "signals": {
+        "whole_object_materialization": [
+          44,
+          90,
+          182,
+          198
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/health_server.py",
+      "lines": 132,
+      "imports": [
+        "aiohttp",
+        "asyncio",
+        "config",
+        "logging",
+        "services",
+        "time"
+      ],
+      "signals": {
+        "background_or_thread": [
+          40,
+          53,
+          74
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/intervention_scheduler.py",
+      "lines": 117,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "datetime",
+        "logging",
+        "os",
+        "pathlib",
+        "sys"
+      ],
+      "signals": {
+        "process_spawn": [
+          39
+        ],
+        "storage_or_native_io": [
+          58
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/invest_kb/__init__.py",
+      "lines": 40,
+      "imports": [
+        "importlib"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/invest_kb/chunker.py",
+      "lines": 155,
+      "imports": [
+        "__future__",
+        "dataclasses",
+        "re"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/invest_kb/client.py",
+      "lines": 306,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "copy",
+        "dataclasses",
+        "hashlib",
+        "json",
+        "lancedb",
+        "logging",
+        "os",
+        "pyarrow",
+        "threading",
+        "typing",
+        "weakref"
+      ],
+      "signals": {
+        "background_or_thread": [
+          141,
+          229,
+          230,
+          306
+        ],
+        "native_or_heavy_import": [
+          22,
+          80,
+          102,
+          133
+        ],
+        "storage_or_native_io": [
+          87
+        ],
+        "whole_object_materialization": [
+          299
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/invest_kb/embed.py",
+      "lines": 59,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "logging",
+        "openai",
+        "os",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/invest_kb/haiku.py",
+      "lines": 233,
+      "imports": [
+        "__future__",
+        "json",
+        "logging",
+        "os",
+        "services.mem0.cli_compat",
+        "services.mem0.client"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/invest_kb/ingest.py",
+      "lines": 168,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "logging",
+        "services.invest_kb",
+        "services.invest_kb.chunker",
+        "services.invest_kb.client",
+        "services.invest_kb.embed",
+        "time",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/invest_kb/search.py",
+      "lines": 335,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "logging",
+        "re",
+        "services.invest_kb",
+        "services.invest_kb.client",
+        "services.invest_kb.embed",
+        "services.offload.knowledge_client"
+      ],
+      "signals": {
+        "background_or_thread": [
+          190,
+          264,
+          272,
+          273
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/invest_kb_eval/__init__.py",
+      "lines": 13,
+      "imports": [
+        "services.invest_kb_eval.citation",
+        "services.invest_kb_eval.gate",
+        "services.invest_kb_eval.mcq"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/invest_kb_eval/citation.py",
+      "lines": 164,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "json",
+        "logging",
+        "os",
+        "re",
+        "services.invest_kb",
+        "services.mem0.cli_compat",
+        "services.mem0.client"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/invest_kb_eval/gate.py",
+      "lines": 37,
+      "imports": [
+        "__future__",
+        "json",
+        "services.invest_kb.search"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/invest_kb_eval/mcq.py",
+      "lines": 192,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "json",
+        "logging",
+        "os",
+        "pathlib",
+        "re",
+        "services.invest_kb",
+        "services.invest_kb.search",
+        "services.mem0.cli_compat",
+        "services.mem0.client"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/job_state.py",
+      "lines": 106,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "collections",
+        "dataclasses",
+        "enum",
+        "time"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/mcp_control.py",
+      "lines": 287,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "contextlib",
+        "dataclasses",
+        "datetime",
+        "json",
+        "logging",
+        "pathlib",
+        "services.claude_api.mcp_client",
+        "threading",
+        "typing",
+        "utils.atomic_write"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          110,
+          123
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mcp_selector.py",
+      "lines": 248,
+      "imports": [
+        "__future__",
+        "config",
+        "logging",
+        "re",
+        "services.mcp_control",
+        "services.mcp_semantic_selector"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/mcp_semantic_selector.py",
+      "lines": 220,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "hashlib",
+        "json",
+        "logging",
+        "numpy",
+        "openai",
+        "os",
+        "services.claude_api.mcp_client",
+        "services.mcp_control",
+        "utils.atomic_write",
+        "utils.cache"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          169
+        ],
+        "storage_or_native_io": [
+          142
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/__init__.py",
+      "lines": 190,
+      "imports": [
+        "importlib",
+        "llm_mem0",
+        "llm_mem0.auth",
+        "logging",
+        "os",
+        "services.mem0",
+        "services.mem0.auth_backend",
+        "services.mem0.client",
+        "services.mem0.client_alpha",
+        "services.mem0.extract",
+        "services.mem0.format",
+        "services.mem0.ingest",
+        "services.mem0.integrity",
+        "services.mem0.search",
+        "sys"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/_config_bridge.py",
+      "lines": 74,
+      "imports": [
+        "__future__",
+        "config",
+        "llm_mem0.settings",
+        "logging",
+        "os"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/_projection.py",
+      "lines": 38,
+      "imports": [
+        "__future__",
+        "os"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/attribute_registry.py",
+      "lines": 110,
+      "imports": [],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/auth_backend.py",
+      "lines": 118,
+      "imports": [
+        "__future__",
+        "llm_mem0.auth.base",
+        "logging",
+        "os",
+        "services.mem0",
+        "services.mem0.cli_compat",
+        "services.oauth_manager"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/batch.py",
+      "lines": 667,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "contextvars",
+        "dataclasses",
+        "json",
+        "logging",
+        "os",
+        "pathlib",
+        "services.mem0.integrity",
+        "threading",
+        "time",
+        "typing",
+        "utils.atomic_write",
+        "uuid"
+      ],
+      "signals": {
+        "background_or_thread": [
+          360,
+          393,
+          394,
+          412,
+          452,
+          455
+        ],
+        "storage_or_native_io": [
+          47,
+          59
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/bm25_index.py",
+      "lines": 467,
+      "imports": [
+        "__future__",
+        "config",
+        "contextlib",
+        "logging",
+        "os",
+        "re",
+        "services.mem0",
+        "services.mem0._projection",
+        "services.mem0.integrity",
+        "sqlite3",
+        "threading",
+        "time",
+        "typing"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          99,
+          102,
+          106,
+          143,
+          147,
+          166,
+          202,
+          207,
+          209,
+          214,
+          288,
+          449,
+          464
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/cli_compat.py",
+      "lines": 146,
+      "imports": [
+        "__future__",
+        "logging",
+        "services.claude_api.client",
+        "uuid"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/client.py",
+      "lines": 459,
+      "imports": [
+        "anthropic",
+        "asyncio",
+        "config",
+        "logging",
+        "mem0",
+        "openai",
+        "os",
+        "requests",
+        "services.mem0.integrity",
+        "services.oauth_manager",
+        "time"
+      ],
+      "signals": {
+        "background_or_thread": [
+          423,
+          432,
+          447,
+          456
+        ],
+        "native_or_heavy_import": [
+          364
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/client_alpha.py",
+      "lines": 62,
+      "imports": [
+        "__future__",
+        "llm_mem0.client",
+        "logging"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/conflict.py",
+      "lines": 95,
+      "imports": [
+        "__future__",
+        "json",
+        "logging",
+        "os",
+        "services.mem0.cli_compat",
+        "services.mem0.client",
+        "services.mem0.format"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/decay.py",
+      "lines": 335,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "logging",
+        "os",
+        "services.mem0",
+        "services.mem0.dedup",
+        "services.mem0.integrity",
+        "services.mem0.reinforce",
+        "services.oauth_manager",
+        "time"
+      ],
+      "signals": {
+        "background_or_thread": [
+          146,
+          190,
+          231,
+          256,
+          311,
+          330
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/dedup.py",
+      "lines": 412,
+      "imports": [
+        "asyncio",
+        "json",
+        "logging",
+        "os",
+        "services.mem0.cli_compat",
+        "services.mem0.client",
+        "services.mem0.conflict",
+        "services.mem0.format"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/extract.py",
+      "lines": 826,
+      "imports": [
+        "config",
+        "json",
+        "logging",
+        "os",
+        "re",
+        "services.mem0",
+        "services.mem0.cli_compat",
+        "services.mem0.client",
+        "services.mem0.format",
+        "services.oauth_manager"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/fact_store.py",
+      "lines": 311,
+      "imports": [
+        "__future__",
+        "config",
+        "contextlib",
+        "logging",
+        "os",
+        "services.mem0._projection",
+        "sqlite3",
+        "threading",
+        "time"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          100,
+          103,
+          107,
+          143,
+          166,
+          189,
+          226,
+          232,
+          238,
+          257,
+          274,
+          292,
+          308
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/format.py",
+      "lines": 196,
+      "imports": [
+        "datetime",
+        "re",
+        "services.sentinel"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/graph.py",
+      "lines": 854,
+      "imports": [
+        "__future__",
+        "config",
+        "contextlib",
+        "dataclasses",
+        "logging",
+        "os",
+        "services.mem0._projection",
+        "sqlite3",
+        "threading",
+        "time",
+        "typing"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          142,
+          145,
+          148,
+          152,
+          254,
+          260,
+          265,
+          275,
+          283,
+          317,
+          323,
+          342,
+          352,
+          359,
+          365,
+          370,
+          376,
+          381,
+          403,
+          411,
+          422,
+          442,
+          465,
+          489,
+          519,
+          549,
+          564,
+          578,
+          624,
+          642,
+          645,
+          650,
+          651,
+          652,
+          653,
+          698,
+          745,
+          757,
+          766,
+          773,
+          794,
+          853
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/history_embed.py",
+      "lines": 145,
+      "imports": [
+        "__future__",
+        "chromadb",
+        "chromadb.utils",
+        "config",
+        "hashlib",
+        "logging",
+        "os"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          42,
+          43
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/history_index.py",
+      "lines": 335,
+      "imports": [
+        "__future__",
+        "config",
+        "contextlib",
+        "logging",
+        "os",
+        "re",
+        "services.mem0",
+        "sqlite3",
+        "threading",
+        "time",
+        "typing"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          104,
+          107,
+          111,
+          159,
+          164,
+          216,
+          263,
+          269,
+          317,
+          332
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/ingest.py",
+      "lines": 1164,
+      "imports": [
+        "asyncio",
+        "collections",
+        "config",
+        "hashlib",
+        "json",
+        "logging",
+        "services.mem0",
+        "services.mem0.attribute_registry",
+        "services.mem0.batch",
+        "services.mem0.client",
+        "services.mem0.conflict",
+        "services.mem0.dedup",
+        "services.mem0.extract",
+        "services.mem0.integrity",
+        "services.mem0.reinforce",
+        "services.mem0.search",
+        "services.oauth_manager",
+        "time"
+      ],
+      "signals": {
+        "background_or_thread": [
+          192,
+          208,
+          273,
+          613,
+          650,
+          660,
+          688,
+          710,
+          780,
+          857,
+          913,
+          934,
+          966,
+          990,
+          1012,
+          1021
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/integrity.py",
+      "lines": 2939,
+      "imports": [
+        "__future__",
+        "atexit",
+        "config",
+        "contextlib",
+        "dataclasses",
+        "hashlib",
+        "json",
+        "logging",
+        "os",
+        "pathlib",
+        "services.mem0",
+        "services.mem0._projection",
+        "sqlite3",
+        "threading",
+        "time",
+        "typing",
+        "uuid"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          264,
+          266,
+          267,
+          271,
+          303,
+          307,
+          311,
+          314,
+          317,
+          333,
+          340,
+          347,
+          377,
+          390,
+          414,
+          434,
+          499,
+          565,
+          581,
+          592,
+          705,
+          737,
+          757,
+          787,
+          794,
+          814,
+          827,
+          838,
+          845,
+          851,
+          868,
+          892,
+          901,
+          927,
+          932,
+          940,
+          950,
+          959,
+          964,
+          984,
+          989,
+          1008,
+          1017,
+          1022,
+          1038,
+          1051,
+          1069,
+          1076,
+          1081,
+          1104,
+          1110,
+          1118,
+          1130,
+          1146,
+          1166,
+          1176,
+          1193,
+          1199,
+          1213,
+          1227,
+          1238,
+          1279,
+          1284,
+          1295,
+          1304,
+          1313,
+          1334,
+          1341,
+          1363,
+          1374,
+          1383,
+          1395,
+          1412,
+          1420,
+          1443,
+          1449,
+          1461,
+          1476,
+          1481,
+          1494,
+          1526,
+          1555,
+          1575,
+          1584,
+          1609,
+          1619,
+          1637,
+          1642,
+          1658,
+          1682,
+          1691,
+          1696,
+          1712,
+          1722,
+          1741,
+          1751,
+          1760
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/morpho.py",
+      "lines": 157,
+      "imports": [
+        "__future__",
+        "janome.tokenizer",
+        "logging",
+        "threading",
+        "typing"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          55
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/priming.py",
+      "lines": 85,
+      "imports": [
+        "__future__",
+        "os",
+        "threading",
+        "time"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/reinforce.py",
+      "lines": 386,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "logging",
+        "math",
+        "os",
+        "services.mem0.integrity",
+        "time"
+      ],
+      "signals": {
+        "background_or_thread": [
+          83,
+          147
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/replay.py",
+      "lines": 639,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "json",
+        "logging",
+        "os",
+        "pathlib",
+        "services.mem0",
+        "services.mem0.cli_compat",
+        "services.mem0.client",
+        "services.mem0.format",
+        "services.mem0.ingest",
+        "services.mem0.integrity",
+        "utils.atomic_write"
+      ],
+      "signals": {
+        "background_or_thread": [
+          175,
+          176,
+          195,
+          252,
+          287,
+          331,
+          332,
+          347,
+          373,
+          394,
+          404,
+          409,
+          437,
+          446,
+          574
+        ],
+        "storage_or_native_io": [
+          86,
+          97
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0/search.py",
+      "lines": 1519,
+      "imports": [
+        "asyncio",
+        "config",
+        "json",
+        "logging",
+        "os",
+        "re",
+        "services.mem0",
+        "services.mem0.cli_compat",
+        "services.mem0.client",
+        "services.mem0.format",
+        "services.mem0.integrity",
+        "services.mem0.reinforce",
+        "services.oauth_manager",
+        "time"
+      ],
+      "signals": {
+        "background_or_thread": [
+          121,
+          128,
+          246,
+          685,
+          699,
+          727,
+          731,
+          740,
+          795,
+          803,
+          1172,
+          1368,
+          1391,
+          1409,
+          1447,
+          1470,
+          1484
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/mem0_alpha.py",
+      "lines": 62,
+      "imports": [
+        "__future__",
+        "llm_mem0",
+        "os"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/oauth_manager.py",
+      "lines": 1297,
+      "imports": [
+        "aiohttp",
+        "anthropic",
+        "asyncio",
+        "dataclasses",
+        "httpx",
+        "json",
+        "logging",
+        "os",
+        "services.claude_api.attestation",
+        "services.claude_api.ratelimit",
+        "ssl",
+        "stat",
+        "tempfile",
+        "threading",
+        "time",
+        "utils.atomic_write"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          363,
+          371,
+          373,
+          1014
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/offload/__init__.py",
+      "lines": 1,
+      "imports": [],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/offload/archive_transport.py",
+      "lines": 109,
+      "imports": [
+        "__future__",
+        "hashlib",
+        "httpx",
+        "json",
+        "os",
+        "pathlib",
+        "services.offload.endpoint",
+        "tempfile"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          60,
+          103
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/offload/endpoint.py",
+      "lines": 36,
+      "imports": [
+        "__future__",
+        "ipaddress",
+        "urllib.parse"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/offload/knowledge_client.py",
+      "lines": 93,
+      "imports": [
+        "__future__",
+        "aiohttp",
+        "asyncio",
+        "json",
+        "math",
+        "os",
+        "services.offload.endpoint"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/offload/knowledge_server.py",
+      "lines": 140,
+      "imports": [
+        "__future__",
+        "aiohttp",
+        "asyncio",
+        "concurrent.futures",
+        "hmac",
+        "json",
+        "lancedb",
+        "logging",
+        "os",
+        "pathlib",
+        "services.invest_kb.search",
+        "services.offload.knowledge_client"
+      ],
+      "signals": {
+        "background_or_thread": [
+          80
+        ],
+        "native_or_heavy_import": [
+          27
+        ],
+        "storage_or_native_io": [
+          31
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/offload/mcp_config.py",
+      "lines": 70,
+      "imports": [
+        "__future__",
+        "collections.abc",
+        "json",
+        "re",
+        "services.offload.endpoint"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/prompt_builder.py",
+      "lines": 374,
+      "imports": [
+        "config",
+        "datetime",
+        "html",
+        "logging",
+        "re",
+        "services.mem0",
+        "services.sentinel",
+        "typing",
+        "zoneinfo"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/provider_router.py",
+      "lines": 226,
+      "imports": [
+        "__future__",
+        "config",
+        "services.codex_app_server.manager",
+        "services.providers.composition",
+        "services.providers.contracts",
+        "services.providers.policy",
+        "services.session",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/providers/__init__.py",
+      "lines": 17,
+      "imports": [
+        "services.providers.contracts"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/providers/composition.py",
+      "lines": 33,
+      "imports": [
+        "__future__",
+        "services",
+        "services.codex_app_server",
+        "services.providers.execution",
+        "services.providers.transport",
+        "services.providers.workflow"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/providers/contracts.py",
+      "lines": 114,
+      "imports": [
+        "__future__",
+        "collections.abc",
+        "dataclasses",
+        "enum",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/providers/execution.py",
+      "lines": 45,
+      "imports": [
+        "__future__",
+        "dataclasses",
+        "services.providers.contracts",
+        "services.providers.policy",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/providers/policy.py",
+      "lines": 49,
+      "imports": [
+        "__future__",
+        "dataclasses",
+        "services.providers.contracts"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/providers/transport.py",
+      "lines": 98,
+      "imports": [
+        "__future__",
+        "collections.abc",
+        "dataclasses",
+        "services.providers.contracts",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/providers/workflow.py",
+      "lines": 216,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "dataclasses",
+        "logging",
+        "services.claude_api.session_store",
+        "services.codex_app_server.manager",
+        "services.providers.contracts",
+        "services.providers.execution",
+        "services.session"
+      ],
+      "signals": {
+        "background_or_thread": [
+          70
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/r2_archive.py",
+      "lines": 1393,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "contextlib",
+        "dataclasses",
+        "datetime",
+        "fcntl",
+        "hashlib",
+        "json",
+        "logging",
+        "mimetypes",
+        "os",
+        "pathlib",
+        "re",
+        "services.offload.archive_transport",
+        "shutil",
+        "sqlite3",
+        "subprocess",
+        "tempfile",
+        "threading",
+        "time",
+        "typing",
+        "utils.atomic_write",
+        "utils.image_validator",
+        "uuid"
+      ],
+      "signals": {
+        "background_or_thread": [
+          1289,
+          1297
+        ],
+        "process_spawn": [
+          1031
+        ],
+        "storage_or_native_io": [
+          168,
+          170,
+          171,
+          172,
+          184,
+          193,
+          218,
+          250,
+          265,
+          325,
+          354,
+          372,
+          388,
+          418,
+          431,
+          442,
+          445,
+          464,
+          465,
+          519,
+          569,
+          761,
+          771,
+          826,
+          838,
+          982,
+          1158,
+          1221,
+          1259,
+          1368
+        ],
+        "whole_object_materialization": [
+          816,
+          1058
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/rate_limit.py",
+      "lines": 122,
+      "imports": [
+        "collections",
+        "config",
+        "logging",
+        "threading",
+        "time"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/runtime_bootstrap.py",
+      "lines": 1159,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "atexit",
+        "collections.abc",
+        "config",
+        "config.paths",
+        "dataclasses",
+        "dotenv",
+        "enum",
+        "fcntl",
+        "logging",
+        "logging.handlers",
+        "os",
+        "services.claude_api",
+        "services.codex_app_server.manager",
+        "services.runtime_state",
+        "services.session",
+        "signal",
+        "stat",
+        "tempfile",
+        "threading",
+        "types",
+        "typing"
+      ],
+      "signals": {
+        "background_or_thread": [
+          753,
+          1069
+        ],
+        "storage_or_native_io": [
+          204,
+          210,
+          237,
+          247,
+          332,
+          338,
+          359
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/runtime_state.py",
+      "lines": 106,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "json",
+        "logging",
+        "os",
+        "services",
+        "services.claude_api",
+        "utils.atomic_write"
+      ],
+      "signals": {
+        "background_or_thread": [
+          103
+        ],
+        "storage_or_native_io": [
+          64
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/sentinel.py",
+      "lines": 114,
+      "imports": [
+        "re",
+        "unicodedata"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/session.py",
+      "lines": 1095,
+      "imports": [
+        "asyncio",
+        "collections",
+        "config",
+        "datetime",
+        "json",
+        "logging",
+        "os",
+        "re",
+        "services.claude_api.errors",
+        "services.mem0",
+        "services.r2_archive",
+        "services.session_registry",
+        "time"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          281,
+          289
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/session_registry.py",
+      "lines": 922,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "collections",
+        "collections.abc",
+        "copy",
+        "dataclasses",
+        "json",
+        "logging",
+        "threading",
+        "typing",
+        "utils.atomic_write"
+      ],
+      "signals": {
+        "background_or_thread": [
+          489,
+          490,
+          692,
+          701,
+          734
+        ],
+        "storage_or_native_io": [
+          239
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/skills.py",
+      "lines": 393,
+      "imports": [
+        "__future__",
+        "dataclasses",
+        "logging",
+        "pathlib",
+        "re",
+        "yaml"
+      ],
+      "signals": {
+        "whole_object_materialization": [
+          117
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "services/structured_log.py",
+      "lines": 226,
+      "imports": [
+        "__future__",
+        "collections.abc",
+        "json",
+        "logging",
+        "re",
+        "services.correlation",
+        "sys",
+        "time"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "services/vi_signal_scheduler.py",
+      "lines": 273,
+      "imports": [
+        "__future__",
+        "argparse",
+        "asyncio",
+        "datetime",
+        "jpholiday",
+        "logging",
+        "os",
+        "pathlib",
+        "sys"
+      ],
+      "signals": {
+        "process_spawn": [
+          100,
+          150
+        ],
+        "storage_or_native_io": [
+          123,
+          170
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "tests/__init__.py",
+      "lines": 0,
+      "imports": [],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/conftest.py",
+      "lines": 386,
+      "imports": [
+        "hashlib",
+        "json",
+        "os",
+        "pathlib",
+        "pytest",
+        "shutil",
+        "sys",
+        "tempfile",
+        "tomllib"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          75
+        ],
+        "whole_object_materialization": [
+          86
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/contract/test_offload_imports.py",
+      "lines": 17,
+      "imports": [
+        "json",
+        "os",
+        "subprocess",
+        "sys"
+      ],
+      "signals": {
+        "process_spawn": [
+          16
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/contract/test_phase4_ci_contracts.py",
+      "lines": 407,
+      "imports": [
+        "__future__",
+        "json",
+        "os",
+        "pathlib",
+        "pytest",
+        "re",
+        "subprocess",
+        "tomllib",
+        "yaml"
+      ],
+      "signals": {
+        "process_spawn": [
+          380
+        ],
+        "storage_or_native_io": [
+          368
+        ],
+        "whole_object_materialization": [
+          69,
+          82,
+          265,
+          277,
+          285,
+          290,
+          400
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/fixtures/tool_loop_eval/evalsearch_server.py",
+      "lines": 111,
+      "imports": [
+        "__future__",
+        "argparse",
+        "mcp.server.fastmcp",
+        "pathlib",
+        "re",
+        "sys"
+      ],
+      "signals": {
+        "whole_object_materialization": [
+          35
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/fixtures/tool_loop_eval/seeds/mem0_seed.py",
+      "lines": 29,
+      "imports": [
+        "asyncio",
+        "services.mem0.ingest",
+        "sys"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/integration/test_claude_api_subprocess_security.py",
+      "lines": 570,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "contextlib",
+        "mcp.shared.message",
+        "os",
+        "pytest",
+        "services.claude_api",
+        "services.claude_api.subprocess_runner",
+        "services.claude_api.tools",
+        "services.deep_research.run_state",
+        "services.deep_research.types",
+        "shlex",
+        "signal",
+        "sys",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {
+        "background_or_thread": [
+          227,
+          230,
+          271,
+          347,
+          527
+        ],
+        "process_spawn": [
+          80,
+          272
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/integration/test_free_code_bridge_subprocess.py",
+      "lines": 12,
+      "imports": [
+        "__future__",
+        "services.free_code_bridge"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/integration/test_knowledge_offload.py",
+      "lines": 84,
+      "imports": [
+        "aiohttp",
+        "aiohttp.test_utils",
+        "asyncio",
+        "pytest",
+        "services.invest_kb",
+        "services.offload",
+        "threading"
+      ],
+      "signals": {
+        "background_or_thread": [
+          62,
+          64
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/integration/test_mem0_subprocess.py",
+      "lines": 25,
+      "imports": [
+        "__future__",
+        "os",
+        "subprocess",
+        "sys"
+      ],
+      "signals": {
+        "process_spawn": [
+          16
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/integration/test_phase4_release_gate.py",
+      "lines": 248,
+      "imports": [
+        "__future__",
+        "hashlib",
+        "json",
+        "pathlib",
+        "pytest",
+        "scripts",
+        "subprocess"
+      ],
+      "signals": {
+        "process_spawn": [
+          14
+        ],
+        "storage_or_native_io": [
+          97,
+          100,
+          111,
+          125,
+          146,
+          153,
+          194,
+          201,
+          207
+        ],
+        "whole_object_materialization": [
+          101,
+          112,
+          126,
+          147,
+          165,
+          202,
+          219,
+          231
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_agent_tool.py",
+      "lines": 252,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "pytest",
+        "services.claude_api",
+        "services.claude_api.tool_loop",
+        "services.deep_research.types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_agy_runner.py",
+      "lines": 178,
+      "imports": [
+        "json",
+        "os",
+        "pytest",
+        "services.claude_api",
+        "services.claude_api.subprocess_runner"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          63,
+          145
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_atomic_write.py",
+      "lines": 98,
+      "imports": [
+        "__future__",
+        "json",
+        "os",
+        "pathlib",
+        "pytest",
+        "stat",
+        "utils.atomic_write"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          57,
+          64,
+          70,
+          76,
+          83
+        ],
+        "whole_object_materialization": [
+          27,
+          45,
+          51,
+          58,
+          65,
+          78
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_attachments.py",
+      "lines": 1175,
+      "imports": [
+        "asyncio",
+        "os",
+        "pytest",
+        "time",
+        "unittest.mock",
+        "utils.attachment_downloader",
+        "utils.attachments"
+      ],
+      "signals": {
+        "background_or_thread": [
+          1069,
+          1109,
+          1158
+        ],
+        "storage_or_native_io": [
+          56,
+          67,
+          77,
+          85,
+          92,
+          100,
+          107,
+          115,
+          122,
+          130,
+          138,
+          146,
+          154,
+          166,
+          177,
+          185,
+          194,
+          207,
+          208,
+          223,
+          230,
+          271,
+          278,
+          285,
+          292,
+          380,
+          385,
+          390,
+          413,
+          428,
+          444,
+          451,
+          456,
+          463,
+          481,
+          488,
+          519,
+          527,
+          538,
+          576,
+          583,
+          590,
+          597,
+          608,
+          617,
+          626,
+          635,
+          644,
+          653,
+          666,
+          676,
+          848,
+          849,
+          882
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_attestation.py",
+      "lines": 68,
+      "imports": [
+        "__future__",
+        "httpx",
+        "importlib",
+        "services.claude_api.attestation"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_backup_state.py",
+      "lines": 40,
+      "imports": [
+        "os",
+        "pathlib",
+        "re",
+        "subprocess"
+      ],
+      "signals": {
+        "process_spawn": [
+          12
+        ],
+        "whole_object_materialization": [
+          27
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_bot.py",
+      "lines": 2865,
+      "imports": [
+        "aiohttp",
+        "asyncio",
+        "bot",
+        "collections",
+        "discord",
+        "io",
+        "json",
+        "logging",
+        "main",
+        "os",
+        "pathlib",
+        "pytest",
+        "services",
+        "services.job_state",
+        "services.mem0",
+        "services.session",
+        "services.skills",
+        "tempfile",
+        "time",
+        "unittest.mock"
+      ],
+      "signals": {
+        "background_or_thread": [
+          566,
+          594
+        ],
+        "storage_or_native_io": [
+          784,
+          2027
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_bot_pipeline_characterization.py",
+      "lines": 934,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "bot",
+        "bot_pipeline",
+        "bot_pipeline.admission",
+        "bot_pipeline.attachment_types",
+        "bot_preprocess",
+        "inspect",
+        "os",
+        "pytest",
+        "services.claude_api.ask_bridge",
+        "types",
+        "unittest.mock",
+        "utils.markdown_parser"
+      ],
+      "signals": {
+        "background_or_thread": [
+          384,
+          573,
+          574,
+          575,
+          576,
+          688
+        ],
+        "storage_or_native_io": [
+          707,
+          739,
+          835
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_bot_recall_limit.py",
+      "lines": 108,
+      "imports": [
+        "bot",
+        "config",
+        "pytest",
+        "services",
+        "tests.test_bot",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_bot_ui_math.py",
+      "lines": 341,
+      "imports": [
+        "__future__",
+        "bot_ui",
+        "dataclasses",
+        "pathlib",
+        "pytest",
+        "unittest.mock"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          119
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_bot_ui_plan.py",
+      "lines": 118,
+      "imports": [
+        "bot_ui",
+        "pytest",
+        "time",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_bot_ui_scratch.py",
+      "lines": 119,
+      "imports": [
+        "bot_ui",
+        "pytest",
+        "time",
+        "unittest.mock"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          104
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_browser_pool.py",
+      "lines": 210,
+      "imports": [
+        "asyncio",
+        "bot_pipeline.runtime",
+        "pytest",
+        "types",
+        "unittest.mock",
+        "utils.browser_pool"
+      ],
+      "signals": {
+        "background_or_thread": [
+          49,
+          82,
+          106,
+          145,
+          146,
+          188
+        ],
+        "storage_or_native_io": [
+          149,
+          192
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_btw_command.py",
+      "lines": 364,
+      "imports": [
+        "bot_commands.btw",
+        "pytest",
+        "services.claude_api.side_question",
+        "services.session",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_cache.py",
+      "lines": 117,
+      "imports": [
+        "__future__",
+        "pytest",
+        "time",
+        "utils.cache"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_cf_browser.py",
+      "lines": 192,
+      "imports": [
+        "__future__",
+        "aiohttp",
+        "pytest",
+        "unittest.mock",
+        "utils.cf_browser"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_characterization.py",
+      "lines": 539,
+      "imports": [
+        "asyncio",
+        "bot",
+        "discord",
+        "pytest",
+        "services",
+        "services.mem0.batch",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_checkpoint_auto_resume.py",
+      "lines": 138,
+      "imports": [
+        "__future__",
+        "config",
+        "importlib",
+        "services.claude_api.entry",
+        "services.claude_api.tool_loop"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api.py",
+      "lines": 570,
+      "imports": [
+        "anthropic",
+        "asyncio",
+        "collections",
+        "contextlib",
+        "json",
+        "pytest",
+        "services.claude_api",
+        "services.oauth_manager",
+        "time",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_capabilities.py",
+      "lines": 62,
+      "imports": [
+        "__future__",
+        "pytest",
+        "services.claude_api",
+        "services.claude_api.capabilities",
+        "services.deep_research.types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_client_factory.py",
+      "lines": 150,
+      "imports": [
+        "__future__",
+        "pytest",
+        "services.claude_api.client_factory",
+        "unittest.mock",
+        "uuid"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_compaction.py",
+      "lines": 483,
+      "imports": [
+        "asyncio",
+        "pytest",
+        "services.claude_api.compaction",
+        "services.session",
+        "time",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_distill.py",
+      "lines": 105,
+      "imports": [
+        "pytest",
+        "services.claude_api",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_entry.py",
+      "lines": 415,
+      "imports": [
+        "asyncio",
+        "base64",
+        "config",
+        "httpx",
+        "inspect",
+        "os",
+        "pytest",
+        "services.claude_api",
+        "services.claude_api.entry",
+        "services.session",
+        "tempfile",
+        "unittest.mock",
+        "utils.image_validator"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_errors.py",
+      "lines": 605,
+      "imports": [
+        "anthropic",
+        "pytest",
+        "services.claude_api.errors",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_evidence.py",
+      "lines": 142,
+      "imports": [
+        "asyncio",
+        "os",
+        "pytest",
+        "services.claude_api",
+        "time"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          113,
+          114
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_image_processor.py",
+      "lines": 249,
+      "imports": [
+        "__future__",
+        "base64",
+        "os",
+        "pathlib",
+        "pytest",
+        "services.claude_api.image_processor",
+        "unittest.mock"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          27,
+          41,
+          54,
+          69,
+          90,
+          102
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_loop_guard.py",
+      "lines": 133,
+      "imports": [
+        "services.claude_api.loop_guard"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_mcp_client.py",
+      "lines": 367,
+      "imports": [
+        "asyncio",
+        "contextlib",
+        "json",
+        "mcp",
+        "pathlib",
+        "pytest",
+        "services.claude_api",
+        "services.claude_api.mcp_client",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {
+        "background_or_thread": [
+          308,
+          311
+        ],
+        "storage_or_native_io": [
+          358
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_ratelimit.py",
+      "lines": 351,
+      "imports": [
+        "__future__",
+        "datetime",
+        "pytest",
+        "services.claude_api",
+        "services.claude_api.ratelimit",
+        "time",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_restricted.py",
+      "lines": 42,
+      "imports": [
+        "pytest",
+        "services.claude_api.restricted"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_retry.py",
+      "lines": 139,
+      "imports": [
+        "datetime",
+        "email.utils",
+        "pytest",
+        "services.claude_api",
+        "services.claude_api.retry",
+        "time"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_session_store.py",
+      "lines": 95,
+      "imports": [
+        "pytest",
+        "services.claude_api",
+        "services.claude_api.session_store",
+        "time"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_stall.py",
+      "lines": 235,
+      "imports": [
+        "asyncio",
+        "pytest",
+        "services.claude_api.stall"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_status.py",
+      "lines": 96,
+      "imports": [
+        "pytest",
+        "services.claude_api.status",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_subprocess_runner.py",
+      "lines": 558,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "contextlib",
+        "os",
+        "pytest",
+        "services.claude_api",
+        "services.claude_api.subprocess_runner",
+        "signal",
+        "sys",
+        "types"
+      ],
+      "signals": {
+        "background_or_thread": [
+          122
+        ],
+        "process_spawn": [
+          86,
+          123,
+          246,
+          408,
+          440,
+          448,
+          453,
+          486,
+          494,
+          499,
+          528
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_tool_loop.py",
+      "lines": 2831,
+      "imports": [
+        "anthropic",
+        "asyncio",
+        "config",
+        "contextlib",
+        "httpx",
+        "json",
+        "logging",
+        "pytest",
+        "services.claude_api",
+        "services.claude_api.client",
+        "services.claude_api.stall",
+        "services.claude_api.tool_loop",
+        "services.claude_api.tools",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_api_tools.py",
+      "lines": 647,
+      "imports": [
+        "asyncio",
+        "config",
+        "os",
+        "pytest",
+        "services.claude_api.tools",
+        "signal",
+        "tempfile"
+      ],
+      "signals": {
+        "background_or_thread": [
+          365,
+          396
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_claude_tag.py",
+      "lines": 285,
+      "imports": [
+        "asyncio",
+        "discord",
+        "pytest",
+        "services.claude_tag",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_codex_app_server_client.py",
+      "lines": 452,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "json",
+        "pytest",
+        "services.codex_app_server.client"
+      ],
+      "signals": {
+        "background_or_thread": [
+          212,
+          252,
+          253,
+          297,
+          329,
+          400,
+          401,
+          424
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_codex_app_server_entry.py",
+      "lines": 116,
+      "imports": [
+        "__future__",
+        "pytest",
+        "services.codex_app_server",
+        "services.codex_app_server.session",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_codex_app_server_manager.py",
+      "lines": 442,
+      "imports": [
+        "__future__",
+        "json",
+        "pytest",
+        "services.codex_app_server",
+        "services.codex_app_server.manager",
+        "services.codex_app_server.session",
+        "stat",
+        "typing"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          133
+        ],
+        "whole_object_materialization": [
+          110
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_codex_app_server_session.py",
+      "lines": 541,
+      "imports": [
+        "__future__",
+        "collections.abc",
+        "pytest",
+        "services.codex_app_server.client",
+        "services.codex_app_server.session",
+        "typing",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_codex_runner.py",
+      "lines": 124,
+      "imports": [
+        "json",
+        "pytest",
+        "services.claude_api",
+        "services.claude_api.subprocess_runner"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          94,
+          102,
+          111
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_command_boundaries.py",
+      "lines": 101,
+      "imports": [
+        "__future__",
+        "bot_commands.archive",
+        "bot_commands.guards",
+        "bot_commands.responses",
+        "bot_commands.state",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_compact_threshold.py",
+      "lines": 61,
+      "imports": [
+        "config",
+        "services.claude_api.compaction",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_config.py",
+      "lines": 424,
+      "imports": [
+        "config",
+        "importlib",
+        "os",
+        "pytest",
+        "services.mcp_selector",
+        "sys",
+        "types",
+        "unittest.mock",
+        "warnings"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          61
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_config_paths.py",
+      "lines": 60,
+      "imports": [
+        "__future__",
+        "config.paths",
+        "importlib.util",
+        "os",
+        "pathlib",
+        "pytest"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_correlation.py",
+      "lines": 62,
+      "imports": [
+        "asyncio",
+        "contextvars",
+        "pytest",
+        "services",
+        "services.correlation"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_correlation_integration.py",
+      "lines": 84,
+      "imports": [
+        "asyncio",
+        "contextvars",
+        "json",
+        "logging",
+        "pytest",
+        "services.correlation",
+        "services.structured_log"
+      ],
+      "signals": {
+        "background_or_thread": [
+          21
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_coverage_improvements.py",
+      "lines": 810,
+      "imports": [
+        "anthropic",
+        "asyncio",
+        "collections",
+        "json",
+        "os",
+        "pytest",
+        "services",
+        "services.claude_api",
+        "tempfile",
+        "time",
+        "unittest.mock",
+        "utils",
+        "utils.attachments",
+        "utils.discord_helpers"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          502
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_deep_research.py",
+      "lines": 3653,
+      "imports": [
+        "asyncio",
+        "config",
+        "contextlib",
+        "discord",
+        "inspect",
+        "json",
+        "os",
+        "pytest",
+        "services.claude_api.subprocess_runner",
+        "services.deep_research",
+        "services.deep_research.evidence_registry",
+        "services.deep_research.magi",
+        "services.deep_research.orchestrator",
+        "services.deep_research.prompts",
+        "services.deep_research.registry",
+        "services.deep_research.run_state",
+        "services.deep_research.types",
+        "services.mem0",
+        "services.oauth_manager",
+        "sys",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {
+        "background_or_thread": [
+          690,
+          695,
+          756,
+          794,
+          797,
+          970,
+          979,
+          3229
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_delib_pipeline.py",
+      "lines": 509,
+      "imports": [
+        "config",
+        "importlib",
+        "pytest",
+        "services.claude_api",
+        "services.claude_api.restricted",
+        "services.claude_api.tool_loop",
+        "services.claude_api.tools",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_discord_helpers.py",
+      "lines": 1660,
+      "imports": [
+        "asyncio",
+        "collections",
+        "config",
+        "discord",
+        "pytest",
+        "time",
+        "unittest.mock",
+        "utils.cache",
+        "utils.context_gateway",
+        "utils.discord_helpers"
+      ],
+      "signals": {
+        "background_or_thread": [
+          1653
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_e2e_security.py",
+      "lines": 938,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "bot",
+        "config",
+        "discord",
+        "importlib",
+        "os",
+        "pytest",
+        "services",
+        "services.oauth_manager",
+        "services.prompt_builder",
+        "services.session",
+        "sys",
+        "types",
+        "unittest.mock",
+        "utils",
+        "utils.attachments",
+        "utils.discord_helpers"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          565,
+          572,
+          584,
+          610,
+          780,
+          791
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_free_code_bridge.py",
+      "lines": 206,
+      "imports": [
+        "__future__",
+        "bot_commands",
+        "free_code_commands",
+        "free_code_commands.commands.local_commands",
+        "free_code_commands.commands.prompt_commands",
+        "free_code_commands.runtime",
+        "pytest",
+        "services.free_code_bridge"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_free_code_commands_framework.py",
+      "lines": 590,
+      "imports": [
+        "__future__",
+        "collections",
+        "dataclasses",
+        "free_code_commands",
+        "free_code_commands._all",
+        "free_code_commands.commands",
+        "free_code_commands.registry",
+        "free_code_commands.runtime",
+        "free_code_commands.shell",
+        "free_code_commands.types",
+        "pytest"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_free_code_commands_internal.py",
+      "lines": 41,
+      "imports": [
+        "__future__",
+        "free_code_commands",
+        "free_code_commands.commands",
+        "free_code_commands.runtime"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_free_code_commands_jsx.py",
+      "lines": 255,
+      "imports": [
+        "__future__",
+        "free_code_commands",
+        "free_code_commands.runtime",
+        "free_code_commands.types"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_free_code_commands_local.py",
+      "lines": 306,
+      "imports": [
+        "__future__",
+        "free_code_commands",
+        "free_code_commands.runtime",
+        "free_code_commands.types",
+        "pytest"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_free_code_commands_prompt.py",
+      "lines": 159,
+      "imports": [
+        "__future__",
+        "free_code_commands",
+        "free_code_commands.commands",
+        "free_code_commands.runtime"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_git_hooks.py",
+      "lines": 18,
+      "imports": [
+        "os",
+        "pathlib",
+        "subprocess"
+      ],
+      "signals": {
+        "process_spawn": [
+          12,
+          17
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_health.py",
+      "lines": 380,
+      "imports": [
+        "hashlib",
+        "importlib",
+        "json",
+        "os",
+        "pathlib",
+        "pwd",
+        "pytest",
+        "services.health",
+        "sys",
+        "time",
+        "unittest.mock",
+        "urllib.error"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          203,
+          224,
+          344
+        ],
+        "whole_object_materialization": [
+          209,
+          231
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_health_server.py",
+      "lines": 249,
+      "imports": [
+        "aiohttp.test_utils",
+        "asyncio",
+        "pytest",
+        "services.health_server",
+        "threading",
+        "time",
+        "unittest.mock"
+      ],
+      "signals": {
+        "background_or_thread": [
+          137,
+          188
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_history_embed.py",
+      "lines": 97,
+      "imports": [
+        "config",
+        "services.mem0",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_history_index.py",
+      "lines": 241,
+      "imports": [
+        "os",
+        "pytest",
+        "services.mem0",
+        "services.mem0.format",
+        "tempfile",
+        "threading"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          136,
+          138
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_image_validator.py",
+      "lines": 88,
+      "imports": [
+        "__future__",
+        "pytest",
+        "utils.image_validator"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_ingest_channel_history.py",
+      "lines": 142,
+      "imports": [
+        "__future__",
+        "datetime",
+        "importlib.util",
+        "os",
+        "pathlib",
+        "pytest",
+        "sys",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_invest_kb_chunker.py",
+      "lines": 80,
+      "imports": [
+        "pytest",
+        "services.invest_kb.chunker"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_invest_kb_eval_gate.py",
+      "lines": 38,
+      "imports": [
+        "pathlib",
+        "services.invest_kb_eval.gate"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          30
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_invest_kb_haiku.py",
+      "lines": 154,
+      "imports": [
+        "json",
+        "pytest",
+        "services.invest_kb",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_invest_kb_ingest.py",
+      "lines": 463,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "pandas",
+        "pytest",
+        "services.invest_kb",
+        "services.invest_kb.ingest",
+        "services.invest_kb.search",
+        "threading",
+        "time"
+      ],
+      "signals": {
+        "background_or_thread": [
+          53,
+          61,
+          328,
+          354,
+          387
+        ],
+        "native_or_heavy_import": [
+          9
+        ],
+        "whole_object_materialization": [
+          49,
+          59
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_invest_kb_search.py",
+      "lines": 260,
+      "imports": [
+        "os",
+        "pyarrow",
+        "pytest",
+        "services.invest_kb",
+        "services.invest_kb.search",
+        "unittest.mock"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          7
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_job_state.py",
+      "lines": 103,
+      "imports": [
+        "asyncio",
+        "pytest",
+        "services.job_state"
+      ],
+      "signals": {
+        "background_or_thread": [
+          79,
+          80,
+          88
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_main.py",
+      "lines": 453,
+      "imports": [
+        "atexit",
+        "config",
+        "fcntl",
+        "importlib",
+        "logging",
+        "os",
+        "pytest",
+        "sys",
+        "types"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          241,
+          260
+        ],
+        "whole_object_materialization": [
+          249,
+          263
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_main_async.py",
+      "lines": 829,
+      "imports": [
+        "asyncio",
+        "atexit",
+        "config",
+        "fcntl",
+        "importlib",
+        "logging",
+        "main_async",
+        "os",
+        "pytest",
+        "services",
+        "signal",
+        "sys",
+        "tempfile",
+        "types"
+      ],
+      "signals": {
+        "background_or_thread": [
+          304,
+          313,
+          383,
+          392,
+          796
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_markdown_parser.py",
+      "lines": 777,
+      "imports": [
+        "pytest",
+        "utils.markdown_parser"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_math_presentation.py",
+      "lines": 269,
+      "imports": [
+        "dataclasses",
+        "pathlib",
+        "pytest",
+        "utils.markdown_parser",
+        "utils.math_presentation"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_math_renderer.py",
+      "lines": 395,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "hashlib",
+        "importlib",
+        "json",
+        "os",
+        "pytest",
+        "sys",
+        "unittest.mock",
+        "utils.math_renderer"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mcp_command.py",
+      "lines": 89,
+      "imports": [
+        "__future__",
+        "free_code_commands",
+        "free_code_commands.runtime"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mcp_control.py",
+      "lines": 155,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "contextlib",
+        "pytest",
+        "services",
+        "services.claude_api",
+        "services.mcp_control",
+        "services.session",
+        "types"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mcp_discord_command.py",
+      "lines": 155,
+      "imports": [
+        "__future__",
+        "bot_commands.mcp",
+        "free_code_commands.runtime",
+        "pytest",
+        "services.mcp_control",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mcp_mem0_server.py",
+      "lines": 332,
+      "imports": [
+        "mcp_mem0_server",
+        "pytest",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mcp_selector.py",
+      "lines": 179,
+      "imports": [
+        "__future__",
+        "config",
+        "json",
+        "pathlib",
+        "pytest",
+        "services",
+        "services.claude_api.entry",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mcp_semantic_selector.py",
+      "lines": 141,
+      "imports": [
+        "json",
+        "pytest",
+        "services",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_alpha_parity.py",
+      "lines": 225,
+      "imports": [
+        "__future__",
+        "config",
+        "importlib",
+        "inspect",
+        "llm_mem0.auth",
+        "llm_mem0.client",
+        "llm_mem0.search",
+        "llm_mem0.settings",
+        "os",
+        "pytest",
+        "services.mem0",
+        "services.mem0.auth_backend",
+        "services.mem0.cli_compat",
+        "services.mem0.search",
+        "sys",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_attribute.py",
+      "lines": 606,
+      "imports": [
+        "config",
+        "json",
+        "pytest",
+        "services.mem0",
+        "services.mem0.attribute_registry",
+        "services.mem0.extract",
+        "services.mem0.format",
+        "services.mem0.ingest",
+        "services.mem0.search",
+        "time"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_backfill.py",
+      "lines": 97,
+      "imports": [
+        "importlib.util",
+        "json",
+        "os",
+        "pytest",
+        "sys"
+      ],
+      "signals": {
+        "whole_object_materialization": [
+          81
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_batch_summary.py",
+      "lines": 51,
+      "imports": [
+        "pytest",
+        "services.mem0.batch"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_bm25.py",
+      "lines": 351,
+      "imports": [
+        "config",
+        "os",
+        "pytest",
+        "services.mem0",
+        "services.mem0.bm25_index",
+        "services.mem0.search",
+        "tempfile",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_cli_compat.py",
+      "lines": 268,
+      "imports": [
+        "pytest",
+        "services.mem0.cli_compat",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_client.py",
+      "lines": 538,
+      "imports": [
+        "asyncio",
+        "logging",
+        "os",
+        "pytest",
+        "services.mem0.client",
+        "sys",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_conflict.py",
+      "lines": 279,
+      "imports": [
+        "__future__",
+        "config",
+        "pytest",
+        "services.mem0",
+        "services.mem0.conflict",
+        "services.mem0.ingest",
+        "services.mem0.search",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_consolidate.py",
+      "lines": 165,
+      "imports": [
+        "importlib.util",
+        "numpy",
+        "openai",
+        "os",
+        "pathlib",
+        "pytest",
+        "services.mem0.dedup",
+        "sys",
+        "tempfile",
+        "time",
+        "unittest.mock"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          8
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_decay.py",
+      "lines": 183,
+      "imports": [
+        "__future__",
+        "pytest",
+        "services.mem0",
+        "time",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_dedup.py",
+      "lines": 372,
+      "imports": [
+        "logging",
+        "pytest",
+        "services.mem0.dedup",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_eval_harness.py",
+      "lines": 33,
+      "imports": [
+        "asyncio",
+        "importlib.util",
+        "os",
+        "pytest",
+        "sys"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_extract_format.py",
+      "lines": 889,
+      "imports": [
+        "asyncio",
+        "json",
+        "pytest",
+        "services.mem0.extract",
+        "services.mem0.format",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_extract_relations.py",
+      "lines": 305,
+      "imports": [
+        "__future__",
+        "os",
+        "pytest",
+        "services.mem0",
+        "services.mem0.extract",
+        "services.mem0.ingest",
+        "tempfile",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_extract_salvage.py",
+      "lines": 257,
+      "imports": [
+        "json",
+        "pytest",
+        "services.mem0.cli_compat",
+        "services.mem0.extract",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_fact_store.py",
+      "lines": 106,
+      "imports": [
+        "config",
+        "pytest",
+        "services.mem0"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_graph.py",
+      "lines": 456,
+      "imports": [
+        "__future__",
+        "os",
+        "pytest",
+        "services.mem0",
+        "tempfile"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          380,
+          381
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_ingest.py",
+      "lines": 484,
+      "imports": [
+        "asyncio",
+        "pytest",
+        "services.mem0.ingest",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_integrity.py",
+      "lines": 2288,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "concurrent.futures",
+        "config",
+        "pytest",
+        "services.mem0",
+        "services.mem0.integrity",
+        "services.mem0.search",
+        "sqlite3",
+        "threading",
+        "time",
+        "unittest.mock"
+      ],
+      "signals": {
+        "background_or_thread": [
+          1466,
+          1487,
+          1509,
+          1538,
+          1554,
+          1566,
+          1573,
+          1578,
+          1647,
+          1674,
+          1677,
+          1684,
+          1690,
+          1741,
+          1750,
+          1758,
+          1765,
+          1788,
+          1797,
+          1818,
+          1831,
+          1864,
+          1874,
+          1884,
+          2019,
+          2025,
+          2112,
+          2125,
+          2128
+        ],
+        "storage_or_native_io": [
+          133,
+          345,
+          384,
+          636,
+          637,
+          646,
+          659,
+          661,
+          822,
+          1367,
+          1375,
+          1761,
+          1880,
+          2070
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_morpho.py",
+      "lines": 90,
+      "imports": [
+        "__future__",
+        "pytest",
+        "services.mem0"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_priming.py",
+      "lines": 72,
+      "imports": [
+        "__future__",
+        "pytest",
+        "services.mem0"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_reinforce.py",
+      "lines": 343,
+      "imports": [
+        "__future__",
+        "math",
+        "pytest",
+        "services.mem0",
+        "services.mem0.reinforce",
+        "time",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_replay.py",
+      "lines": 217,
+      "imports": [
+        "__future__",
+        "pytest",
+        "services.mem0",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_mem0_search.py",
+      "lines": 1470,
+      "imports": [
+        "asyncio",
+        "config",
+        "json",
+        "logging",
+        "pytest",
+        "services.mem0",
+        "services.mem0.search",
+        "time",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_merge_entities_script.py",
+      "lines": 274,
+      "imports": [
+        "__future__",
+        "importlib.util",
+        "json",
+        "os",
+        "pathlib",
+        "pytest",
+        "services.mem0",
+        "services.mem0.graph",
+        "sys",
+        "tempfile"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          71,
+          75,
+          79,
+          105,
+          109,
+          129,
+          134,
+          139,
+          143,
+          147,
+          152,
+          156,
+          170,
+          173,
+          180,
+          188,
+          195,
+          211,
+          214,
+          257,
+          261
+        ],
+        "whole_object_materialization": [
+          271
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_microcompact.py",
+      "lines": 91,
+      "imports": [
+        "services.claude_api.microcompact"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_model_command.py",
+      "lines": 167,
+      "imports": [
+        "bot_commands.model_cmds",
+        "discord",
+        "inspect",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_oauth_manager.py",
+      "lines": 1951,
+      "imports": [
+        "__future__",
+        "aiohttp",
+        "asyncio",
+        "importlib",
+        "json",
+        "logging",
+        "os",
+        "pathlib",
+        "pytest",
+        "services.claude_api",
+        "services.oauth_manager",
+        "stat",
+        "subprocess",
+        "sys",
+        "time",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {
+        "process_spawn": [
+          120,
+          141
+        ],
+        "storage_or_native_io": [
+          111,
+          170,
+          229,
+          301,
+          1116,
+          1169,
+          1194,
+          1228,
+          1422,
+          1478,
+          1489,
+          1541,
+          1565,
+          1575,
+          1637,
+          1685,
+          1711,
+          1751,
+          1788,
+          1814,
+          1891
+        ],
+        "whole_object_materialization": [
+          268,
+          293,
+          305,
+          308,
+          725,
+          1117,
+          1487,
+          1539,
+          1563,
+          1569,
+          1888,
+          1889,
+          1923,
+          1924
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_operational_gates.py",
+      "lines": 1721,
+      "imports": [
+        "__future__",
+        "fcntl",
+        "hashlib",
+        "json",
+        "os",
+        "pathlib",
+        "pytest",
+        "re",
+        "shutil",
+        "sqlite3",
+        "stat",
+        "subprocess"
+      ],
+      "signals": {
+        "process_spawn": [
+          56,
+          67,
+          188,
+          514,
+          1254,
+          1258,
+          1325,
+          1329,
+          1406,
+          1410
+        ],
+        "storage_or_native_io": [
+          118,
+          143,
+          161,
+          163,
+          195,
+          219,
+          233,
+          259,
+          313,
+          317,
+          334,
+          372,
+          394,
+          396,
+          401,
+          431,
+          460,
+          487,
+          758,
+          860,
+          901,
+          1228,
+          1489,
+          1490,
+          1491,
+          1536,
+          1571,
+          1572,
+          1573,
+          1574,
+          1615,
+          1617,
+          1618,
+          1654,
+          1655,
+          1656
+        ],
+        "whole_object_materialization": [
+          154,
+          170,
+          198,
+          278,
+          360,
+          397,
+          547,
+          562,
+          579,
+          592,
+          611,
+          659,
+          716,
+          720,
+          863,
+          901,
+          998,
+          1044,
+          1064,
+          1075,
+          1287,
+          1311,
+          1366,
+          1389,
+          1456
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_prefix_commands.py",
+      "lines": 132,
+      "imports": [
+        "bot_commands.prefix",
+        "pytest",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_progress.py",
+      "lines": 83,
+      "imports": [
+        "services.claude_api.progress"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_prompt_builder.py",
+      "lines": 659,
+      "imports": [
+        "asyncio",
+        "datetime",
+        "pytest",
+        "re",
+        "services.prompt_builder",
+        "unittest.mock",
+        "zoneinfo"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_provider_continuity.py",
+      "lines": 735,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "json",
+        "pytest",
+        "services",
+        "services.claude_api",
+        "services.codex_app_server",
+        "services.providers",
+        "services.providers.contracts",
+        "services.providers.workflow",
+        "services.session",
+        "threading",
+        "unittest.mock"
+      ],
+      "signals": {
+        "background_or_thread": [
+          141,
+          142,
+          143,
+          144,
+          330,
+          462,
+          610,
+          666
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_provider_contracts.py",
+      "lines": 158,
+      "imports": [
+        "__future__",
+        "ast",
+        "pathlib",
+        "pytest",
+        "services",
+        "services.codex_app_server",
+        "services.providers.contracts",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_provider_router_codex.py",
+      "lines": 252,
+      "imports": [
+        "__future__",
+        "inspect",
+        "pytest",
+        "services",
+        "services.codex_app_server",
+        "services.session",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_r2_archive.py",
+      "lines": 383,
+      "imports": [
+        "__future__",
+        "config",
+        "json",
+        "pathlib",
+        "services",
+        "sqlite3",
+        "subprocess"
+      ],
+      "signals": {
+        "process_spawn": [
+          220,
+          248,
+          263,
+          283,
+          364
+        ],
+        "storage_or_native_io": [
+          29,
+          33,
+          65,
+          92,
+          122,
+          150,
+          195,
+          196,
+          197,
+          237,
+          279,
+          332,
+          333,
+          335,
+          345,
+          346,
+          347,
+          348,
+          350,
+          363
+        ],
+        "whole_object_materialization": [
+          53,
+          76,
+          165,
+          167,
+          172,
+          174,
+          203,
+          277,
+          369
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_rate_limit.py",
+      "lines": 128,
+      "imports": [
+        "config",
+        "pytest",
+        "services.rate_limit",
+        "time",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_render_cleanup.py",
+      "lines": 45,
+      "imports": [
+        "os",
+        "pytest",
+        "time",
+        "unittest.mock",
+        "utils"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          18,
+          22
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_response_sanitizer.py",
+      "lines": 106,
+      "imports": [
+        "pytest",
+        "utils.response_sanitizer"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_runtime_bootstrap.py",
+      "lines": 890,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "config",
+        "config.paths",
+        "dataclasses",
+        "importlib",
+        "logging",
+        "os",
+        "pathlib",
+        "pytest",
+        "services.claude_api",
+        "services.codex_app_server",
+        "services.runtime_bootstrap",
+        "services.session",
+        "signal",
+        "subprocess",
+        "sys",
+        "threading",
+        "unittest.mock"
+      ],
+      "signals": {
+        "background_or_thread": [
+          534,
+          535,
+          536,
+          707
+        ],
+        "process_spawn": [
+          88,
+          183
+        ],
+        "storage_or_native_io": [
+          413,
+          430
+        ],
+        "whole_object_materialization": [
+          419,
+          580
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_runtime_state.py",
+      "lines": 99,
+      "imports": [
+        "config",
+        "json",
+        "pytest",
+        "services",
+        "services.claude_api",
+        "services.runtime_state",
+        "time"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_sentinel.py",
+      "lines": 69,
+      "imports": [
+        "services.sentinel"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_session.py",
+      "lines": 1404,
+      "imports": [
+        "asyncio",
+        "collections",
+        "config",
+        "json",
+        "logging",
+        "os",
+        "pytest",
+        "services.session",
+        "services.session_registry",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_session_registry.py",
+      "lines": 780,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "collections",
+        "collections.abc",
+        "dataclasses",
+        "json",
+        "pytest",
+        "services.session",
+        "services.session_registry",
+        "threading"
+      ],
+      "signals": {
+        "background_or_thread": [
+          410,
+          440,
+          474,
+          502,
+          586,
+          587,
+          589,
+          743,
+          750
+        ],
+        "storage_or_native_io": [
+          28,
+          47,
+          60,
+          70
+        ],
+        "whole_object_materialization": [
+          54,
+          66,
+          625,
+          679
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_session_replay_cap.py",
+      "lines": 41,
+      "imports": [
+        "config",
+        "services.session"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_skills.py",
+      "lines": 144,
+      "imports": [
+        "__future__",
+        "os",
+        "pathlib",
+        "pytest",
+        "services",
+        "services.claude_api",
+        "services.skills"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          26,
+          109
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_skills_command.py",
+      "lines": 195,
+      "imports": [
+        "__future__",
+        "bot_commands.session_cmds",
+        "bot_commands.skills",
+        "discord",
+        "services.skills",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_spinner_live.py",
+      "lines": 151,
+      "imports": [
+        "asyncio",
+        "bot",
+        "pytest",
+        "services",
+        "tests.test_bot",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_sre_critical_integration.py",
+      "lines": 92,
+      "imports": [
+        "asyncio",
+        "json",
+        "logging",
+        "os",
+        "pathlib",
+        "pytest",
+        "services.claude_api",
+        "services.health",
+        "services.oauth_manager",
+        "services.session",
+        "signal",
+        "subprocess",
+        "sys",
+        "time"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          24
+        ],
+        "whole_object_materialization": [
+          35
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_structured_log.py",
+      "lines": 525,
+      "imports": [
+        "json",
+        "logging",
+        "pytest",
+        "services.runtime_bootstrap",
+        "services.structured_log",
+        "sys",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_table_renderer.py",
+      "lines": 333,
+      "imports": [
+        "hashlib",
+        "os",
+        "pytest",
+        "utils.table_renderer"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          173
+        ],
+        "whole_object_materialization": [
+          115,
+          186
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/test_tool_catalog.py",
+      "lines": 211,
+      "imports": [
+        "config",
+        "pytest",
+        "services",
+        "services.claude_api",
+        "services.claude_api.errors",
+        "services.claude_api.mcp_client",
+        "services.claude_api.tools",
+        "services.mcp_selector",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/test_tool_loop_refactor_compat.py",
+      "lines": 249,
+      "imports": [
+        "asyncio",
+        "inspect",
+        "pytest",
+        "services.claude_api.loop_contracts",
+        "services.claude_api.loop_observability",
+        "services.claude_api.message_codec",
+        "services.claude_api.request_shape",
+        "services.claude_api.tool_display",
+        "services.claude_api.tool_execution",
+        "services.claude_api.tool_loop",
+        "types",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/unit/test_archive_http_transport.py",
+      "lines": 128,
+      "imports": [
+        "config",
+        "hashlib",
+        "httpx",
+        "json",
+        "pathlib",
+        "pytest",
+        "services",
+        "services.offload.archive_transport",
+        "subprocess"
+      ],
+      "signals": {
+        "process_spawn": [
+          88
+        ],
+        "storage_or_native_io": [
+          25,
+          39,
+          47
+        ],
+        "whole_object_materialization": [
+          52,
+          60
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/unit/test_bot_final_regressions.py",
+      "lines": 1029,
+      "imports": [
+        "PIL",
+        "__future__",
+        "asyncio",
+        "bot_pipeline",
+        "bot_pipeline.attachment_types",
+        "bot_pipeline.fifo",
+        "bot_pipeline.runtime",
+        "bot_pipeline.turn_outbox",
+        "bot_preprocess",
+        "bot_ui",
+        "discord",
+        "os",
+        "pytest",
+        "services.mem0",
+        "struct",
+        "time",
+        "types",
+        "unittest.mock",
+        "utils",
+        "utils.attachment_downloader",
+        "utils.context_gateway",
+        "utils.render_store",
+        "zlib"
+      ],
+      "signals": {
+        "background_or_thread": [
+          295,
+          296,
+          297,
+          322,
+          324,
+          325,
+          511,
+          543,
+          558,
+          594,
+          634,
+          655,
+          686,
+          697,
+          723,
+          742,
+          947,
+          981,
+          994
+        ],
+        "native_or_heavy_import": [
+          13
+        ],
+        "storage_or_native_io": [
+          566,
+          776,
+          1016,
+          1027
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/unit/test_codex_turn_hooks.py",
+      "lines": 425,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "copy",
+        "pytest",
+        "services.codex_app_server",
+        "services.codex_app_server.client",
+        "services.codex_app_server.session",
+        "services.codex_app_server.turn_hooks"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/unit/test_discord_link_prompt.py",
+      "lines": 108,
+      "imports": [
+        "__future__",
+        "bot_pipeline",
+        "pytest",
+        "types",
+        "unittest.mock",
+        "utils.context_gateway"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/unit/test_offload_boundaries.py",
+      "lines": 69,
+      "imports": [
+        "json",
+        "pytest",
+        "services.offload.endpoint",
+        "services.offload.knowledge_client",
+        "services.offload.mcp_config"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "tests/unit/test_phase4_scripts.py",
+      "lines": 1052,
+      "imports": [
+        "__future__",
+        "hashlib",
+        "json",
+        "pathlib",
+        "pytest",
+        "scripts",
+        "tests.conftest",
+        "types"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          20,
+          599,
+          620,
+          876,
+          927
+        ],
+        "whole_object_materialization": [
+          732
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/unit/test_remote_math.py",
+      "lines": 54,
+      "imports": [
+        "PIL",
+        "io",
+        "pytest",
+        "unittest.mock",
+        "utils"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          7
+        ]
+      },
+      "role": "test"
+    },
+    {
+      "path": "tests/unit/test_scheduled_offload.py",
+      "lines": 28,
+      "imports": [
+        "pytest",
+        "services",
+        "unittest.mock"
+      ],
+      "signals": {},
+      "role": "test"
+    },
+    {
+      "path": "utils/__init__.py",
+      "lines": 0,
+      "imports": [],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "utils/atomic_write.py",
+      "lines": 92,
+      "imports": [
+        "__future__",
+        "json",
+        "os",
+        "pathlib",
+        "typing",
+        "uuid"
+      ],
+      "signals": {
+        "storage_or_native_io": [
+          49,
+          55
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "utils/attachment_downloader.py",
+      "lines": 476,
+      "imports": [
+        "PIL",
+        "__future__",
+        "aiohttp",
+        "asyncio",
+        "collections.abc",
+        "logging",
+        "os",
+        "re",
+        "tempfile",
+        "typing",
+        "unicodedata",
+        "utils.image_validator",
+        "warnings"
+      ],
+      "signals": {
+        "background_or_thread": [
+          126
+        ],
+        "native_or_heavy_import": [
+          16
+        ],
+        "storage_or_native_io": [
+          78,
+          87
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "utils/attachment_policy.py",
+      "lines": 240,
+      "imports": [
+        "__future__",
+        "collections.abc",
+        "fnmatch",
+        "logging",
+        "os",
+        "re",
+        "typing",
+        "urllib.parse",
+        "utils.image_validator"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "utils/attachment_store.py",
+      "lines": 57,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "os",
+        "re",
+        "utils.render_store"
+      ],
+      "signals": {
+        "background_or_thread": [
+          53
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "utils/attachments.py",
+      "lines": 488,
+      "imports": [
+        "aiohttp",
+        "asyncio",
+        "config",
+        "os",
+        "re",
+        "utils"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "utils/browser_backend.py",
+      "lines": 388,
+      "imports": [
+        "__future__",
+        "aiohttp",
+        "asyncio",
+        "collections",
+        "glob",
+        "itertools",
+        "json",
+        "logging",
+        "os",
+        "pathlib",
+        "typing"
+      ],
+      "signals": {
+        "background_or_thread": [
+          277,
+          357
+        ],
+        "process_spawn": [
+          271
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "utils/browser_pool.py",
+      "lines": 20,
+      "imports": [
+        "utils.browser_backend"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "utils/cache.py",
+      "lines": 95,
+      "imports": [
+        "__future__",
+        "collections",
+        "time",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "utils/cf_browser.py",
+      "lines": 79,
+      "imports": [
+        "__future__",
+        "config",
+        "logging",
+        "utils.browser_backend"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "utils/context_gateway.py",
+      "lines": 399,
+      "imports": [
+        "__future__",
+        "asyncio",
+        "collections.abc",
+        "dataclasses",
+        "discord",
+        "logging",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "utils/discord_helpers.py",
+      "lines": 761,
+      "imports": [
+        "aiohttp",
+        "collections.abc",
+        "config",
+        "discord",
+        "logging",
+        "re",
+        "urllib.parse",
+        "utils",
+        "utils.cache"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "utils/image_validator.py",
+      "lines": 61,
+      "imports": [
+        "__future__"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "utils/markdown_parser.py",
+      "lines": 471,
+      "imports": [
+        "dataclasses",
+        "re",
+        "utils.math_presentation"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "utils/math_presentation.py",
+      "lines": 646,
+      "imports": [
+        "__future__",
+        "dataclasses",
+        "enum",
+        "re",
+        "typing"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "utils/math_renderer.py",
+      "lines": 317,
+      "imports": [
+        "asyncio",
+        "config",
+        "json",
+        "logging",
+        "os",
+        "re",
+        "services.offload.endpoint",
+        "utils.browser_pool",
+        "utils.cf_browser",
+        "utils.render_store"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "utils/render_store.py",
+      "lines": 188,
+      "imports": [
+        "PIL",
+        "__future__",
+        "hashlib",
+        "logging",
+        "os",
+        "struct",
+        "time",
+        "uuid",
+        "zlib"
+      ],
+      "signals": {
+        "native_or_heavy_import": [
+          13
+        ],
+        "storage_or_native_io": [
+          92,
+          96
+        ]
+      },
+      "role": "application"
+    },
+    {
+      "path": "utils/response_sanitizer.py",
+      "lines": 86,
+      "imports": [
+        "re",
+        "utils.markdown_parser"
+      ],
+      "signals": {},
+      "role": "application"
+    },
+    {
+      "path": "utils/table_renderer.py",
+      "lines": 201,
+      "imports": [
+        "bleach",
+        "html",
+        "logging",
+        "markdown",
+        "utils.cf_browser",
+        "utils.render_store"
+      ],
+      "signals": {},
+      "role": "application"
+    }
+  ],
+  "runtime": {
+    "memory_kib": {
+      "MemTotal": 8126060,
+      "MemAvailable": 4521488,
+      "SwapTotal": 11534324,
+      "SwapFree": 8846084
+    },
+    "pressure": {
+      "cpu": "some avg10=1.18 avg60=1.75 avg300=4.42 total=554835198\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0",
+      "memory": "some avg10=0.04 avg60=0.09 avg300=0.68 total=144961562\nfull avg10=0.04 avg60=0.08 avg300=0.50 total=130437617",
+      "io": "some avg10=0.41 avg60=1.71 avg300=6.33 total=2441068273\nfull avg10=0.32 avg60=1.40 avg300=4.43 total=2248439344"
+    },
+    "systemd": [
+      {
+        "MainPID": "385684",
+        "MemoryCurrent": "860950528",
+        "CPUUsageNSec": "912379730000",
+        "Id": "discord-bot.service",
+        "ActiveState": "active",
+        "pss_kib": null
+      },
+      {
+        "MainPID": "386710",
+        "MemoryCurrent": "167051264",
+        "CPUUsageNSec": "54208985000",
+        "Id": "discord-bot-kanae-claude.service",
+        "ActiveState": "active",
+        "pss_kib": 199189
+      },
+      {
+        "MainPID": "0",
+        "MemoryCurrent": "[not set]",
+        "CPUUsageNSec": "[not set]",
+        "Id": "hermes-discord-codex.service",
+        "ActiveState": "failed"
+      },
+      {
+        "MainPID": "900",
+        "MemoryCurrent": "162488320",
+        "CPUUsageNSec": "171373940000",
+        "Id": "chromadb-server.service",
+        "ActiveState": "active",
+        "pss_kib": 138287
+      },
+      {
+        "MainPID": "932",
+        "MemoryCurrent": "4239360",
+        "CPUUsageNSec": "311755648000",
+        "Id": "mcp-mem0-shared.service",
+        "ActiveState": "active",
+        "pss_kib": 7773
+      },
+      {
+        "MainPID": "925",
+        "MemoryCurrent": "62152704",
+        "CPUUsageNSec": "147392336000",
+        "Id": "intervention-scheduler.service",
+        "ActiveState": "active",
+        "pss_kib": 3809
+      },
+      {
+        "MainPID": "957",
+        "MemoryCurrent": "499712",
+        "CPUUsageNSec": "8144936000",
+        "Id": "vi-signal-scheduler.service",
+        "ActiveState": "active",
+        "pss_kib": 388
+      }
+    ]
+  }
+}

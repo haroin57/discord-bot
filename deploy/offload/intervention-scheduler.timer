@@ -1,0 +1,11 @@
+[Unit]
+Description=Run intervention check every 30 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00,30:00 Asia/Tokyo
+Unit=intervention-scheduler.service
+Persistent=false
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

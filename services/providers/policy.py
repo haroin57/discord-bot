@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 
 from services.providers.contracts import ProviderName, ProviderRequest
 
@@ -24,6 +25,9 @@ def resolve_provider_name(
     default: str | None,
 ) -> ProviderName:
     if restricted:
+        if ((default or '').strip().lower() == PROVIDER_CODEX
+                and os.environ.get('CODEX_RESTRICTED_ENABLED', '').lower() in {'1', 'true'}):
+            return PROVIDER_CODEX
         return PROVIDER_CLAUDE
     value = (explicit or "").strip().lower()
     if value in PROVIDERS:

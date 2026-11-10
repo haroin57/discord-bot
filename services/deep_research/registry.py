@@ -282,6 +282,30 @@ async def run_subagent(
     briefing = _compact_briefing(
         defn.system_prompt, briefing, DEEP_RESEARCH_SUBAGENT_INPUT_BUDGET_CHARS,
     )
+    from services.codex_app_server import auxiliary
+    if auxiliary.enabled():
+        async def execute_codex_tool(name, arguments):
+            allowed, reason = can_use_tool(name, arguments)
+            if not allowed:
+                return reason
+            if tool_invocation_callback:
+                await tool_invocation_callback(name, arguments)
+            return await execute_tool(name, arguments)
+        try:
+            result = await auxiliary.run_task(
+                prompt=briefing, instructions=defn.system_prompt,
+                tools=tools_for_api, execute_tool=execute_codex_tool,
+                effort=defn.effort or 'high', timeout_s=defn.idle_timeout_s,
+                max_tool_calls=defn.max_tool_turns,
+                text_stream_callback=text_stream_callback,
+            )
+            state.add_usage(auxiliary.normalized_usage(result))
+            text = result.final_text.strip()
+            return SubAgentResult(subq=briefing, summary_md=text[:_MAX_RESULT_CHARS],
+                                  cited_sids=[], ok=bool(text), error=None if text else 'empty result')
+        except Exception as exc:
+            log.warning('Codex research helper failed: %s', type(exc).__name__)
+            return SubAgentResult(subq=briefing, summary_md='', ok=False, error=type(exc).__name__)
     # 一時的な過負荷（overloaded_error / 5xx）はバックオフでリトライ。本ルートと同じ堅牢性。
     last_exc: BaseException | None = None
     result = None

@@ -18,6 +18,7 @@ fail-open で吸収し、API 直フォールバックへ回す。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -158,7 +159,9 @@ async def ask_agy(prompt: str, *, timeout_s: int) -> str:
         return stdout
 
     # stdout 空（非TTY バグ）→ transcript フォールバック
-    answer = _read_transcript_answer()
+    # CLI transcripts can be large. Directory scans and JSONL parsing must
+    # not block Discord heartbeats or other conversations on the event loop.
+    answer = await asyncio.to_thread(_read_transcript_answer)
     if answer:
         return answer
     raise RuntimeError(

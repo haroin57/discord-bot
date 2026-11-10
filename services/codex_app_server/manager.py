@@ -12,6 +12,7 @@ import re
 import time
 import tomllib
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -22,6 +23,7 @@ from config import (
     CODEX_APP_SERVER_CWD,
     CODEX_APP_SERVER_DANGEROUSLY_BYPASS_APPROVALS_AND_SANDBOX,
     CODEX_APP_SERVER_INHERIT_MCP_SERVERS,
+    CODEX_APP_SERVER_IDLE_TIMEOUT_S,
     CODEX_APP_SERVER_MAX_SESSIONS,
     CODEX_APP_SERVER_MEM0_MCP_URL,
     CODEX_APP_SERVER_PATH,
@@ -29,6 +31,7 @@ from config import (
     CODEX_APP_SERVER_SANDBOX,
     CODEX_APP_SERVER_STATE_PATH,
     CODEX_APP_SERVER_TIMEOUT_S,
+    CODEX_APP_SERVER_TURN_HOOKS_ENABLED,
     CODEX_APP_SERVER_USE_LEGACY_LANDLOCK,
     CODEX_BIN,
 )
@@ -78,7 +81,7 @@ def _global_codex_config() -> dict[str, Any]:
         return {}
 
 
-def configured_mcp_endpoints() -> dict[str, str]:
+def configured_mcp_endpoints(user_id: int | None = None) -> dict[str, str]:
     """Return the bot's explicit, credential-free MCP endpoint allowlist."""
     endpoints: dict[str, str] = {}
     mem0_url = _safe_mcp_url(CODEX_APP_SERVER_MEM0_MCP_URL)
@@ -115,10 +118,20 @@ def configured_mcp_endpoints() -> dict[str, str]:
             log.warning("Inherited Codex MCP server has no safe URL: %s", name)
             continue
         endpoints[name] = url
+    from services.codex_app_server import mcp_bridge
+    if mcp_bridge.enabled():
+        endpoints = {name: url for name, url in endpoints.items()
+                     if mcp_bridge.server_allowed(name, user_id)}
+        # The per-service bridge uses this bot's memory namespace and current
+        # helper provider; do not route to another daemon's Claude credentials.
+        endpoints.pop('kanae-mem0', None)
+        # Route the alarm through the same per-call enable/authorization gate
+        # as the other private tools, instead of also exposing a raw URL.
+        endpoints.pop('kanae-alarm', None)
     return endpoints
 
 
-def build_app_server_extra_args(model: str) -> list[str]:
+def build_app_server_extra_args(model: str, user_id: int | None = None) -> list[str]:
     """Build explicit model + credential-free MCP config overrides.
 
     The running Discord service has a deliberately narrow PATH and also owns
@@ -139,7 +152,7 @@ def build_app_server_extra_args(model: str) -> list[str]:
     if CODEX_APP_SERVER_USE_LEGACY_LANDLOCK:
         args.extend(["--enable", "use_legacy_landlock"])
     args.extend(["-c", f"model={_toml_string(model)}"])
-    endpoints = configured_mcp_endpoints()
+    endpoints = configured_mcp_endpoints(user_id)
 
     for name, url in sorted(endpoints.items()):
         args.extend([
@@ -157,6 +170,9 @@ def build_app_server_extra_args(model: str) -> list[str]:
     for name in sorted((global_config.get("plugins") or {}).keys()):
         if _PLUGIN_NAME_RE.fullmatch(str(name)):
             args.extend(["-c", f"plugins.{name}.enabled=false"])
+    from services.codex_app_server import mcp_bridge
+    if mcp_bridge.enabled():
+        args.extend(mcp_bridge.bridge_args(user_id))
     return args
 
 
@@ -173,15 +189,90 @@ class CodexSessionManager:
         *,
         state_path: str = CODEX_APP_SERVER_STATE_PATH,
         max_sessions: int = CODEX_APP_SERVER_MAX_SESSIONS,
+        idle_timeout_s: float = CODEX_APP_SERVER_IDLE_TIMEOUT_S,
     ) -> None:
         self.state_path = state_path
         self.max_sessions = max(1, int(max_sessions))
+        self.idle_timeout_s = max(0.0, float(idle_timeout_s))
         self._state = self._load_state()
         self._sessions: OrderedDict[str, CodexSession] = OrderedDict()
         self._locks: dict[str, asyncio.Lock] = {}
         self._channel_locks: dict[int, asyncio.Lock] = {}
         self._active_keys: set[str] = set()
         self._state_lock = asyncio.Lock()
+        self._idle_handles: dict[str, asyncio.TimerHandle] = {}
+        self._retire_tasks: set[asyncio.Task] = set()
+        self._waiting_keys: dict[str, int] = {}
+        self._closing = False
+
+    @asynccontextmanager
+    async def _turn_slot(self, key, channel_lock, lock):
+        if self._closing:
+            raise RuntimeError("Codex session manager is closed")
+        self._waiting_keys[key] = self._waiting_keys.get(key, 0) + 1
+        self._cancel_idle_timer(key)
+        try:
+            async with channel_lock, lock:
+                if self._closing:
+                    raise RuntimeError("Codex session manager is closed")
+                yield
+        finally:
+            count = self._waiting_keys[key] - 1
+            if count:
+                self._waiting_keys[key] = count
+            else:
+                self._waiting_keys.pop(key, None)
+                session = self._sessions.get(key)
+                if session is not None and key not in self._idle_handles:
+                    self._schedule_idle_retirement(key, session)
+                if not self._closing:
+                    await self._evict_if_needed()
+
+    def _cancel_idle_timer(self, key: str) -> None:
+        handle = self._idle_handles.pop(key, None)
+        if handle is not None:
+            handle.cancel()
+
+    def _schedule_idle_retirement(self, key: str, session: CodexSession) -> None:
+        self._cancel_idle_timer(key)
+        if self._closing or not self.idle_timeout_s or self._sessions.get(key) is not session:
+            return
+
+        def expire() -> None:
+            self._idle_handles.pop(key, None)
+            task = asyncio.create_task(
+                self._retire_idle(key, session), name="codex-idle-retirement"
+            )
+            self._retire_tasks.add(task)
+            task.add_done_callback(self._retire_tasks.discard)
+
+        self._idle_handles[key] = asyncio.get_running_loop().call_later(
+            self.idle_timeout_s, expire
+        )
+
+    async def _retire_idle(self, key: str, session: CodexSession) -> None:
+        # A queued/acquired turn cancels the timer. A callback already queued
+        # on the event loop must additionally check identity and lock state.
+        channel_id = int(key.split(":", 1)[0])
+        channel_lock = self._channel_locks.get(channel_id)
+        if (
+            self._sessions.get(key) is not session
+            or key in self._active_keys
+            or key in self._waiting_keys
+            or (channel_lock is not None and channel_lock.locked())
+            or key in self._idle_handles
+        ):
+            if self._sessions.get(key) is session and key not in self._active_keys:
+                self._schedule_idle_retirement(key, session)
+            return
+        # No await before removal, so a new turn resumes a fresh process from
+        # the persisted thread instead of racing a process being shut down.
+        self._sessions.pop(key, None)
+        try:
+            await session.close()
+            log.info("Retired idle Codex app-server session key=%s", key)
+        except Exception:
+            log.exception("Idle Codex session retirement failed key=%s", key)
 
     def _load_state(self) -> dict[str, dict[str, Any]]:
         try:
@@ -246,7 +337,8 @@ class CodexSessionManager:
         channel_key = int(channel_id)
         channel_lock = self._channel_locks.setdefault(channel_key, asyncio.Lock())
         lock = self._locks.setdefault(key, asyncio.Lock())
-        async with channel_lock, lock:
+        async with self._turn_slot(key, channel_lock, lock):
+            self._cancel_idle_timer(key)
             session = self._sessions.get(key)
             requested_instructions_hash = hashlib.sha256(
                 developer_instructions.encode("utf-8", "replace")
@@ -291,16 +383,20 @@ class CodexSessionManager:
                 if session is not None:
                     await session.close()
                 stored = self._state.get(key) or {}
+                from services.codex_app_server import mcp_bridge
+                extra_args = (build_app_server_extra_args(model, user_id)
+                              if mcp_bridge.enabled() else build_app_server_extra_args(model))
                 session = CodexSession(
                     cwd=CODEX_APP_SERVER_CWD,
                     codex_bin=CODEX_BIN,
                     stored_thread_id=stored.get("thread_id"),
                     global_args=build_app_server_global_args(),
-                    extra_args=build_app_server_extra_args(model),
+                    extra_args=extra_args,
                     sandbox=CODEX_APP_SERVER_SANDBOX,
                     approval_policy=CODEX_APP_SERVER_APPROVAL_POLICY,
                     turn_timeout_s=CODEX_APP_SERVER_TIMEOUT_S,
                     post_tool_timeout_s=CODEX_APP_SERVER_POST_TOOL_TIMEOUT_S,
+                    turn_hooks_enabled=CODEX_APP_SERVER_TURN_HOOKS_ENABLED,
                     child_env={"PATH": CODEX_APP_SERVER_PATH},
                 )
                 self._sessions[key] = session
@@ -351,6 +447,7 @@ class CodexSessionManager:
             }
             await self._save_state()
             await self._evict_if_needed()
+            self._schedule_idle_retirement(key, session)
             return result
 
     async def _evict_if_needed(self) -> None:
@@ -360,6 +457,7 @@ class CodexSessionManager:
                     candidate_key
                     for candidate_key in self._sessions
                     if candidate_key not in self._active_keys
+                    and candidate_key not in self._waiting_keys
                 ),
                 None,
             )
@@ -368,6 +466,7 @@ class CodexSessionManager:
                 # Discord turn. The next completed turn retries eviction.
                 return
             session = self._sessions.pop(candidate)
+            self._cancel_idle_timer(candidate)
             await session.close()
             log.info("Evicted idle Codex app-server session key=%s", candidate)
 
@@ -384,6 +483,7 @@ class CodexSessionManager:
                 lock = self._locks.setdefault(key, asyncio.Lock())
                 async with lock:
                     session = self._sessions.pop(key, None)
+                    self._cancel_idle_timer(key)
                     if session is not None:
                         await session.close()
                     self._state.pop(key, None)
@@ -403,6 +503,7 @@ class CodexSessionManager:
             lock = self._locks.setdefault(key, asyncio.Lock())
             async with lock:
                 session = self._sessions.pop(key, None)
+                self._cancel_idle_timer(key)
                 if session is not None:
                     await session.close()
                 self._state.pop(key, None)
@@ -412,13 +513,20 @@ class CodexSessionManager:
             return True
 
     async def close_all(self) -> None:
+        self._closing = True
+        for handle in self._idle_handles.values():
+            handle.cancel()
+        self._idle_handles.clear()
         sessions = list(self._sessions.values())
         self._sessions.clear()
-        for session in sessions:
+        async def close(session):
             try:
                 await session.close()
             except Exception:
                 log.debug("Codex session close failed", exc_info=True)
+        await asyncio.gather(*(close(session) for session in sessions))
+        if self._retire_tasks:
+            await asyncio.gather(*tuple(self._retire_tasks), return_exceptions=True)
 
 
 _manager: CodexSessionManager | None = None

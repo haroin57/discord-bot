@@ -51,7 +51,7 @@ _query_cache: TTLLRUCache[str, list[float]] = TTLLRUCache(maxsize=256, ttl_s=600
 # embedding match must not eagerly start a private data/action server on an
 # unrelated admin message.  The keyword selector applies both an explicit
 # domain trigger and the corresponding user permission gate.
-_KEYWORD_ONLY_SERVERS = frozenset({"realestate", "nature-remo"})
+_KEYWORD_ONLY_SERVERS = frozenset({"realestate", "nature-remo", "kanae-alarm"})
 
 _openai_client = None
 

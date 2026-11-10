@@ -1,0 +1,19 @@
+{
+  "name": "discord-bot-archive",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "types": "wrangler types --include-runtime false",
+    "check": "tsc --noEmit",
+    "build": "wrangler deploy --dry-run --env='' --outdir dist",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "overrides": { "sharp": "0.35.4" },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260908.1",
+    "miniflare": "5.20260908.0-alpha",
+    "typescript": "7.0.2",
+    "wrangler": "4.130.0"
+  }
+}

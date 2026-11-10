@@ -60,7 +60,7 @@ def apply() -> None:
     os.environ.setdefault(
         "MEM0_FORMAT_LEGEND",
         "(凡例: imp=重要度1-5 / Live>Hot>Warm>Cold=鮮度tier / "
-        "[日付]=最終確認日 / [条件: ...]=その条件下でのみ成り立つ事実)",
+        "日付は記録・確認・参照・有効期間を区別 / [条件: ...]=その条件下でのみ成り立つ事実)",
     )
     os.environ.setdefault("MEM0_FORMAT_FOOTER", "[End of Mem0 memories]")
 

@@ -606,8 +606,8 @@ build_release_venv() {
         return 1
     fi
     if [[ -f "${temporary}/src/requirements.lock" ]] \
-        && ! "${venv}/bin/python" -m pip install \
-            --requirement "${temporary}/src/requirements.lock"; then
+        && ! (cd "${temporary}/src" && "${venv}/bin/python" -m pip install \
+            --requirement requirements.lock); then
         rm -rf -- "${temporary}"
         return 1
     fi

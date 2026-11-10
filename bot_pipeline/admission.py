@@ -178,11 +178,11 @@ def guild_message_addresses_bot(
     if direct_mention or reply_mention:
         return True
 
-    ignored_role_mentions = mentioned_role_ids & ignored_role_ids
-    own_role_mentions = mentioned_role_ids & bot_role_ids
-    if own_role_mentions - ignored_role_mentions:
-        return True
-    if ignored_role_mentions:
+    # Role mentions are not an addressable bot identity. Discord may expand a
+    # mentioned role into ``message.mentions``, and multiple bot identities can
+    # share that role. Only a literal user mention or a reply ping above may
+    # wake the bot; any role-only callout is rejected before keyword fallback.
+    if mentioned_role_ids:
         return False
 
     content_lower = content.lower()

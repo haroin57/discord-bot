@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -38,12 +40,13 @@ except ImportError:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VI_SCRIPT = REPO_ROOT / "scripts" / "vi_signal_alert.py"
-VI_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
-LOG_FILE = REPO_ROOT / ".state" / "vi_signal_alert.log"
+VI_PYTHON = Path(sys.executable)
+_LOG_ROOT = Path(os.environ.get("BOT_STATE_DIR", str(REPO_ROOT / ".state")))
+LOG_FILE = _LOG_ROOT / "vi_signal_alert.log"
 # fwd記録 (ADR-0026): 発火後5営業日の株価追跡を vi_fwd_record.py で記録する。
 # 発火判定 (run_vi_check) の直後に同じ18:00サイクルで走らせる。
 FWD_SCRIPT = REPO_ROOT / "scripts" / "vi_fwd_record.py"
-FWD_LOG_FILE = REPO_ROOT / ".state" / "vi_fwd_record.log"
+FWD_LOG_FILE = _LOG_ROOT / "vi_fwd_record.log"
 
 # 実行時刻: 18:00 JST (b0nchichi 確定, 2026-06-15)
 # 16:00 引け → 16:00 前後で日経公式CSV確報反映 → 18:00 で確実に取れる。
@@ -228,6 +231,20 @@ async def vi_signal_daemon() -> None:
             await asyncio.sleep(60)
 
 
+async def run_once() -> int:
+    """One business-day cycle for a systemd timer; no catch-up notifications."""
+    if not is_business_day(date.today()):
+        return 0
+    outcomes = []
+    for check in (run_vi_check, run_fwd_record):
+        try:
+            outcomes.append(await check())
+        except Exception:
+            logger.exception("scheduled VI check failed")
+            outcomes.append(1)
+    return next((code for code in outcomes if code), 0)
+
+
 def main() -> None:
     """独立 systemd service (`python -m services.vi_signal_scheduler`) のエントリ。
 
@@ -240,6 +257,12 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    import argparse
+    parser = argparse.ArgumentParser(description="VI signal scheduler")
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args()
+    if args.once:
+        raise SystemExit(asyncio.run(run_once()))
     try:
         asyncio.run(vi_signal_daemon())
     except KeyboardInterrupt:

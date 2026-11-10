@@ -332,22 +332,25 @@ async def _build_task_prompt(
     # --- attachments on the task message (mirror on_message) ---
     http = await deps.get_http_session()
     all_atts = list(getattr(msg, "attachments", None) or [])
-    image_paths = await download_attachments(http, all_atts)
-    if image_paths:
-        await asyncio.to_thread(
-            r2_archive.archive_images,
-            image_paths,
-            channel_id=msg.channel.id,
-            request_message_id=msg.id,
-            direction="inbound",
-            author_id=getattr(msg.author, "id", None),
-            source="discord-reaction-task",
-            per_path_metadata=attachment_metadata_by_path(all_atts, image_paths),
+    from utils.attachment_downloader import attachment_reuse_scope
+
+    with attachment_reuse_scope():
+        image_paths = await download_attachments(http, all_atts)
+        if image_paths:
+            await asyncio.to_thread(
+                r2_archive.archive_images,
+                image_paths,
+                channel_id=msg.channel.id,
+                request_message_id=msg.id,
+                direction="inbound",
+                author_id=getattr(msg.author, "id", None),
+                source="discord-reaction-task",
+                per_path_metadata=attachment_metadata_by_path(all_atts, image_paths),
+            )
+        text_atts = await download_text_attachments(http, all_atts)
+        arbitrary_atts = await download_arbitrary_attachments(
+            http, all_atts, caller_is_admin=author_is_admin,
         )
-    text_atts = await download_text_attachments(http, all_atts)
-    arbitrary_atts = await download_arbitrary_attachments(
-        http, all_atts, caller_is_admin=author_is_admin,
-    )
 
     # --- parent channel / thread context (Q2: message + channel context) ---
     conv_context = ""
@@ -449,7 +452,11 @@ async def _process(
         body = _status_text(text)
         deps.track_task(_safe_edit(anchor, body[:1990]), name="claude_tag_status")
 
-    response_text, _session, _resumed = await call_with_tools(
+    provider_call = call_with_tools
+    from config import DEFAULT_LLM_PROVIDER
+    if DEFAULT_LLM_PROVIDER == 'codex':
+        from services.codex_app_server.entry import call_with_tools as provider_call
+    response_text, _session, _resumed = await provider_call(
         prompt,
         send_target.id,
         deps.sessions,

@@ -345,8 +345,13 @@ async def _run(
                 "❌ 一般 Web 検索バックエンド（brave-search / tavily）が未設定です。",
             )
             return
-        api_client = await make_api_client(False)
-        pool = McpPool(
+        from services.codex_app_server import auxiliary
+        api_client = None if auxiliary.enabled() else await make_api_client(False)
+        pool_type = McpPool
+        if auxiliary.enabled():
+            from services.deep_research.mcp_actor import ResearchMcpPool
+            pool_type = ResearchMcpPool
+        pool = pool_type(
             stack=stack,
             available_configs=research_cfg,
             process_observer=run.register_mcp_process,
@@ -1027,23 +1032,32 @@ async def _clarify(
 
     questions = ""
     try:
-        async with StallWatchdog(thread.id, None, idle_timeout_s=120) as watchdog:
-            result = await run_agent_loop(
-                build_clarify_briefing(query, state.user_memories),
-                thread.id,
-                history=[],
-                system_prompt=CLARIFIER_SYSTEM,
-                tools_for_api=[],
-                can_use_tool=lambda _n, _i: (False, "no tools"),
-                execute_tool=_noop_execute,
-                max_turns=1,
-                stall_watchdog=watchdog,
-                api_client=api_client,
-                model=DEEP_RESEARCH_LEAD_MODEL,
-                extra_betas=MODEL_BETAS,
+        from services.codex_app_server import auxiliary
+        if auxiliary.enabled():
+            result = await auxiliary.run_task(
+                prompt=build_clarify_briefing(query, state.user_memories),
+                instructions=CLARIFIER_SYSTEM, timeout_s=120,
             )
-        state.add_usage(getattr(result, "usage_total", None))
-        questions = (getattr(result, "text", "") or "").strip()
+            state.add_usage(auxiliary.normalized_usage(result))
+            questions = result.final_text.strip()
+        else:
+            async with StallWatchdog(thread.id, None, idle_timeout_s=120) as watchdog:
+                result = await run_agent_loop(
+                    build_clarify_briefing(query, state.user_memories),
+                    thread.id,
+                    history=[],
+                    system_prompt=CLARIFIER_SYSTEM,
+                    tools_for_api=[],
+                    can_use_tool=lambda _n, _i: (False, "no tools"),
+                    execute_tool=_noop_execute,
+                    max_turns=1,
+                    stall_watchdog=watchdog,
+                    api_client=api_client,
+                    model=DEEP_RESEARCH_LEAD_MODEL,
+                    extra_betas=MODEL_BETAS,
+                )
+            state.add_usage(getattr(result, "usage_total", None))
+            questions = (getattr(result, "text", "") or "").strip()
     except asyncio.CancelledError:
         raise
     except Exception:

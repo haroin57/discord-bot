@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import contextvars
+import functools
 import hashlib
 import json
 import logging
@@ -11,6 +13,7 @@ import os
 import shutil
 import threading
 import time
+import weakref
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -42,8 +45,12 @@ class TurnOutbox:
     def __init__(self, path: str) -> None:
         self.path = path
         self._lock = threading.RLock()
-        self._reconcile_locks: dict[str, asyncio.Lock] = {}
+        # Async locks belong to the event loop, not the journal worker. Weak
+        # entries live while holders/waiters reference them and cannot grow
+        # forever or be evicted underneath an active reconciliation.
+        self._reconcile_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._state = self._load()
+        self._dirty = False
 
     def _load(self) -> dict[str, Any]:
         try:
@@ -60,7 +67,45 @@ class TurnOutbox:
         return state
 
     def _save(self) -> None:
+        self._dirty = True
         atomic_write_json(self.path, self._state)
+        self._dirty = False
+
+    def _flush_pending(self) -> None:
+        with self._lock:
+            if self._dirty:
+                self._save()
+
+    async def run_io(self, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run journal I/O off-loop without leaving a cancelled write behind.
+
+        A receipt must reach durable storage before cancellation cleanup can
+        inspect or discard the turn. Shield and drain the worker even when a
+        second cancellation arrives; a thread cannot be cancelled safely.
+        """
+        # Use a Future rather than a Task wrapping to_thread. Event-loop
+        # shutdown cancels every Task; cancelling a to_thread Task would mark
+        # it done before the real thread has persisted an acknowledged turn.
+        context = contextvars.copy_context()
+        worker = asyncio.get_running_loop().run_in_executor(
+            None, functools.partial(context.run, operation, *args, **kwargs)
+        )
+        cancellation = None
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+            except Exception:
+                break
+        if cancellation is not None:
+            try:
+                worker.result()
+            except Exception:
+                log.exception("turn outbox I/O failed during cancellation")
+            raise cancellation
+        return worker.result()
 
     def begin(
         self,
@@ -73,6 +118,9 @@ class TurnOutbox:
         archive_intent: dict[str, Any] | None = None,
     ) -> None:
         with self._lock:
+            if request_id in self._state["turns"]:
+                self._flush_pending()
+                return
             self._state["turns"].setdefault(
                 request_id,
                 {
@@ -144,9 +192,15 @@ class TurnOutbox:
             if turn is None:
                 return
             receipt = turn["delivery"]
+            changed = not receipt.get("acknowledged")
             for message_id in message_ids:
                 if message_id not in receipt["message_ids"]:
                     receipt["message_ids"].append(message_id)
+                    changed = True
+            changed = changed or (streamed and not receipt["streamed"])
+            if not changed:
+                self._flush_pending()
+                return
             receipt["streamed"] = bool(receipt["streamed"] or streamed)
             receipt["acknowledged"] = True
             turn["updated_at"] = time.time()
@@ -209,6 +263,7 @@ class TurnOutbox:
                     f"{hashlib.sha256(key_payload.encode()).hexdigest()[:24]}"
                 )
                 turn["archive_jobs"].append(archive_job)
+                turn["steps"]["archive"] = "pending"
             elif safe_response_id is not None:
                 existing["response_message_id"] = safe_response_id
             turn["updated_at"] = time.time()
@@ -268,7 +323,7 @@ class TurnOutbox:
     def _is_terminal(turn: dict[str, Any]) -> bool:
         return all(
             value in {"done", "skipped"} for value in turn.get("steps", {}).values()
-        )
+        ) and all(job.get("status") == "done" for job in turn.get("archive_jobs", []))
 
     @staticmethod
     def _payload_complete(turn: dict[str, Any]) -> bool:
@@ -301,6 +356,9 @@ class TurnOutbox:
         with self._lock:
             turn = self._state["turns"].get(request_id)
             if turn is None:
+                return
+            if turn["steps"].get(step) == status:
+                self._flush_pending()
                 return
             turn["steps"][step] = status
             turn["updated_at"] = time.time()
@@ -338,11 +396,7 @@ class TurnOutbox:
         record: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> bool:
         """Apply every idempotent step, retaining failures for restart replay."""
-        with self._lock:
-            reconcile_lock = self._reconcile_locks.setdefault(
-                request_id,
-                asyncio.Lock(),
-            )
+        reconcile_lock = self._reconcile_locks.setdefault(request_id, asyncio.Lock())
         async with reconcile_lock:
             return await self._reconcile_locked(
                 request_id,
@@ -359,9 +413,12 @@ class TurnOutbox:
         session: Callable[[dict[str, Any]], Awaitable[None]],
         record: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> bool:
-        turn = self.snapshot(request_id)
+        turn = await self.run_io(self.snapshot, request_id)
         if turn is None or not turn.get("delivery", {}).get("acknowledged"):
             return False
+        if self._is_terminal(turn):
+            await self.run_io(self._flush_pending)
+            return True
         callbacks = {"session": session, "record": record}
         failed = False
 
@@ -378,59 +435,73 @@ class TurnOutbox:
                     job["response_message_id"] = delivered_ids[0]
             if not job.get("idempotency_key"):
                 job["idempotency_key"] = f"{request_id}:archive"
-            self._mark_archive_job(request_id, job["key"], "applying")
+            await self.run_io(self._mark_archive_job, request_id, job["key"], "applying")
             try:
                 await archive(job)
             except Exception as exc:
                 failed = True
-                self._mark_archive_job(request_id, job["key"], "pending")
+                await self.run_io(self._mark_archive_job, request_id, job["key"], "pending")
                 log.warning("turn outbox archive reconcile failed: %s", exc)
             else:
-                self._mark_archive_job(request_id, job["key"], "done")
-        latest = self.snapshot(request_id)
+                await self.run_io(self._mark_archive_job, request_id, job["key"], "done")
+        latest = await self.run_io(self.snapshot, request_id)
         if latest is not None and all(
             job.get("status") == "done" for job in latest["archive_jobs"]
         ):
-            self._mark(request_id, "archive", "done")
+            await self.run_io(self._mark, request_id, "archive", "done")
 
-        latest = self.snapshot(request_id)
+        latest = await self.run_io(self.snapshot, request_id)
         if latest is None:
             return False
-        if not self._payload_complete(latest):
+        if not self._payload_complete(latest) and await self.run_io(
+            self._mark_partial_if_incomplete, request_id
+        ):
             # A stream can be acknowledged before provider completion. A
             # crash/cancellation then has no response/session payload to
             # commit. Retain the delivery receipt, finish archive intent, and
             # explicitly terminalize the unavailable steps for restart replay.
-            for step in callbacks:
-                if latest.get("steps", {}).get(step) not in {"done", "skipped"}:
-                    self._mark(request_id, step, "skipped")
-            with self._lock:
-                current = self._state["turns"].get(request_id)
-                if current is not None:
-                    current["terminal_state"] = "partial"
-                    current["updated_at"] = time.time()
-                    self._save()
-            self._prune_terminal()
+            await self.run_io(self._prune_terminal)
             return not failed
 
         for step, callback in callbacks.items():
-            latest = self.snapshot(request_id)
+            latest = await self.run_io(self.snapshot, request_id)
             if latest is None or latest["steps"].get(step) == "done":
                 continue
-            self._mark(request_id, step, "applying")
+            await self.run_io(self._mark, request_id, step, "applying")
             latest["idempotency_key"] = request_id
             latest["idempotency_step"] = step
             try:
                 await callback(latest)
             except Exception as exc:
                 failed = True
-                self._mark(request_id, step, "pending")
+                await self.run_io(self._mark, request_id, step, "pending")
                 log.warning("turn outbox %s reconcile failed: %s", step, exc)
             else:
-                self._mark(request_id, step, "done")
+                await self.run_io(self._mark, request_id, step, "done")
 
-        self._prune_terminal()
+        await self.run_io(self._prune_terminal)
         return not failed
+
+    def _mark_partial_if_incomplete(self, request_id: str) -> bool:
+        """Atomically recheck provider completion before terminalizing a stream.
+
+        prepare() may complete between asynchronous snapshots. It either wins
+        this lock and prevents skipping, or runs later and reopens both steps.
+        """
+        with self._lock:
+            current = self._state["turns"].get(request_id)
+            if current is None or self._payload_complete(current):
+                return False
+            changed = current.get("terminal_state") != "partial"
+            for step in ("session", "record"):
+                if current.get("steps", {}).get(step) not in {"done", "skipped"}:
+                    current["steps"][step] = "skipped"
+                    changed = True
+            current["terminal_state"] = "partial"
+            if changed or self._dirty:
+                current["updated_at"] = time.time()
+                self._save()
+            return True
 
     def _prune_terminal(self) -> None:
         with self._lock:
@@ -439,9 +510,8 @@ class TurnOutbox:
                 for request_id, turn in self._state["turns"].items()
                 if self._is_terminal(turn)
             ]
-            for request_id, _ in sorted(terminal, key=lambda item: item[1])[
-                :-_TERMINAL_LIMIT
-            ]:
+            expired = sorted(terminal, key=lambda item: item[1])[:-_TERMINAL_LIMIT]
+            for request_id, _ in expired:
                 self._state["turns"].pop(request_id, None)
-                self._reconcile_locks.pop(request_id, None)
-            self._save()
+            if expired or self._dirty:
+                self._save()

@@ -19,7 +19,9 @@ import re
 from config import (
     ADMIN_USER_IDS,
     AGENTIC_INBOX_ALLOWED_USER_IDS,
+    KANAE_ALARM_ALLOWED_USER_IDS,
     MCP_SERVERS,
+    MCP_SERVERS_ALARM,
     MCP_SERVERS_BASE,
     MCP_SERVERS_DOCS,
     MCP_SERVERS_HEAVY,
@@ -108,6 +110,13 @@ _IOT_TRIGGERS = tuple(kw.lower() for kw in (
     "アプライアンス", "appliance", "アクテュエータ", "actuator",
 ))
 
+# ALARM tier — kanae-alarm（Mac 目覚まし: 大音量 YouTube 再生）。個人ゲート
+# KANAE_ALARM_ALLOWED_USER_IDS（既定で haroin 単独）を語った時だけ spawn する。
+_ALARM_TRIGGERS = tuple(kw.lower() for kw in (
+    "アラーム", "目覚まし", "めざまし", "目覚め", "起こして", "叩き起こ",
+    "alarm", "wake me", "wake up", "wakeup", "wake-up",
+))
+
 
 # REALESTATE tier — SUUMO/HOMES 物件検索 MCP. admin-only かつ trigger 必須.
 # 一般ユーザーが trigger word を打っても user_id ゲートで弾かれる二重防御。
@@ -186,6 +195,14 @@ def pick_mcp_servers(raw_user_text: str, user_id: int | None = None) -> dict:
         and any(kw in text for kw in _IOT_TRIGGERS)
     ):
         servers.update(MCP_SERVERS_IOT)
+    # ALARM は admin 全員ではなく KANAE_ALARM_ALLOWED_USER_IDS だけ
+    # （haroin の Mac を大音量で鳴らす個人アクション。既定で haroin 単独）。
+    if (
+        user_id is not None
+        and user_id in KANAE_ALARM_ALLOWED_USER_IDS
+        and any(kw in text for kw in _ALARM_TRIGGERS)
+    ):
+        servers.update(MCP_SERVERS_ALARM)
     # MAIL は admin 全員ではなく AGENTIC_INBOX_ALLOWED_USER_IDS だけ
     # （haroin 個人の受信箱。送信系ツールも生えているので二重に絞る）。
     if (

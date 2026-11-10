@@ -193,17 +193,18 @@ async def _vector_search(tbl, vec: list[float], col: str, limit: int) -> list[di
 def _vector_search_sync(tbl, vec: list[float], col: str, limit: int) -> list[dict]:
     """Synchronous LanceDB ANN call, invoked only through an offload boundary."""
     # LanceDB returns _distance ascending (lower = closer for cosine).
-    df = (
+    raw_rows = (
         tbl.search(vec, vector_column_name=col)
         .metric("cosine")
         .limit(limit)
-        .to_pandas()
+        .select(["id", "summary", "text", "source", "source_id", "source_url", "title", "lang", "license", "category", "_distance"])
+        .to_list()
     )
     rows = []
-    for _, r in df.iterrows():
+    for r in raw_rows:
         d = float(r.get("_distance", 1.0))
         sim = 1.0 - d  # cosine sim
-        rows.append(_row_to_result(r.to_dict(), sim))
+        rows.append(_row_to_result(r, sim))
     return rows
 
 
@@ -249,14 +250,19 @@ async def search_invest_kb(
       5. RRF merge into top-20
       6. Haiku rerank -> top-`limit`
     """
-    from services.invest_kb.client import get_table_async
-
     q = (query or "").strip()
     if not q:
         return []
-    tbl = await get_table_async()
-    if await asyncio.to_thread(tbl.count_rows) == 0:
-        return []
+    from services.offload.knowledge_client import remote_search_enabled, search_vectors
+
+    use_remote = remote_search_enabled()
+    tbl = None
+    if not use_remote:
+        from services.invest_kb.client import get_table_async
+
+        tbl = await get_table_async()
+        if await asyncio.to_thread(tbl.count_rows) == 0:
+            return []
 
     queries: list[str] = [q]
     hyde_text = ""
@@ -277,11 +283,14 @@ async def search_invest_kb(
 
     # ANN each variant against both vectors, in parallel.
     per_variant_lim = max(8, limit * 4)
-    tasks = []
-    for v in vecs:
-        tasks.append(_vector_search(tbl, v, "vector_body", per_variant_lim))
-        tasks.append(_vector_search(tbl, v, "vector_summary", per_variant_lim))
-    hits = await asyncio.gather(*tasks)
+    if use_remote:
+        hits = await search_vectors(vecs, per_variant_lim)
+    else:
+        tasks = []
+        for v in vecs:
+            tasks.append(_vector_search(tbl, v, "vector_body", per_variant_lim))
+            tasks.append(_vector_search(tbl, v, "vector_summary", per_variant_lim))
+        hits = await asyncio.gather(*tasks)
     merged = _rrf_merge(*hits, limit=max(20, limit * 5))
 
     # Patch 3 (2026-06-17) — noise gate. Embedding cosine fakes a ~0.30-0.36

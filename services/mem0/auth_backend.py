@@ -87,6 +87,10 @@ class BotOAuthBackend(AuthBackend):
         return client_mod._build_config()["llm"]
 
     def default_model(self) -> str:
+        from services.codex_app_server import auxiliary
+        if auxiliary.enabled():
+            from config import CODEX_APP_SERVER_MODEL
+            return CODEX_APP_SERVER_MODEL
         return os.environ.get("MEM0_LLM_MODEL", "claude-haiku-4-5-20251001")
 
     def provider_id(self) -> str:

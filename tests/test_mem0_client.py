@@ -536,3 +536,24 @@ class TestGetAnthropicClient:
 
         assert result is new_client
         assert client_mod._async_anthropic_token == "tok-new"
+
+
+@pytest.mark.asyncio
+async def test_revoked_oauth_does_not_block_openai_compatible_fallback(monkeypatch):
+    from services.oauth_manager import OAuthRefreshFailed
+
+    monkeypatch.setattr(client_mod, "ensure_valid_token", AsyncMock(side_effect=OAuthRefreshFailed("revoked")))
+    monkeypatch.setattr(client_mod, "get_access_token", lambda: None)
+    monkeypatch.setattr(client_mod, "_desired_llm_provider", lambda: "opencode")
+    expected = object()
+    factory = MagicMock(return_value=expected)
+    with patch("openai.AsyncOpenAI", factory):
+        assert await client_mod.get_anthropic_client() is expected
+    assert factory.call_args.kwargs["base_url"] == "https://api.opencode.ai/v1"
+
+
+@pytest.mark.asyncio
+async def test_memory_refresh_preserves_cancellation(monkeypatch):
+    monkeypatch.setattr(client_mod, "ensure_valid_token", AsyncMock(side_effect=asyncio.CancelledError))
+    with pytest.raises(asyncio.CancelledError):
+        await client_mod._refresh_token_if_available()

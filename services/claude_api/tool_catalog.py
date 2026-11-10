@@ -25,6 +25,7 @@ from config import (
     ADMIN_USER_IDS,
     ADVISOR_ENABLED,
     ADVISOR_MODEL,
+    KANAE_ALARM_ALLOWED_USER_IDS,
     NATURE_REMO_ALLOWED_USER_IDS,
     TOOL_SEARCH_VARIANT,
 )
@@ -90,7 +91,7 @@ def _reset_for_test() -> None:
 # --- permission gate --------------------------------------------------------
 # keyword selector（services/mcp_selector.py）の user ゲートと同一条件。
 # defer 広告は「モデルから発見可能」を意味するので、ゲートは fail-closed。
-_GATED_SERVERS = ("realestate", "nature-remo")
+_GATED_SERVERS = ("realestate", "nature-remo", "kanae-alarm")
 
 
 def _server_allowed(key: str, user_id: int | None) -> bool:
@@ -98,6 +99,8 @@ def _server_allowed(key: str, user_id: int | None) -> bool:
         return user_id is not None and user_id in ADMIN_USER_IDS
     if key == "nature-remo":
         return user_id is not None and user_id in NATURE_REMO_ALLOWED_USER_IDS
+    if key == "kanae-alarm":
+        return user_id is not None and user_id in KANAE_ALARM_ALLOWED_USER_IDS
     return True
 
 

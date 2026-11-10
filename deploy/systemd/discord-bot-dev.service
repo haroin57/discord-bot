@@ -21,6 +21,7 @@ Environment=CODEX_BIN=/home/ubuntu/.volta/tools/image/packages/@openai/codex/bin
 Environment=CODEX_APP_SERVER_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=R2_ARCHIVE_WRANGLER_BIN=/home/ubuntu/.volta/tools/image/packages/wrangler/lib/node_modules/wrangler/bin/wrangler.js
 Environment=PYTHON_DOTENV_DISABLED=1
+Environment=BOT_KEYWORDS=
 Environment=WEB_API_HOST=127.0.0.1
 Environment=WEB_API_PORT=3003
 Environment=OAUTH_PRIMARY_CREDENTIALS_PATH=/var/lib/kanae-bot-dev/.claude/.credentials.json

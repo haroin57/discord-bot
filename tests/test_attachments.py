@@ -806,7 +806,11 @@ class TestDownloadTextAttachments:
         att = self._make_text_att()
         resp = MagicMock()
         resp.status = 200
-        resp.read = AsyncMock(return_value=b"hello world")
+
+        async def chunks(_size):
+            yield b"hello world"
+
+        resp.content.iter_chunked = chunks
         resp.__aenter__ = AsyncMock(return_value=resp)
         resp.__aexit__ = AsyncMock(return_value=False)
 

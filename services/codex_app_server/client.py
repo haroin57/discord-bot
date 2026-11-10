@@ -15,6 +15,12 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from services.claude_api.subprocess_runner import (
+    await_cleanup_task,
+    spawn_process,
+    wait_or_terminate_process_group,
+)
+
 
 class CodexAppServerError(RuntimeError):
     """A JSON-RPC error returned by Codex app-server."""
@@ -243,14 +249,14 @@ class AsyncCodexAppServerClient:
                 *self._extra_args,
             )
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    *argv,
+                proc = await spawn_process(
+                    argv,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=self._env,
                     cwd=self._cwd,
-                    limit=self._stream_limit,
+                    stream_limit=self._stream_limit,
                 )
             except FileNotFoundError as exc:
                 raise CodexProcessError(
@@ -455,7 +461,7 @@ class AsyncCodexAppServerClient:
         The operation is idempotent and safe to call concurrently.
         """
 
-        async with self._close_lock:
+        async with self._close_lock, self._start_lock:
             if self._closed:
                 return
             self._closed = True
@@ -468,54 +474,49 @@ class AsyncCodexAppServerClient:
                 )
             )
 
-            proc = self._proc
-            try:
-                if proc is not None:
-                    writer = proc.stdin
-                    if writer is not None:
-                        try:
-                            writer.close()
-                            wait_closed = getattr(writer, "wait_closed", None)
-                            if wait_closed is not None:
-                                await wait_closed()
-                        except (
-                            BrokenPipeError,
-                            ConnectionResetError,
-                            RuntimeError,
-                            ValueError,
-                            OSError,
-                        ):
-                            pass
+            await await_cleanup_task(
+                self._close_process(timeout), name="codex-app-server-cleanup"
+            )
 
-                    if proc.returncode is None:
-                        try:
-                            proc.terminate()
-                        except OSError:
-                            pass
+    async def _close_process(self, timeout: float) -> None:
+        proc = self._proc
+        try:
+            if proc is not None:
+                writer = proc.stdin
+                if writer is not None:
                     try:
-                        await asyncio.wait_for(asyncio.shield(proc.wait()), timeout)
-                    except asyncio.TimeoutError:
-                        if proc.returncode is None:
-                            try:
-                                proc.kill()
-                            except OSError:
-                                pass
-                        try:
-                            await asyncio.wait_for(asyncio.shield(proc.wait()), 1.0)
-                        except asyncio.TimeoutError:
-                            pass
-            finally:
-                tasks = (self._stdout_task, self._stderr_task, self._wait_task)
-                current = asyncio.current_task()
-                pending_tasks = [
-                    task for task in tasks if task is not None and task is not current
-                ]
-                for task in pending_tasks:
-                    if not task.done():
-                        task.cancel()
-                if pending_tasks:
-                    await asyncio.gather(*pending_tasks, return_exceptions=True)
-                self._closing = False
+                        writer.close()
+                        wait_closed = getattr(writer, "wait_closed", None)
+                        if wait_closed is not None:
+                            # An unread, full stdin pipe must not postpone
+                            # process termination indefinitely.
+                            await asyncio.wait_for(
+                                wait_closed(), max(0.01, min(timeout, 0.25))
+                            )
+                    except (
+                        BrokenPipeError, ConnectionResetError, RuntimeError,
+                        ValueError, OSError, TimeoutError,
+                    ):
+                        pass
+
+                # First allow normal EOF shutdown so the MCP bridge can
+                # unwind its task-affine child transports. Then terminate
+                # only the spawn-fenced group owned by this client.
+                await wait_or_terminate_process_group(
+                    proc, grace_s=max(0.01, timeout)
+                )
+        finally:
+            tasks = (self._stdout_task, self._stderr_task, self._wait_task)
+            current = asyncio.current_task()
+            pending_tasks = [
+                task for task in tasks if task is not None and task is not current
+            ]
+            for task in pending_tasks:
+                if not task.done():
+                    task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            self._closing = False
 
     async def __aenter__(self) -> AsyncCodexAppServerClient:
         return await self.start()

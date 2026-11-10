@@ -1,0 +1,12 @@
+# Send only the read-only service source and its dependency manifest. In
+# particular, .env, conversation state, repository history and caches are absent.
+**
+!services/
+!services/__init__.py
+!services/offload/
+!services/offload/*.py
+!services/invest_kb/
+!services/invest_kb/*.py
+!deploy/
+!deploy/offload/
+!deploy/offload/knowledge-requirements.txt

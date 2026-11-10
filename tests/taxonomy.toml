@@ -44,6 +44,7 @@ version = 1
 "test_codex_app_server_entry.py" = "unit"
 "test_codex_app_server_manager.py" = "unit"
 "test_codex_app_server_session.py" = "unit"
+"test_codex_auxiliary_fallback.py" = "unit"
 "test_codex_runner.py" = "unit"
 "test_command_boundaries.py" = "contract"
 "test_compact_threshold.py" = "unit"
