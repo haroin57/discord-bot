@@ -80,7 +80,12 @@ The primary paths are `/var/lib/kanae-bot/.claude/.credentials.json`,
 `/var/lib/kanae-hermes/.claude/.credentials.json` respectively. Their failover
 files use `.credentials-failover.json` in the same private directory.
 The units set explicit `OAUTH_PRIMARY_CREDENTIALS_PATH`,
-`OAUTH_FAILOVER_CREDENTIALS_PATH`, and `OAUTH_FAILOVER_ENABLED=true` values.
+`OAUTH_FAILOVER_CREDENTIALS_PATH`, and `OAUTH_FAILOVER_ENABLED=false` values.
+Failover is off by default (ADR-0055): a standby credential that nobody renews
+expires silently — the previous one sat expired from 2026-07-18 to 2026-11-10 —
+and a dead standby is worse than none, because it reads as a switch target that
+does not exist. Set it back to `true` only alongside a credential that is
+actually kept current.
 OAuth failover state remains under that identity's private `BOT_STATE_DIR` and
 is never written into a checkout.
 

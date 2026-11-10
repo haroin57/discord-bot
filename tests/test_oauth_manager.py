@@ -2041,3 +2041,57 @@ class TestRatelimitReset:
         assert st.five_h_utilization == 0.0
         blocked, _ = rl.should_block()
         assert blocked is False
+
+
+class TestFailoverLogState:
+    """The init log used to print `failover_available=<file was readable>`,
+    which read as "a switch target exists" while the credential had been
+    expired since 2026-07-18. Report what actually gates a switch (ADR-0055).
+    """
+
+    def test_disabled_leg_says_disabled(self, monkeypatch):
+        import services.oauth_manager as om
+
+        monkeypatch.setattr(om, "OAUTH_FAILOVER_ENABLED", False)
+        # Even with a readable credential on disk, a disabled leg is not a
+        # switch target and must not be advertised as one.
+        assert om._failover_log_state(True) == "disabled"
+
+    def test_unreadable_leg_is_distinguished_from_expired(self, monkeypatch):
+        import services.oauth_manager as om
+
+        monkeypatch.setattr(om, "OAUTH_FAILOVER_ENABLED", True)
+        assert om._failover_log_state(False) == "unreadable"
+
+    def test_expired_credential_is_reported_unusable_with_reason(
+        self, monkeypatch, tmp_path
+    ):
+        import json
+        import os
+        import services.oauth_manager as om
+
+        path = tmp_path / "failover.json"
+        path.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "a", "refreshToken": "r",
+            # expired four months ago, exactly the real incident's shape
+            "expiresAt": 1752817384779,
+        }}))
+        os.chmod(path, 0o600)
+        monkeypatch.setattr(om, "OAUTH_FAILOVER_ENABLED", True)
+        monkeypatch.setattr(om._accounts["failover"], "credentials_path", str(path))
+
+        state = om._failover_log_state(True)
+        assert state.startswith("unusable(")
+        assert "access_token_expired" in state
+
+    def test_flag_defaults_to_off(self):
+        import importlib
+        import services.oauth_manager as om
+
+        # Reloaded with no env override: the leg must come up off, so a stale
+        # standby can never silently become the advertised switch target.
+        module = importlib.reload(om)
+        try:
+            assert module.OAUTH_FAILOVER_ENABLED is False
+        finally:
+            importlib.reload(om)
