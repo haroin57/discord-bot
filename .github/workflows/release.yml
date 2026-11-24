@@ -47,7 +47,7 @@ env:
 
 jobs:
   trust-controller:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
       - name: Validate manual release identity
@@ -95,7 +95,7 @@ jobs:
 
   collection-contract:
     needs: trust-controller
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -110,7 +110,7 @@ jobs:
 
   unit-fast:
     needs: trust-controller
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -123,7 +123,7 @@ jobs:
 
   characterization:
     needs: trust-controller
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -136,7 +136,7 @@ jobs:
 
   integration:
     needs: trust-controller
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -149,7 +149,7 @@ jobs:
 
   offline-eval:
     needs: trust-controller
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -178,7 +178,7 @@ jobs:
       - integration
       - offline-eval
       - security
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Verify trusted controller identity
