@@ -2,8 +2,10 @@
 # Operational release gate shared by automatic and manual deployment.
 #
 # dev:  run smoke tests against the exact checked-out target.
-# prod: require an exact-SHA staging receipt, a healthy staging readiness
-#       payload, a protected-path manifest rooted outside the checkout, and a
+# prod: require a staging receipt that authorises the target (an exact SHA, or
+#       an identical-tree descendant such as a dev->master merge commit), a
+#       healthy staging readiness payload at that same reviewed tree, a
+#       protected-path manifest rooted outside the checkout, and a
 #       generation-consistent snapshot restore rehearsal.
 set -euo pipefail
 umask 077
@@ -26,6 +28,27 @@ else
 fi
 
 log() { echo "[release_gate/${MODE}] $*"; }
+
+# Decide whether a reviewed staging SHA authorises promoting ${target}.
+#
+# An exact SHA match is always accepted (unchanged behaviour).  Otherwise the
+# target is accepted only when it BOTH descends from the reviewed commit AND
+# carries a byte-identical tree.  This lets a GitHub "Merge pull request #N"
+# commit on master — whose SHA necessarily differs from the already-green dev
+# tip it re-parents — pass the gate, while still refusing to promote any tree
+# that was never green on staging: a fast-forward onto *new* (unreviewed)
+# content has a different tree and an unrelated commit that merely copied the
+# tree is not a descendant.  Both failures and unknown objects fail closed.
+release_sha_authorizes_target() {
+    local reviewed="$1" target="$2" reviewed_tree target_tree
+    [[ "${reviewed}" == "${target}" ]] && return 0
+    git -C "${BOT_DIR}" cat-file -e "${reviewed}^{commit}" 2>/dev/null || return 1
+    git -C "${BOT_DIR}" cat-file -e "${target}^{commit}" 2>/dev/null || return 1
+    git -C "${BOT_DIR}" merge-base --is-ancestor "${reviewed}" "${target}" || return 1
+    reviewed_tree="$(git -C "${BOT_DIR}" rev-parse --verify --quiet "${reviewed}^{tree}")" || return 1
+    target_tree="$(git -C "${BOT_DIR}" rev-parse --verify --quiet "${target}^{tree}")" || return 1
+    [[ -n "${reviewed_tree}" && "${reviewed_tree}" == "${target_tree}" ]]
+}
 
 [[ -d "${BOT_DIR}/.git" ]] || {
     log "repository missing: ${BOT_DIR}"
@@ -88,8 +111,8 @@ if ! [[ "${staging_sha}" =~ ^[0-9a-f]{40}$ ]]; then
     log "staging receipt contains an invalid SHA"
     exit 3
 fi
-if [[ "${staging_sha}" != "${TARGET_SHA}" ]]; then
-    log "staging SHA ${staging_sha:0:8} does not exactly match target ${TARGET_SHA:0:8}"
+if ! release_sha_authorizes_target "${staging_sha}" "${TARGET_SHA}"; then
+    log "staging SHA ${staging_sha:0:8} does not authorize target ${TARGET_SHA:0:8} (needs exact match, or an identical-tree descendant such as a merge commit)"
     exit 3
 fi
 
@@ -97,22 +120,32 @@ ready_payload="$(curl -fsS --max-time 5 -- "${staging_ready_url}")" || {
     log "staging is not ready: ${staging_ready_url}"
     exit 3
 }
-if ! python3 -c '
-import json, sys
+# Extract the staging process's own release_sha (fail closed on bad JSON, a
+# non-ok status, or a malformed SHA), then authorise it against the target
+# with the same exact-or-identical-tree-descendant rule used for the receipt.
+# Staging runs the already-green dev tip, whose SHA differs from a master merge
+# commit even though the deployed tree is identical.
+ready_sha="$(python3 -c '
+import json, re, sys
 try:
     payload = json.loads(sys.stdin.read())
 except (json.JSONDecodeError, UnicodeError):
     raise SystemExit(1)
-target = sys.argv[1]
-if not isinstance(payload, dict):
+if not isinstance(payload, dict) or payload.get("status") != "ok":
     raise SystemExit(1)
-if payload.get("status") != "ok" or payload.get("release_sha") != target:
+release_sha = payload.get("release_sha")
+if not isinstance(release_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", release_sha):
     raise SystemExit(1)
-' "${TARGET_SHA}" <<<"${ready_payload}"; then
+sys.stdout.write(release_sha)
+' <<<"${ready_payload}")" || {
+    log "staging readiness payload is not status=ok at target ${TARGET_SHA:0:8}"
+    exit 3
+}
+if ! release_sha_authorizes_target "${ready_sha}" "${TARGET_SHA}"; then
     log "staging readiness payload is not status=ok at target ${TARGET_SHA:0:8}"
     exit 3
 fi
-log "staging receipt and readiness passed (${staging_sha:0:8})"
+log "staging receipt and readiness passed (${staging_sha:0:8} ready=${ready_sha:0:8})"
 
 # The protected manifest is trusted only when its digest is supplied by the
 # installed unit/environment, or when it is root-owned and not group/other
