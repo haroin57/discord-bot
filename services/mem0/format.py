@@ -1,43 +1,28 @@
 """Format retrieved Mem0 memories as a prompt-injection block."""
 
-import re
 from datetime import datetime, timezone
 
-from services.sentinel import POWER_PHRASE_RE
-
-# Markers an attacker could have stored in a fact (via the ingestion path)
-# that would close the <retrieved_memories> fence or impersonate any trusted
-# prompt-scaffold block when echoed back into the prompt. Strip them
-# defensively at format time as second-order injection defense.
-#
-# This pattern set MIRRORS `_SENTINEL_RE` in bot.py / services/prompt_builder.py
-# so a fact echoed via format_memories_for_prompt cannot inject a scaffold
-# marker that the outer sanitize layer used to catch. The outer
-# `_sanitize_untrusted_text(mem0_block)` call was removed for hot-path
-# performance, so this blocklist is now the single source of scrubbing.
-_FACT_TEXT_BLOCKLIST = re.compile(
-    r"\[(?:Message from|End of|Mem0|Attached images|Current message|Thread:|"
-    r"Channel recent|Referenced message|Replied-to message|End of thread|"
-    r"End of channel|End of Mem0|History|End of history|Trusted context|"
-    r"untrusted_user_input)"
-    r"[^\]\n]*\]"
-    r"|</?retrieved_memories[^>]*>"
-    r"|</?history_search[^>]*>"
-    r"|</?untrusted_user_input[^>]*>",
-    re.IGNORECASE,
-)
+from services.sentinel import apply_sentinel_filters
 
 
 def _scrub_fact_text(text: str) -> str:
-    """Drop markers that could close the memories fence or impersonate trust headers.
+    """Drop markers that could close a data fence or impersonate trust headers.
 
-    Also applies POWER_PHRASE_RE to redact power-grab phrases (M15).
+    Second-order injection defense: a fact (or a history-search line, or its
+    speaker label) echoed back into the prompt must not be able to close the
+    ``<retrieved_memories>`` / ``<history_search>`` fence or forge a trusted
+    scaffold marker (``<trusted_user_input>`` / ``[現在の発言者 …]`` /
+    ``<sleep_enforcement …>`` …).
+
+    Delegates to the single-source ``apply_sentinel_filters`` in
+    ``services.sentinel`` so this scrub stays exactly SENTINEL_RE-equivalent
+    (F-w1-01 / F-w1-07) and gains NFKC + zero-width normalization (F-w1-03) —
+    no separate, drifting blocklist to keep in sync. Also redacts power-grab
+    phrases via POWER_PHRASE_RE (M15), both folded into that helper.
     """
     if not text:
         return text
-    text = _FACT_TEXT_BLOCKLIST.sub("[redacted-marker]", text)
-    text = POWER_PHRASE_RE.sub("[redacted]", text)
-    return text
+    return apply_sentinel_filters(text)
 
 
 _TIER_LABELS = {0: "Live", 1: "Hot", 2: "Warm", 3: "Cold"}
@@ -173,7 +158,12 @@ def format_history_for_prompt(results: list[dict]) -> str:
             who = author or "誰か"
         else:
             who = author or role
-        lines.append(f"- ({who}) {_scrub_fact_text(text)}")
+        # Scrub the speaker label too: `author` is a user-settable Discord
+        # display name (bot_pipeline/record.py stores it verbatim), so an
+        # attacker who renames themselves to a forged trust marker / speaker
+        # spoof must not reach the admin prompt through this `(who)` slot
+        # (F-w1-08).
+        lines.append(f"- ({_scrub_fact_text(who)}) {_scrub_fact_text(text)}")
     if len(lines) == 1:
         return ""
     lines.append("[End of history]")

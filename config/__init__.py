@@ -2001,6 +2001,12 @@ MEM0_SMART_SEARCH = _bool_env("MEM0_SMART_SEARCH", True)  # P3
 # the race for the 5 slots. Admins get a wider window; non-admins stay narrow.
 MEM0_RECALL_LIMIT = int(os.environ.get("MEM0_RECALL_LIMIT", "12"))
 MEM0_RECALL_LIMIT_RESTRICTED = int(os.environ.get("MEM0_RECALL_LIMIT_RESTRICTED", "5"))
+# Hard ceiling on the per-turn Mem0 recall await in the prompt builder. The
+# recall task can fan out to a Haiku rewrite/rerank round-trip plus the Mem0
+# MCP; if any of those hang, the whole Discord turn would stall indefinitely
+# (a plain try/except can't recover from a hang). On timeout the turn
+# continues with no injected memories (F-w3-06).
+MEM0_RECALL_TIMEOUT_S = float(os.environ.get("MEM0_RECALL_TIMEOUT_S", "20"))
 # Core memory 常時注入枠: importance=5 かつ tier∈{Live,Hot} の基本事実（名前・
 # 所属・健康情報等）をクエリ非依存で recall 結果の先頭にマージする。従来は
 # クエリの引き次第でコア事実が欠落していた。TTL キャッシュで get_all を償却。

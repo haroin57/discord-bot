@@ -61,12 +61,14 @@ def normalize_for_sentinel(text: str) -> str:
 SENTINEL_RE = re.compile(
     r"\[(?:Message from|End of|Mem0|Attached images|Current message|Thread:|"
     r"Channel recent|Referenced message|Replied-to message|End of thread|"
-    r"End of channel|End of Mem0|Trusted context|untrusted_user_input|"
-    r"trusted_user_input)[^\]\n]*\]"
+    r"End of channel|End of Mem0|History|Trusted context|現在の発言者|現在時刻|"
+    r"untrusted_user_input|trusted_user_input)[^\]\n]*\]"
     r"|</?retrieved_memories[^>]*>"
+    r"|</?history_search[^>]*>"
     r"|</?untrusted_user_input[^>]*>"
     r"|</?trusted_user_input[^>]*>"
-    r"|</?replied_to_trusted_message[^>]*>",
+    r"|</?replied_to_trusted_message[^>]*>"
+    r"|</?sleep_enforcement[^>]*>",
     re.IGNORECASE,
 )
 
@@ -80,17 +82,22 @@ POWER_PHRASE_RE = re.compile(
 
 
 def sanitize_untrusted_text(text: str) -> str:
-    """Remove prompt-scaffold sentinel labels and obvious power-grab phrases.
+    """Normalize then remove prompt-scaffold sentinel labels and power-grab phrases.
 
     Applied to every piece of untrusted text before it is concatenated into
     the Claude prompt. Idempotent — running it twice on already-sanitized
     text returns the same result, so layered defenses can call it freely.
 
-    Note: does NOT normalize Unicode. Callers that may receive adversarial
-    input should use `apply_sentinel_filters` instead.
+    Normalizes first (NFKC fold + zero-width strip, via
+    ``normalize_for_sentinel``) so Unicode lookalikes (e.g. full-width
+    ``＜／untrusted_user_input＞``) and zero-width-split tags cannot slip a
+    forged closing tag or trust header past the ASCII patterns below
+    (F-w1-03). This makes the live bot sanitize path equivalent to
+    ``apply_sentinel_filters``.
     """
     if not text:
         return text
+    text = normalize_for_sentinel(text)
     text = SENTINEL_RE.sub("[redacted-marker]", text)
     text = POWER_PHRASE_RE.sub("[redacted]", text)
     return text
