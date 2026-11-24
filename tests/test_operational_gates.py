@@ -362,6 +362,11 @@ printf '[snapshot] done: %s\n' "$SNAPSHOT_DIR"
 
 
 def test_prod_release_gate_rejects_ancestor_receipt_for_new_target(tmp_path: Path):
+    # A receipt that is an ancestor of the target but carries a *different*
+    # tree means the target introduced content that was never green on
+    # staging.  Promoting it would be a fast-forward of unreviewed code, so the
+    # gate must still refuse even though the identical-tree merge-commit case is
+    # now allowed.
     repo, ancestor_sha = _make_repo(tmp_path)
     (repo / "tracked.txt").write_text("target\n", encoding="utf-8")
     _git(repo, "commit", "-qam", "target")
@@ -383,7 +388,90 @@ def test_prod_release_gate_rejects_ancestor_receipt_for_new_target(tmp_path: Pat
     )
 
     assert result.returncode == 3
-    assert "does not exactly match target" in result.stdout
+    assert "does not authorize target" in result.stdout
+
+
+def test_prod_release_gate_accepts_identical_tree_merge_commit(tmp_path: Path):
+    # A "Merge pull request #N" commit on master re-parents the already-green
+    # dev tip without changing any file, so its SHA differs from the staging
+    # receipt/readiness SHA while the deployed tree is byte-identical.  The gate
+    # must promote it: the receipt SHA is an ancestor of the merge commit and
+    # both resolve to the same tree.
+    repo, _base = _make_repo(tmp_path)
+    _git(repo, "checkout", "-qb", "devtip")
+    (repo / "tracked.txt").write_text("promoted\n", encoding="utf-8")
+    _git(repo, "commit", "-qam", "reviewed dev work")
+    dev_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "-")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "--no-edit",
+        "-m",
+        "Merge pull request #1 from devtip",
+        "devtip",
+    )
+    merge_sha = _git(repo, "rev-parse", "HEAD")
+    assert merge_sha != dev_sha
+    assert _git(repo, "rev-parse", f"{dev_sha}^{{tree}}") == _git(
+        repo, "rev-parse", f"{merge_sha}^{{tree}}"
+    )
+
+    trusted_state = tmp_path / "trusted-state"
+    receipt = trusted_state / "dev" / "successful.sha"
+    receipt.parent.mkdir(parents=True)
+    # Staging recorded the dev tip, not the master merge commit.
+    receipt.write_text(dev_sha + "\n", encoding="utf-8")
+    manifest, manifest_digest = _protected_manifest(repo, tmp_path, merge_sha)
+    snapshot_dir = tmp_path / "snapshot"
+    snapshot = tmp_path / "snapshot.sh"
+    snapshot.write_text(
+        """#!/usr/bin/env bash
+set -eu
+if [[ "${1:-}" == "--verify" ]]; then
+    [[ "$2" == "$SNAPSHOT_DIR" ]]
+    printf 'verified' >"$VERIFY_MARKER"
+    exit 0
+fi
+mkdir -p "$SNAPSHOT_DIR"
+printf '[snapshot] done: %s\n' "$SNAPSHOT_DIR"
+""",
+        encoding="utf-8",
+    )
+    snapshot.chmod(snapshot.stat().st_mode | stat.S_IXUSR)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    curl = fake_bin / "curl"
+    # Staging readiness reports the dev tip it is actually running.
+    curl.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf \'%s\\n\' \'{{"status":"ok","release_sha":"{dev_sha}"}}\'\n',
+        encoding="utf-8",
+    )
+    curl.chmod(curl.stat().st_mode | stat.S_IXUSR)
+    verified = tmp_path / "verified"
+
+    result = _run(
+        str(RELEASE_GATE),
+        "prod",
+        merge_sha,
+        env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "RELEASE_GATE_BOT_DIR": str(repo),
+            "RELEASE_GATE_TRUSTED_STATE_ROOT": str(trusted_state),
+            "RELEASE_GATE_STAGING_RECEIPT": str(receipt),
+            "RELEASE_GATE_PROTECTED_MANIFEST": str(manifest),
+            "RELEASE_GATE_PROTECTED_MANIFEST_SHA256": manifest_digest,
+            "RELEASE_GATE_SNAPSHOT_SCRIPT": str(snapshot),
+            "SNAPSHOT_DIR": str(snapshot_dir),
+            "VERIFY_MARKER": str(verified),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert verified.read_text(encoding="utf-8") == "verified"
+    assert "backup/restore rehearsal passed" in result.stdout
 
 
 def test_prod_release_gate_rejects_manifest_from_checkout(tmp_path: Path):
@@ -580,6 +668,17 @@ def test_runtime_units_have_distinct_uids_and_bot_cannot_write_checkout():
         if "/home/ubuntu" in text:
             assert "kanae-code" in text
         assert "kanae-state" not in text
+
+
+def test_discord_bot_units_disable_keyword_wakeups():
+    units = (
+        ROOT / "deploy/systemd/discord-bot.service",
+        ROOT / "deploy/systemd/discord-bot-dev.service",
+        ROOT / "deploy/systemd/hermes-discord-codex.service",
+    )
+    for unit in units:
+        text = unit.read_text(encoding="utf-8")
+        assert re.search(r"^Environment=BOT_KEYWORDS=$", text, re.MULTILINE)
 
 
 def test_state_writers_use_private_service_directories():

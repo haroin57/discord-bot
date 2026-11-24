@@ -380,6 +380,25 @@ class CanonicalRepository:
             ).fetchone()
         return self._fact_dict(row)
 
+    def get_facts(self, identifiers: Iterable[str]) -> dict[str, dict | None]:
+        """Resolve a bounded retrieval batch using one connection/snapshot.
+
+        Retain get_fact's canonical/legacy identifier resolution exactly.
+        Reusing the connection avoids reopening SQLite for every candidate.
+        """
+        identifiers = list(dict.fromkeys(identifiers))
+        if not identifiers:
+            return {}
+        with self._read() as conn:
+            conn.execute("BEGIN")
+            return {
+                identifier: self._fact_dict(conn.execute(
+                    "SELECT * FROM canonical_facts WHERE fact_id=? OR legacy_id=? LIMIT 1",
+                    (identifier, identifier),
+                ).fetchone()) if identifier else None
+                for identifier in identifiers
+            }
+
     def list_facts(self, user_id: str, *, include_inactive: bool = False) -> list[dict]:
         sql = "SELECT * FROM canonical_facts WHERE user_id=?"
         params: tuple = (str(user_id),)
@@ -2916,6 +2935,32 @@ def canonical_fact_visible(
     if not user_id:
         return False
     fact = get_repository().get_fact(identifier)
+    return _canonical_row_visible(fact, user_id, current_channel_id, selected)
+
+
+def canonical_facts_visible(
+    identifiers: Iterable[str],
+    user_id: str,
+    *,
+    current_channel_id: str | None = None,
+    require_present: bool = False,
+) -> dict[str, bool]:
+    """Apply the identical lifecycle/scope rules with no cross-turn cache."""
+    identifiers = list(dict.fromkeys(identifiers))
+    selected = os.environ.get("MEM0_INTEGRITY_MODE", "legacy").lower()
+    if selected == "legacy":
+        return dict.fromkeys(identifiers, True)
+    if not user_id:
+        return dict.fromkeys(identifiers, False)
+    rows = get_repository().get_facts(identifiers)
+    return {
+        identifier: (not require_present or fact is not None)
+        and _canonical_row_visible(fact, user_id, current_channel_id, selected)
+        for identifier, fact in rows.items()
+    }
+
+
+def _canonical_row_visible(fact, user_id, current_channel_id, selected) -> bool:
     if fact is None:
         return selected != "canonical"
     if fact["user_id"] != str(user_id) or fact["status"] != "active":

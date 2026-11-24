@@ -8,6 +8,7 @@ loop.
 
 from services.codex_app_server.session import (
     CodexAuthError,
+    CodexModelUnavailableError,
     CodexProtocolError,
     CodexSession,
     CodexTurnError,
@@ -18,6 +19,7 @@ from services.codex_app_server.manager import clear_codex_thread
 
 __all__ = [
     "CodexAuthError",
+    "CodexModelUnavailableError",
     "CodexProtocolError",
     "CodexSession",
     "CodexTurnError",

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -26,6 +27,7 @@ from services.codex_app_server.client import (
     CodexAppServerError,
     CodexProcessError,
 )
+from services.codex_app_server.turn_hooks import TurnHooks
 
 log = logging.getLogger(__name__)
 
@@ -38,12 +40,26 @@ class CodexAuthError(RuntimeError):
     """The app-server is not authenticated with a ChatGPT account."""
 
 
+def _auth_failure(message: str) -> CodexAuthError:
+    from services.codex_app_server.readiness import record_auth_result
+    record_auth_result(False)
+    return CodexAuthError(message)
+
+
 class CodexProtocolError(RuntimeError):
     """The app-server returned a response that violates our contract."""
 
 
 class CodexTurnError(RuntimeError):
     """A Codex turn reached a failed terminal state."""
+
+
+class CodexModelUnavailableError(CodexTurnError):
+    """The requested model is not offered to this account (retired/plan-gated).
+
+    Distinct from auth: the OAuth session is healthy, so this must never
+    poison auth readiness or tell the operator to re-run ``codex login``.
+    """
 
 
 @dataclass
@@ -61,6 +77,8 @@ class CodexTurnResult:
     model_context_window: int | None = None
     compacted: bool = False
     completed_items: list[dict[str, Any]] = field(default_factory=list)
+    hook_recovery_nudges: int = 0
+    hook_completion_reviews: int = 0
 
 
 Callback = Callable[..., Awaitable[Any] | Any]
@@ -81,9 +99,38 @@ _AUTH_HINTS = (
 )
 
 
+# "The 'X' model is not supported when using Codex with a ChatGPT account."
+# also contains "chatgpt account"; model checks must run before auth checks.
+_MODEL_UNAVAILABLE_HINTS = (
+    "model is not supported",
+    "model_not_found",
+    "does not exist or you do not have access",
+)
+
+
 def _looks_like_auth_failure(*parts: object) -> bool:
     text = "\n".join(str(part or "") for part in parts).lower()
     return any(hint in text for hint in _AUTH_HINTS)
+
+
+def _looks_like_model_unavailable(*parts: object) -> bool:
+    text = "\n".join(str(part or "") for part in parts).lower()
+    return any(hint in text for hint in _MODEL_UNAVAILABLE_HINTS)
+
+
+def _classified_failure(auth_message: str, *parts: object) -> Exception | None:
+    """Map a Codex failure to model-unavailable or auth, else ``None``.
+
+    ``parts[0]`` is the primary error; only it is echoed (stderr tails stay
+    out of the message). Echoing keeps the real cause visible instead of
+    collapsing every hint match into "run codex login".
+    """
+    detail = " ".join(str(parts[0] if parts else "").split())[:200]
+    if _looks_like_model_unavailable(*parts):
+        return CodexModelUnavailableError(f"Codex model unavailable: {detail}")
+    if _looks_like_auth_failure(*parts):
+        return _auth_failure(f"{auth_message} ({detail})" if detail else auth_message)
+    return None
 
 
 def _thread_id_from_result(result: dict[str, Any]) -> str:
@@ -117,6 +164,18 @@ def _is_missing_thread_error(exc: BaseException) -> bool:
     )
 
 
+def _tool_failed(item: dict[str, Any]) -> bool:
+    """Normalize terminal native/dynamic/MCP failures for the evidence ledger."""
+    if item.get('status') in {'failed', 'declined', 'cancelled', 'canceled'}:
+        return True
+    if item.get('success') is False or item.get('error'):
+        return True
+    if item.get('type') == 'commandExecution' and item.get('exitCode') not in (None, 0):
+        return True
+    result = item.get('result')
+    return isinstance(result, dict) and result.get('isError') is True
+
+
 async def _invoke(callback: Callback | None, *args: Any) -> Any:
     if callback is None:
         return None
@@ -132,7 +191,7 @@ async def _invoke(callback: Callback | None, *args: Any) -> Any:
         return None
 
 
-def build_turn_input(prompt: Any) -> list[dict[str, Any]]:
+def build_turn_input(prompt: Any, *, allow_local_images: bool = True) -> list[dict[str, Any]]:
     """Translate the bot prompt and downloaded image paths to Codex inputs."""
     items: list[dict[str, Any]] = []
     text_parts: list[str] = []
@@ -170,6 +229,8 @@ def build_turn_input(prompt: Any) -> list[dict[str, Any]]:
     # bot.py already downloaded and size-validated these paths.  Passing them
     # as localImage makes vision work natively instead of asking Codex to infer
     # an image from a prose-only path.
+    if not allow_local_images:
+        return [item for item in items if item.get('type') == 'text']
     seen: set[str] = set()
     for match in _IMAGE_LINE_RE.finditer(text):
         raw = match.group("path").strip()
@@ -206,8 +267,15 @@ class CodexSession:
         approval_policy: str = "untrusted",
         turn_timeout_s: float = 1800.0,
         post_tool_timeout_s: float = 180.0,
+        turn_hooks_enabled: bool = False,
         child_env: dict[str, str] | None = None,
         client_factory: Callable[..., AsyncCodexAppServerClient] | None = None,
+        dynamic_tools: list[dict] | None = None,
+        tool_executor: Callable[..., Awaitable[str]] | None = None,
+        ephemeral: bool = False,
+        max_tool_calls: int = 30,
+        allow_host_approvals: bool = True,
+        allow_local_images: bool = True,
     ) -> None:
         self.cwd = os.path.abspath(os.path.expanduser(cwd))
         expanded_bin = os.path.expanduser(codex_bin)
@@ -223,7 +291,15 @@ class CodexSession:
         self.approval_policy = approval_policy
         self.turn_timeout_s = turn_timeout_s
         self.post_tool_timeout_s = post_tool_timeout_s
+        self.turn_hooks_enabled = turn_hooks_enabled
         self.child_env = dict(child_env or {})
+        self.dynamic_tools = list(dynamic_tools or [])
+        self.tool_executor = tool_executor
+        self.ephemeral = ephemeral
+        self.max_tool_calls = max(0, max_tool_calls)
+        self.allow_host_approvals = allow_host_approvals
+        self.allow_local_images = allow_local_images
+        self._tool_call_count = 0
         self._client_factory = client_factory or AsyncCodexAppServerClient
         self._client: AsyncCodexAppServerClient | None = None
         self.thread_id = (stored_thread_id or "").strip() or None
@@ -266,7 +342,7 @@ class CodexSession:
                 client_name="kanae_discord_bot",
                 client_title="Kanae Discord Bot",
                 client_version="1.0",
-                capabilities={},
+                capabilities={"experimentalApi": True} if self.dynamic_tools else {},
             )
         except FileNotFoundError as exc:
             raise CodexUnavailableError(
@@ -280,7 +356,7 @@ class CodexSession:
             account = await self._client.request("account/read", {}, timeout=15)
         except (CodexAppServerError, CodexProcessError, TimeoutError) as exc:
             if _looks_like_auth_failure(exc, *self._client.stderr_tail(20)):
-                raise CodexAuthError(
+                raise _auth_failure(
                     "Codex ChatGPT authentication is unavailable; run `codex login`."
                 ) from exc
             raise CodexUnavailableError(f"Codex account preflight failed: {exc}") from exc
@@ -291,7 +367,7 @@ class CodexSession:
             # This integration intentionally proves and uses the ChatGPT OAuth
             # subscription route. API-key accounts are rejected rather than
             # silently changing billing paths.
-            raise CodexAuthError(
+            raise _auth_failure(
                 "Codex is not logged in with ChatGPT OAuth; run `codex login`."
             )
 
@@ -307,16 +383,29 @@ class CodexSession:
             try:
                 result = await self._client.request(
                     "thread/resume",
-                    {"threadId": self.thread_id, **common},
-                    timeout=30,
+                    # Discord already owns its displayed history. Hydrating
+                    # every past turn can return megabytes we never consume;
+                    # excludeTurns retains Codex's durable model context.
+                    {"threadId": self.thread_id, "excludeTurns": True, **common},
+                    timeout=90,
                 )
                 self.resumed = True
+            except TimeoutError:
+                # Keep this diagnostic outside the bounded traceback so the
+                # failing method and budget survive log truncation.
+                log.warning(
+                    "Codex thread/resume timed out thread=%s timeout_s=90",
+                    str(self.thread_id)[:12],
+                )
+                raise
             except CodexAppServerError as exc:
                 if not _is_missing_thread_error(exc):
-                    if _looks_like_auth_failure(exc, *self._client.stderr_tail(20)):
-                        raise CodexAuthError(
-                            "Codex OAuth session refresh failed; run `codex login`."
-                        ) from exc
+                    failure = _classified_failure(
+                        "Codex OAuth session refresh failed; run `codex login`.",
+                        exc, *self._client.stderr_tail(20),
+                    )
+                    if failure is not None:
+                        raise failure from exc
                     raise
                 log.warning(
                     "Persisted Codex thread is unavailable; starting fresh: %s",
@@ -326,11 +415,23 @@ class CodexSession:
                 self._resume_fell_back = True
 
         if result is None:
-            result = await self._client.request(
-                "thread/start",
-                {**common, "ephemeral": False},
-                timeout=30,
-            )
+            start_options = {"ephemeral": self.ephemeral}
+            if self.dynamic_tools:
+                start_options["dynamicTools"] = self.dynamic_tools
+            try:
+                result = await self._client.request(
+                    "thread/start",
+                    {**common, **start_options},
+                    timeout=30,
+                )
+            except (CodexAppServerError, CodexProcessError, TimeoutError) as exc:
+                failure = _classified_failure(
+                    "Codex OAuth thread startup failed; run `codex login`.",
+                    exc, *self._client.stderr_tail(20),
+                )
+                if failure is not None:
+                    raise failure from exc
+                raise
             self.resumed = False
 
         thread_id = _thread_id_from_result(result)
@@ -391,6 +492,10 @@ class CodexSession:
         thinking_finalize_callback: Callback | None = None,
         progress: dict[str, Any] | None = None,
         resume_fallback_context: str = "",
+        tool_result_callback: Callback | None = None,
+        scratch_stream_callback: Callback | None = None,
+        scratch_finalize_callback: Callback | None = None,
+        turn_hooks: TurnHooks | None = None,
     ) -> CodexTurnResult:
         thread_id = await self.ensure_started(
             model=model, developer_instructions=developer_instructions,
@@ -411,7 +516,7 @@ class CodexSession:
 
         params: dict[str, Any] = {
             "threadId": thread_id,
-            "input": build_turn_input(effective_prompt),
+            "input": build_turn_input(effective_prompt, allow_local_images=self.allow_local_images),
             "model": model,
             "effort": effort,
             "cwd": self.cwd,
@@ -420,22 +525,28 @@ class CodexSession:
         try:
             started = await self._client.request("turn/start", params, timeout=30)
         except (CodexAppServerError, CodexProcessError, TimeoutError) as exc:
-            if _looks_like_auth_failure(exc, *self._client.stderr_tail(30)):
-                raise CodexAuthError(
-                    "Codex OAuth request failed; run `codex login` and retry."
-                ) from exc
+            failure = _classified_failure(
+                "Codex OAuth request failed; run `codex login` and retry.",
+                exc, *self._client.stderr_tail(30),
+            )
+            if failure is not None:
+                raise failure from exc
             raise CodexTurnError(f"Codex turn/start failed: {exc}") from exc
 
         turn_id = str((started.get("turn") or {}).get("id") or "")
         if not turn_id:
             raise CodexProtocolError("turn/start returned no turn id")
         self._active_turn_id = turn_id
+        self._tool_call_count = 0
 
         item_partials: dict[str, str] = {}
+        item_phases: dict[str, str] = {}
+        hooks = (turn_hooks or TurnHooks()) if self.turn_hooks_enabled else None
         reasoning_partial = ""
         completed_items: list[dict[str, Any]] = []
         final_text = ""
         last_agent_text = ""
+        last_agent_phase = ""
         token_usage_last: dict[str, Any] | None = None
         token_usage_total: dict[str, Any] | None = None
         context_window: int | None = None
@@ -486,6 +597,11 @@ class CodexSession:
                 event_params = event.get("params") or {}
                 event_thread = event_params.get("threadId")
                 event_turn = event_params.get("turnId")
+                if method == "turn/completed":
+                    # Some protocol versions carry the id only in `turn`.
+                    event_turn = event_turn or (
+                        event_params.get("turn") or {}
+                    ).get("id")
                 if event_thread not in (None, thread_id):
                     continue
                 if event_turn not in (None, turn_id):
@@ -512,17 +628,38 @@ class CodexSession:
                     compacted = True
                     continue
 
+                if method == "turn/plan/updated":
+                    if hooks is not None:
+                        hooks.observe_plan(event_params.get("plan"))
+                    continue
+
                 if method == "item/started":
                     item = event_params.get("item") or {}
+                    if item.get("type") == "agentMessage":
+                        item_phases[str(item.get("id") or "")] = str(
+                            item.get("phase") or "",
+                        )
                     if item.get("type") == "contextCompaction":
                         compacted = True
                     await self._announce_tool(item, tool_invocation_callback)
                     continue
 
                 if method == "item/agentMessage/delta":
+                    if text_stream_callback is None:
+                        # Final text comes from item/turn completion. Helpers
+                        # without a stream consumer need no growing duplicate.
+                        continue
                     item_id = str(event_params.get("itemId") or "")
                     delta = str(event_params.get("delta") or "")
                     if delta:
+                        # A final answer (including an unknown legacy phase)
+                        # must not reach Discord before the completion hook.
+                        # Explicit commentary continues to stream normally.
+                        if (
+                            hooks is not None
+                            and item_phases.get(item_id) != "commentary"
+                        ):
+                            continue
                         item_partials[item_id] = item_partials.get(item_id, "") + delta
                         await _invoke(text_stream_callback, item_partials[item_id])
                     continue
@@ -531,6 +668,8 @@ class CodexSession:
                     "item/reasoning/summaryTextDelta",
                     "item/plan/delta",
                 }:
+                    if thinking_stream_callback is None:
+                        continue
                     delta = str(event_params.get("delta") or "")
                     if delta:
                         reasoning_partial += delta
@@ -549,14 +688,50 @@ class CodexSession:
                         continue
                     completed_items.append(item)
                     item_type = item.get("type")
+                    if hooks is not None:
+                        recovery_prompt = hooks.observe_item(item, turn_id=turn_id)
+                        if recovery_prompt:
+                            log.info(
+                                "Codex hook repeated_failure thread=%s turn=%s",
+                                thread_id[:12], turn_id[:12],
+                            )
+                            await _invoke(
+                                status_callback,
+                                "同じ操作の失敗が続いたため、手順を見直しています。",
+                            )
+                            try:
+                                await self._client.request(
+                                    "turn/steer",
+                                    {
+                                        "threadId": thread_id,
+                                        "expectedTurnId": turn_id,
+                                        "input": [{"type": "text", "text": recovery_prompt}],
+                                    },
+                                    timeout=max(
+                                        0.001, min(5.0, deadline - time.monotonic()),
+                                    ),
+                                )
+                            except (CodexAppServerError, CodexProcessError, TimeoutError):
+                                # It may already have completed, or the server
+                                # may not support steering. Do not resend an
+                                # ambiguously accepted nudge. Stop still checks.
+                                log.info(
+                                    "Codex recovery steer unavailable; "
+                                    "completion hook remains active",
+                                )
                     if item_type == "agentMessage":
+                        item_id = str(item.get("id") or "")
+                        item_partials.pop(item_id, None)
+                        item_phases.pop(item_id, None)
                         text = str(item.get("text") or "")
                         if text:
                             last_agent_text = text
                             phase = str(item.get("phase") or "")
+                            last_agent_phase = phase
                             if phase in {"final_answer", "finalAnswer"}:
                                 final_text = text
-                            await _invoke(incremental_text_callback, text)
+                            if hooks is None or phase == "commentary":
+                                await _invoke(incremental_text_callback, text)
                     elif item_type == "reasoning":
                         await _invoke(thinking_finalize_callback)
                         reasoning_partial = ""
@@ -567,6 +742,19 @@ class CodexSession:
                         "dynamicToolCall", "webSearch", "imageGeneration",
                     }:
                         post_tool_last_activity_at = time.monotonic()
+                        name = str(item.get('tool') or item_type)
+                        arguments = item.get('arguments') or {}
+                        if not isinstance(arguments, dict):
+                            arguments = {'input': str(arguments)}
+                        if item_type == 'commandExecution':
+                            arguments = {'command': item.get('command', '')}
+                        is_error = _tool_failed(item)
+                        await _invoke(tool_result_callback, name, arguments,
+                                      json.dumps(item, ensure_ascii=False), is_error)
+                        if name == 'Scratchpad' and arguments.get('section') and not is_error:
+                            await _invoke(scratch_stream_callback, str(arguments['section']),
+                                          str(arguments.get('content', '')), str(arguments.get('op', 'write')))
+                            await _invoke(scratch_finalize_callback)
                     continue
 
                 if method == "model/rerouted":
@@ -593,10 +781,11 @@ class CodexSession:
                     if event_params.get("willRetry") is True:
                         await _invoke(status_callback, "Codex が接続を再試行中")
                         continue
-                    if _looks_like_auth_failure(message):
-                        raise CodexAuthError(
-                            "Codex OAuth failed; run `codex login` and retry."
-                        )
+                    failure = _classified_failure(
+                        "Codex OAuth failed; run `codex login` and retry.", message,
+                    )
+                    if failure is not None:
+                        raise failure
                     raise CodexTurnError(message)
 
                 if method == "turn/completed":
@@ -610,6 +799,7 @@ class CodexSession:
                                 and item.get("text")
                             ):
                                 last_agent_text = str(item["text"])
+                                last_agent_phase = str(item.get("phase") or "")
                                 if str(item.get("phase") or "") in {
                                     "final_answer", "finalAnswer",
                                 }:
@@ -617,20 +807,81 @@ class CodexSession:
                     if status not in {"completed", "interrupted"}:
                         error = turn.get("error") or {}
                         message = str(error.get("message") or f"turn status={status}")
-                        if _looks_like_auth_failure(message):
-                            raise CodexAuthError(
-                                "Codex OAuth failed; run `codex login` and retry."
-                            )
+                        failure = _classified_failure(
+                            "Codex OAuth failed; run `codex login` and retry.", message,
+                        )
+                        if failure is not None:
+                            raise failure
                         raise CodexTurnError(message)
                     if status == "interrupted":
                         raise asyncio.CancelledError
+                    if hooks is not None:
+                        # Normally item/completed is authoritative. Also cover
+                        # servers that supply completed items only in the
+                        # terminal snapshot; observe_item deduplicates ids.
+                        for item in turn.get("items") or []:
+                            if isinstance(item, dict):
+                                hooks.observe_item(
+                                    item, turn_id=turn_id, allow_recovery=False,
+                                )
+                        review_prompt = hooks.completion_prompt()
+                        if review_prompt:
+                            log.info(
+                                "Codex hook completion_review thread=%s failures=%d pending_steps=%d",
+                                thread_id[:12], hooks.failure_count, hooks.pending_steps,
+                            )
+                            await _invoke(
+                                status_callback,
+                                "実行結果と未完了の手順を確認しています。",
+                            )
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError(
+                                    "Codex completion check exceeded the turn deadline",
+                                )
+                            # Continue on the same thread, under the same model,
+                            # effort, permissions, manager lock and deadline.
+                            # Never replay the original request or its tools.
+                            review_params = dict(params)
+                            review_params["input"] = [
+                                {"type": "text", "text": review_prompt},
+                            ]
+                            try:
+                                reviewed = await self._client.request(
+                                    "turn/start", review_params,
+                                    timeout=min(30.0, remaining),
+                                )
+                            except (CodexAppServerError, CodexProcessError) as exc:
+                                raise CodexTurnError(
+                                    "Codex completion check could not start",
+                                ) from exc
+                            next_turn_id = str(
+                                (reviewed.get("turn") or {}).get("id") or "",
+                            )
+                            if not next_turn_id or next_turn_id == turn_id:
+                                raise CodexProtocolError(
+                                    "completion check returned no new turn id",
+                                )
+                            turn_id = next_turn_id
+                            self._active_turn_id = turn_id
+                            final_text = last_agent_text = reasoning_partial = ""
+                            last_agent_phase = ""
+                            item_partials.clear()
+                            item_phases.clear()
+                            post_tool_last_activity_at = None
+                            continue
                     break
 
             answer = (final_text or last_agent_text).strip()
             if not answer:
                 raise CodexTurnError("Codex completed without an agent message")
+            if hooks is not None and (final_text or last_agent_phase != "commentary"):
+                await _invoke(text_stream_callback, answer)
+                await _invoke(incremental_text_callback, answer)
             was_resumed = self.resumed or self._has_completed_turn
             self._has_completed_turn = True
+            from services.codex_app_server.readiness import record_auth_result
+            record_auth_result(True)
             return CodexTurnResult(
                 final_text=answer,
                 thread_id=thread_id,
@@ -645,6 +896,8 @@ class CodexSession:
                 model_context_window=context_window,
                 compacted=compacted,
                 completed_items=completed_items,
+                hook_recovery_nudges=hooks.recovery_nudges if hooks else 0,
+                hook_completion_reviews=hooks.completion_reviews if hooks else 0,
             )
         except asyncio.CancelledError:
             await self.interrupt()
@@ -687,6 +940,26 @@ class CodexSession:
         request_id = request.get("id")
         method = str(request.get("method") or "")
         params = request.get("params") or {}
+
+        if method == "item/tool/call" and self.tool_executor is not None:
+            name = str(params.get("tool") or "")
+            allowed = {tool["name"] for tool in self.dynamic_tools}
+            valid_thread = bool(self.thread_id) and params.get("threadId") == self.thread_id
+            valid_turn = bool(self._active_turn_id) and params.get("turnId") == self._active_turn_id
+            arguments = params.get("arguments")
+            if (name not in allowed or not valid_thread or not valid_turn
+                    or not isinstance(arguments, dict)
+                    or self._tool_call_count >= self.max_tool_calls):
+                result = {"success": False, "contentItems": [{"type": "inputText", "text": "Tool call denied by host policy or budget."}]}
+            else:
+                self._tool_call_count += 1
+                try:
+                    text = await asyncio.wait_for(self.tool_executor(name, arguments), timeout=self.post_tool_timeout_s)
+                    result = {"success": True, "contentItems": [{"type": "inputText", "text": str(text)}]}
+                except Exception as exc:
+                    result = {"success": False, "contentItems": [{"type": "inputText", "text": f"Tool execution failed: {type(exc).__name__}"}]}
+            await self._client.respond(request_id, result)
+            return
 
         if method in {
             "item/commandExecution/requestApproval", "execCommandApproval",
@@ -741,6 +1014,8 @@ class CodexSession:
     async def _request_approval(
         self, tool_name: str, tool_input: dict[str, Any], detail: str,
     ) -> bool:
+        if not self.allow_host_approvals:
+            return False
         decision, rule = evaluate_permission(tool_name, tool_input)
         if decision == "deny":
             log.warning("Codex tool denied by permission rule %s", rule)

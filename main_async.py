@@ -167,6 +167,11 @@ def _configure_runtime_paths(settings: RuntimeSettings) -> None:
 
 async def _bootstrap_oauth() -> bool:
     """Load, refresh, and durably verify the serving OAuth credential."""
+    from services.codex_app_server import readiness as codex_readiness
+    if not codex_readiness.claude_required():
+        status = codex_readiness.check()
+        log.info('Codex-only runtime credential preflight ok=%s', status['ok'])
+        return status['ok']
     from services import oauth_manager
 
     initialized = oauth_manager.init()

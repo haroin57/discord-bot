@@ -10,12 +10,15 @@ import tempfile
 import unicodedata
 import warnings
 from collections.abc import Awaitable, Callable, Coroutine
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, TypeVar
 
 import aiohttp
 from PIL import Image, UnidentifiedImageError
 
 from utils.image_validator import identify_image_mime
+from utils.render_store import image_validation_lock, run_file_operation
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +37,41 @@ _TEXT_MIMES = {
     "application/x-yaml",
     "application/yaml",
 }
+
+# A validation receipt, not a payload cache. Each caller/provenance group owns
+# a fresh set; asyncio children share that set only for the group's lifetime.
+_validated_attachments: ContextVar[set[tuple] | None] = ContextVar(
+    "validated_attachment_downloads", default=None,
+)
+
+
+@contextmanager
+def attachment_reuse_scope():
+    """Avoid re-downloading successfully validated media within one group."""
+    token = _validated_attachments.set(set())
+    try:
+        yield
+    finally:
+        _validated_attachments.reset(token)
+
+
+def _attachment_key(attachment) -> tuple | None:
+    values = tuple(getattr(attachment, field, None) for field in
+                   ("id", "url", "content_type", "filename", "size"))
+    if not all(type(value) in (str, int, type(None)) for value in values):
+        return None
+    return (id(attachment), *values)
+
+
+def _record_validated(attachment) -> None:
+    receipts = _validated_attachments.get()
+    if receipts is not None and (key := _attachment_key(attachment)) is not None:
+        receipts.add(key)
+
+
+def _already_validated(attachment) -> bool:
+    receipts = _validated_attachments.get()
+    return receipts is not None and _attachment_key(attachment) in receipts
 
 
 def _declared_mime(attachment: Any) -> str:
@@ -73,7 +111,7 @@ def _fully_decoded_image(
         actual_mime = identify_image_mime(head)
         if actual_mime is None or actual_mime != declared_mime:
             return False
-        with warnings.catch_warnings():
+        with image_validation_lock, warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(path) as image:
                 if not _dimensions_allowed(
@@ -198,9 +236,10 @@ async def download_image(
                                 max_bytes,
                             )
                             return None
-                        file.write(chunk)
+                        await run_file_operation(file.write, chunk)
                 declared_mime = _declared_mime(attachment)
-                if not _fully_decoded_image(
+                if not await run_file_operation(
+                    _fully_decoded_image,
                     part_path,
                     declared_mime=declared_mime,
                     max_width=max_width,
@@ -217,6 +256,7 @@ async def download_image(
                 log.info(
                     "Downloaded attachment: %s -> %s", attachment.filename, destination
                 )
+                _record_validated(attachment)
                 return destination
         except Exception as exc:
             log.warning(
@@ -284,14 +324,20 @@ async def download_text(
             async with session.get(attachment.url, allow_redirects=False) as response:
                 if response.status != 200:
                     return None
-                data = await response.read()
-                if len(data) > max_bytes:
-                    log.warning(
-                        "Text attachment %s too large after download",
-                        attachment.filename,
-                    )
-                    return None
-                text = _decode_text(data)
+                chunks = []
+                total = 0
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        log.warning(
+                            "Aborting text attachment %s: exceeded %d bytes mid-stream",
+                            attachment.filename,
+                            max_bytes,
+                        )
+                        return None
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+                text = await run_file_operation(_decode_text, data)
                 if text is None:
                     log.warning(
                         "Rejecting text attachment with invalid encoding/control bytes: %s",
@@ -303,6 +349,7 @@ async def download_text(
                     attachment.filename,
                     len(data),
                 )
+                _record_validated(attachment)
                 return attachment.filename or "attachment.txt", text
         except Exception as exc:
             log.warning(
@@ -366,6 +413,11 @@ async def download_arbitrary(
             extension,
         )
         return None
+    if _already_validated(attachment):
+        # The dedicated downloader already returned this exact validated
+        # upload to the caller. Failed/oversized/mislabeled uploads have no
+        # receipt and still run the existing binary-policy fallback below.
+        return None
     safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(attachment.id))[:64] or "att"
     safe_base = sanitize_basename(attachment.filename or "")
     destination = os.path.realpath(
@@ -404,19 +456,19 @@ async def download_arbitrary(
                                 max_bytes,
                             )
                             return None
-                        file.write(chunk)
+                        await run_file_operation(file.write, chunk)
                 declared_mime = _declared_mime(attachment)
-                if declared_mime in _IMAGE_MIMES and _fully_decoded_image(
+                if declared_mime in _IMAGE_MIMES and await run_file_operation(
+                    _fully_decoded_image,
                     part_path,
                     declared_mime=declared_mime,
                 ):
                     # The dedicated image path already owns this valid payload.
                     return None
                 if declared_mime in _TEXT_MIMES:
-                    with open(part_path, "rb") as file:
-                        if _decode_text(file.read()) is not None:
-                            # The dedicated text path already owns this valid payload.
-                            return None
+                    if await run_file_operation(_is_text_file, part_path):
+                        # The dedicated text path already owns this valid payload.
+                        return None
                 os.replace(part_path, destination)
                 part_path = None
                 log.info(
@@ -445,6 +497,11 @@ async def download_arbitrary(
             except OSError:
                 pass
     return None
+
+
+def _is_text_file(path: str) -> bool:
+    with open(path, "rb") as file:
+        return _decode_text(file.read()) is not None
 
 
 async def download_arbitraries(

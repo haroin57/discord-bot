@@ -14,9 +14,11 @@ from utils.cf_browser import render_screenshot
 from utils.render_store import (
     is_cached,
     prepare,
-    publish_png,
+    publish_png_async,
     remove_if_exists,
     render_paths,
+    render_lock,
+    run_file_operation,
     temporary_png_path,
     write_html,
     write_png,
@@ -140,8 +142,6 @@ async def render_table_image(
     output_dir: str = TABLE_OUTPUT_DIR,
 ) -> str | None:
     """Render a Markdown table as a PNG image. Returns the file path, or None on failure."""
-    prepare(output_dir)
-
     # Cache key includes a template/sanitizer version so previously-rendered
     # PNGs that may have contained injected HTML are not served after the
     # bleach allowlist + caption escape was added. Bump _TEMPLATE_VERSION on
@@ -154,14 +154,25 @@ async def render_table_image(
         cache_key=cache_key,
     )
 
+    async with render_lock(out_path):
+        return await _render_table_image(
+            md_table, caption, out_path, html_path, output_dir
+        )
+
+
+async def _render_table_image(
+    md_table: str, caption: str, out_path: str, html_path: str, output_dir: str
+) -> str | None:
+    await run_file_operation(prepare, output_dir)
+
     # Cache hit
-    if is_cached(out_path):
+    if await run_file_operation(is_cached, out_path):
         return out_path
 
     # Build HTML
     import html as _html
 
-    table_html = _md_table_to_html(md_table)
+    table_html = await run_file_operation(_md_table_to_html, md_table)
     # Caption comes from an LLM-rendered markdown heading and can include
     # arbitrary user-controlled text; HTML-escape so it cannot inject <script>
     # or event-handler attributes into the rendered page.
@@ -176,7 +187,7 @@ async def render_table_image(
 
     # Keep the .html on disk for debugging/parity; the remote browser renders
     # from the inlined string (it cannot see local files).
-    write_html(html_path, full_html)
+    await run_file_operation(write_html, html_path, full_html)
 
     # Clip to the table container so the PNG is the table box (not a full page).
     # Tables use only local fonts + inline CSS, so no network wait is needed.
@@ -189,8 +200,8 @@ async def render_table_image(
         if not png_bytes:
             log.warning("Table render failed (Browser Rendering returned no image)")
             return None
-        write_png(part_path, png_bytes)
-        if not publish_png(part_path, out_path):
+        await run_file_operation(write_png, part_path, png_bytes)
+        if not await publish_png_async(part_path, out_path):
             log.warning("Table render returned an incomplete PNG")
             return None
     except OSError as e:
@@ -198,4 +209,4 @@ async def render_table_image(
         return None
     finally:
         remove_if_exists(part_path)
-    return out_path if is_cached(out_path) else None
+    return out_path

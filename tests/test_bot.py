@@ -216,6 +216,15 @@ class TestOnMessage:
         msg.reply.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_guild_bare_name_ignored_when_keywords_disabled(self, monkeypatch):
+        monkeypatch.setattr("bot.BOT_KEYWORDS", [])
+        msg = _make_message(content="かなえ hello", author_id=12345)
+
+        await self._dispatch(msg)
+
+        msg.reply.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_guild_keyword_triggers(self, monkeypatch):
         import bot
 
@@ -335,40 +344,21 @@ class TestOnMessage:
         msg.reply.assert_called()
 
     @pytest.mark.asyncio
-    async def test_role_mention_triggers(self, monkeypatch):
-        import bot
-
+    async def test_role_mention_does_not_trigger(self, monkeypatch):
         monkeypatch.setattr("bot.BOT_ROLE_IDS", {7777})
 
         role_mock = MagicMock()
         role_mock.id = 7777
 
-        msg = _make_message(content="hey", author_id=12345)
+        msg = _make_message(
+            content="<@&7777> かなえ hey",
+            author_id=12345,
+        )
         msg.role_mentions = [role_mock]
 
-        with (
-            patch("bot.strip_mention", return_value="hey"),
-            patch(
-                "bot.call_with_tools",
-                new_callable=AsyncMock,
-                return_value=("ok", None, False),
-            ),
-            patch(
-                "bot.get_http_session", new_callable=AsyncMock, return_value=MagicMock()
-            ),
-            patch("bot.download_attachments", new_callable=AsyncMock, return_value=[]),
-            patch(
-                "bot.resolve_message_links", new_callable=AsyncMock, return_value="hey"
-            ),
-            patch("bot.extract_image_paths", return_value=[]),
-            patch("bot.split_message", return_value=["ok"]),
-            patch("bot.cleanup_attachments"),
-            patch("bot.fetch_channel_context", new_callable=AsyncMock, return_value=""),
-            patch("bot.fetch_thread_context", new_callable=AsyncMock, return_value=""),
-        ):
-            await self._dispatch(msg)
+        await self._dispatch(msg)
 
-            msg.reply.assert_called()
+        msg.reply.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_other_bot_role_does_not_trigger_from_expanded_mentions(

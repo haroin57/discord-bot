@@ -6,6 +6,7 @@ import os
 import time
 
 from services.oauth_manager import (
+    OAuthRefreshFailed,
     ensure_valid_token,
     get_access_token,
     init as oauth_init,
@@ -69,8 +70,11 @@ async def get_anthropic_client():
     Returns None only when neither auth method is available.
     """
     global _async_anthropic_client, _async_anthropic_token
+    from services.codex_app_server import auxiliary
+    if auxiliary.enabled():
+        return auxiliary.CodexTextClient()
     oauth_init()  # idempotent
-    await ensure_valid_token()
+    await _refresh_token_if_available()
     token = get_access_token()
 
     # Same fallback chain as _build_config / _get_mem0 (P1-e/P4b): both the
@@ -123,6 +127,22 @@ async def get_anthropic_client():
     # No auth at all (or an explicit non-anthropic MEM0_LLM_PROVIDER override
     # that this direct-call path doesn't serve).
     return None
+
+
+async def _refresh_token_if_available() -> None:
+    """A revoked Claude session must not disable independent memory backends.
+
+    Only the expected OAuth failure is handled. Cancellation and unexpected
+    programming errors still propagate. OAuth clears hard-expired tokens
+    before raising, so provider selection cannot reuse the revoked token.
+    """
+    from services.codex_app_server import auxiliary
+    if auxiliary.enabled():
+        return
+    try:
+        await ensure_valid_token()
+    except OAuthRefreshFailed:
+        log.warning("Mem0 OAuth unavailable; retaining non-Claude memory paths")
 
 
 def _refresh_mem0_client_token() -> None:
@@ -182,6 +202,9 @@ def _desired_llm_provider() -> "str | None":
     provider. Order: explicit MEM0_LLM_PROVIDER override → Anthropic (OAuth
     or API key) → OpenRouter → OpenCode Zen → None.
     """
+    from services.codex_app_server import auxiliary
+    if auxiliary.enabled():
+        return 'codex'
     configured = os.environ.get("MEM0_LLM_PROVIDER", "anthropic")
     if configured != "anthropic":
         return configured  # explicit override wins; no fallback logic
@@ -305,6 +328,11 @@ def _build_config() -> dict:
         },
     }
 
+    if desired == 'codex':
+        from config import CODEX_APP_SERVER_MODEL
+        from services.mem0.codex_llm import configuration
+        config['llm'] = configuration(CODEX_APP_SERVER_MODEL)
+
     return config
 
 
@@ -356,7 +384,7 @@ def _get_mem0():
         return None
 
     # Initialize OAuth BEFORE creating any Anthropic clients
-    if not oauth_init():
+    if _desired_llm_provider() != 'codex' and not oauth_init():
         log.error("OAuth init failed — Mem0 LLM calls will not work")
 
     try:
@@ -424,7 +452,7 @@ async def get_all_memories(user_id: str, limit: int | None = None) -> list[dict]
     if not mem:
         return []
     try:
-        await ensure_valid_token()  # refresh OAuth if needed
+        await _refresh_token_if_available()
         _refresh_mem0_client_token()
         kwargs: dict = {"user_id": user_id}
         if limit is not None:
@@ -448,7 +476,7 @@ async def delete_memory(memory_id: str) -> bool:
     if not mem:
         return False
     try:
-        await ensure_valid_token()  # refresh OAuth if needed
+        await _refresh_token_if_available()
         _refresh_mem0_client_token()
         from services.mem0.integrity import get_application_service
 

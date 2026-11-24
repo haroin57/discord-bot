@@ -448,7 +448,7 @@ async def _reconcile_turn_outbox(request_id: str) -> bool:
 
 
 async def _replay_turn_outbox() -> None:
-    for turn in _turn_outbox.pending():
+    for turn in await _turn_outbox.run_io(_turn_outbox.pending):
         await _reconcile_turn_outbox(turn["request_id"])
 
 
@@ -719,6 +719,9 @@ async def on_ready():
         _track_task(_periodic_memory_trim(), name="memory_trim")
         _track_task(r2_archive.archive_worker(), name="r2_archive")
         _track_task(_replay_turn_outbox(), name="turn_outbox_replay")
+        _track_task(bot_record.alpha_recovery_worker(
+            add_memories=add_memories, allowed_user_ids=ADMIN_USER_IDS,
+        ), name="mem0_batch_recovery")
 
 
 # ---------------------------------------------------------------------------
@@ -883,6 +886,24 @@ def _guild_message_addresses_bot(message: discord.Message) -> bool:
 
 
 @bot.event
+async def on_raw_message_delete(payload):
+    from services import guild_context
+    await guild_context.forget([payload.message_id])
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload):
+    from services import guild_context
+    await guild_context.forget(list(payload.message_ids))
+
+
+@bot.event
+async def on_raw_message_edit(payload):
+    from services import guild_context
+    await guild_context.observe_edit(payload)
+
+
+@bot.event
 async def on_message(message: discord.Message):
     # Own the dispatch before admission awaits or spawns indexing work. This
     # closes the phase gap where a SIGTERM could otherwise miss a task that had
@@ -890,6 +911,10 @@ async def on_message(message: discord.Message):
     # cleanup completed.
     if not _runtime_resources.register_dispatch_task(asyncio.current_task()):
         return
+    from services import guild_context
+    # Receipt precedes admission: a correction addressed to another speaker
+    # must still be visible to subsequent turns, without making the bot reply.
+    await guild_context.observe(message)
     admitted = await bot_admission.admit_message(
         message,
         bot=bot,
@@ -1062,7 +1087,8 @@ async def on_message(message: discord.Message):
     _renderer = None
     delivery = bot_publish.DeliveryState(
         request_id=turn_request_id,
-        receipt_callback=lambda state: _turn_outbox.record_delivery(
+        receipt_callback=lambda state: _turn_outbox.run_io(
+            _turn_outbox.record_delivery,
             turn_request_id,
             message_ids=state.message_ids,
             streamed=state.streamed,
@@ -1077,7 +1103,7 @@ async def on_message(message: discord.Message):
         )
 
     async def _register_turn_archive(**kwargs) -> None:
-        await asyncio.to_thread(
+        await _turn_outbox.run_io(
             _turn_outbox.add_archive_job,
             turn_request_id,
             **kwargs,
@@ -1092,7 +1118,8 @@ async def on_message(message: discord.Message):
         # Stage the immutable request and its archive intent only after FIFO
         # admission. No model/stream callback can acknowledge a turn whose
         # durable request payload has not been atomically written.
-        _turn_outbox.stage_request(
+        await _turn_outbox.run_io(
+            _turn_outbox.stage_request,
             turn_request_id,
             request_message_id=message.id,
             channel_id=message.channel.id,
@@ -1238,6 +1265,13 @@ async def on_message(message: discord.Message):
             recalling_phase=JobPhase.RECALLING,
         )
         prompt = prompt_result.prompt
+        shared_context = await guild_context.context_for(
+            message, bot, max_chars=min(24000, max(0, MAX_PROMPT_CHARS - len(prompt) - 2)),
+        )
+        if shared_context:
+            # Also inject on native thread resume, which otherwise skips the
+            # other speakers' messages in the full channel context.
+            prompt = f"{shared_context}\n\n{prompt}"
         _active_skill_prompt = prompt_result.active_skill_prompt
 
         model_result = await bot_model.invoke_model(
@@ -1326,7 +1360,8 @@ async def on_message(message: discord.Message):
         record_response_text = response_text or (
             getattr(_renderer, "committed", "") or ""
         )
-        _turn_outbox.prepare(
+        await _turn_outbox.run_io(
+            _turn_outbox.prepare,
             turn_request_id,
             {
                 "caller_is_admin": caller_is_admin,
@@ -1344,7 +1379,8 @@ async def on_message(message: discord.Message):
             nonlocal turn_committed
             if turn_committed:
                 return
-            _turn_outbox.record_delivery(
+            await _turn_outbox.run_io(
+                _turn_outbox.record_delivery,
                 turn_request_id,
                 message_ids=delivery.message_ids,
                 streamed=delivery.streamed,
@@ -1550,10 +1586,14 @@ async def on_message(message: discord.Message):
                         cleanup_attachments,
                         [*image_paths, *binary_paths],
                     )
-                    turn_snapshot = _turn_outbox.snapshot(turn_request_id)
+                    turn_snapshot = await _turn_outbox.run_io(
+                        _turn_outbox.snapshot, turn_request_id
+                    )
                     if turn_snapshot is not None and turn_snapshot.get(
                         "delivery", {}
                     ).get("acknowledged"):
                         await _reconcile_turn_outbox(turn_request_id)
                     else:
-                        _turn_outbox.discard_unacknowledged(turn_request_id)
+                        await _turn_outbox.run_io(
+                            _turn_outbox.discard_unacknowledged, turn_request_id
+                        )

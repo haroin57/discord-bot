@@ -94,11 +94,13 @@ async def test_codex_dispatch_forwards_exactly_advertised_callbacks(
     assert result.as_legacy_tuple() == ("codex", None, True)
     assert captured["status_callback"] is _text_callback
     assert captured["thinking_stream_callback"] is _text_callback
-    assert "scratch_stream_callback" not in captured
-    assert "verify_stream_callback" not in captured
+    assert captured["scratch_stream_callback"] is _scratch_callback
+    assert captured["scratch_finalize_callback"] is _finalize_callback
+    assert captured["verify_stream_callback"] is _text_callback
+    assert captured["verify_finalize_callback"] is _finalize_callback
     assert ProviderCapability.STATUS in advertised
-    assert ProviderCapability.SCRATCH_STREAM not in advertised
-    assert ProviderCapability.VERIFY_STREAM not in advertised
+    assert ProviderCapability.SCRATCH_STREAM in advertised
+    assert ProviderCapability.VERIFY_STREAM in advertised
 
 
 @pytest.mark.asyncio

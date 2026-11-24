@@ -7,6 +7,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from utils.attachment_downloader import attachment_reuse_scope
+
 from bot_pipeline.admission import AttachmentLimits, classify_attachment_rejections
 from bot_pipeline.attachment_types import (
     AttachmentArtifacts,
@@ -251,76 +253,77 @@ async def prepare_context(
         if reference_attachments:
             download_groups.append((reference_attachments, reply_source))
         for attachments, source in download_groups:
-            downloaded_images = await deps.download_attachments(
-                http_session,
-                attachments,
-            )
-            image_paths.extend(downloaded_images)
-            artifacts.images.extend(
-                ImageArtifact(path=path, provenance=source)
-                for path in downloaded_images
-            )
-            if downloaded_images:
-                inbound_metadata = deps.attachment_metadata_by_path(
+            with attachment_reuse_scope():
+                downloaded_images = await deps.download_attachments(
+                    http_session,
                     attachments,
-                    downloaded_images,
                 )
-                refs = await asyncio.to_thread(
-                    deps.archive_images,
-                    downloaded_images,
-                    channel_id=message.channel.id,
-                    request_message_id=message.id,
-                    direction="inbound",
-                    author_id=source.sender_id,
-                    source="discord-attachment",
-                    per_path_metadata=inbound_metadata,
+                image_paths.extend(downloaded_images)
+                artifacts.images.extend(
+                    ImageArtifact(path=path, provenance=source)
+                    for path in downloaded_images
                 )
-                if refs:
-                    log.info(
-                        "R2 staged %d inbound image(s) for message %s",
-                        len(refs),
-                        message.id,
+                if downloaded_images:
+                    inbound_metadata = deps.attachment_metadata_by_path(
+                        attachments,
+                        downloaded_images,
                     )
+                    refs = await asyncio.to_thread(
+                        deps.archive_images,
+                        downloaded_images,
+                        channel_id=message.channel.id,
+                        request_message_id=message.id,
+                        direction="inbound",
+                        author_id=source.sender_id,
+                        source="discord-attachment",
+                        per_path_metadata=inbound_metadata,
+                    )
+                    if refs:
+                        log.info(
+                            "R2 staged %d inbound image(s) for message %s",
+                            len(refs),
+                            message.id,
+                        )
 
-            downloaded_texts = await deps.download_text_attachments(
-                http_session,
-                attachments,
-            )
-            text_attachments.extend(downloaded_texts)
-            artifacts.texts.extend(
-                TextArtifact(
-                    filename=filename,
-                    content=content,
-                    provenance=source,
+                downloaded_texts = await deps.download_text_attachments(
+                    http_session,
+                    attachments,
                 )
-                for filename, content in downloaded_texts
-            )
+                text_attachments.extend(downloaded_texts)
+                artifacts.texts.extend(
+                    TextArtifact(
+                        filename=filename,
+                        content=content,
+                        provenance=source,
+                    )
+                    for filename, content in downloaded_texts
+                )
 
-            # Binary inspection is authorized by attachment provenance, not by
-            # the author of the message that happened to reference it.
-            downloaded_binaries = await deps.download_arbitrary_attachments(
-                http_session,
-                attachments,
-                caller_is_admin=source.trusted,
-            )
-            arbitrary_attachments.extend(downloaded_binaries)
-            if binary_paths is not None:
-                binary_paths.extend(
-                    str(metadata["path"])
+                # Binary inspection is authorized by attachment provenance, not by
+                # the author of the message that happened to reference it.
+                downloaded_binaries = await deps.download_arbitrary_attachments(
+                    http_session,
+                    attachments,
+                    caller_is_admin=source.trusted,
+                )
+                arbitrary_attachments.extend(downloaded_binaries)
+                if binary_paths is not None:
+                    binary_paths.extend(
+                        str(metadata["path"])
+                        for metadata in downloaded_binaries
+                        if metadata.get("path")
+                    )
+                artifacts.binaries.extend(
+                    BinaryArtifact(
+                        metadata=metadata,
+                        provenance=AttachmentProvenance(
+                            sender_id=source.sender_id,
+                            origin=source.origin,
+                            trusted=False,
+                        ),
+                    )
                     for metadata in downloaded_binaries
-                    if metadata.get("path")
                 )
-            artifacts.binaries.extend(
-                BinaryArtifact(
-                    metadata=metadata,
-                    provenance=AttachmentProvenance(
-                        sender_id=source.sender_id,
-                        origin=source.origin,
-                        trusted=False,
-                    ),
-                )
-                for metadata in downloaded_binaries
-            )
 
         resolved_prompt = await launched.links
         conv_context = await launched.thread

@@ -1,0 +1,5 @@
+# Versions match the gateway's tested native data format. OAuth/Discord/Mem0
+# dependencies are deliberately absent from this read-only service.
+aiohttp==3.14.1
+lancedb==0.33.0
+pyarrow==24.0.0

@@ -406,9 +406,15 @@ def get_readiness_snapshot(bot=None) -> dict[str, Any]:
     mem0_st = _check_mem0()
     system_st = _check_system()
     release_st = _check_release()
+    from services.codex_app_server import readiness as codex_readiness
+    claude_required = codex_readiness.claude_required()
+    codex_st = codex_readiness.check() if os.environ.get('DEFAULT_LLM_PROVIDER', '').lower() == 'codex' else None
+    if not claude_required:
+        oauth_st['required'] = False
     overall_ok = (
         discord_st["ok"]
-        and oauth_st["ok"]
+        and (oauth_st["ok"] or not claude_required)
+        and (codex_st is None or codex_st['ok'])
         and mem0_st["ok"]
         and system_st["ok"]
         and release_st["ok"]
@@ -424,6 +430,7 @@ def get_readiness_snapshot(bot=None) -> dict[str, Any]:
             "mem0": mem0_st,
             "system": system_st,
             "release": release_st,
+            **({'codex': codex_st} if codex_st is not None else {}),
         },
     }
 

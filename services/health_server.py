@@ -33,6 +33,7 @@ class HealthServer:
         self.app.router.add_get("/health", self._handle_health)
         self._runner: web.AppRunner | None = None
         self._release_verification_task: asyncio.Task[None] | None = None
+        self._readiness_task: asyncio.Task | None = None
         # Fallback uptime if services.health snapshot ever fails hard.
         self._started_at: float = time.time()
 
@@ -71,10 +72,19 @@ class HealthServer:
             # psutil and the Chroma heartbeat are synchronous.  Keep them away
             # from the bot event loop so a stopped dependency cannot stall the
             # Discord gateway heartbeat.
-            snap = await asyncio.to_thread(
-                health_service.get_readiness_snapshot,
-                bot=self.bot,
-            )
+            # Coalesce overlapping probes only. A completed result is never
+            # cached: the next request must see current dependency health.
+            # Shield the shared worker from disconnected/cancelled clients;
+            # cancelling to_thread cannot stop its synchronous network I/O.
+            if self._readiness_task is None or self._readiness_task.done():
+                self._readiness_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        health_service.get_readiness_snapshot, bot=self.bot
+                    ),
+                    name="readiness-snapshot",
+                )
+                self._readiness_task.add_done_callback(self._observe_readiness)
+            snap = await asyncio.shield(self._readiness_task)
         except Exception as exc:  # pragma: no cover — health must never fail hard
             log.exception("get_readiness_snapshot failed closed: %s", exc)
             uptime = int(time.time() - self._started_at) if self._started_at else 0
@@ -90,6 +100,13 @@ class HealthServer:
             }
         status_code = 200 if snap.get("status") == "ok" else 503
         return web.json_response(snap, status=status_code)
+
+    @staticmethod
+    def _observe_readiness(task: asyncio.Task) -> None:
+        # Retrieve failures even when every HTTP waiter disconnected. The
+        # handler still receives the exception and returns a fail-closed 503.
+        if not task.cancelled():
+            task.exception()
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         """Backward-compatible readiness alias for existing external probes."""

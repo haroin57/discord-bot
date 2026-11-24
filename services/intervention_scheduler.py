@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -18,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ALERT_SCRIPT = REPO_ROOT / "scripts" / "intervention_alert.py"
-VI_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
-LOG_FILE = REPO_ROOT / ".state" / "intervention_alert.log"
+VI_PYTHON = Path(sys.executable)
+LOG_FILE = Path(os.environ.get("BOT_STATE_DIR", str(REPO_ROOT / ".state"))) / "intervention_alert.log"
 
 INTERVAL_MINUTES = 30
 
@@ -102,6 +104,12 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
+    import argparse
+    parser = argparse.ArgumentParser(description="Intervention scheduler")
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args()
+    if args.once:
+        raise SystemExit(asyncio.run(run_intervention_check()))
     asyncio.run(intervention_daemon())
 
 

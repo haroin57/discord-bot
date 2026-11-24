@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import sys
 import warnings
 from datetime import date, datetime, timedelta
@@ -30,7 +31,7 @@ import requests
 import yfinance as yf
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-STATE_FILE = REPO_ROOT / ".state" / "vi_fwd_records.json"
+STATE_FILE = Path(os.environ.get("BOT_STATE_DIR", str(REPO_ROOT / ".state"))) / "vi_fwd_records.json"
 
 UA = {"User-Agent": "Mozilla/5.0"}
 URL_VI = "https://indexes.nikkei.co.jp/nkave/historical/nikkei_stock_average_vi_daily_jp.csv"

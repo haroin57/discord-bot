@@ -102,8 +102,21 @@ class _SpawnHarness:
 
 @pytest.fixture
 def spawn_harness(monkeypatch) -> _SpawnHarness:
+    from services.codex_app_server import client as client_module
     harness = _SpawnHarness()
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", harness.spawn)
+
+    async def spawn(argv, *, stream_limit, **kwargs):
+        return await harness.spawn(*argv, limit=stream_limit, **kwargs)
+
+    async def cleanup(process, *, grace_s):
+        if process.returncode is None:
+            process.terminate()
+        await process.wait()
+
+    # Transport unit tests use fake Process objects. The actual spawn fence
+    # and descendant cleanup are exercised with real local processes below.
+    monkeypatch.setattr(client_module, "spawn_process", spawn)
+    monkeypatch.setattr(client_module, "wait_or_terminate_process_group", cleanup)
     return harness
 
 
@@ -450,3 +463,29 @@ async def test_non_json_stdout_is_diagnostic_not_an_event(
     assert client.stderr_tail() == ["<non-json on codex stdout: 34 bytes>"]
     assert await client.next_event(timeout=0) is None
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_owned_spawn_before_finishing(monkeypatch, spawn_harness):
+    from services.codex_app_server import client as client_module
+    spawned = asyncio.Event()
+    release = asyncio.Event()
+    original = client_module.spawn_process
+
+    async def delayed_spawn(*args, **kwargs):
+        spawned.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(client_module, 'spawn_process', delayed_spawn)
+    client = AsyncCodexAppServerClient()
+    start = asyncio.create_task(client.start())
+    await spawned.wait()
+    close = asyncio.create_task(client.close())
+    await asyncio.sleep(0)
+    assert not close.done()
+    release.set()
+    await start
+    await close
+    assert spawn_harness.process.returncode is not None
+    assert not client.is_alive

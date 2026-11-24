@@ -40,7 +40,7 @@ def mem0_pkg():
 
 
 class TestPublicApi:
-    def test_all_13_symbols_present(self, mem0_pkg):
+    def test_original_symbols_and_quality_extensions_present(self, mem0_pkg):
         expected = {
             "MEM0_RELEVANCE_MAX_DISTANCE", "MEM0_RELEVANCE_THRESHOLD",
             "add_memories", "assess_recall_confidence", "delete_memory",
@@ -48,6 +48,7 @@ class TestPublicApi:
             "format_memories_for_prompt", "get_all_memories",
             "search_memories", "search_memories_multi",
             "search_memories_smart", "should_use_memory_llm_mode",
+            "search_memories_at_time", "search_memories_hybrid",
         }
         assert expected == set(mem0_pkg.__all__)
         for name in expected:
@@ -214,12 +215,18 @@ class TestHistoryContract:
     def test_history_index_signatures(self):
         from services.mem0 import history_index
         sig = inspect.signature(history_index.index_line)
-        assert list(sig.parameters) == ["channel_id", "ts", "role", "text", "author"]
+        assert list(sig.parameters)[:5] == ["channel_id", "ts", "role", "text", "author"]
+        for name in list(sig.parameters)[5:]:
+            assert sig.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+            assert sig.parameters[name].default is not inspect.Parameter.empty
         assert hasattr(history_index, "search_history")
         assert hasattr(history_index, "get_lines_since")
 
     def test_history_embed_signatures(self):
         from services.mem0 import history_embed
         sig = inspect.signature(history_embed.index_line)
-        assert list(sig.parameters) == ["channel_id", "ts", "role", "author", "text"]
+        assert list(sig.parameters)[:5] == ["channel_id", "ts", "role", "author", "text"]
+        for name in list(sig.parameters)[5:]:
+            assert sig.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+            assert sig.parameters[name].default is not inspect.Parameter.empty
         assert hasattr(history_embed, "search_semantic")

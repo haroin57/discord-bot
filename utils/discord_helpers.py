@@ -10,6 +10,7 @@ import discord
 
 from utils.cache import TTLLRUCache
 from utils import context_gateway
+from services.guild_context import can_view
 
 from config import (
     ADMIN_USER_IDS,
@@ -403,7 +404,8 @@ def _requester_can_read(channel: discord.abc.Messageable, requester) -> bool:
 
     The bot may have joined admin-only channels the attacker cannot see. If
     we blindly fetched messages we'd be a lifted-privilege oracle. Require
-    the requester to be a guild member with `read_message_history`.
+    the requester to be a guild member with `read_message_history`, and for a
+    private thread, actual thread membership.
     """
     guild = getattr(channel, "guild", None)
     if guild is None:
@@ -415,16 +417,18 @@ def _requester_can_read(channel: discord.abc.Messageable, requester) -> bool:
         )
         return any(getattr(r, "id", None) == requester.id for r in recipients)
     member = guild.get_member(requester.id)
-    if member is None:
-        return False
-    perms_for = getattr(channel, "permissions_for", None)
-    if perms_for is None:
-        return False
+    # Delegate to the single membership-aware predicate shared with guild
+    # context fan-out. `can_view` verifies view_channel + read_message_history
+    # AND, for a private thread, ThreadMember participation (or manage_threads).
+    # A plain `permissions_for()` on a Thread only reflects the *parent*
+    # channel, so without this a non-member could read a private thread via a
+    # message link / <#thread> mention (F-w1-02, confused deputy).
     try:
-        perms = perms_for(member)
+        return can_view(channel, member, getattr(guild, "id", None))
     except Exception:
+        # Fail closed on any unexpected permissions error, matching the prior
+        # contract where a raising permissions_for() denied access.
         return False
-    return bool(perms.read_message_history and perms.view_channel)
 
 
 async def _resolve_one_link(

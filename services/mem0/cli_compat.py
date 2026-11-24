@@ -94,6 +94,9 @@ async def cli_messages_create(
     list is passed via the ``anthropic-beta`` header instead, which the API
     accepts identically.
     """
+    from services.codex_app_server.auxiliary import CodexTextClient
+    if isinstance(client, CodexTextClient):
+        return await client.complete(system=task_prompt, prompt=user_message, max_tokens=max_tokens)
     headers = cli_headers()
     # Strip the long-context beta (context-1m-*) for ALL Mem0 helper calls.
     # These tasks (extract / dedup / rewrite / HyDE / rerank / classify) send

@@ -81,18 +81,20 @@ def _context_item(
     author_id = getattr(author, "id", None)
     # Discord's author.bot flag is attacker-independent provenance, but it is
     # not an authorization boundary: webhooks and unrelated bots also set it.
-    # Only identities injected by the composition root may cross the trusted
-    # prompt boundary. A missing current-bot identity therefore fails closed.
-    known_bot_id = (
-        bot_user_id
-        if isinstance(bot_user_id, int) and not isinstance(bot_user_id, bool)
-        else None
-    )
+    # Only admin *humans* injected by the composition root may cross the
+    # trusted prompt boundary.
+    #
+    # The bot's own prior output is deliberately NOT trusted here (F-w1-04):
+    # the assistant routinely echoes non-admin / web-sourced text, so promoting
+    # its past messages into the <trusted_user_input> partition would launder
+    # attacker-controlled content into a primary instruction on a later admin
+    # turn. Bot output still appears as untrusted context *data*.
+    # `bot_user_id` is retained in the signature for call-site stability.
     trusted = bool(
         caller_is_admin
         and isinstance(author_id, int)
         and not isinstance(author_id, bool)
-        and (author_id == known_bot_id or author_id in admin_user_ids)
+        and author_id in admin_user_ids
     )
     lines, _ = build_lines([(name, body)])
     rendered = lines[0] if lines else f"{name}: {body}"

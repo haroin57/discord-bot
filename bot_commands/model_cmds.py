@@ -73,6 +73,7 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
     # 選択肢に無い実験用モデルのための custom に残す。
     @app_commands.choices(
         model=[
+            app_commands.Choice(name="GPT-6 Astra (Codex)", value="gpt-6-astra"),
             app_commands.Choice(name="GPT-5.6 Sol (Codex)", value="gpt-5.6-sol"),
             app_commands.Choice(name="GPT-5.6 Terra (Codex)", value="gpt-5.6-terra"),
             app_commands.Choice(name="GPT-5.6 Luna (Codex)", value="gpt-5.6-luna"),

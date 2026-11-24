@@ -86,6 +86,7 @@ def normalize_image_filenames(text: str, search_dirs: Iterable[str]) -> str:
         r"(?<![/\w])(\b[\w._-]+\.(?:png|jpg|jpeg|gif|webp|svg))\b",
     )
     replacements: dict[str, str] = {}
+    directories = tuple(search_dirs)
     for match in bare_pattern.finditer(text):
         filename = match.group(1)
         if filename in replacements:
@@ -94,15 +95,17 @@ def normalize_image_filenames(text: str, search_dirs: Iterable[str]) -> str:
             continue
         candidates = [
             os.path.join(directory, filename)
-            for directory in search_dirs
+            for directory in directories
             if os.path.isfile(os.path.join(directory, filename))
         ]
+        # Remember misses and ambiguous names for the rest of this response.
+        replacements[filename] = filename
         if len(candidates) == 1:
             replacements[filename] = candidates[0]
             log.info("Normalized bare filename %s -> %s", filename, candidates[0])
-    for filename, full_path in replacements.items():
-        text = text.replace(filename, full_path)
-    return text
+    # Replace only bare matches, never the same name inside an absolute path
+    # or as a suffix of a different filename.
+    return bare_pattern.sub(lambda match: replacements[match.group(1)], text)
 
 
 def extract_image_paths(

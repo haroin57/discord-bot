@@ -301,18 +301,14 @@ def search_bm25(
         log.warning("bm25 search failed: %s", exc)
         return []
     out: list[dict] = []
-    from services.mem0.integrity import canonical_fact_visible, get_repository
+    from services.mem0.integrity import canonical_facts_visible
 
-    managed = os.environ.get("MEM0_INTEGRITY_MODE", "legacy").lower() != "legacy"
-    repository = get_repository() if managed else None
+    visibility = canonical_facts_visible(
+        [r["fact_id"] for r in rows], user_id,
+        current_channel_id=current_channel_id, require_present=True,
+    )
     for i, r in enumerate(rows):
-        if managed and repository.get_fact(r["fact_id"]) is None:
-            continue
-        if not canonical_fact_visible(
-            r["fact_id"],
-            user_id,
-            current_channel_id=current_channel_id,
-        ):
+        if not visibility[r["fact_id"]]:
             continue
         out.append(
             {

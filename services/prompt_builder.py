@@ -23,6 +23,7 @@ _WEEKDAYS_JA = ("月", "火", "水", "木", "金", "土", "日")
 # used inside PromptBuilder.sanitize so the rest of this file is unchanged.
 from services.sentinel import SENTINEL_RE as _SENTINEL_RE
 from services.sentinel import POWER_PHRASE_RE as _POWER_PHRASE_RE
+from services.sentinel import normalize_for_sentinel as _normalize_for_sentinel
 
 log = logging.getLogger(__name__)
 
@@ -47,9 +48,15 @@ class PromptBuilder:
 
     @staticmethod
     def sanitize(text: str) -> str:
-        """Remove prompt-scaffold sentinel labels and obvious power-grab phrases."""
+        """Remove prompt-scaffold sentinel labels and obvious power-grab phrases.
+
+        Normalizes first (NFKC fold + zero-width strip) so Unicode-lookalike /
+        zero-width-split forged tags cannot slip past the ASCII patterns
+        (F-w1-03), matching the live ``sanitize_untrusted_text`` path.
+        """
         if not text:
             return text
+        text = _normalize_for_sentinel(text)
         text = _SENTINEL_RE.sub("[redacted-marker]", text)
         text = _POWER_PHRASE_RE.sub("[redacted]", text)
         return text

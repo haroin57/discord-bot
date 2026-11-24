@@ -135,11 +135,24 @@ MAX_FILE_ATTACHMENTS = 5
 # model emit a credential path should not be auto-attachable even if
 # .attachignore is missing or its globs don't cover hidden-file variants
 # (e.g. `.credentials.json` vs the existing `credentials.json` pattern).
+#
+# The `*.json` / `*.jsonl` globs are deliberately broad: the live host keeps
+# OAuth/credential material in JSON (`~/.codex/auth.json`, `config.json`,
+# `sessions.json`, cloudflared `<uuid>.json`, gcloud
+# `application_default_credentials.json`) and the bot runs as the file owner
+# (F-w2-01/F-w2-02), so a single injected path could exfiltrate a live token.
+# Blocking the whole family is the safe default here — arbitrary JSON/JSONL
+# auto-attachment for admins is sacrificed for credential containment. Render
+# outputs are PNG/SVG images (handled by extract_image_paths, which does NOT
+# consult this denylist), so this does not affect chart/table/math rendering.
 _SECRET_BASENAME_EXACT = frozenset(
     {
         ".env",
         ".credentials.json",
         "credentials.json",
+        "auth.json",
+        "config.json",
+        "sessions.json",
         "hosts.yml",
         "id_rsa",
         "id_dsa",
@@ -161,6 +174,8 @@ _SECRET_BASENAME_GLOBS = (
     "*.sqlite",
     "*.sqlite3",
     "*.db",
+    "*.json",
+    "*.jsonl",
 )
 
 

@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+import weakref
 
 from services.mem0.format import strip_json_fence
 
@@ -45,6 +46,7 @@ def _is_fact_valid(
     *,
     expected_user_id: str | None = None,
     check_scope: bool = True,
+    _canonical_visible: bool | None = None,
 ) -> bool:
     """Phase B-2: hide facts that the conflict-detection layer
     soft-archived (valid_to <= now). The flag MEM0_HIDE_ARCHIVED is the
@@ -60,7 +62,9 @@ def _is_fact_valid(
     """
     md = r.get("metadata") or {}
     fact_id = r.get("id") or r.get("memory_id")
-    if fact_id:
+    if _canonical_visible is False:
+        return False
+    if fact_id and _canonical_visible is None:
         from services.mem0.integrity import canonical_fact_visible
 
         if not canonical_fact_visible(
@@ -96,6 +100,26 @@ def _is_fact_valid(
         return int(vt) > int(time.time())
     except (TypeError, ValueError):
         return True
+
+
+def _filter_valid_facts(
+    rows: list[dict], user_id: str, current_channel_id: str | None = None,
+    *, check_scope: bool = True, require_present: bool = False,
+) -> list[dict]:
+    """Batch canonical I/O; async callers must dispatch this to a worker."""
+    from services.mem0.integrity import canonical_facts_visible
+
+    visibility = canonical_facts_visible(
+        [str(r.get("id") or r.get("memory_id")) for r in rows
+         if r.get("id") or r.get("memory_id")],
+        str(user_id), current_channel_id=current_channel_id,
+        require_present=require_present,
+    )
+    return [r for r in rows if (not require_present or r.get("id") or r.get("memory_id"))
+            and _is_fact_valid(
+        r, current_channel_id, expected_user_id=str(user_id), check_scope=check_scope,
+        _canonical_visible=visibility.get(str(r.get("id") or r.get("memory_id"))),
+    )]
 
 
 async def search_memories(
@@ -142,7 +166,7 @@ async def search_memories(
             limit,
             len(results),
         )
-        filtered = [
+        candidates = [
             r
             for r in results
             if (
@@ -150,13 +174,8 @@ async def search_memories(
                 or r.get("score") is None
                 or r.get("score", 0) <= MEM0_RELEVANCE_MAX_DISTANCE
             )
-            and _is_fact_valid(
-                r,
-                current_channel_id,
-                expected_user_id=str(user_id),
-            )
         ]
-        return filtered
+        return await asyncio.to_thread(_filter_valid_facts, candidates, user_id, current_channel_id)
     except Exception as exc:
         log.warning("Mem0 search error: %s", exc)
         return []
@@ -262,19 +281,9 @@ async def search_memories_hybrid(
         log.warning("hybrid: bm25 search failed: %s", bm25_hits)
         bm25_hits = []
     elif os.environ.get("MEM0_INTEGRITY_MODE", "legacy").lower() != "legacy":
-        from services.mem0.integrity import get_repository
-
-        repository = get_repository()
-        bm25_hits = [
-            hit
-            for hit in bm25_hits
-            if repository.get_fact(str(hit.get("id") or "")) is not None
-            and _is_fact_valid(
-                hit,
-                current_channel_id,
-                expected_user_id=str(user_id),
-            )
-        ]
+        bm25_hits = await asyncio.to_thread(
+            _filter_valid_facts, bm25_hits, user_id, current_channel_id, require_present=True,
+        )
     fused = bm25_index.rrf_merge(
         vector_hits,
         bm25_hits,
@@ -815,6 +824,8 @@ async def _expand_query_via_graph(query: str, user_id: str) -> list[str]:
 # 重いので user_id 単位の TTL キャッシュで償却する。
 _CORE_CACHE: dict[str, tuple[float, list[dict]]] = {}
 _CORE_CACHE_KEEP = 10  # キャッシュに保持する上限（取り出しは max_items で切る）
+_CORE_CACHE_USERS = 256
+_CORE_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
 async def get_core_memories(
@@ -822,6 +833,18 @@ async def get_core_memories(
     max_items: int = 3,
     *,
     current_channel_id: str | None = None,
+) -> list[dict]:
+    # Concurrent turns for one user share the fill, but never the channel
+    # visibility decision. Weak lock entries do not retain inactive users.
+    lock = _CORE_LOCKS.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        return await _get_core_memories_locked(
+            user_id, max_items, current_channel_id=current_channel_id,
+        )
+
+
+async def _get_core_memories_locked(
+    user_id: str, max_items: int, *, current_channel_id: str | None,
 ) -> list[dict]:
     """常時注入すべきコア事実（imp=5, tier∈{Live,Hot}）を返す。
 
@@ -842,15 +865,8 @@ async def get_core_memories(
     now = time.monotonic()
     hit = _CORE_CACHE.get(user_id)
     if hit is not None and now - hit[0] < MEM0_CORE_CACHE_TTL_S:
-        return [
-            dict(m)
-            for m in hit[1]
-            if _is_fact_valid(
-                m,
-                current_channel_id,
-                expected_user_id=str(user_id),
-            )
-        ][:max_items]
+        visible = await asyncio.to_thread(_filter_valid_facts, hit[1], user_id, current_channel_id)
+        return [dict(m) for m in visible[:max_items]]
     try:
         from services.mem0.client import get_all_memories
 
@@ -867,13 +883,8 @@ async def get_core_memories(
             if imp < 5 or md.get("tier") not in (0, 1):
                 continue
             # scope はここで判定しない（キャッシュ汚染防止）。valid_to のみ。
-            if not _is_fact_valid(
-                m,
-                expected_user_id=str(user_id),
-                check_scope=False,
-            ):
-                continue
             core.append(m)
+        core = await asyncio.to_thread(_filter_valid_facts, core, user_id, check_scope=False)
         # tier 昇順（Live が先）→ 直近 reinforce 降順。importance は全件 5。
         core.sort(
             key=lambda m: (
@@ -884,16 +895,11 @@ async def get_core_memories(
         core = core[:_CORE_CACHE_KEEP]
         for m in core:
             m["_core"] = True
-        _CORE_CACHE[user_id] = (now, core)
-        return [
-            dict(m)
-            for m in core
-            if _is_fact_valid(
-                m,
-                current_channel_id,
-                expected_user_id=str(user_id),
-            )
-        ][:max_items]
+        if user_id not in _CORE_CACHE and len(_CORE_CACHE) >= _CORE_CACHE_USERS:
+            _CORE_CACHE.pop(min(_CORE_CACHE, key=lambda uid: _CORE_CACHE[uid][0]))
+        _CORE_CACHE[user_id] = (time.monotonic(), core)
+        visible = await asyncio.to_thread(_filter_valid_facts, core, user_id, current_channel_id)
+        return [dict(m) for m in visible[:max_items]]
     except Exception as exc:
         log.warning("core memory fetch failed (non-fatal): %s", exc)
         return []
@@ -1029,7 +1035,8 @@ async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[st
     # Morphological variant: "上伊那ぼたんで誰が一番好き？" → "上伊那 ぼたん
     # 一番 好き" weights the proper nouns rather than letting stop-particles
     # drag the vector toward the question-form centroid.
-    morpho_variant = _expand_query_via_morpho(query)
+    # Janome's cold dictionary load and Japanese tokenization are synchronous.
+    morpho_variant = await asyncio.to_thread(_expand_query_via_morpho, query)
     if morpho_variant and morpho_variant not in queries:
         log.info("morpho_expand: %r → %r", (query or "")[:60], morpho_variant)
         queries.append(morpho_variant)
@@ -1086,12 +1093,8 @@ async def _expand_episode_bundle(
             for r in bundle
             if r.get("id")
             and r.get("id") not in seen
-            and _is_fact_valid(
-                r,
-                current_channel_id,
-                expected_user_id=str(user_id),
-            )
         ]
+        extras = await asyncio.to_thread(_filter_valid_facts, extras, user_id, current_channel_id)
         if not extras:
             return 0
         # Tag them so downstream prompt builders can render the bundle
@@ -1175,6 +1178,20 @@ async def search_memories_smart(
         if include_core
         else None
     )
+    try:
+        return await _search_memories_smart_with_core(
+            query, user_id, limit, rewrite, rerank, current_channel_id, core_task,
+        )
+    finally:
+        if core_task is not None:
+            if not core_task.done():
+                core_task.cancel()
+            await asyncio.gather(core_task, return_exceptions=True)
+
+
+async def _search_memories_smart_with_core(
+    query, user_id, limit, rewrite, rerank, current_channel_id, core_task,
+):
     queries = await _expand_queries(query, user_id, rewrite=rewrite)
     # Phase A-1: hybrid retrieval (vector + BM25 RRF fusion). Falls back to
     # vector-only when MEM0_HYBRID_ENABLED=false. Same return shape as
@@ -1461,13 +1478,20 @@ async def _graph_expand_candidates(
     if not fact_best_activation:
         return candidates
 
-    siblings: list[dict] = []
+    managed = os.environ.get("MEM0_INTEGRITY_MODE", "legacy").lower() != "legacy"
+    canonical_rows = {}
+    if managed:
+        from services.mem0.integrity import get_repository
+
+        canonical_rows = await asyncio.to_thread(
+            get_repository().get_facts, list(fact_best_activation),
+        )
+    planned = []
+    scheduled_provider_ids = set(seen_provider_ids)
     for fid, act in fact_best_activation.items():
         provider_id = fid
-        if os.environ.get("MEM0_INTEGRITY_MODE", "legacy").lower() != "legacy":
-            from services.mem0.integrity import get_repository
-
-            canonical = await asyncio.to_thread(get_repository().get_fact, fid)
+        if managed:
+            canonical = canonical_rows[fid]
             # Managed graph rows are canonical projections. An orphan graph
             # row, a deleted fact, or a fact without a vector binding must
             # never revive data through the shadow search path.
@@ -1478,23 +1502,31 @@ async def _graph_expand_candidates(
             provider_id = str(canonical.get("legacy_id") or "")
             if not provider_id:
                 continue
-        if provider_id in seen_provider_ids:
+        if provider_id in scheduled_provider_ids:
             continue
+        scheduled_provider_ids.add(provider_id)
+        planned.append((fid, act, provider_id))
+
+    fetch_slots = asyncio.Semaphore(4)
+    async def fetch_sibling(provider_id):
         try:
-            fact = await asyncio.to_thread(mem.get, provider_id)
+            async with fetch_slots:
+                return await asyncio.to_thread(mem.get, provider_id)
         except Exception:
-            continue
+            return None
+
+    fetched = await asyncio.gather(*(fetch_sibling(provider_id) for _, _, provider_id in planned))
+    visible = await asyncio.to_thread(
+        _filter_valid_facts,
+        [fact for fact in fetched if isinstance(fact, dict) and fact.get("memory")],
+        user_id, current_channel_id,
+    )
+    visible_objects = {id(fact) for fact in visible}
+    siblings: list[dict] = []
+    for (fid, act, provider_id), fact in zip(planned, fetched):
         # Phase R: graph 経由の sibling は search_memories の validity
         # フィルタを通らないので、archived / 他会話 scope をここで落とす。
-        if not (
-            isinstance(fact, dict)
-            and fact.get("memory")
-            and _is_fact_valid(
-                fact,
-                current_channel_id,
-                expected_user_id=str(user_id),
-            )
-        ):
+        if id(fact) not in visible_objects:
             continue
         distance = max(
             _GRAPH_SIBLING_MIN_DISTANCE,

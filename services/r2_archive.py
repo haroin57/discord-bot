@@ -2,7 +2,7 @@
 
 The Discord hot path never talks to R2 directly.  It first copies an object
 into a local, fsync-backed spool under ``.state/r2_archive``.  A background
-worker uploads queued objects with Wrangler.  A Cloudflare outage therefore
+worker uploads queued objects through HTTP or Wrangler. A Cloudflare outage therefore
 cannot make a local transcript write or Discord reply fail, and temporary
 rendered images remain available after their original files are deleted.
 
@@ -36,7 +36,7 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -919,7 +919,7 @@ def _sync_state_once_locked() -> dict[str, Any]:
     changed: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
 
-    for path in sorted(root.rglob("*")):
+    for path in _iter_state_files(root):
         if not path.is_file():
             continue
         relative = path.relative_to(root)
@@ -989,6 +989,21 @@ def _sync_state_once_locked() -> dict[str, Any]:
     }
 
 
+def _iter_state_files(root: Path):
+    """Prune spool/native scratch trees before traversal, not after visiting."""
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        base = Path(directory)
+        dirs[:] = sorted(
+            name for name in dirs
+            if not _state_path_excluded((base / name).relative_to(root))
+            and not (base / name).is_symlink()
+        )
+        for name in sorted(files):
+            path = base / name
+            if not path.is_symlink():
+                yield path
+
+
 def _wrangler_binary() -> str:
     configured = str(getattr(config, "R2_ARCHIVE_WRANGLER_BIN", "")).strip()
     candidates = [
@@ -1020,6 +1035,21 @@ def _run_wrangler(
         timeout=timeout or float(getattr(config, "R2_ARCHIVE_COMMAND_TIMEOUT_S", 300)),
         check=False,
         env=_wrangler_env(),
+    )
+
+
+def _http_transport():
+    mode = str(getattr(config, "R2_ARCHIVE_TRANSPORT", "wrangler"))
+    if mode == "wrangler":
+        return None
+    if mode != "http":
+        raise ValueError("R2_ARCHIVE_TRANSPORT must be wrangler or http")
+    from services.offload.archive_transport import ArchiveHTTPTransport
+
+    return ArchiveHTTPTransport(
+        str(getattr(config, "R2_ARCHIVE_HTTP_URL", "")),
+        str(getattr(config, "R2_ARCHIVE_HTTP_TOKEN", "")),
+        timeout=float(getattr(config, "R2_ARCHIVE_HTTP_TIMEOUT_S", 60)),
     )
 
 
@@ -1081,12 +1111,14 @@ def flush_pending_once(*, limit: int | None = None) -> dict[str, Any]:
                     "pending": status["pending"],
                     "skipped": "flush already running in another process",
                 }
-            return _flush_pending_once_locked(limit=limit)
+            transport = _http_transport()
+            with transport if transport is not None else nullcontext():
+                return _flush_pending_once_locked(limit=limit, transport=transport)
     finally:
         _flush_lock.release()
 
 
-def _flush_pending_once_locked(*, limit: int | None = None) -> dict[str, Any]:
+def _flush_pending_once_locked(*, limit: int | None = None, transport=None) -> dict[str, Any]:
     limit = limit or int(getattr(config, "R2_ARCHIVE_FLUSH_BATCH", 20))
     pending_dir = _pending_dir()
     pending_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1094,13 +1126,24 @@ def _flush_pending_once_locked(*, limit: int | None = None) -> dict[str, Any]:
     failed = 0
     now = time.time()
 
-    for manifest_path in sorted(pending_dir.glob("*.json"))[:limit]:
+    # Backoff entries must not consume the batch budget. Preserve ordering for
+    # the same key so an old failed snapshot cannot overwrite a newer one.
+    blocked_keys: set[str] = set()
+    attempted = 0
+    for manifest_path in sorted(pending_dir.glob("*.json")):
         manifest = _load_queue_manifest(manifest_path)
         if not manifest:
             failed += 1
             continue
-        if float(manifest.get("next_attempt_at", 0.0) or 0.0) > now:
+        key = str(manifest.get("key", ""))
+        if key in blocked_keys:
             continue
+        if float(manifest.get("next_attempt_at", 0.0) or 0.0) > now:
+            blocked_keys.add(key)
+            continue
+        if attempted >= limit:
+            break
+        attempted += 1
         try:
             _catalog_restore_from_manifest(manifest)
         except sqlite3.Error as exc:
@@ -1108,6 +1151,7 @@ def _flush_pending_once_locked(*, limit: int | None = None) -> dict[str, Any]:
         payload_name = Path(str(manifest.get("payload", ""))).name
         payload_path = pending_dir / payload_name
         if not payload_path.is_file():
+            blocked_keys.add(key)
             manifest["last_error"] = "spool payload missing"
             attempts = int(manifest.get("attempts", 0)) + 1
             manifest["attempts"] = attempts
@@ -1134,14 +1178,26 @@ def _flush_pending_once_locked(*, limit: int | None = None) -> dict[str, Any]:
             str(manifest.get("content_type") or "application/octet-stream"),
             "--remote",
         ]
+        delivered = False
         try:
-            result = _run_wrangler(args)
-        except (OSError, subprocess.SubprocessError) as exc:
-            result = None
+            # Large database/snapshot files keep the existing CLI path; the
+            # Worker deliberately caps single requests at 64 MiB. Ordinary
+            # history and image objects reuse one HTTP connection per batch.
+            http_limit = int(getattr(config, "R2_ARCHIVE_HTTP_MAX_OBJECT_BYTES", 67108864))
+            if transport is not None and payload_path.stat().st_size <= http_limit:
+                if manifest["bucket"] != _bucket():
+                    raise ValueError("archive manifest references another bucket")
+                normalize_object_key(manifest["key"])
+                transport.upload(manifest, payload_path)
+                delivered = True
+                error = ""
+            else:
+                result = _run_wrangler(args)
+                delivered = result.returncode == 0
+                error = (result.stderr or result.stdout or "wrangler upload failed").strip()
+        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
             error = str(exc)
-        else:
-            error = (result.stderr or result.stdout or "wrangler upload failed").strip()
-        if result is not None and result.returncode == 0:
+        if delivered:
             try:
                 _catalog_mark_delivery(manifest)
             except sqlite3.Error as exc:
@@ -1155,6 +1211,7 @@ def _flush_pending_once_locked(*, limit: int | None = None) -> dict[str, Any]:
                 )
             uploaded += 1
             continue
+        blocked_keys.add(key)
         attempts = int(manifest.get("attempts", 0)) + 1
         manifest["attempts"] = attempts
         manifest["last_error"] = error[-1000:]
@@ -1263,12 +1320,16 @@ def normalize_object_key(value: str) -> str:
 
 
 def fetch_object(value: str, destination: str | os.PathLike[str]) -> Path:
-    """Fetch one archived object through Wrangler into ``destination``."""
+    """Fetch one archived object through the configured archive transport."""
     if not is_enabled():
         raise RuntimeError("R2 archive is disabled")
     key = normalize_object_key(value)
     target = Path(destination)
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    transport = _http_transport()
+    if transport is not None:
+        with transport:
+            return transport.download(key, target)
     # Wrangler refuses to overwrite in some versions.  Callers may reserve a
     # secure tempfile name first, so remove that empty placeholder immediately
     # before the authenticated download.

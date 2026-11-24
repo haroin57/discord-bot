@@ -268,6 +268,14 @@ class TestAdminUserIdsEnv:
 
 
 class TestBotKeywordsWarning:
+    def test_empty_setting_disables_keyword_wake(self, monkeypatch):
+        """An explicit empty setting disables bare-name guild wake-ups."""
+        monkeypatch.setenv("BOT_KEYWORDS", "")
+        import config
+
+        importlib.reload(config)
+        assert config.BOT_KEYWORDS == []
+
     def test_short_keyword_warning(self, monkeypatch):
         """Keywords shorter than 3 chars should trigger a warning during reload."""
         monkeypatch.setenv("BOT_KEYWORDS", "ab,かなえ")
