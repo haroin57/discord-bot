@@ -22,7 +22,7 @@ env:
 
 jobs:
   collection-contract:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -33,7 +33,7 @@ jobs:
         run: python scripts/run_test_lane.py collection-contract --workers auto
 
   unit-fast:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -42,7 +42,7 @@ jobs:
         run: python scripts/run_test_lane.py unit-fast --workers auto
 
   characterization:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -51,7 +51,7 @@ jobs:
         run: python scripts/run_test_lane.py characterization --workers auto
 
   integration:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -60,7 +60,7 @@ jobs:
         run: python scripts/run_test_lane.py integration --workers auto
 
   offline-eval:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
