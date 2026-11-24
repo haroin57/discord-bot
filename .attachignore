@@ -52,6 +52,15 @@
 
 # Cloudflared config
 /etc/cloudflared/*
+/home/ubuntu/.cloudflared/*
+
+# Agent / CLI credential directories (F-w2-02): OAuth + MCP tokens live here
+# and the bot runs as their owner (ubuntu), so these must never be attachable.
+/home/ubuntu/.codex/*
+/home/ubuntu/.claude/*
+/home/ubuntu/.config/gcloud/*
+/home/ubuntu/.aws/*
+/home/ubuntu/.ssh/*
 
 # Environment / secret files
 .env
@@ -60,6 +69,12 @@
 .env.dev.enc
 .env.prd.enc
 credentials.json
+auth.json
+sessions.json
+config.json
+*/auth.json
+*.json
+*.jsonl
 *.key
 *.pem
 *.secret
