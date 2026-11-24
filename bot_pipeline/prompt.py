@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -139,8 +140,14 @@ def _append_attachments(
     if text_attachments:
         total = 0
         for filename, content in text_attachments:
+            # html.escape the filename so a crafted attachment name
+            # (attacker-controlled: utils/attachment_downloader returns the raw
+            # Discord filename) cannot break out of the name="..." attribute and
+            # inject a forged <attached_file>/scaffold tag (F-w1-05 / C3). The
+            # sanitize() pass only strips known markers; escaping the quote and
+            # angle brackets closes the structural attribute break-out.
             block = (
-                f'<attached_file name="{sanitize(filename)}">\n'
+                f'<attached_file name="{html.escape(sanitize(filename), quote=True)}">\n'
                 f"{sanitize(content)}\n</attached_file>"
             )
             parts.append(block)
@@ -428,9 +435,19 @@ async def _build_base_prompt(
         if untrusted_context:
             untrusted_attachment_parts.append(untrusted_context)
             breakdown["untrusted_conv_context"] = len(untrusted_context)
-    if not data.will_resume and not data.conv_context:
+    # Recent-history injection is admin-only. load_history_channel tails the
+    # channel JSONL (user+assistant turns), which can contain prior admin
+    # turns (command output, secrets, internal instructions). Injecting that
+    # for a non-admin — the old `else parts` branch dropped it straight into
+    # the non-admin's untrusted block — leaked admin conversation to the
+    # restricted model (F-w1-06). Gate the whole call on caller_is_admin.
+    if (
+        not data.will_resume
+        and not data.conv_context
+        and data.caller_is_admin
+    ):
         await _inject_recent_history(
-            parts=(untrusted_attachment_parts if data.caller_is_admin else parts),
+            parts=untrusted_attachment_parts,
             breakdown=breakdown,
             channel_id=data.message.channel.id,
             load_history_channel=deps.load_history_channel,
@@ -527,7 +544,25 @@ async def build_prompt(
         data.job.phase = recalling_phase
         await data.status.update("🧠 記憶を検索中")
         try:
-            memory_results = await data.mem0_task
+            # Bound the recall await so a hung Mem0 search (search_memories_smart
+            # can fan out to Haiku rewrite/rerank + the Mem0 MCP) cannot stall
+            # the whole turn forever. On timeout, continue with no memories
+            # rather than block (F-w3-06). A plain `except` can't recover from a
+            # hang — only the timeout can — so this must wrap the await itself.
+            from config import MEM0_RECALL_TIMEOUT_S
+
+            try:
+                async with asyncio.timeout(MEM0_RECALL_TIMEOUT_S):
+                    memory_results = await data.mem0_task
+            except TimeoutError:
+                cancel = getattr(data.mem0_task, "cancel", None)
+                if callable(cancel):
+                    cancel()
+                log.warning(
+                    "Mem0 recall exceeded %ss; continuing without memories",
+                    MEM0_RECALL_TIMEOUT_S,
+                )
+                memory_results = []
             memory_block = deps.format_memories_for_prompt(memory_results)
             if memory_block:
                 wrapped = (
