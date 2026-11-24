@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import logging
 import math
@@ -15,7 +16,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 
-from .client import _get_mem0, mem_get_all, mem_search
+from .client import _get_mem0, batch_get_facts_sync, mem_get_all, mem_search
 from .llm import complete_json, escape_braces
 from .settings import settings
 
@@ -305,20 +306,17 @@ async def search_memories_hybrid(
     lexical: dict[str, dict] = {}
     mem = None
     provider_loaded = False
-    slots = asyncio.Semaphore(4)
 
-    async def hydrate(row):
-        if mem is None:
+    def hydrate(row, facts_by_id):
+        # facts_by_id[id] is byte-identical to the old mem.get(row["id"]);
+        # missing ids are simply absent (same as the old per-id None drop).
+        fact = facts_by_id.get(row["id"])
+        if not isinstance(fact, dict):
             return None
-        try:
-            async with slots:
-                fact = await asyncio.to_thread(mem.get, row["id"])
-            if not _is_fact_valid(fact, current_channel_id, expected_user_id=user_id) or not fact.get("memory"):
-                return None
-            return {**fact, "id": row["id"], "vector_distance": None,
-                    "score": None, "retrieval_sources": ["bm25"]}
-        except Exception:
+        if not _is_fact_valid(fact, current_channel_id, expected_user_id=user_id) or not fact.get("memory"):
             return None
+        return {**fact, "id": row["id"], "vector_distance": None,
+                "score": None, "retrieval_sources": ["bm25"]}
 
     while True:
         missing = []
@@ -333,7 +331,15 @@ async def search_memories_hybrid(
             if not provider_loaded:
                 mem = await asyncio.to_thread(_get_mem0)
                 provider_loaded = True
-            hydrated = await asyncio.gather(*(hydrate(row) for row in missing))
+            # N+1 → 1: fetch every missing id in a single Chroma round trip,
+            # then project back in request order (hydrate drops misses/invalid).
+            if mem is None:
+                hydrated = []
+            else:
+                facts_by_id = await asyncio.to_thread(
+                    batch_get_facts_sync, mem, [row["id"] for row in missing],
+                )
+                hydrated = [hydrate(row, facts_by_id) for row in missing]
             try:
                 supported = await _filter_supported_facts([row for row in hydrated if row is not None])
             except Exception as exc:
@@ -758,6 +764,7 @@ async def get_episode_facts(
     return (await _filter_supported_facts(filtered))[:limit]
 
 
+@functools.lru_cache(maxsize=512)
 def _expand_query_via_morpho(query: str) -> str:
     """Phase A-1 follow-up: extract content words from the query via Janome
     and join them with whitespace so the resulting variant can be embedded
@@ -766,6 +773,12 @@ def _expand_query_via_morpho(query: str) -> str:
 
     Returned variant is consumed by smart_search the same way LLM-rewrite
     variants are — appended to the queries list, then deduped on insert.
+
+    Pure function of ``query`` (deterministic Janome tokenisation), so it is
+    memoised: a single smart-search turn invokes it twice on the same query —
+    once in ``_expand_queries`` (:1182) and once in ``_rerank_memories``
+    (:628) — and the cache collapses that double Janome pass (and repeats
+    across turns) into one, with byte-identical output.
     """
     try:
         from . import morpho
@@ -1204,6 +1217,27 @@ async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[st
     return queries
 
 
+async def _prewarm_query_embeddings(queries: list[str]) -> None:
+    """Batch-embed the expanded variant set + warm the short-TTL cache (#6).
+
+    Non-fatal: any failure leaves the per-variant embed path (lazily cached)
+    intact, so recall quality is never affected — only round-trip count.
+    """
+    ttl = settings.MEM0_QUERY_EMBED_CACHE_TTL_S
+    if ttl <= 0 or not queries:
+        return
+    try:
+        from .query_embed_cache import prewarm_sync
+        mem = await asyncio.to_thread(_get_mem0)
+        if mem is None:
+            return
+        await asyncio.to_thread(
+            prewarm_sync, mem, list(queries), ttl, settings.MEM0_QUERY_EMBED_CACHE_MAX,
+        )
+    except Exception as exc:
+        log.warning("query embedding prewarm failed (non-fatal): %s", exc)
+
+
 async def _expand_episode_bundle(
     reranked: list[dict], user_id: str, current_channel_id: str | None,
 ) -> int:
@@ -1310,6 +1344,10 @@ async def _search_memories_smart_with_core(
     query, user_id, limit, rewrite, rerank, current_channel_id, core_task,
 ):
     queries = await _expand_queries(query, user_id, rewrite=rewrite)
+    # explore-C #6: embed the whole expanded variant set in one round trip and
+    # warm the TTL cache, so the per-variant mem.search below hits the cache
+    # instead of embedding each variant (and each refill pass) separately.
+    await _prewarm_query_embeddings(queries)
     # Phase A-1: hybrid retrieval (vector + BM25 RRF fusion). Falls back to
     # vector-only when MEM0_HYBRID_ENABLED=false. Same return shape as
     # search_memories_multi, so the downstream rerank / graph_expand keep
@@ -1509,13 +1547,6 @@ async def _graph_expand_candidates(
     # --- pull sibling facts for every activated entity -------------------
     if per_entity <= 0:
         return candidates
-    fetch_slots = asyncio.Semaphore(4)
-    async def fetch_sibling(fid):
-        try:
-            async with fetch_slots:
-                return await asyncio.to_thread(mem.get, fid)
-        except Exception:
-            return None
 
     fetched: dict[str, dict | None] = {}
     selected: dict[int, list[str]] = {}
@@ -1536,8 +1567,12 @@ async def _graph_expand_candidates(
             for fid in related:
                 if fid not in seen_ids and fid not in fetched:
                     missing.setdefault(fid, None)
-        documents = await asyncio.gather(*(fetch_sibling(fid) for fid in missing))
-        for fid, doc in zip(missing, documents):
+        # N+1 → 1: one Chroma round trip for this frontier's sibling ids;
+        # project back over `missing` in insertion order (same as the old
+        # gather + zip). Missing/invalid ids map to None, as before.
+        docs_by_id = await asyncio.to_thread(batch_get_facts_sync, mem, list(missing))
+        for fid in missing:
+            doc = docs_by_id.get(fid)
             fetched[fid] = {**doc, "id": fid} if (
                 isinstance(doc, dict) and doc.get("memory")
                 and _is_fact_valid(doc, current_channel_id, expected_user_id=user_id)

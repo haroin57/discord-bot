@@ -1,6 +1,7 @@
 """Semantic search: plain/multi/smart + LLM-based query rewrite & re-rank."""
 
 import asyncio
+import functools
 import logging
 import os
 import re
@@ -13,6 +14,7 @@ from services.mem0.client import (
     MEM0_RELEVANCE_MAX_DISTANCE,
     _get_mem0,
     _refresh_mem0_client_token,
+    batch_get_facts_sync,
 )
 from services.oauth_manager import (
     ensure_valid_token,
@@ -764,6 +766,7 @@ async def get_episode_facts(
     return filtered[:limit]
 
 
+@functools.lru_cache(maxsize=512)
 def _expand_query_via_morpho(query: str) -> str:
     """Phase A-1 follow-up: extract content words from the query via Janome
     and join them with whitespace so the resulting variant can be embedded
@@ -772,6 +775,10 @@ def _expand_query_via_morpho(query: str) -> str:
 
     Returned variant is consumed by smart_search the same way LLM-rewrite
     variants are — appended to the queries list, then deduped on insert.
+
+    Pure function of ``query`` (deterministic Janome tokenisation), so it is
+    memoised to collapse repeated passes on the same query into one Janome
+    tokenisation with byte-identical output (parity with the alpha path).
     """
     try:
         from services.mem0 import morpho
@@ -1062,6 +1069,27 @@ async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[st
     return queries
 
 
+async def _prewarm_query_embeddings(queries: list[str]) -> None:
+    """Batch-embed the expanded variant set + warm the short-TTL cache (#6).
+
+    Non-fatal: any failure leaves the per-variant embed path (lazily cached)
+    intact, so recall quality is never affected — only round-trip count.
+    """
+    ttl = int(os.environ.get("MEM0_QUERY_EMBED_CACHE_TTL_S", "60"))
+    if ttl <= 0 or not queries:
+        return
+    try:
+        from services.mem0.query_embed_cache import prewarm_sync
+
+        maxsize = int(os.environ.get("MEM0_QUERY_EMBED_CACHE_MAX", "256"))
+        mem = await asyncio.to_thread(_get_mem0)
+        if mem is None:
+            return
+        await asyncio.to_thread(prewarm_sync, mem, list(queries), ttl, maxsize)
+    except Exception as exc:
+        log.warning("query embedding prewarm failed (non-fatal): %s", exc)
+
+
 async def _expand_episode_bundle(
     reranked: list[dict],
     user_id: str,
@@ -1193,6 +1221,10 @@ async def _search_memories_smart_with_core(
     query, user_id, limit, rewrite, rerank, current_channel_id, core_task,
 ):
     queries = await _expand_queries(query, user_id, rewrite=rewrite)
+    # explore-C #6: embed the whole expanded variant set in one round trip and
+    # warm the TTL cache, so the per-variant mem.search below hits the cache
+    # instead of embedding each variant (and each refill pass) separately.
+    await _prewarm_query_embeddings(queries)
     # Phase A-1: hybrid retrieval (vector + BM25 RRF fusion). Falls back to
     # vector-only when MEM0_HYBRID_ENABLED=false. Same return shape as
     # search_memories_multi, so the downstream rerank / graph_expand keep
@@ -1507,15 +1539,14 @@ async def _graph_expand_candidates(
         scheduled_provider_ids.add(provider_id)
         planned.append((fid, act, provider_id))
 
-    fetch_slots = asyncio.Semaphore(4)
-    async def fetch_sibling(provider_id):
-        try:
-            async with fetch_slots:
-                return await asyncio.to_thread(mem.get, provider_id)
-        except Exception:
-            return None
-
-    fetched = await asyncio.gather(*(fetch_sibling(provider_id) for _, _, provider_id in planned))
+    # N+1 → 1: one Chroma round trip for every planned sibling id (planned
+    # provider_ids are already de-duplicated via scheduled_provider_ids), then
+    # rebuild the per-`planned` list so the zip/identity logic below is
+    # unchanged. Missing ids map to None, as the old per-id get did.
+    facts_by_id = await asyncio.to_thread(
+        batch_get_facts_sync, mem, [provider_id for _, _, provider_id in planned],
+    )
+    fetched = [facts_by_id.get(provider_id) for _, _, provider_id in planned]
     visible = await asyncio.to_thread(
         _filter_valid_facts,
         [fact for fact in fetched if isinstance(fact, dict) and fact.get("memory")],

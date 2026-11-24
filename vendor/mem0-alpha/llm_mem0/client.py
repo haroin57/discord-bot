@@ -364,6 +364,127 @@ def mem_get_all(mem, *, user_id: str, limit: int | None = None):
 
 
 # ---------------------------------------------------------------------------
+# Batch get — one Chroma round trip for a set of ids (explore-C #4)
+# ---------------------------------------------------------------------------
+# ``mem.get(id)`` is one Chroma ``collection.get(ids=[id])`` HTTP round trip.
+# The retrieval hot path (search.py hydrate / graph sibling fetch) fans those
+# out N-wide (``asyncio.gather`` + Semaphore), so a recall turn issues up to
+# ~300 of them. ChromaDB's ``collection.get`` natively accepts a *list* of
+# ids, so the whole fan-out collapses into a single round trip.
+#
+# Output invariance (Lean ``KanaeVerify.ChromaBatchGet``): for a distinct id
+# list the batch returns the *same set*, in request order when projected by the
+# caller, drops missing ids identically, and never adds a key outside the
+# request. The per-record dict is byte-identical to ``mem.get(id)`` — same
+# ``MemoryItem`` shaping (``score``/``metadata`` keys), same promoted payload
+# keys, same timestamp normalisation — so downstream ``_is_fact_valid`` /
+# dict-spread behaviour is unchanged.
+
+_BATCH_PROMOTED_PAYLOAD_KEYS = ("user_id", "agent_id", "run_id", "actor_id", "role")
+_BATCH_CORE_AND_PROMOTED_KEYS = {
+    "data", "hash", "created_at", "updated_at", "id", *_BATCH_PROMOTED_PAYLOAD_KEYS,
+}
+
+
+def _format_vector_record(record_id: str, payload: dict | None) -> dict:
+    """Shape one Chroma record into the exact dict ``Memory.get(id)`` returns.
+
+    Mirrors ``mem0.memory.main.Memory.get`` line-for-line: ``MemoryItem``
+    model dump (keeps the ``score``/``metadata`` keys), promoted payload keys,
+    then the remaining payload fields collected under ``metadata``.
+    """
+    from mem0.configs.base import MemoryItem
+    from mem0.memory.main import _normalize_iso_timestamp_to_utc
+
+    payload = payload or {}
+    item = MemoryItem(
+        id=record_id,
+        memory=payload.get("data", ""),
+        hash=payload.get("hash"),
+        created_at=_normalize_iso_timestamp_to_utc(payload.get("created_at")),
+        updated_at=_normalize_iso_timestamp_to_utc(payload.get("updated_at")),
+    ).model_dump()
+    for key in _BATCH_PROMOTED_PAYLOAD_KEYS:
+        if key in payload:
+            item[key] = payload[key]
+    extra = {k: v for k, v in payload.items() if k not in _BATCH_CORE_AND_PROMOTED_KEYS}
+    if extra:
+        item["metadata"] = extra
+    return item
+
+
+def _per_id_get_map(mem, ids) -> dict:
+    """Fallback: the original N+1, returned as an id→fact map (misses dropped)."""
+    out: dict = {}
+    for i in ids:
+        try:
+            fact = mem.get(i)
+        except Exception:
+            fact = None
+        if fact:
+            out[i] = fact
+    return out
+
+
+def batch_get_facts_sync(mem, ids) -> dict:
+    """One-round-trip batch equivalent of ``{i: mem.get(i)}`` for present ids.
+
+    Returns a mapping ``{id: fact}`` containing only ids that exist; callers
+    project it back in their own request order (so ordering is their loop's
+    responsibility, exactly as with the per-id version). The request is
+    de-duplicated and non-str/empty ids are dropped before the round trip.
+
+    Falls back to per-id ``mem.get`` when the backing store is not a
+    Chroma-style ``collection`` or the batch call raises — never returning
+    fewer facts than the per-id loop would. Sync; wrap in ``to_thread``.
+    """
+    seen: set = set()
+    uniq: list = []
+    for i in ids:
+        if isinstance(i, str) and i and i not in seen:
+            seen.add(i)
+            uniq.append(i)
+    if not uniq:
+        return {}
+
+    vs = getattr(mem, "vector_store", None)
+    coll = getattr(vs, "collection", None)
+    coll_get = getattr(coll, "get", None)
+    if coll is None or not callable(coll_get):
+        return _per_id_get_map(mem, uniq)
+
+    try:
+        raw = coll_get(ids=uniq)  # single Chroma round trip
+    except Exception as exc:
+        log.warning("batch get failed (%s); falling back to per-id", type(exc).__name__)
+        return _per_id_get_map(mem, uniq)
+
+    # A real Chroma get returns {"ids": [...], "metadatas": [...], ...} with list
+    # values. Anything else (None, malformed, a test double) → fall back to the
+    # per-id path so we are never *less* correct than the original loop.
+    if not isinstance(raw, dict):
+        return _per_id_get_map(mem, uniq)
+    got_ids = raw.get("ids")
+    metadatas = raw.get("metadatas")
+    if not isinstance(got_ids, list):
+        return _per_id_get_map(mem, uniq)
+    if not isinstance(metadatas, list):
+        metadatas = []
+    # chromadb's query path nests one level ([[...]]); the get path is flat.
+    # Normalise both, same as mem0's ChromaDB._parse_output.
+    if got_ids and isinstance(got_ids[0], list):
+        got_ids = got_ids[0]
+    if metadatas and isinstance(metadatas[0], list):
+        metadatas = metadatas[0]
+
+    out: dict = {}
+    for idx, rid in enumerate(got_ids):
+        payload = metadatas[idx] if idx < len(metadatas) else None
+        out[rid] = _format_vector_record(rid, payload)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Low-level housekeeping (direct mem0 access — used by housekeeping/compaction
 # scripts and by search.py's graph-expansion path)
 # ---------------------------------------------------------------------------
