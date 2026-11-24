@@ -523,3 +523,130 @@ class TestInstallStructuredLogging:
                 outer.close()
             logger.removeHandler(external)
             external.close()
+
+
+class TestConfigureNoisyLoggers:
+    """OPT-B: third-party log-volume hygiene (httpx/aiohttp.access/httpcore)."""
+
+    def _snapshot(self):
+        names = ("httpx", "httpcore", "aiohttp.access")
+        state = {}
+        for name in names:
+            lg = logging.getLogger(name)
+            state[name] = (lg.level, list(lg.filters))
+        return state
+
+    def _restore(self, state):
+        import services.structured_log as sl
+
+        for name, (level, filters) in state.items():
+            lg = logging.getLogger(name)
+            lg.setLevel(level)
+            for extra in list(lg.filters):
+                if extra not in filters:
+                    lg.removeFilter(extra)
+        sl.flush_http_counters()
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        state = self._snapshot()
+        for key in ("BOT_HTTP_COUNTER", "BOT_LOG_LEVEL_HTTPX",
+                    "BOT_LOG_LEVEL_AIOHTTP_ACCESS", "BOT_LOG_LEVEL_HTTPCORE"):
+            monkeypatch.delenv(key, raising=False)
+        yield
+        self._restore(state)
+
+    def test_aiohttp_and_httpcore_raised_to_warning(self):
+        from services.structured_log import configure_noisy_loggers
+
+        configure_noisy_loggers()
+        assert logging.getLogger("aiohttp.access").level == logging.WARNING
+        assert logging.getLogger("httpcore").level == logging.WARNING
+
+    def test_counter_disabled_sets_httpx_warning(self, monkeypatch):
+        from services.structured_log import configure_noisy_loggers
+
+        monkeypatch.setenv("BOT_HTTP_COUNTER", "0")
+        result = configure_noisy_loggers()
+        assert result is None
+        httpx_logger = logging.getLogger("httpx")
+        assert httpx_logger.level == logging.WARNING
+        assert not any(
+            getattr(f, "_discord_bot_http_counter_filter", False)
+            for f in httpx_logger.filters
+        )
+
+    def test_env_override_level(self, monkeypatch):
+        from services.structured_log import configure_noisy_loggers
+
+        monkeypatch.setenv("BOT_LOG_LEVEL_AIOHTTP_ACCESS", "ERROR")
+        configure_noisy_loggers()
+        assert logging.getLogger("aiohttp.access").level == logging.ERROR
+
+    def test_counter_filter_suppresses_request_line(self):
+        from services.structured_log import configure_noisy_loggers
+
+        counter = configure_noisy_loggers()
+        assert counter is not None
+        # A request line is dropped (filter returns False) but counted...
+        record = _make_record(
+            msg='HTTP Request: POST http://localhost:8000/collections/x/get '
+            '"HTTP/1.1 200 OK"'
+        )
+        assert counter.filter(record) is False
+        # ...while a WARNING is never swallowed.
+        warn = _make_record(msg="connection reset", level=logging.WARNING)
+        assert counter.filter(warn) is True
+
+    def test_counter_is_idempotent(self):
+        from services.structured_log import configure_noisy_loggers
+
+        first = configure_noisy_loggers()
+        second = configure_noisy_loggers()
+        assert first is second
+        installed = [
+            f
+            for f in logging.getLogger("httpx").filters
+            if getattr(f, "_discord_bot_http_counter_filter", False)
+        ]
+        assert len(installed) == 1
+
+    def test_counts_emitted_on_rid_change_and_flush(self):
+        import services.structured_log as sl
+        from services.structured_log import configure_noisy_loggers, flush_http_counters
+
+        counter = configure_noisy_loggers()
+        assert counter is not None
+        emitted: list[tuple[str, dict[str, int]]] = []
+        orig = sl._emit_http_counter
+        sl._emit_http_counter = lambda rid, counts: emitted.append((rid, dict(counts)))
+        try:
+            with mock.patch("services.correlation.get_request_id", return_value="aaaa1111"):
+                counter.filter(
+                    _make_record(msg='HTTP Request: POST http://h/collections/x/get "HTTP/1.1 200 OK"')
+                )
+                counter.filter(
+                    _make_record(msg='HTTP Request: POST http://h/collections/x/query "HTTP/1.1 200 OK"')
+                )
+                counter.filter(
+                    _make_record(msg='HTTP Request: POST http://api/v1/embeddings "HTTP/1.1 200 OK"')
+                )
+                counter.filter(
+                    _make_record(msg='HTTP Request: PUT http://r2/objects "HTTP/1.1 200 OK"')
+                )
+            # rid change flushes the first request's aggregate.
+            with mock.patch("services.correlation.get_request_id", return_value="bbbb2222"):
+                counter.filter(
+                    _make_record(msg='HTTP Request: POST http://h/collections/x/get "HTTP/1.1 200 OK"')
+                )
+            assert emitted, "rid change should flush previous counts"
+            rid, counts = emitted[0]
+            assert rid == "aaaa1111"
+            assert counts == {"get": 1, "query": 1, "embeddings": 1, "put": 1, "other": 0}
+            emitted.clear()
+            flush_http_counters()
+            rid2, counts2 = emitted[0]
+            assert rid2 == "bbbb2222"
+            assert counts2["get"] == 1
+        finally:
+            sl._emit_http_counter = orig
