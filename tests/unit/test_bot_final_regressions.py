@@ -215,7 +215,10 @@ async def test_context_items_preserve_author_trust_partition() -> None:
 
 
 @pytest.mark.asyncio
-async def test_context_gateway_trusts_only_injected_exact_identities() -> None:
+async def test_context_gateway_trusts_only_admin_humans() -> None:
+    # F-w1-04: the current bot identity (900) is NOT trusted — its output can
+    # echo non-admin / web content, so it stays untrusted *data*. Only admin
+    # humans (42) cross the trusted boundary; unrelated bots (901) never do.
     messages = [
         SimpleNamespace(
             author=SimpleNamespace(id=900, display_name="Current", bot=True),
@@ -253,7 +256,7 @@ async def test_context_gateway_trusts_only_injected_exact_identities() -> None:
         build_lines=lambda pairs: ([f"{name}: {body}" for name, body in pairs], 0),
     )
     trusted = {item.author_id: item.trusted for item in block.items}
-    assert trusted == {900: True, 42: True, 901: False}
+    assert trusted == {900: False, 42: True, 901: False}
 
     fail_closed = await context_gateway.fetch_channel_context(
         Channel(),
