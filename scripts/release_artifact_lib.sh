@@ -611,6 +611,19 @@ build_release_venv() {
         rm -rf -- "${temporary}"
         return 1
     fi
+    # Install the vendored mem0-alpha package (import name: llm_mem0). The bot
+    # imports llm_mem0 whenever MEM0_ALPHA_ENABLED=1, so a release venv without
+    # it crashes at startup with ModuleNotFoundError. It must be a regular
+    # (non-editable) install: the venv is built under ${temporary} and then
+    # relocated into the immutable generation, so an editable .pth would encode
+    # the stale temporary path. --no-deps keeps the build hermetic against the
+    # already-pinned requirements.lock.
+    if [[ -d "${temporary}/src/vendor/mem0-alpha" ]] \
+        && ! (cd "${temporary}/src" && "${venv}/bin/python" -m pip install \
+            --no-deps ./vendor/mem0-alpha); then
+        rm -rf -- "${temporary}"
+        return 1
+    fi
     if ! "${venv}/bin/python" -m pip check >/dev/null \
         || ! "${venv}/bin/python" -c \
             'import sys; raise SystemExit(sys.prefix == sys.base_prefix)'; then
