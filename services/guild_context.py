@@ -17,10 +17,21 @@ import logging
 import os
 from pathlib import Path
 import sqlite3
+import threading
 import time
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+# Schema creation (CREATE TABLE/INDEX IF NOT EXISTS + the version-column
+# migration) is idempotent, so running the full DDL on every ``_connect`` only
+# re-parses ~10 statements per operation (≈13 connects/turn on the recall path).
+# Memoize it per database path: the connection, row factory, busy-timeout and
+# chmod stay per-connection (cheap syscalls / correctness), but the DDL runs
+# once per path. ``threading.Lock`` guards the set because store operations run
+# on the ``asyncio.to_thread`` executor pool.
+_schema_ready: set[str] = set()
+_schema_lock = threading.Lock()
 _MAX_ROWS_PER_GUILD = 1000
 _MAX_MESSAGE_CHARS = 6000
 _MAX_CONTEXT_CHARS = 24000
@@ -37,32 +48,49 @@ class GuildContextStore:
         self.path.chmod(0o600)
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA busy_timeout=5000')
-        db.execute('''CREATE TABLE IF NOT EXISTS messages (
-            message_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL,
-            channel_id INTEGER NOT NULL, author_id INTEGER NOT NULL,
-            author TEXT NOT NULL, content TEXT NOT NULL, bot INTEGER NOT NULL,
-            created_at REAL NOT NULL, version REAL NOT NULL DEFAULT 0)''')
-        if 'version' not in {row[1] for row in db.execute('PRAGMA table_info(messages)')}:
-            try:
-                db.execute('ALTER TABLE messages ADD COLUMN version REAL NOT NULL DEFAULT 0')
-            except sqlite3.OperationalError as exc:
-                if 'duplicate column' not in str(exc):
-                    raise
-        db.execute('CREATE INDEX IF NOT EXISTS messages_guild ON messages(guild_id, created_at)')
-        # The recency key includes edits, not only original creation time.
-        # Keep reads/retention indexed without changing correction ordering.
-        db.execute('''CREATE INDEX IF NOT EXISTS messages_guild_updated
-            ON messages(guild_id, MAX(created_at,version) DESC, message_id DESC)''')
-        db.execute('''CREATE INDEX IF NOT EXISTS messages_updated
-            ON messages(MAX(created_at,version))''')
-        db.execute('''CREATE TABLE IF NOT EXISTS deleted_messages (
-            message_id INTEGER PRIMARY KEY, deleted_at REAL NOT NULL)''')
-        db.execute('''CREATE TABLE IF NOT EXISTS pending_edits (
-            message_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL,
-            channel_id INTEGER NOT NULL, content TEXT NOT NULL, version REAL NOT NULL)''')
-        db.execute('CREATE INDEX IF NOT EXISTS deleted_messages_age ON deleted_messages(deleted_at)')
-        db.execute('CREATE INDEX IF NOT EXISTS pending_edits_age ON pending_edits(version)')
+        self._ensure_schema(db)
         return db
+
+    def _ensure_schema(self, db) -> None:
+        """Create tables/indexes once per database path (idempotent DDL).
+
+        SQLite still parses every ``CREATE … IF NOT EXISTS`` even when the
+        object exists, so re-running the full DDL on each of the ~13 connects
+        per recall turn is pure overhead. The DDL is autocommitted, so a single
+        run per path is visible to every later connection on that file.
+        """
+        key = str(self.path)
+        if key in _schema_ready:
+            return
+        with _schema_lock:
+            if key in _schema_ready:
+                return
+            db.execute('''CREATE TABLE IF NOT EXISTS messages (
+                message_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL, author_id INTEGER NOT NULL,
+                author TEXT NOT NULL, content TEXT NOT NULL, bot INTEGER NOT NULL,
+                created_at REAL NOT NULL, version REAL NOT NULL DEFAULT 0)''')
+            if 'version' not in {row[1] for row in db.execute('PRAGMA table_info(messages)')}:
+                try:
+                    db.execute('ALTER TABLE messages ADD COLUMN version REAL NOT NULL DEFAULT 0')
+                except sqlite3.OperationalError as exc:
+                    if 'duplicate column' not in str(exc):
+                        raise
+            db.execute('CREATE INDEX IF NOT EXISTS messages_guild ON messages(guild_id, created_at)')
+            # The recency key includes edits, not only original creation time.
+            # Keep reads/retention indexed without changing correction ordering.
+            db.execute('''CREATE INDEX IF NOT EXISTS messages_guild_updated
+                ON messages(guild_id, MAX(created_at,version) DESC, message_id DESC)''')
+            db.execute('''CREATE INDEX IF NOT EXISTS messages_updated
+                ON messages(MAX(created_at,version))''')
+            db.execute('''CREATE TABLE IF NOT EXISTS deleted_messages (
+                message_id INTEGER PRIMARY KEY, deleted_at REAL NOT NULL)''')
+            db.execute('''CREATE TABLE IF NOT EXISTS pending_edits (
+                message_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL, content TEXT NOT NULL, version REAL NOT NULL)''')
+            db.execute('CREATE INDEX IF NOT EXISTS deleted_messages_age ON deleted_messages(deleted_at)')
+            db.execute('CREATE INDEX IF NOT EXISTS pending_edits_age ON pending_edits(version)')
+            _schema_ready.add(key)
 
     def record(self, *, message_id: int, guild_id: int, channel_id: int,
                author_id: int, author: str, content: str, bot: bool,
@@ -262,51 +290,63 @@ async def _hydrate_visible(message: Any) -> None:
     guild_id = _guild_id(message)
     if guild_id is None:
         return
+    async def _hydrate_one(channel: Any) -> None:
+        key = (guild_id, channel.id)
+        try:
+            # Compare only messages known before the history request.
+            # Gateway receipts concurrent with the request are not deletes.
+            async with _store_lock:
+                prior_ids = await asyncio.to_thread(get_store().history_ids, guild_id,
+                                                    channel.id, before=time.time() - 10)
+            seen_ids: set[int] = set()
+            records: list[dict] = []
+            try:
+                async with asyncio.timeout(5):
+                    async for item in channel.history(limit=60):
+                        seen_ids.add(item.id)
+                        record = _message_record(item)
+                        if record:
+                            records.append(record)
+            finally:
+                # Preserve partial successful history on HTTP failure,
+                # without treating an incomplete page as deletion proof.
+                if records:
+                    async with _store_lock:
+                        await asyncio.to_thread(get_store().record_many, records)
+            # Reconcile deletions while disconnected, but only within the
+            # fetched window. Older history is deliberately not inferred.
+            missing = prior_ids - seen_ids
+            if seen_ids:
+                missing = {mid for mid in missing if mid >= min(seen_ids)}
+            if missing:
+                await forget(list(missing))
+            _hydrated[key] = time.monotonic()
+        except Exception:
+            log.warning('Guild context backfill failed channel=%s', channel.id)
+
     async with _hydrate_locks.setdefault(guild_id, asyncio.Lock()):
         channels = list(getattr(message.guild, 'text_channels', [])) + list(getattr(message.guild, 'threads', []))
         channels.sort(key=lambda ch: getattr(ch, 'last_message_id', 0) or 0, reverse=True)
         channels = [message.channel] + [ch for ch in channels if ch.id != message.channel.id]
-        checked = 0
+        # Select up to 6 eligible channels, preserving the previous
+        # TTL-freshness + visibility + cap gate, then hydrate them concurrently
+        # instead of serially. Each channel contributes its own visible ids; the
+        # final visible set is independent of hydration order
+        # (KanaeVerify.GuildHydrate.hydrate_order_independent / optimized_eq_spec),
+        # and completion is still awaited in-turn, so same-turn reconciliation
+        # and retry-on-next-turn semantics are unchanged.
+        selected: list[Any] = []
         for channel in channels:
             key = (guild_id, channel.id)
             if time.monotonic() - _hydrated.get(key, -float('inf')) < 300:
                 continue
             if not can_view(channel, message.author, guild_id):
                 continue
-            if checked >= 6:
+            selected.append(channel)
+            if len(selected) >= 6:
                 break
-            checked += 1
-            try:
-                # Compare only messages known before the history request.
-                # Gateway receipts concurrent with the request are not deletes.
-                async with _store_lock:
-                    prior_ids = await asyncio.to_thread(get_store().history_ids, guild_id,
-                                                        channel.id, before=time.time() - 10)
-                seen_ids: set[int] = set()
-                records: list[dict] = []
-                try:
-                    async with asyncio.timeout(5):
-                        async for item in channel.history(limit=60):
-                            seen_ids.add(item.id)
-                            record = _message_record(item)
-                            if record:
-                                records.append(record)
-                finally:
-                    # Preserve partial successful history on HTTP failure,
-                    # without treating an incomplete page as deletion proof.
-                    if records:
-                        async with _store_lock:
-                            await asyncio.to_thread(get_store().record_many, records)
-                # Reconcile deletions while disconnected, but only within the
-                # fetched window. Older history is deliberately not inferred.
-                missing = prior_ids - seen_ids
-                if seen_ids:
-                    missing = {mid for mid in missing if mid >= min(seen_ids)}
-                if missing:
-                    await forget(list(missing))
-                _hydrated[key] = time.monotonic()
-            except Exception:
-                log.warning('Guild context backfill failed channel=%s', channel.id)
+        if selected:
+            await asyncio.gather(*(_hydrate_one(channel) for channel in selected))
         if len(_hydrated) > 2048:
             for key, _ in sorted(_hydrated.items(), key=lambda item: item[1])[:-1024]:
                 _hydrated.pop(key, None)
