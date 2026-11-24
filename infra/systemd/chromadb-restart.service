@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart ChromaDB before its memory growth reaches the cgroup cap (memory-diet 2026-10-16)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl try-restart chromadb-server.service

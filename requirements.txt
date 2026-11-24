@@ -8,7 +8,7 @@ discord.py>=2.7,<3.0
 python-dotenv>=1.0,<2.0
 claude-code-sdk==0.0.25            # SRE-H7: exact pin; bypassPermissions is SDK-internal
 anthropic>=0.88.0,<1.0             # SRE-H7: surface the transitive dep so upgrades are visible
-mcp==1.28.1                        # PR4 of claude-api-unify: direct pin so deleting
+mcp==1.30.0                        # PR4 of claude-api-unify: direct pin so deleting
                                    # claude-code-sdk in PR9 does not drop the MCP SDK.
                                    # Review quarterly; pre-1.0 minor releases can rename
                                    # fields like Tool.inputSchema (see test_tool_schema_shape).

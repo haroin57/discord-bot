@@ -313,7 +313,8 @@ discord-bot の journal のうち WARNING 以上を haroin サーバーの
 - **free-tier は req/min が低い**: 描画連発で 429 → 1リトライ後 None (text fallback)。
   頻発するならリトライのバックオフ延長 or クライアント側キューを検討
 - mermaid (mmdc) は別経路で**ローカル Chromium 依存のまま** — mermaid-cli と
-  ~/.cache/puppeteer は削除禁止。トークン失効時も renderer は None を返して
+  ~/.cache/puppeteer は削除禁止。呼び出しは必ず `mmdc-safe`（`scripts/mmdc_safe.sh` を apply_memory_diet_host.sh が配置）経由
+  （最新 Chrome 解決 + CDP pipe + timeout。素の mmdc は Chrome を孤児化させる、2026-10-16）。トークン失効時も renderer は None を返して
   bot はテキスト劣化で継続する (落ちない)
 
 ### Workers 一覧 (ソース: ~/archives/cloudflare-workers-src-20260704/)

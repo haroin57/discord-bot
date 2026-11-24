@@ -270,6 +270,10 @@ if __name__ == "__main__":
     if _http_port:
         mcp.settings.host = "127.0.0.1"
         mcp.settings.port = int(_http_port)
+        # Claude Code hook (mem0_hook_daemon.py proxies its socket here).
+        from services.mem0.hook_http import register_hook_route
+
+        register_hook_route(mcp)
         log.info("mem0 MCP serving streamable-http on 127.0.0.1:%s/mcp", _http_port)
         mcp.run(transport="streamable-http")
     else:

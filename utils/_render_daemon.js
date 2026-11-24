@@ -41,12 +41,20 @@ async function getBrowser() {
 
   const launchOpts = {
     headless: 'new',
+    // CDP over a pipe instead of a WebSocket: when this daemon dies (even by
+    // SIGKILL) the pipe closes and Chrome exits on its own. With the default
+    // WebSocket transport Chrome survives as a PPID=1 orphan because it is
+    // launched detached and moves itself into its own systemd scope, so
+    // neither process-group kills nor the service cgroup reach it.
+    pipe: true,
     args: [
       ...(config.args || []),
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-gpu',
       '--disable-dev-shm-usage',
+      '--disable-component-update',
+      '--disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,OptimizationTargetPrediction,OnDeviceModelService',
     ],
   };
   if (chromePath) {
@@ -56,6 +64,16 @@ async function getBrowser() {
   browser = await loadPuppeteer().launch(launchOpts);
   browser.on('disconnected', () => {
     browser = null;
+  });
+  const child = browser.process();
+  const profileArg = child && (child.spawnargs || []).find((a) => a.startsWith('--user-data-dir='));
+  // Let the owner kill Chrome directly if this daemon becomes unresponsive and
+  // remove the temp profile that puppeteer only deletes on a clean close.
+  send({
+    id: null,
+    event: 'browser',
+    pid: child ? child.pid : null,
+    userDataDir: profileArg ? profileArg.slice('--user-data-dir='.length) : null,
   });
   return browser;
 }

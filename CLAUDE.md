@@ -141,7 +141,7 @@ Mem0 のレコードは user_id で namespace 分離されている。**2026-06-
   - 一般: `/tmp/discord_bot_attachments/`
   - admin画像: `/home/ubuntu/` 配下も可
 - 1応答あたり画像は最大10枚まで添付可能
-- Mermaid生成: `mmdc -p /home/ubuntu/puppeteer-config.json -i input.mmd -o /tmp/mermaid_output/output.png`
+- Mermaid生成: `mmdc-safe -i input.mmd -o /tmp/mermaid_output/output.png`（`/usr/local/bin/mmdc-safe`。素の `mmdc` は Chrome 版不一致で失敗し、異常終了時に Chrome を孤児化させるので使わない）
 
 ## 調査・検索ルール
 - ニュース・時事・トレンドの調査時は Brave Search + X scraper（search_x）を必ず併用
