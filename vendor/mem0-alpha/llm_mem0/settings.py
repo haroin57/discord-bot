@@ -97,6 +97,12 @@ _SPECS: dict[str, _Spec] = {
     # Pre-rerank gate: drop candidates physically too far before the LLM
     # rerank sees them. score = distance (small = similar).
     "MEM0_RELEVANCE_MAX_DISTANCE": _Spec(1.2, float),
+    # Query-embedding cache (explore-C #6): batch-embed expanded query variants
+    # in one input=[…] call + memoise identical variants for a short TTL so the
+    # multi-query fan-out / refill loop issues no repeat embedding round trips.
+    # Output-invariant (deterministic embeddings). 0 disables the whole feature.
+    "MEM0_QUERY_EMBED_CACHE_TTL_S": _Spec(60, int),
+    "MEM0_QUERY_EMBED_CACHE_MAX": _Spec(256, int),
     # DEPRECATED — no longer consulted on the rerank=True path (a cosine gate
     # after an LLM rerank silently killed non-English queries). Declared so
     # env config that sets it still resolves.
