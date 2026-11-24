@@ -82,6 +82,67 @@ log = logging.getLogger("mem0-mcp")
 DEFAULT_USER_ID = "573489206240870410"
 
 
+class _PermissionDenied(ValueError):
+    """Raised when a call targets a user_id outside this instance's allow-list.
+
+    Subclasses ValueError so the existing per-tool ``except ValueError`` guards
+    turn it into a rejection string instead of crashing the tool.
+    """
+
+
+def _configured_allowed_user_ids() -> frozenset[str]:
+    """Namespaces this MCP instance may read/write/delete.
+
+    The MCP transport (stdio, or shared streamable-http bound to 127.0.0.1)
+    carries NO caller identity, so a model-supplied ``user_id`` argument is not
+    proof of ownership. We therefore pin — at process start — the set of
+    user_ids this instance is permitted to touch:
+
+      - Default: ``{DEFAULT_USER_ID}`` — the single-owner deployment かなえ/先輩
+        run, where every legitimate caller operates on 先輩's namespace.
+      - Override: ``MEM0_MCP_ALLOWED_USER_IDS`` (comma/space separated
+        snowflakes) for an explicit multi-owner host.
+
+    Any tool call whose target user_id is not in this set is rejected before it
+    can reach the store, closing the cross-tenant read/add/list/delete path
+    (F-w2-04 / F-w3-04) where a shared-daemon consumer (e.g. ignite-codex)
+    passed an arbitrary victim snowflake to these ownership-less tools. This is
+    defence-in-depth alongside the systemd / loopback-bind isolation.
+    """
+    ids = {DEFAULT_USER_ID}
+    for token in re.split(r"[,\s]+", os.environ.get("MEM0_MCP_ALLOWED_USER_IDS", "")):
+        token = token.strip()
+        if not token:
+            continue
+        if _USER_ID_PATTERN.fullmatch(token):
+            ids.add(token)
+        else:
+            log.warning(
+                "Ignoring malformed id in MEM0_MCP_ALLOWED_USER_IDS: %r", token
+            )
+    return frozenset(ids)
+
+
+_ALLOWED_USER_IDS = _configured_allowed_user_ids()
+
+
+def _authorized_user_id(user_id: str) -> str:
+    """Validate format AND authorize the namespace against the allow-list.
+
+    Unlike :func:`_validated_user_id` (format gate only), this binds the call to
+    the set of namespaces this instance may touch, so a caller cannot cross
+    tenants by passing another user's snowflake.
+    """
+    user_id = _validated_user_id(user_id)
+    if user_id not in _ALLOWED_USER_IDS:
+        log.warning(
+            "mem0 MCP: rejecting cross-tenant access to user_id=%s (not allow-listed)",
+            user_id,
+        )
+        raise _PermissionDenied("permission denied")
+    return user_id
+
+
 def _format_for_mcp(memories: list[dict], limit: int | None = None, *, details: bool = False,
                     include_ids: bool = False) -> str:
     """MCP-safe formatter without bracketed boundary markers.
@@ -166,7 +227,9 @@ async def search(
         query: Natural language query describing what you want to recall.
         limit: Max number of memories to return (default 5).
         user_id: Mem0 user key. Defaults to 先輩's Discord ID so results
-            are shared with the Discord bot.
+            are shared with the Discord bot. Must be allow-listed for this
+            instance (see MEM0_MCP_ALLOWED_USER_IDS); a non-allow-listed
+            namespace is rejected with "permission denied".
         smart: When True, use rewriting+reranking pipeline. Adds ~2 Haiku
             calls of latency in exchange for higher hit rate. Default: False.
         as_of: Optional timezone-aware ISO8601 time for alpha historical/future
@@ -176,7 +239,7 @@ async def search(
         mode: Explicit vector/hybrid/smart. Omitted preserves smart/default; as_of takes precedence.
     """
     try:
-        user_id = _validated_user_id(user_id)
+        user_id = _authorized_user_id(user_id)
         contracts.validate_input_text(query=query)
         channel_id = contracts.identifier(channel_id, "channel_id")
         selected_mode = contracts.search_mode(mode, smart)
@@ -237,7 +300,9 @@ async def add(
     Args:
         user_message: The user's message text.
         assistant_message: The assistant's reply text.
-        user_id: Mem0 user key (default: 先輩's Discord ID).
+        user_id: Mem0 user key (default: 先輩's Discord ID). Must be
+            allow-listed for this instance (see MEM0_MCP_ALLOWED_USER_IDS);
+            a non-allow-listed namespace is rejected with "permission denied".
         context: Optional recent conversation context to prepend.
             Include the last few messages leading up to this exchange
             so Mem0's extractor can understand the full conversational flow.
@@ -251,7 +316,7 @@ async def add(
         valid_to: Explicit effective end, not earlier than valid_from.
     """
     try:
-        user_id = _validated_user_id(user_id)
+        user_id = _authorized_user_id(user_id)
         contracts.validate_input_text(user_message=user_message, assistant_message=assistant_message, context=context)
         metadata = contracts.provenance_metadata(request_id=request_id, source_id=source_id,
             source_message_ids=source_message_ids, source_author_id=source_author_id,
@@ -292,14 +357,16 @@ async def list_all(user_id: str = DEFAULT_USER_ID, limit: StrictInt = 50,
     created_at_unix, …). See the `search` docstring for definitions.
 
     Args:
-        user_id: Mem0 user key (default: 先輩's Discord ID).
+        user_id: Mem0 user key (default: 先輩's Discord ID). Must be
+            allow-listed for this instance (see MEM0_MCP_ALLOWED_USER_IDS);
+            a non-allow-listed namespace is rejected with "permission denied".
         limit: Max number of memories to return (default 50). The full
             count is huge; raise this only when you really need it.
         offset: Rows to skip, 0..10000; enumeration is not a snapshot.
         details: Include bounded condition/time/source metadata. IDs are always included.
     """
     try:
-        user_id = _validated_user_id(user_id)
+        user_id = _authorized_user_id(user_id)
         offset = contracts.page_offset(offset)
     except ValueError as e:
         return f"(rejected: {e})"
@@ -321,21 +388,35 @@ async def list_all(user_id: str = DEFAULT_USER_ID, limit: StrictInt = 50,
 async def delete(memory_id: str, user_id: str = DEFAULT_USER_ID) -> str:
     """Delete a specific memory by its Mem0 ID.
 
-    Only the owner of the memory (matched by user_id) can delete it.
+    Authorization is enforced in two layers, because the MCP transport carries
+    no caller identity and cannot itself prove who is asking:
+
+    1. ``user_id`` must be in this instance's allow-list (see
+       ``_configured_allowed_user_ids``). A caller cannot delete in a namespace
+       this server was not started for. By default that is only 先輩's.
+    2. ``memory_id`` must already exist in that (authorized) user_id's
+       namespace; otherwise the delete is refused. This prevents deleting a
+       record that belongs to a *different* allow-listed namespace by guessing
+       its id, since the underlying ``delete_memory`` resolves by id alone.
+
+    Note: this binds deletion to the instance's configured owner(s), not to a
+    per-request caller identity — that distinction cannot exist on an
+    unauthenticated local transport.
 
     Args:
         memory_id: The memory ID returned by `list_all` or `search`.
-        user_id: Discord snowflake of the requesting user. Must match the
-            user_id stored on the memory record.
+        user_id: Target Mem0 namespace. Must be allow-listed for this instance
+            (defaults to 先輩's Discord ID) and must own `memory_id`.
     """
     try:
-        user_id = _validated_user_id(user_id)
+        user_id = _authorized_user_id(user_id)
         memory_id = contracts.identifier(memory_id, "memory_id", required=True)
     except ValueError as e:
         return f"(rejected: {e})"
 
-    # Verify ownership before deletion by searching all memories for this user
-    # and confirming the target memory_id exists in their namespace.
+    # Confirm the target memory_id exists in the (already allow-listed) user_id's
+    # namespace before deleting — delete_memory resolves by id alone, so this
+    # keeps a caller from reaching another allow-listed namespace's records.
     try:
         user_memories = await _strict_listing(user_id)
     except Exception:
@@ -361,7 +442,7 @@ async def fact_history(attribute: str, user_id: str = DEFAULT_USER_ID, limit: St
     Disabled/unavailable lineage is reported separately from a missing history.
     """
     try:
-        user_id = _validated_user_id(user_id)
+        user_id = _authorized_user_id(user_id)
         attribute = contracts.identifier(attribute, "attribute", required=True)
     except ValueError as exc:
         return f"(rejected: {exc})"

@@ -254,6 +254,23 @@ class TestSecretBasenameDenylist:
         assert _basename_is_secret("/home/ubuntu/data/app.sqlite")
         assert _basename_is_secret("/home/ubuntu/data/app.db")
 
+    def test_json_credentials_rejected(self):
+        # F-w2-02: Codex / cloud CLI OAuth + MCP credentials live in JSON and
+        # the bot runs as the file owner, so the whole JSON family is blocked.
+        assert _basename_is_secret("/home/ubuntu/.codex/auth.json")
+        assert _basename_is_secret("/home/ubuntu/.codex/config.json")
+        assert _basename_is_secret("/home/ubuntu/.codex/sessions.json")
+        assert _basename_is_secret(
+            "/home/ubuntu/.config/gcloud/application_default_credentials.json"
+        )
+        assert _basename_is_secret("/home/ubuntu/.cloudflared/abcd-1234.json")
+        assert _basename_is_secret("/home/ubuntu/anything.json")
+
+    def test_jsonl_rejected(self):
+        # .jsonl holds chat/session transcripts that can carry secrets.
+        assert _basename_is_secret("/home/ubuntu/.codex/history.jsonl")
+        assert _basename_is_secret("/tmp/session.jsonl")
+
     def test_innocuous_files_pass(self):
         assert not _basename_is_secret("/home/ubuntu/notes.md")
         assert not _basename_is_secret("/home/ubuntu/report.pdf")
@@ -284,6 +301,31 @@ class TestExtractFilePathsDenylist:
         pem = tmp_path / "server.pem"
         pem.write_text("-----BEGIN PRIVATE KEY-----")
         text = f"path: {pem}"
+        assert extract_file_paths(text) == []
+
+    def test_auth_json_under_admin_dir_rejected(self, tmp_path, monkeypatch):
+        # F-w2-02: a prompt-injected `~/.codex/auth.json` path must not be
+        # auto-attached even though it exists under an allowed dir.
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        codex = tmp_path / ".codex"
+        codex.mkdir()
+        auth = codex / "auth.json"
+        auth.write_text('{"tokens": {"access_token": "live-codex-oauth"}}')
+        text = f"見て {auth}"
+        assert extract_file_paths(text) == []
+
+    def test_jsonl_under_admin_dir_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        transcript = tmp_path / "history.jsonl"
+        transcript.write_text('{"role": "user", "content": "secret"}\n')
+        text = f"attach {transcript}"
+        assert extract_file_paths(text) == []
+
+    def test_arbitrary_json_under_admin_dir_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("utils.attachments.ADMIN_FILE_DIRS", (str(tmp_path),))
+        data = tmp_path / "config.json"
+        data.write_text('{"k": "v"}')
+        text = f"path {data}"
         assert extract_file_paths(text) == []
 
     def test_normal_file_still_allowed(self, tmp_path, monkeypatch):

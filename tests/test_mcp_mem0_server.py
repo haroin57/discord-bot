@@ -332,3 +332,99 @@ class TestDeleteTool:
         _svc("delete_memory").return_value = None
         out = await _m.delete(memory_id="nope")
         assert "delete failed" in out
+
+
+# ===========================================================================
+# Cross-tenant authorization (F-w2-04 / F-w3-04)
+# ===========================================================================
+
+# A well-formed snowflake that is NOT the default/allow-listed owner.
+VICTIM_UID = "111111111111111111"
+
+
+class TestConfiguredAllowedUserIds:
+    def test_default_is_default_user_only(self, monkeypatch):
+        monkeypatch.delenv("MEM0_MCP_ALLOWED_USER_IDS", raising=False)
+        allowed = _m._configured_allowed_user_ids()
+        assert allowed == frozenset({_m.DEFAULT_USER_ID})
+
+    def test_env_override_adds_valid_ids(self, monkeypatch):
+        monkeypatch.setenv(
+            "MEM0_MCP_ALLOWED_USER_IDS", f"{VICTIM_UID}, 222222222222222222"
+        )
+        allowed = _m._configured_allowed_user_ids()
+        assert _m.DEFAULT_USER_ID in allowed
+        assert VICTIM_UID in allowed
+        assert "222222222222222222" in allowed
+
+    def test_env_override_ignores_malformed(self, monkeypatch):
+        monkeypatch.setenv("MEM0_MCP_ALLOWED_USER_IDS", "not-a-snowflake, 123")
+        allowed = _m._configured_allowed_user_ids()
+        assert allowed == frozenset({_m.DEFAULT_USER_ID})
+
+
+class TestAuthorizedUserId:
+    def test_default_user_allowed(self, monkeypatch):
+        monkeypatch.setattr(_m, "_ALLOWED_USER_IDS", frozenset({_m.DEFAULT_USER_ID}))
+        assert _m._authorized_user_id(_m.DEFAULT_USER_ID) == _m.DEFAULT_USER_ID
+
+    def test_non_allowlisted_denied(self, monkeypatch):
+        monkeypatch.setattr(_m, "_ALLOWED_USER_IDS", frozenset({_m.DEFAULT_USER_ID}))
+        with pytest.raises(_m._PermissionDenied, match="permission denied"):
+            _m._authorized_user_id(VICTIM_UID)
+
+    def test_malformed_still_value_error(self, monkeypatch):
+        monkeypatch.setattr(_m, "_ALLOWED_USER_IDS", frozenset({_m.DEFAULT_USER_ID}))
+        with pytest.raises(ValueError, match="invalid user_id"):
+            _m._authorized_user_id("nope")
+
+
+class TestCrossTenantRejection:
+    """A caller must not reach another user's namespace by passing their
+    snowflake. Default allow-list holds only DEFAULT_USER_ID."""
+
+    @pytest.fixture(autouse=True)
+    def pin_default_allowlist(self, monkeypatch):
+        monkeypatch.setattr(_m, "_ALLOWED_USER_IDS", frozenset({_m.DEFAULT_USER_ID}))
+
+    @pytest.mark.asyncio
+    async def test_search_cross_tenant_denied(self):
+        out = await _m.search(query="secrets", user_id=VICTIM_UID)
+        assert "permission denied" in out
+        _svc("search_memories").assert_not_awaited()
+        _svc("search_memories_smart").assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_add_cross_tenant_denied(self):
+        out = await _m.add(
+            user_message="u", assistant_message="a", user_id=VICTIM_UID
+        )
+        assert "permission denied" in out
+        _svc("add_memories").assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_list_all_cross_tenant_denied(self):
+        out = await _m.list_all(user_id=VICTIM_UID)
+        assert "permission denied" in out
+        _svc("get_all_memories").assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delete_cross_tenant_denied(self):
+        # The fake-ownership path must never run: rejection happens up front,
+        # so neither the listing nor the delete is attempted.
+        _svc("get_all_memories").return_value = [{"id": "victim-mem", "memory": "x"}]
+        _svc("delete_memory").return_value = True
+        out = await _m.delete(memory_id="victim-mem", user_id=VICTIM_UID)
+        assert "permission denied" in out
+        _svc("get_all_memories").assert_not_awaited()
+        _svc("delete_memory").assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_user_id_allowed(self, monkeypatch):
+        monkeypatch.setattr(
+            _m, "_ALLOWED_USER_IDS", frozenset({_m.DEFAULT_USER_ID, VICTIM_UID})
+        )
+        _svc("search_memories").return_value = [{"memory": "ok"}]
+        out = await _m.search(query="q", user_id=VICTIM_UID)
+        assert "ok" in out
+        _svc("search_memories").assert_awaited_once()
