@@ -271,6 +271,17 @@ async def main() -> None:
         except ImportError:
             _setup_logging()
 
+        # OPT-B: quiet third-party request chatter (httpx ~52%, aiohttp.access
+        # ~33% of the prod journal) while keeping per-request Chroma/embedding/R2
+        # call counts observable via a [HTTP_CALLS] summary line. Best-effort:
+        # never block startup on a logging tweak.
+        try:
+            from services.structured_log import configure_noisy_loggers
+
+            configure_noisy_loggers()
+        except Exception as log_config_error:  # pragma: no cover - defensive
+            log.warning("configure_noisy_loggers failed: %s", log_config_error)
+
         _acquire_pidlock()
         # cleanup_stale_attachments now scheduled from bot.on_ready (Phase G/D5).
 
