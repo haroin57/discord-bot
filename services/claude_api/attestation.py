@@ -17,6 +17,7 @@ and confirmed consistent across versions 2.1.37 → 2.1.92+.
 
 import logging
 
+import httpx
 import xxhash
 
 log = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ async def cch_request_hook(request) -> None:
     body = request.content
     if body and _PLACEHOLDER in body:
         request._content = patch_cch_body(body)
+        request.stream = httpx.ByteStream(request._content)
         # Update Content-Length if present (same length, but be safe)
         if "content-length" in request.headers:
             request.headers["content-length"] = str(len(request._content))
