@@ -20,18 +20,18 @@ log = logging.getLogger(__name__)
 # run daily). DO NOT edit between the marker comments; manual edits will be
 # clobbered on the next refresh run.
 # AUTO-CAPTURE-START
-CC_VERSION = "2.1.296"
+CC_VERSION = "2.1.331"
 CC_ENTRYPOINT = "sdk-cli"
 MODEL_BETAS = [
     "claude-code-20250219",
     "oauth-2025-04-20",
     "interleaved-thinking-2025-05-14",
-    "thinking-token-count-2026-05-13",
     "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
-    "mid-conversation-system-2026-04-07",
     "per-turn-control-2026-07-01",
     "mid-conversation-tool-changes-2026-07-01",
+    "tool-provenance-2026-10-26",
+    "thinking-token-count-2026-05-13",
     "advanced-tool-use-2025-11-20",
     "mid-conversation-system-clear-at-2026-08-21",
     "effort-2025-11-24",
