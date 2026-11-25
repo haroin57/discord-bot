@@ -169,3 +169,10 @@ wsproto==1.3.2
 xxhash==3.7.0
 yarl==1.25.1
 zipp==3.23.0
+
+# Vendored Mem0α (import name: llm_mem0). Installed from the in-tree source so
+# every release venv and CI env gets it via the existing requirements.lock
+# install step, without depending on a build-library change (which auto_deploy
+# sources before the checkout is updated). Its deps (mem0ai/chromadb/aiohttp/
+# requests) are pinned above, so this resolves with no extra downloads.
+./vendor/mem0-alpha
