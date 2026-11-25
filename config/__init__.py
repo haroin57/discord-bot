@@ -2189,6 +2189,21 @@ MEM0_SCHEMA_ABSTRACT_DRY_RUN = _bool_env("MEM0_SCHEMA_ABSTRACT_DRY_RUN", True)
 # enabled.
 MEM0_FOK_ENABLED = _bool_env("MEM0_FOK_ENABLED", False)
 
+# explore-C #2: cheap-first Mem0 recall escalation. When enabled, smart search
+# runs only the LLM-free retrieval layers first (graph alias + morpho + hybrid
+# vector/BM25), reads recall confidence, and escalates to the expensive
+# rewrite+HyDE+keywords+rerank helper tier ONLY when the cheap read is not
+# confident. Off by default — flag-off behaviour is byte-identical to the
+# unconditional helper pipeline, so merging changes nothing until it is
+# enabled (after the offline recall eval passes). The escalation threshold is
+# the cheap tier's best raw cosine distance: at or above it (or no candidate
+# at all) → escalate. Default mirrors the FOK "weak" boundary so only genuinely
+# confident cheap recall skips the helpers.
+MEM0_CHEAP_FIRST_ENABLED = _bool_env("MEM0_CHEAP_FIRST_ENABLED", False)
+MEM0_CHEAP_FIRST_ESCALATE_DISTANCE = float(
+    os.environ.get("MEM0_CHEAP_FIRST_ESCALATE_DISTANCE", "0.75")
+)
+
 # Stable namespace for kanae's own Mem0 entries. The bot's runtime hook
 # (bot.py) writes to this user_id. Falls back to `str(bot.user.id)` if
 # unset, matching historical behavior.

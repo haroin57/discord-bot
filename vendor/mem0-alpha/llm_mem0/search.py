@@ -1073,6 +1073,21 @@ def assess_recall_confidence(candidates: list[dict]) -> dict:
     }
 
 
+def should_escalate_recall(confidence: dict) -> bool:
+    """Deterministic escalation decision for cheap-first recall.
+
+    Pure function of the cheap tier's confidence read — mirrors the Lean
+    model ``KanaeVerify.Escalation.escalate`` (same input → same decision).
+    Escalate to the expensive rewrite+HyDE+keywords+rerank tier when the
+    cheapest-retrieved best raw cosine distance is missing or no closer than
+    ``MEM0_CHEAP_FIRST_ESCALATE_DISTANCE`` (lower distance = higher
+    confidence)."""
+    best = confidence.get("best_distance")
+    if best is None:
+        return True
+    return float(best) >= settings.MEM0_CHEAP_FIRST_ESCALATE_DISTANCE
+
+
 def _fire_recall_reinforcement(results: list[dict]) -> None:
     """Phase ①: testing-effect reinforcement for facts actually surfaced by
     search — as opposed to reinforce_existing (reinforce.py), which only
@@ -1340,9 +1355,72 @@ async def search_memories_smart(
             await asyncio.gather(core_task, return_exceptions=True)
 
 
+async def _cheap_first_recall(
+    query, user_id, limit, rewrite, rerank, current_channel_id, core_task,
+):
+    """explore-C #2 cheap-first tier.
+
+    Run ONLY the LLM-free retrieval layers (graph alias + morpho + hybrid
+    vector/BM25) and read recall confidence. When confident, return the cheap
+    result directly — skipping the rewrite/HyDE/keywords/rerank helper LLMs.
+    When not confident, return ``None`` so the caller escalates to the full
+    pipeline (byte-identical to the flag-off path), making the escalated
+    result set converge on the reference semantics.
+    """
+    cheap_queries = await _expand_queries(query, user_id, rewrite=False)
+    await _prewarm_query_embeddings(cheap_queries)
+    cheap_candidates = await _search_multi_hybrid(
+        cheap_queries, user_id, limit=20,
+        apply_distance_filter=not rerank,
+        current_channel_id=current_channel_id,
+    )
+    confidence = assess_recall_confidence(cheap_candidates)
+    escalate = should_escalate_recall(confidence)
+    log.info(
+        "[MEM0_CHEAP_FIRST escalate=%s status=%s best_distance=%s candidates=%d]",
+        escalate, confidence["status"],
+        "none" if confidence["best_distance"] is None else f'{confidence["best_distance"]:.3f}',
+        confidence["candidate_count"],
+    )
+    if escalate:
+        return None
+    # Confident: enrich with the LLM-free graph expansion, then return via the
+    # plain-path reinforcement boost + distance gate. No helper LLM, no rerank.
+    try:
+        cheap_candidates = await _graph_expand_candidates(
+            cheap_candidates, user_id, current_channel_id=current_channel_id,
+        )
+    except Exception as exc:
+        log.warning("graph_expand failed (non-fatal): %s", exc)
+    _apply_reinforcement_boost(cheap_candidates)
+    max_distance = settings.MEM0_RELEVANCE_MAX_DISTANCE
+    filtered = [
+        r for r in cheap_candidates
+        if _distance(r) is None or _distance(r) <= max_distance
+    ][:limit]
+    _log_smart_metrics(query, cheap_candidates, len(filtered), 0, rerank=False)
+    final = await _finalize_smart_result(
+        filtered, core_task, limit, confidence, fok_block=False)
+    _fire_recall_reinforcement(final)
+    return final
+
+
 async def _search_memories_smart_with_core(
     query, user_id, limit, rewrite, rerank, current_channel_id, core_task,
 ):
+    # explore-C #2: cheap-first. Only meaningful when an expensive tier
+    # (rewrite and/or rerank) was requested — otherwise this is already the
+    # cheap path. On escalation (_cheap_first_recall returns None) fall through
+    # to the unchanged full pipeline below so the result converges on the
+    # flag-off semantics. core_task is consumed exactly once: the confident
+    # branch awaits it inside _finalize_smart_result; the escalation branch
+    # leaves it for the full pipeline below.
+    if settings.MEM0_CHEAP_FIRST_ENABLED and (rewrite or rerank):
+        cheap = await _cheap_first_recall(
+            query, user_id, limit, rewrite, rerank, current_channel_id, core_task,
+        )
+        if cheap is not None:
+            return cheap
     queries = await _expand_queries(query, user_id, rewrite=rewrite)
     # explore-C #6: embed the whole expanded variant set in one round trip and
     # warm the TTL cache, so the per-variant mem.search below hits the cache
