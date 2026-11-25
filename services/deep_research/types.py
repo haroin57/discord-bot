@@ -1,13 +1,18 @@
 """Deep Research の中間状態とデータ型（ADR-0028）.
 
-すべて orchestrator のプロセスメモリに保持し、通常チャットの session / JSONL とは
-一切共有しない（FR-11 セッション非汚染）。
+実行中はorchestratorが保持し、用件に接続した調査はWorkStoreにcheckpointを保存します。
+通常チャットのnative sessionやJSONLとは共有しません。
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime, timezone
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def normalize_url(url: str) -> str:
@@ -32,6 +37,11 @@ class SourceRef:
     snippet: str = ""
     # EvidenceRegistry が支持判定に使う、検索結果から機械抽出した根拠断片。
     evidence: list[str] = field(default_factory=list)
+    fetched_at: str = field(default_factory=utc_now)
+    # A source's reporting date is not its retrieval date. Unknown stays null.
+    as_of: str | None = None
+    fresh_for_s: float | None = None
+    version: int = 1
 
 
 @dataclass
@@ -73,6 +83,7 @@ class ResearchState:
     results: list[SubAgentResult] = field(default_factory=list)
     started_at: float = field(default_factory=time.monotonic)
     tokens_used: int = 0
+    tokens_before_resume: int = 0
     phase: str = "init"
     # --- MAGI 推論層（FR-M1/M2）---
     # 中心的問い（Stage1 暫定 → Stage2 研ぎ直し → 承認ゲート確定）と、その「なぜ核心か」。
@@ -83,6 +94,49 @@ class ResearchState:
     # リクエスト者の Mem0 長期記憶（recall 済みの整形済みブロック）。clarify/planner/refine/
     # integrator の briefing に注入する。MAGI 3視点には渡さない（独立性を汚さないため）。
     user_memories: str = ""
+    work_id: str | None = None
+    work_revision: int = 1
+    mode: str = "decision"
+    created_at: str = field(default_factory=utc_now)
+    elapsed_before_resume: float = 0.0
+    requirements: dict = field(default_factory=dict)
+    evaluations: dict[str, dict] = field(default_factory=dict)
+    agent_results: dict[str, dict] = field(default_factory=dict)
+    questions: dict[str, dict] = field(default_factory=dict)
+    decision_record: dict = field(default_factory=dict)
+    learning_record: dict = field(default_factory=dict)
+    evidence_quality: dict = field(default_factory=dict)
+    completion_criteria: list[str] = field(default_factory=list)
+    unknowns: list[str] = field(default_factory=list)
+    completion_status: str = "in_progress"
+    incomplete_reason: str = ""
+    report: str = ""
+    approval_revision: int | None = None
+    memory_epoch: int | None = None
+    audience_key: str | None = None
+    clarification_required: bool = True
+    clarification_default: str | None = None
+
+    def snapshot(self) -> dict:
+        """Provider independent durable state; no native thread or process clock."""
+        payload = asdict(self)
+        payload.pop("started_at", None)
+        payload["elapsed_before_resume"] = self.elapsed_s()
+        # Recalled personal context must be checked again against current policies.
+        payload["user_memories"] = ""
+        return payload
+
+    @classmethod
+    def restore(cls, payload: dict) -> "ResearchState":
+        allowed = {item.name for item in fields(cls)} - {"started_at"}
+        values = {key: value for key, value in payload.items() if key in allowed}
+        values["sources"] = {
+            key: SourceRef(**value) for key, value in values.get("sources", {}).items()
+        }
+        values["results"] = [SubAgentResult(**value) for value in values.get("results", [])]
+        values["lens_outputs"] = [LensResult(**value) for value in values.get("lens_outputs", [])]
+        values["tokens_before_resume"] = values.get("tokens_used", 0)
+        return cls(**values)
 
     def register_source(
         self,
@@ -91,6 +145,8 @@ class ResearchState:
         title: str = "",
         source_type: str = "web",
         snippet: str = "",
+        as_of: str | None = None,
+        fresh_for_s: float | None = None,
     ) -> SourceRef | None:
         """URL を sid 付きで登録（既出なら既存を返す）。無効 URL は None。"""
         norm = normalize_url(url)
@@ -98,6 +154,19 @@ class ResearchState:
             return None
         existing = self.sources.get(norm)
         if existing is not None:
+            existing.fetched_at = utc_now()
+            snippet_changed = bool(snippet and snippet[:300] != existing.snippet)
+            date_changed = as_of is not None and as_of != existing.as_of
+            if snippet_changed or date_changed:
+                if existing.fresh_for_s is not None or fresh_for_s is not None or date_changed:
+                    existing.evidence = []
+                existing.version += 1
+            if snippet_changed:
+                existing.snippet = snippet[:300]
+            if as_of is not None:
+                existing.as_of = as_of
+            if fresh_for_s is not None:
+                existing.fresh_for_s = fresh_for_s
             return existing
         sid = f"S{len(self.sources) + 1}"
         ref = SourceRef(
@@ -106,6 +175,8 @@ class ResearchState:
             url=url,
             source_type=source_type,
             snippet=(snippet or "")[:300],
+            as_of=as_of,
+            fresh_for_s=fresh_for_s,
         )
         self.sources[norm] = ref
         return ref
@@ -126,4 +197,4 @@ class ResearchState:
                 pass
 
     def elapsed_s(self) -> float:
-        return time.monotonic() - self.started_at
+        return self.elapsed_before_resume + time.monotonic() - self.started_at

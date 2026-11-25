@@ -13,6 +13,7 @@ import os
 import re
 import time
 from collections import OrderedDict, deque
+from functools import wraps
 from types import SimpleNamespace
 
 import aiohttp
@@ -356,6 +357,9 @@ _runtime_resources = RuntimeResources(
     force_cancel_timeout_s=SHUTDOWN_FORCE_CLEANUP_TIMEOUT_S,
 )
 _turn_outbox = TurnOutbox(os.path.join(STATE_DIR, "bot_turn_outbox.json"))
+_work_runtime = None
+_conversation_policy_registry = None
+_work_schedule_stop = asyncio.Event()
 
 
 def _serialize_session_info(info) -> dict | str | None:
@@ -590,6 +594,9 @@ async def _patched_close() -> None:
     global _http_session
     log.info("Closing bot and cleaning up resources...")
     _begin_drain()
+    _work_schedule_stop.set()
+    if _work_runtime is not None:
+        await _work_runtime.close()
     try:
         await _runtime_resources.close()
     finally:
@@ -722,6 +729,40 @@ async def on_ready():
         _track_task(bot_record.alpha_recovery_worker(
             add_memories=add_memories, allowed_user_ids=ADMIN_USER_IDS,
         ), name="mem0_batch_recovery")
+        from services.work.bootstrap import enabled, build_runtime
+        if enabled():
+            global _work_runtime, _conversation_policy_registry
+            from services.conversation_policy import ConversationPolicyRegistry
+            from services.memory_policy import get_memory_policy
+
+            def work_provider_options(channel_id, actor_id):
+                key = (int(channel_id), int(actor_id))
+                return {"provider": resolve_provider(explicit=_PROVIDER_OVERRIDES.get(key),
+                            model=_MODEL_OVERRIDES.get(key), restricted=False),
+                        "model": _MODEL_OVERRIDES.get(key), "effort": _EFFORT_OVERRIDES.get(key)}
+
+            async def resume_research(work_id, actor_id, channel):
+                from services.deep_research.orchestrator import resume_deep_research
+                from services.work.store import get_work_store
+                from services.work.research import is_research_work
+                user = bot.get_user(int(actor_id)) or await bot.fetch_user(int(actor_id))
+                deps = deep_research.DeepResearchDeps(bot=bot, send_segmented=_send_segmented,
+                    get_http_session=get_http_session, track_task=_track_task,
+                    work_store=get_work_store(), memory_policy=get_memory_policy(), work_id=work_id)
+                if is_research_work(deps.work_store, work_id, actor_id):
+                    await resume_deep_research(channel, user, work_id, deps)
+                else:
+                    requested = [event for event in deps.work_store.list_events(work_id, limit=1000)
+                                 if event["kind"] == "research_requested"]
+                    skip = bool(requested[-1]["payload"].get("skip_clarify")) if requested else False
+                    work = deps.work_store.get(work_id, actor_id)
+                    await deep_research.run_deep_research(channel, user, work.goal, deps, skip_clarify=skip)
+
+            _work_runtime = build_runtime(bot=bot, task_factory=_track_task,
+                provider_options=work_provider_options, research_resume=resume_research)
+            _conversation_policy_registry = ConversationPolicyRegistry(
+                os.path.join(STATE_DIR, "conversation_policy.sqlite3"), get_memory_policy())
+            _track_task(_work_runtime.schedules.run(_work_schedule_stop), name="work_schedules")
 
 
 # ---------------------------------------------------------------------------
@@ -885,6 +926,18 @@ def _guild_message_addresses_bot(message: discord.Message) -> bool:
     )
 
 
+def _conversation_scoped(handler):
+    @wraps(handler)
+    async def wrapped(message):
+        from services.work_context import current_conversation
+        token = current_conversation.set(None)
+        try:
+            await handler(message)
+        finally:
+            current_conversation.reset(token)
+    return wrapped
+
+
 @bot.event
 async def on_raw_message_delete(payload):
     from services import guild_context
@@ -904,6 +957,7 @@ async def on_raw_message_edit(payload):
 
 
 @bot.event
+@_conversation_scoped
 async def on_message(message: discord.Message):
     # Own the dispatch before admission awaits or spawns indexing work. This
     # closes the phase gap where a SIGTERM could otherwise miss a task that had
@@ -915,6 +969,14 @@ async def on_message(message: discord.Message):
     # Receipt precedes admission: a correction addressed to another speaker
     # must still be visible to subsequent turns, without making the bot reply.
     await guild_context.observe(message)
+    if (_work_runtime is not None and not message.author.bot and is_admin(message.author)
+            and deep_research.is_active_research_thread(message.channel.id)):
+        from services.work_intent import classify_work_intent
+        control_text = strip_mention(message.content, bot.user.id).strip()
+        intent = classify_work_intent(control_text)
+        if intent.action in {"amend", "status", "pause", "cancel", "resume", "followup", "answer", "list"}:
+            if await _work_runtime.handle_message(message, control_text, caller_is_admin=True):
+                return
     admitted = await bot_admission.admit_message(
         message,
         bot=bot,
@@ -954,6 +1016,32 @@ async def on_message(message: discord.Message):
     is_dm = admitted.is_dm
     raw_user_text = admitted.raw_user_text
     prompt = raw_user_text
+
+    if _work_runtime is not None:
+        from services.memory_policy import handle_control
+        from services.work_context import current_conversation
+        private = _work_runtime._private(message.channel, str(message.author.id))
+        if caller_is_admin:
+            control = await handle_control(raw_user_text, str(message.author.id),
+                str(message.channel.id), private, source_message_id=str(message.id),
+                source_timestamp=getattr(message, "created_at", None))
+            if control is not None:
+                destination = message.channel
+                if control.private_response and not private:
+                    try:
+                        destination = await message.author.create_dm()
+                    except discord.HTTPException:
+                        await message.channel.send(control.message,
+                            allowed_mentions=discord.AllowedMentions.none())
+                        return
+                await destination.send(control.message, allowed_mentions=discord.AllowedMentions.none())
+                return
+        if await _work_runtime.handle_message(message, raw_user_text, caller_is_admin=caller_is_admin):
+            return
+        if _conversation_policy_registry is not None:
+            privacy = _conversation_policy_registry.begin(message.author.id, message.channel.id, private,
+                source_message_id=str(message.id))
+            current_conversation.set(privacy)
 
     _request_key = (message.channel.id, message.author.id)
     _forced_model = _MODEL_OVERRIDES.get(_request_key)
@@ -1141,6 +1229,15 @@ async def on_message(message: discord.Message):
             },
         )
         job.phase = JobPhase.PREPROCESSING
+        from services.work_context import current_conversation
+        privacy = current_conversation.get()
+        if privacy is not None and _conversation_policy_registry is not None:
+            privacy = _conversation_policy_registry.begin(message.author.id,
+                message.channel.id, privacy.private, source_message_id=str(message.id))
+            current_conversation.set(privacy)
+        if privacy is not None and privacy.rebuild:
+            from services.conversation_policy import retire_native_context
+            await retire_native_context(message.channel.id, message.author.id)
         if was_queued:
             await status.update("⏳ 考え中...")
             # Swap ⏳→👀 now that processing actually starts.
@@ -1319,6 +1416,12 @@ async def on_message(message: discord.Message):
         actually_resumed = model_result.actually_resumed
         _renderer = model_result.renderer
 
+        if privacy is not None:
+            from services.memory_policy import get_memory_policy
+            if not get_memory_policy().is_current(privacy.epoch):
+                await status.edit_final("処理中に記憶または公開範囲が変更されました。古い情報を含む回答を保留しました。新しい指定は次の応答から適用します。")
+                return
+
         job.phase = JobPhase.FINALIZING
         await status.update("🪄 整形中")
 
@@ -1424,6 +1527,8 @@ async def on_message(message: discord.Message):
             raise
         if delivery.body_delivered:
             await _commit_delivered_turn()
+            if privacy is not None and _conversation_policy_registry is not None:
+                _conversation_policy_registry.commit(privacy)
     except asyncio.CancelledError as _cancel:
         job.phase = JobPhase.FAILED
         # ADR-0038: distinguish a real /abort (cancel("user abort")) from a

@@ -18,13 +18,14 @@ _TOOL_GUIDE = """# ツールの使い分け（サブ質問のドメインに応�
 
 
 CLARIFIER_SYSTEM = """あなたは調査スコープを確定するアシスタントです。
-ユーザーの調査依頼に対し、成果物を依頼の意図に合わせるための **明確化質問を2〜3個** 出してください。
+ユーザーの調査依頼に対し、調査を進めるために不足している条件だけを確認します。
 
 ルール:
-- 出力は質問のみ。前置き・挨拶・「調べます」等は書かない。
-- 各質問は箇条書き（`- ` 始まり）1行で簡潔に。
+- 出力はJSONです。形式は {"questions":[{"text":"質問", "required":true, "default":null}]} です。
+- 回答なしでは進められない質問はrequired=true、default=nullにします。
+- 任意の質問はrequired=falseにし、提案する具体的な既定条件をdefaultに書きます。既定条件の提示は承認ではありません。
 - 観点の例: 対象の時間範囲 / 地域・市場 / 深さ（概観 vs 詳細）/ 出力で重視する側面 / 除外したいもの。
-- 依頼が既に十分具体的でも、確認のための質問を最低1つは出す（範囲確認）。
+- 依頼が既に十分具体的ならquestions=[]を返します。最大3問です。
 """
 
 
@@ -45,8 +46,8 @@ def _mem_prefix(user_memories: str) -> str:
 def build_clarify_briefing(query: str, user_memories: str = "") -> str:
     return (
         f"{_mem_prefix(user_memories)}"
-        "次の調査依頼について、スコープを確定するための明確化質問を2〜3個、"
-        "箇条書きで出してください。リクエスト者の長期記憶（あれば）を踏まえ、"
+        "次の調査依頼について、不足する条件だけをrequired/default付きのJSONで出してください。"
+        "リクエスト者の長期記憶（あれば）を踏まえ、"
         "既に分かっていることは聞き直さず、判断文脈や利害に踏み込む質問を優先してください。\n\n"
         f"調査依頼:\n{query}"
     )
@@ -192,7 +193,7 @@ def build_synthesis_briefing(state) -> str:
         parts.append("# 収集ソース一覧（この番号で引用する）")
         for ref in state.sources.values():
             title = ref.title or ref.url
-            parts.append(f"[{ref.sid}] {title} — {ref.url}")
+            parts.append(f"[{ref.sid}] {title} — {ref.url} / 取得:{ref.fetched_at} / 対象時点:{ref.as_of or '不明'}")
         parts.append("")
     parts.append("# 各サブ調査の要約")
     for i, res in enumerate(state.results, 1):
@@ -308,7 +309,7 @@ def build_evidence_digest(state, *, max_chars: int = 24000) -> str:
         refs = list(state.sources.values())
         for ref in refs[:_DIGEST_MAX_SOURCES]:
             title = ref.title or ref.url
-            head.append(f"[{ref.sid}] {title} — {ref.url}")
+            head.append(f"[{ref.sid}] {title} — {ref.url} / 取得:{ref.fetched_at} / 対象時点:{ref.as_of or '不明'}")
         if len(refs) > _DIGEST_MAX_SOURCES:
             head.append(f"…（他 {len(refs) - _DIGEST_MAX_SOURCES} 件のソースを省略）")
     else:

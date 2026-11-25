@@ -46,3 +46,4 @@ python-multipart>=0.0.31,<0.1    # PYSEC-2026-3036, PYSEC-2026-3037, PYSEC-2026-
 
 # Test packages live in requirements-dev.txt now so prod installs do not
 # pull pytest / pytest-asyncio / pytest-cov / pytest-xdist needlessly.
+jsonschema>=4.26,<5  # Validate host-owned Work tool arguments before dispatch.

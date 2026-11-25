@@ -78,6 +78,7 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
             app_commands.Choice(name="GPT-5.6 Terra (Codex)", value="gpt-5.6-terra"),
             app_commands.Choice(name="GPT-5.6 Luna (Codex)", value="gpt-5.6-luna"),
             app_commands.Choice(name="Fable 5", value="claude-fable-5"),
+            app_commands.Choice(name="Opus 5.5", value="claude-opus-5-5"),
             app_commands.Choice(name="Opus 4.8", value="claude-opus-4-8"),
             app_commands.Choice(name="Opus 4.7", value="claude-opus-4-7"),
             app_commands.Choice(name="Sonnet 5", value="claude-sonnet-5"),

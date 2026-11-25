@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 import discord
 
@@ -54,13 +55,26 @@ async def wait_for_reaction_or_reply(
         return (
             getattr(payload, "message_id", None) == getattr(target_msg, "id", None)
             and getattr(payload, "user_id", None) == uid
+            and str(getattr(payload, "emoji", "")) in {"✅", "👍"}
         )
 
     def message_check(message) -> bool:
+        from services.work_intent import classify_work_intent
+        if classify_work_intent(getattr(message, "content", "") or "").action in {
+            "amend", "status", "pause", "cancel", "resume", "list", "aside", "new", "answer", "followup",
+        }:
+            return False
         return (
             getattr(message.channel, "id", None) == thread_id
             and getattr(message.author, "id", None) == uid
             and not getattr(message.author, "bot", False)
+            and (
+                getattr(getattr(message, "reference", None), "message_id", None)
+                == getattr(target_msg, "id", None)
+                or (getattr(message, "content", "") or "").strip().lower()
+                in {"承認", "進めて", "続けて", "approve", "continue", "明日回答", "明日回答する", "あとで回答"}
+                or bool(re.search(r"(?:明日|後日|あとで|後で).{0,10}(?:回答|返答|答え)", getattr(message, "content", "") or ""))
+            )
         )
 
     reaction_task = asyncio.ensure_future(

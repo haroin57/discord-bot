@@ -14,6 +14,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from typing import Callable
 
 from config import (
     DEEP_RESEARCH_MAX_TOOL_RESULT_CHARS,
@@ -167,21 +168,36 @@ async def _guarded_call_tool(pool, server_locks: dict, qualified_name: str, args
         )
 
 
-def _make_tool_callbacks(pool, server_locks: dict, tools_for_api: list[dict], state: ResearchState):
+def _make_tool_callbacks(
+    pool,
+    server_locks: dict,
+    tools_for_api: list[dict],
+    state: ResearchState,
+    *,
+    parent_can_use_tool: Callable | None = None,
+    builtin_execute_tool: Callable | None = None,
+):
     """run_agent_loop 用の (can_use_tool, execute_tool) を生成。
 
-    - can_use_tool: 広告した web ツールのみ許可（searcher に Bash/Edit 等は与えない）。
+    - can_use_tool: 広告したツールのみ許可し、親の権限判定があれば適用する。
     - execute_tool: 保護付き MCP 呼び出し → 生戻り値からソースを機械抽出 → tool_result 返却。
+      明示的な builtin dispatcher がある場合だけ広告した組み込みツールも実行する。
     """
     allowed = {t.get("name") for t in (tools_for_api or []) if t.get("name")}
 
     def can_use_tool(name, tool_input):
         if name in allowed:
+            if parent_can_use_tool is not None:
+                return parent_can_use_tool(name, tool_input)
             return True, ""
         return False, f"Deep Research では次のツールのみ使用できます: {sorted(allowed)}"
 
     async def execute_tool(name, tool_input):
         try:
+            if not name.startswith("mcp__"):
+                if builtin_execute_tool is None or name not in allowed:
+                    return f"<tool_use_error>Tool '{name}' is not available to this subagent</tool_use_error>"
+                return await builtin_execute_tool(name, tool_input)
             raw = await _guarded_call_tool(pool, server_locks, name, tool_input)
         except asyncio.TimeoutError:
             return f"<tool_use_error>MCP call '{name}' timed out after {TOOL_CALL_TIMEOUT_S}s</tool_use_error>"
@@ -262,6 +278,8 @@ async def run_subagent(
     tool_invocation_callback=None,
     text_stream_callback=None,
     model_override: str | None = None,
+    parent_can_use_tool: Callable | None = None,
+    builtin_execute_tool: Callable | None = None,
 ) -> SubAgentResult:
     """1 サブエージェントを fresh-context で実行し、最終要約のみ返す（CLI 準拠）。
 
@@ -269,7 +287,14 @@ async def run_subagent(
     内部で握って `ok=False` の結果に変換する（部分成功 synthesis を可能にする）。
     `CancelledError` のみ伝播（/abort 用）。
     """
-    can_use_tool, execute_tool = _make_tool_callbacks(pool, server_locks, tools_for_api, state)
+    can_use_tool, execute_tool = _make_tool_callbacks(
+        pool,
+        server_locks,
+        tools_for_api,
+        state,
+        parent_can_use_tool=parent_can_use_tool,
+        builtin_execute_tool=builtin_execute_tool,
+    )
     model = model_override or defn.model
     # effort=max 等の思考力 override（MAGI lead / integrator 用）。None は client 既定。
     output_config_override = {"effort": defn.effort} if defn.effort else None

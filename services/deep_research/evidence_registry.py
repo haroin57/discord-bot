@@ -212,12 +212,16 @@ class EvidenceRegistry:
         title: str = "",
         source_type: str = "web",
         snippet: str = "",
+        as_of: str | None = None,
+        fresh_for_s: float | None = None,
     ) -> SourceRef | None:
         ref = self.state.register_source(
             url=url,
             title=title,
             source_type=source_type,
             snippet=snippet,
+            as_of=as_of,
+            fresh_for_s=fresh_for_s,
         )
         if ref is not None:
             evidence = " ".join(

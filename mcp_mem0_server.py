@@ -461,6 +461,145 @@ async def fact_history(attribute: str, user_id: str = DEFAULT_USER_ID, limit: St
     return contracts.details_json("untrusted_fact_history", rows, _scrub_fact_text)
 
 
+# ---------------------------------------------------------------------------
+# Observation log — numeric time series (体重・食事kcal/栄養素・歩数) kept
+# OUTSIDE Mem0 in its own SQLite store (services/observations.py). Whose rows
+# a call may touch is decided by services/observation_scope.py from the
+# process env (stdio child stamped by the bot) or the X-Kanae-Obs-Speaker
+# header (shared HTTP daemon, stamped per Codex app-server), never by the
+# model-supplied user_id alone.
+# ---------------------------------------------------------------------------
+from typing import Any  # noqa: E402
+
+from mcp.server.fastmcp import Context  # noqa: E402
+
+from services import observation_tools as _obs  # noqa: E402
+from services.observation_scope import SPEAKER_HEADER as _OBS_SPEAKER_HEADER  # noqa: E402
+
+
+def _obs_header_speaker(ctx: "Context | None") -> str | None:
+    """The speaker header of the current HTTP request (None on stdio or when absent)."""
+    if ctx is None:
+        return None
+    try:
+        request = ctx.request_context.request
+    except Exception:  # outside a request
+        return None
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return None
+    value = headers.get(_OBS_SPEAKER_HEADER)
+    return None if value is None else str(value)
+
+
+async def log_observation(
+    metric: str,
+    # Fields that can carry a health value take any JSON ("73.9", "73.9kg", a
+    # list of foods): a bad one is rejected by the observation code without
+    # echoing it, never by argument/schema validation, whose message quotes
+    # the input (and the bot journals it when it validates against this
+    # schema, e.g. once this live handle is advertised).
+    value: Any = None,
+    unit: str = "",
+    basis: str = "",
+    observed_date: str = "",
+    meal_slot: str | None = None,
+    item: Any = None,
+    value_low: Any = None,
+    value_high: Any = None,
+    inputs: Any = "",
+    method: str = "",
+    supersedes: str = "",
+    retract: bool = False,
+    user_id: str = "",
+    source_msg_id: str = "",
+    ctx: Context | None = None,
+) -> str:
+    """Record one number the user reported about themselves (time series, not a Mem0 fact).
+
+    Call once per number when the user states their body weight, body fat,
+    meal energy (kcal), protein/fat/carbs (g) or step count. Do not store
+    these with `add`. Retries of the same message are deduplicated.
+
+    Args:
+        metric: weight | body_fat | kcal | protein | fat | carbs | steps
+            (other snake_case names allowed with an explicit unit).
+        value: The number, in the metric's unit (kg, %, kcal, g, 歩); convert first.
+        unit: Optional; must match the metric's unit.
+        basis: user_stated (default; the user said the number) | label (from a
+            nutrition label/package) | estimate (you estimated it — then pass
+            inputs, method and preferably value_low/value_high).
+        observed_date: YYYY-MM-DD (JST), or today/yesterday/一昨日 counted from
+            the day the user's message was sent. Default: that day. One
+            message may log the same metric for several days.
+        meal_slot: breakfast | lunch | dinner | snack (meal metrics only).
+        item: Food name for per-item rows. For kcal etc., no meal_slot and no
+            item means the user's stated whole-day total.
+        value_low: Lower bound of an estimate range (with value_high).
+        value_high: Upper bound of an estimate range.
+        inputs: What and how much was eaten, as the user said it (text or JSON).
+        method: Estimation method/version, e.g. "mext-food-table/2026-10".
+        supersedes: id (obs_…) of the row this corrects; fields you omit keep
+            that row's values, meal_slot="" / item="" clear them (e.g. a meal
+            row that was really the whole-day total). Never re-log a corrected
+            number without it.
+        retract: With supersedes, withdraw that row instead of correcting it.
+        user_id: Leave empty — the current speaker is used.
+        source_msg_id: Leave empty — the bot supplies the message id.
+    """
+    return await _obs.log_observation(
+        metric=metric, value=value, unit=unit, basis=basis, observed_date=observed_date,
+        meal_slot=meal_slot, item=item, value_low=value_low, value_high=value_high,
+        inputs=inputs, method=method, supersedes=supersedes, retract=retract,
+        user_id=user_id, source_msg_id=source_msg_id,
+        header_speaker=_obs_header_speaker(ctx),
+    )
+
+
+async def query_observations(
+    metric: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    user_id: str = "",
+    limit: int = 100,
+    ctx: Context | None = None,
+) -> str:
+    """List the current speaker's logged numbers (latest value of each, corrections applied).
+
+    Use for trends and "what did I weigh last week" questions instead of
+    searching Mem0.
+
+    Args:
+        metric: weight | body_fat | kcal | protein | fat | carbs | steps, or empty for all.
+        date_from: First day, YYYY-MM-DD (JST) or today/yesterday (counted from
+            the day the user's message was sent). Empty = open.
+        date_to: Last day (inclusive). Empty = open.
+        user_id: Leave empty — the current speaker is used.
+        limit: Max rows (default 100, max 500).
+    """
+    return await _obs.query_observations(
+        metric=metric, date_from=date_from, date_to=date_to, user_id=user_id, limit=limit,
+        header_speaker=_obs_header_speaker(ctx),
+    )
+
+
+async def daily_summary(date: str = "", user_id: str = "", ctx: Context | None = None) -> str:
+    """One day's totals for the current speaker: meal kcal/nutrients summed, latest weight/steps.
+
+    Args:
+        date: YYYY-MM-DD (JST) or today/yesterday. Default: the day the user's
+            message was sent.
+        user_id: Leave empty — the current speaker is used.
+    """
+    return await _obs.daily_summary(date=date, user_id=user_id,
+                                    header_speaker=_obs_header_speaker(ctx))
+
+
+if _obs.tools_enabled():
+    for _obs_tool in (log_observation, query_observations, daily_summary):
+        mcp.tool()(_obs_tool)
+
+
 if __name__ == "__main__":
     log.info("Starting mem0 MCP server (default user_id=%s)", DEFAULT_USER_ID)
     # Shared-instance mode: when MCP_HTTP_PORT is set, serve one streamable-HTTP

@@ -556,18 +556,22 @@ def batch_get_facts_sync(mem, ids) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def get_all_memories(user_id: str, limit: int | None = None) -> list[dict]:
+async def get_all_memories(user_id: str, limit: int | None = None, *, strict: bool = False) -> list[dict]:
     """Retrieve memories for a user.
 
     `limit` is forwarded to Mem0 / ChromaDB so the underlying query can stop
     early instead of fetching the entire collection and slicing in Python.
     Pass None (default) to fetch all (used by the weekly housekeeping cron;
     avoid on hot paths).
+    ``strict=True`` distinguishes backend unavailability from an empty namespace
+    for explicit correction and deletion receipts. The alpha facade has the same API.
     """
     # 初回 init は ChromaDB heartbeat (同期 requests) + Memory.from_config を
     # 含むためイベントループから直接呼ばない（最大5秒のループ停止になる）。
     mem = await asyncio.to_thread(_get_mem0)
     if not mem:
+        if strict:
+            raise RuntimeError("Mem0 is unavailable")
         return []
     try:
         await _refresh_token_if_available()
@@ -576,6 +580,8 @@ async def get_all_memories(user_id: str, limit: int | None = None) -> list[dict]
         if limit is not None:
             kwargs["limit"] = limit
         raw = await asyncio.to_thread(mem.get_all, **kwargs)
+        if strict and not (isinstance(raw, list) or (isinstance(raw, dict) and isinstance(raw.get("results"), list))):
+            raise RuntimeError("Mem0 returned an invalid memory listing")
         return (
             raw.get("results", [])
             if isinstance(raw, dict)
@@ -583,6 +589,8 @@ async def get_all_memories(user_id: str, limit: int | None = None) -> list[dict]
         )
     except Exception as exc:
         log.warning("Mem0 get_all error: %s", exc)
+        if strict:
+            raise
         return []
 
 

@@ -9,6 +9,7 @@ from typing import Awaitable, Callable
 import discord
 
 from .types import LensResult
+from services.work.research import ResearchInterrupted
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,8 @@ class MagiScheduler:
         )
         results: list[LensResult] = []
         for key, result in zip(self.lens_order, raw):
+            if isinstance(result, ResearchInterrupted):
+                raise result
             if isinstance(result, LensResult):
                 results.append(result)
             else:
@@ -65,6 +68,9 @@ class MagiScheduler:
                     )
                 )
         ctx.state.lens_outputs = results
+        journal = getattr(ctx, "journal", None)
+        if journal:
+            journal.save(ctx.state, "lenses_completed")
         if not any(result.ok and result.body.strip() for result in results):
             return None
         await self.safe_edit(

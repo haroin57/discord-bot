@@ -19,6 +19,7 @@ return the localized error message without retrying.
 
 import asyncio
 import logging
+import functools
 import os
 import time
 from contextlib import AsyncExitStack
@@ -66,7 +67,7 @@ from services.claude_api.compaction import (
     reset_rapid_refill,
     start_background_compaction,
 )
-from services.claude_api.microcompact import microcompact_tool_results
+from services.claude_api.microcompact import microcompact_tool_results, sticky_microcompact
 from services.mcp_selector import (
     get_mcp_servers_by_keys,
     select_mcp_servers,
@@ -439,6 +440,34 @@ def _compose_system_prompt(
     return f"{SYSTEM_PROMPT.rstrip()}\n\n{active_skill_prompt.strip()}"
 
 
+async def _prepare_mcp_and_replay(
+    raw_user_text: str, channel_id: int, user_id: "int | None",
+) -> tuple[dict, tuple[list[dict], str, str] | None]:
+    """Overlap independent selection I/O and replay reads for an admin turn.
+
+    Neither operation mutates the session registry or executes tools. Keep the
+    existing fail-open history read, but propagate selector errors and caller
+    cancellation after collecting both child tasks.
+    """
+    async def load_replay() -> tuple[list[dict], str, str] | None:
+        try:
+            return await asyncio.to_thread(load_api_replay_channel, channel_id)
+        except Exception as exc:
+            log.warning("[ch=%d] history load failed: %s", channel_id, exc)
+            return None
+
+    selection = asyncio.create_task(select_mcp_servers(raw_user_text, user_id=user_id))
+    replay = asyncio.create_task(load_replay())
+    try:
+        selected, loaded = await asyncio.gather(selection, replay)
+        return selected, loaded
+    finally:
+        for task in (selection, replay):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(selection, replay, return_exceptions=True)
+
+
 async def call_with_tools(
     prompt: str,
     channel_id: int,
@@ -502,8 +531,11 @@ async def call_with_tools(
         if restricted:
             chosen_mcp_cfg: dict[str, dict] = {}
             always_advertised_mcp_keys: set[str] = set()
+            loaded_replay = None
         else:
-            chosen_mcp_cfg = await select_mcp_servers(raw_user_text, user_id=user_id)
+            chosen_mcp_cfg, loaded_replay = await _prepare_mcp_and_replay(
+                raw_user_text, channel_id, user_id,
+            )
             always_advertised_mcp_keys = set(ALWAYS_ADVERTISED_MCP_KEYS)
             if EVAL_MCP_ENABLED and "evalsearch" in MCP_SERVERS:
                 # 評価ハーネス: 凍結コーパス検索を eager spawn 経路で広告する
@@ -545,74 +577,74 @@ async def call_with_tools(
         # in docs/plans/pdf-pdf-pdf-pdf-tingly-moth.md).
         prior_history: list[dict] = []
         latest_context_snapshot = ""
-        if not restricted:
-            try:
-                (
-                    loaded_history,
-                    loaded_snapshot,
-                    loaded_snapshot_ts,
-                ) = await asyncio.to_thread(load_api_replay_channel, channel_id)
-            except Exception as exc:
-                log.warning("[ch=%d] history load failed: %s", channel_id, exc)
-            else:
-                latest_context_snapshot = loaded_snapshot
-                if latest_context_snapshot and loaded_snapshot_ts:
-                    try:
-                        from datetime import datetime, timezone
+        if loaded_replay is not None:
+            loaded_history, loaded_snapshot, loaded_snapshot_ts = loaded_replay
+            latest_context_snapshot = loaded_snapshot
+            if latest_context_snapshot and loaded_snapshot_ts:
+                try:
+                    from datetime import datetime, timezone
 
-                        snap_dt = datetime.fromisoformat(loaded_snapshot_ts)
-                        if snap_dt.tzinfo is None:
-                            snap_dt = snap_dt.replace(tzinfo=timezone.utc)
-                        age = (datetime.now(timezone.utc) - snap_dt).total_seconds()
-                        if age > _SNAPSHOT_MAX_AGE_S:
-                            log.info(
-                                "[ch=%d] stale context snapshot dropped (age=%.0fs)",
-                                channel_id,
-                                age,
-                            )
-                            latest_context_snapshot = ""
-                    except (ValueError, TypeError):
-                        pass
-                # ADR-0010 phase 3: seed the prior transcript regardless of
-                # session freshness — the same thing the official CLI's
-                # --resume does. Before this, a restart / 30-min TTL lapse
-                # (resumable=False) silently dropped the whole conversation;
-                # now the context survives the boundary, and when the window
-                # has grown past the Fable-safe budget it is compacted below
-                # before the request goes out.
-                prior_history = loaded_history
+                    snap_dt = datetime.fromisoformat(loaded_snapshot_ts)
+                    if snap_dt.tzinfo is None:
+                        snap_dt = snap_dt.replace(tzinfo=timezone.utc)
+                    age = (datetime.now(timezone.utc) - snap_dt).total_seconds()
+                    if age > _SNAPSHOT_MAX_AGE_S:
+                        log.info(
+                            "[ch=%d] stale context snapshot dropped (age=%.0fs)",
+                            channel_id,
+                            age,
+                        )
+                        latest_context_snapshot = ""
+                except (ValueError, TypeError):
+                    pass
+            # ADR-0010 phase 3: seed the prior transcript regardless of
+            # session freshness — the same thing the official CLI's
+            # --resume does. Before this, a restart / 30-min TTL lapse
+            # (resumable=False) silently dropped the whole conversation;
+            # now the context survives the boundary, and when the window
+            # has grown past the Fable-safe budget it is compacted below
+            # before the request goes out.
+            prior_history = loaded_history
 
-                # Time-based microcompact (ported from CLI $F_/wF_): on an idle
-                # gap, clear OLD tool_result bodies (cheap, no LLM) before the
-                # costly full compaction below. Gap is measured from the freshest
-                # replayed snapshot timestamp; older tool outputs become a short
-                # placeholder while the last KEEP_RECENT are kept verbatim.
-                if MICROCOMPACT_ENABLED and prior_history and loaded_snapshot_ts:
-                    try:
-                        from datetime import datetime, timezone
+            # Time-based microcompact (ported from CLI $F_/wF_): on an idle
+            # gap, clear OLD tool_result bodies (cheap, no LLM) before the
+            # costly full compaction below. Gap is measured from the freshest
+            # replayed snapshot timestamp; older tool outputs become a short
+            # placeholder while the last KEEP_RECENT are kept verbatim.
+            _mc_sticky = os.environ.get("MICROCOMPACT_STICKY", "0") == "1"
+            if MICROCOMPACT_ENABLED and prior_history and (loaded_snapshot_ts or _mc_sticky):
+                try:
+                    from datetime import datetime, timezone
 
+                    _gap_min = 0.0
+                    if loaded_snapshot_ts:
                         _sdt = datetime.fromisoformat(loaded_snapshot_ts)
                         if _sdt.tzinfo is None:
                             _sdt = _sdt.replace(tzinfo=timezone.utc)
                         _gap_min = (
                             datetime.now(timezone.utc) - _sdt
                         ).total_seconds() / 60.0
-                        prior_history, _mc_saved = microcompact_tool_results(
-                            prior_history,
-                            gap_minutes=_gap_min,
-                            gap_threshold_min=MICROCOMPACT_GAP_MIN,
-                            keep_recent=MICROCOMPACT_KEEP_RECENT,
+                    _mc = (
+                        functools.partial(sticky_microcompact, channel_id)
+                        if _mc_sticky
+                        else microcompact_tool_results
+                    )
+                    prior_history, _mc_saved = _mc(
+                        prior_history,
+                        gap_minutes=_gap_min,
+                        gap_threshold_min=MICROCOMPACT_GAP_MIN,
+                        keep_recent=MICROCOMPACT_KEEP_RECENT,
+                    )
+                    if _mc_saved > 0:
+                        log.info(
+                            "[ch=%d] microcompact: gap=%.0fmin, cleared old "
+                            "tool_results (~%d tokens reclaimed)",
+                            channel_id,
+                            _gap_min,
+                            _mc_saved,
                         )
-                        if _mc_saved > 0:
-                            log.info(
-                                "[ch=%d] microcompact: gap=%.0fmin, cleared old "
-                                "tool_results (~%d tokens reclaimed)",
-                                channel_id,
-                                _gap_min,
-                                _mc_saved,
-                            )
-                    except (ValueError, TypeError):
-                        pass
+                except (ValueError, TypeError):
+                    pass
 
         # 5. Per-call settings
         if restricted:
@@ -664,6 +696,19 @@ async def call_with_tools(
                 pool_available = {
                     k: v for k, v in MCP_SERVERS.items() if k in _spawnable
                 }
+                # Observation log: this request's mem0 child may only touch the
+                # speaker's numbers, keyed to this Discord message. On failure
+                # the static config's OBS_SPEAKER_USER_ID="-" fails closed.
+                try:
+                    from services.observation_scope import scope_mcp_configs
+
+                    pool_available = scope_mcp_configs(
+                        pool_available, speaker_user_id=user_id,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "observation scope stamping failed: %s", type(exc).__name__,
+                    )
             pool = McpPool(stack=stack, available_configs=pool_available)
             if chosen_mcp_cfg:
                 # Always-advertised MCPs (Mem0) are spawned lazily on first

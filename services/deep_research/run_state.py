@@ -70,6 +70,7 @@ class ResearchRun:
     state: ResearchState
     run_id: str = field(default_factory=lambda: uuid4().hex)
     approval_deadline: float | None = None
+    journal: object = field(default=None, repr=False)
     _tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
     _stack_cleanup_task: asyncio.Task | None = field(default=None, repr=False)
     _stack_cleanup_done: bool = field(default=False, repr=False)

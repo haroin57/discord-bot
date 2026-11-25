@@ -21,6 +21,12 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
 
         channel_id = interaction.channel_id
         cancelled = cancel_channel_jobs(channel_id) if channel_id is not None else 0
+        if channel_id is not None:
+            try:
+                from services.work.runtime import get_work_runtime
+                cancelled += get_work_runtime().interrupt_channel(str(channel_id))
+            except RuntimeError:
+                pass
         if cancelled == 0:
             await interaction.response.send_message(
                 "中断対象なし (進行中・待機中の応答はありません)", ephemeral=True,
@@ -77,14 +83,23 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
             get_http_session=deps.get_http_session,
             track_task=deps.track_task,
         )
-        deps.track_task(
-            deep_research.run_deep_research(
-                channel, interaction.user, query, dr_deps, skip_clarify=skip_clarify,
-            ),
-            name="deep_research",
-        )
+        from services.work.store import get_work_store
+        from services.memory_policy import get_memory_policy
+        dr_deps.work_store = get_work_store()
+        dr_deps.memory_policy = get_memory_policy()
+        work = dr_deps.work_store.create(str(interaction.user.id), str(channel.id), query,
+            f"research:{interaction.id}", guild_id=str(interaction.guild_id) if interaction.guild_id else None)
+        dr_deps.work_id = work.id
+        dr_deps.work_store.record_event(work.id, "research_requested", {"skip_clarify": skip_clarify})
+        from services.work.runtime import get_work_runtime
+        try:
+            runtime = get_work_runtime()
+        except RuntimeError:
+            await interaction.followup.send(f"用件 {work.id} を保存しました。実行基盤の起動後に /work resume で再開できます。", ephemeral=True)
+            return
+        await runtime.start(work.id, str(interaction.user.id), channel)
         await interaction.followup.send(
-            "🔬 Deep Research を開始しました。スレッドで進行します（数分かかることがあります）。",
+            f"用件 {work.id} を保存しました。調査はスレッドで進行します。",
             ephemeral=True,
         )
 

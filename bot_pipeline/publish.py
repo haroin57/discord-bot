@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from services.conversation_policy import assert_current_delivery
+
 import asyncio
 import inspect
 import io
@@ -180,6 +182,7 @@ async def send_segmented(
             text = segment.content.strip()
             if text:
                 for chunk in deps.split_message(text):
+                    assert_current_delivery()
                     sent = await sender.send(chunk)
                     if delivery_state is not None:
                         await delivery_state.record_message(
@@ -196,6 +199,7 @@ async def send_segmented(
                 try:
                     attachment = discord.File(image_path)
                     try:
+                        assert_current_delivery()
                         sent = await sender.send(file=attachment)
                         if delivery_state is not None:
                             await delivery_state.record_message(
@@ -218,6 +222,7 @@ async def send_segmented(
             else:
                 log.warning("Table render failed, falling back to text")
                 for chunk in deps.split_message(segment.markdown):
+                    assert_current_delivery()
                     sent = await sender.send(chunk)
                     if delivery_state is not None:
                         await delivery_state.record_message(
@@ -238,6 +243,7 @@ async def send_segmented(
                         description=description.strip()[:1024] or None,
                     )
                     try:
+                        assert_current_delivery()
                         sent = await sender.send(file=attachment)
                         if delivery_state is not None:
                             await delivery_state.record_message(
@@ -264,6 +270,7 @@ async def send_segmented(
                     if not segment.display_mode
                     else f"```\n{segment.latex}\n```"
                 )
+                assert_current_delivery()
                 sent = await sender.send(fallback)
                 if delivery_state is not None:
                     await delivery_state.record_message(
@@ -272,6 +279,7 @@ async def send_segmented(
                     )
 
     if attach_files:
+        assert_current_delivery()
         sent = await message.channel.send(files=attach_files)
         attachment_response_id = sent.id
         if delivery_state is not None:
@@ -331,6 +339,7 @@ async def prepare_response(
         (raw_user_text or "")[:80],
     )
     try:
+        assert_current_delivery()
         await message.reply("⚠️ うまく返事できなかったです。もう一度試してください。")
         await status.delete_if_alive()
     except discord.errors.HTTPException as exc:
@@ -468,6 +477,7 @@ async def publish_response(
                         len(reply_files),
                     )
                     reply_files = reply_files[:10]
+                assert_current_delivery()
                 sent = await message.channel.send(files=reply_files)
                 await delivery.record_message(sent, on_first_ack=on_first_ack)
                 await archive_generated(sent.id)
@@ -488,6 +498,7 @@ async def publish_response(
                         len(all_files),
                     )
                     all_files = all_files[:10]
+                assert_current_delivery()
                 sent = await message.reply(
                     "📄 長文のため response.md として添付します。",
                     files=all_files,
@@ -515,6 +526,7 @@ async def publish_response(
                     reply_files = reply_files[:10]
                 for index, chunk in enumerate(deps.split_message(response_text)):
                     if index == 0 and reply_files:
+                        assert_current_delivery()
                         sent = await sender.send(chunk, files=reply_files)
                         await delivery.record_message(
                             sent,
@@ -522,6 +534,7 @@ async def publish_response(
                         )
                         await archive_generated(sent.id)
                     else:
+                        assert_current_delivery()
                         sent = await sender.send(chunk)
                         await delivery.record_message(
                             sent,
@@ -579,6 +592,7 @@ async def publish_response(
             for name, reason in attachment_rejections[:10]
         ]
         try:
+            assert_current_delivery()
             await message.channel.send("\n".join(lines))
         except discord.errors.HTTPException:
             pass

@@ -730,6 +730,8 @@ async def run_agent_loop(
             extra_headers=extra_headers,
             fallback_used=fallback_used,
         )
+        from services.claude_api.prefix_audit import audit_request_prefix
+        audit_request_prefix(channel_id, stream_kwargs)
 
         # Live token stream for the CURRENT turn's visible text. Accumulated
         # across text_delta events so text_stream_callback always receives the

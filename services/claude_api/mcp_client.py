@@ -292,6 +292,93 @@ STATIC_MCP_TOOL_SCHEMAS: dict[str, list[dict]] = {
                 "required": ["user_message", "assistant_message"],
             },
         },
+        # Observation log (services/observations.py): numbers stay a time
+        # series outside Mem0. user_id/source_msg_id are bound by the bot
+        # (services/observation_scope.py), so the model should omit them.
+        {
+            "name": "mcp__mem0__log_observation",
+            "description": (
+                "Record one number the user reported about themselves: "
+                "weight(kg) / body_fat(%) / kcal / protein・fat・carbs(g) / "
+                "steps(歩). One call per number; corrections pass supersedes="
+                "<obs id> (never re-log) and keep the fields you omit "
+                "(meal_slot=\"\" / item=\"\" clear them). basis: user_stated "
+                "(default) / label "
+                "(nutrition label) / estimate (you estimated: also give inputs = "
+                "what and how much as the user said, method = method/version, "
+                "value_low/value_high). Meal metrics take meal_slot "
+                "breakfast/lunch/dinner/snack and item per food; no slot and no "
+                "item = the user's whole-day total. Omit user_id. "
+                "【いつ呼ぶか】ユーザーが自分の体重・食事のカロリー/栄養素・"
+                "歩数などの数値を言ったとき。これらは add (Mem0) に入れない。"
+            ),
+            # The bot validates tool input against this schema and journals a
+            # failure WITH the offending value (tool_execution: "input
+            # validation failed: ..."). Fields that can carry a health value
+            # therefore accept any JSON: the server parses them and rejects
+            # bad ones with a content-free message instead.
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "metric": {"type": "string"},
+                    "value": {"description": "number in the metric's unit (kg, %, kcal, g, 歩)"},
+                    "unit": {"type": "string"},
+                    "basis": {"type": "string",
+                              "enum": ["user_stated", "label", "estimate"]},
+                    "observed_date": {"type": "string",
+                                      "description": "YYYY-MM-DD (JST) or today/yesterday, counted "
+                                                     "from the day the user's message was sent "
+                                                     "(the default)"},
+                    "meal_slot": {"type": "string",
+                                  "description": "breakfast / lunch / dinner / snack"},
+                    "item": {"description": "food name (text)"},
+                    "value_low": {"description": "number: lower bound of an estimate"},
+                    "value_high": {"description": "number: upper bound of an estimate"},
+                    "inputs": {"description": "what and how much was eaten, as the user "
+                                              "said it (text or JSON)"},
+                    "method": {"type": "string"},
+                    "supersedes": {"type": "string"},
+                    "retract": {"type": "boolean", "default": False},
+                    "user_id": {"type": "string"},
+                    "source_msg_id": {"type": "string"},
+                },
+                "required": ["metric"],
+            },
+        },
+        {
+            "name": "mcp__mem0__query_observations",
+            "description": (
+                "List the speaker's logged numbers (latest value of each, "
+                "corrections applied) for a metric and JST date range. "
+                "【いつ呼ぶか】体重・摂取カロリー・歩数の推移や過去の値を聞かれたとき"
+                "（Mem0 search ではなくこちら）。"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "metric": {"type": "string"},
+                    "date_from": {"type": "string"},
+                    "date_to": {"type": "string"},
+                    "user_id": {"type": "string"},
+                    "limit": {"type": "integer", "default": 100},
+                },
+            },
+        },
+        {
+            "name": "mcp__mem0__daily_summary",
+            "description": (
+                "One JST day's totals for the speaker: meal kcal/nutrients "
+                "summed per meal, latest weight/steps. "
+                "【いつ呼ぶか】「今日何kcal食べた？」など1日の集計を聞かれたとき。"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string"},
+                    "user_id": {"type": "string"},
+                },
+            },
+        },
     ],
 }
 

@@ -28,8 +28,10 @@ from services.session_registry import (
     SessionRegistry,
     SessionRepository,
 )
+from services.stable_replay import StableReplayWindow
 
 log = logging.getLogger(__name__)
+_stable_api_replay_window = StableReplayWindow(max_channels=MAX_SESSIONS)
 
 # ---------------------------------------------------------------------------
 # SDK session IDs (channel_id -> SessionInfo for --resume)
@@ -273,6 +275,21 @@ def _history_file(channel_id: int) -> str:
 def append_jsonl(channel_id: int, entry: dict) -> None:
     """Append a single entry to the channel's JSONL transcript (fire-and-forget safe)."""
     _validate_channel_id(channel_id)
+    from services.work_context import current_conversation
+    privacy = current_conversation.get()
+    if privacy is not None:
+        from services.memory_policy import get_memory_policy
+        policy = get_memory_policy()
+        if not policy.is_current(privacy.epoch):
+            raise RuntimeError("Stale memory epoch cannot be persisted as current context")
+        entry = dict(entry)
+        entry["memory_epoch"] = privacy.epoch
+        entry["audience_key"] = policy.audience_key(
+            privacy.owner_id, privacy.channel_id, privacy.private,
+        )
+        entry["owner_id"] = privacy.owner_id
+        if privacy.source_message_id is not None:
+            entry["source_message_id"] = privacy.source_message_id
     entry["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     entry["channel_id"] = channel_id
     # Open with 0o600 so conversation transcripts are not world-readable on a
@@ -594,7 +611,7 @@ def _tail_jsonl(
     previous `data = read() + data` pattern which was O(n²) in memory churn
     (1 MB file → ~64 MB intermediate allocation under the old pattern).
     """
-    if not os.path.isfile(path):
+    if max_entries <= 0 or not os.path.isfile(path):
         return []
     try:
         with open(path, "rb") as f:
@@ -638,7 +655,10 @@ def _tail_jsonl(
         cutoff_dt = datetime.now(timezone.utc) - timedelta(days=max_age_days)
 
     messages: list[dict] = []
-    for line in lines:
+    # Parse newest rows first. Structured tool transcripts can dwarf the
+    # display text; parsing rows we would immediately discard doubles that
+    # CPU/allocation cost on every replay. Restore chronological order below.
+    for line in reversed(lines):
         line = line.strip()
         if not line:
             continue
@@ -662,6 +682,13 @@ def _tail_jsonl(
                     except (ValueError, TypeError):
                         pass
             msg = {"role": entry["role"], "content": entry["content"]}
+            from services.work_context import current_conversation
+            provenance_keys = ("memory_epoch", "audience_key", "owner_id", "source_message_id", "message_id")
+            if current_conversation.get() is not None:
+                provenance_keys += ("timestamp", "channel_id")
+            for key in provenance_keys:
+                if key in entry:
+                    msg[key] = entry[key]
             # Carry the speaker label forward when present so callers that care
             # about attribution (load_api_replay_channel) can use it. Absent on
             # old rows / assistant turns — harmless to omit.
@@ -685,9 +712,11 @@ def _tail_jsonl(
                 if entry.get("timestamp"):
                     msg["timestamp"] = entry["timestamp"]
             messages.append(msg)
-    if len(messages) > max_entries:
-        messages = messages[-max_entries:]
-    return messages
+            if len(messages) == max_entries:
+                break
+    messages.reverse()
+    from services.conversation_policy import filter_rows
+    return filter_rows(messages)
 
 
 def load_history_channel(channel_id: int) -> list[dict]:
@@ -956,12 +985,18 @@ def load_api_replay_channel(channel_id: int) -> tuple[list[dict], str, str]:
     from config import HISTORY_MAX_AGE_DAYS
 
     _validate_channel_id(channel_id)
+    extra_rows = max(0, min(MAX_MESSAGES_PER_CHANNEL, int(os.environ.get("CLAUDE_API_REPLAY_EXTRA_ROWS", "0"))))
+    minimum_rows = MAX_MESSAGES_PER_CHANNEL * 2
     rows = _tail_jsonl(
         _history_file(channel_id),
-        MAX_MESSAGES_PER_CHANNEL * 2,
+        minimum_rows + extra_rows + (1 if extra_rows else 0),
         include_context_snapshot=True,
         max_age_days=HISTORY_MAX_AGE_DAYS,
     )
+    if extra_rows:
+        rows = _stable_api_replay_window.select(
+            channel_id, rows, minimum_rows=minimum_rows, extra_rows=extra_rows,
+        )
     # Self-heal channels already poisoned by persisted sentinel/error replies:
     # drop assistant rows whose content is "(no response)" or an error message.
     # Replaying them primes the model to keep refusing (ADR-0008). New writes are

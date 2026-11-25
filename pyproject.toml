@@ -59,6 +59,10 @@ files = [
     "services/offload/archive_transport.py",
     "services/offload/knowledge_client.py",
     "services/offload/knowledge_server.py",
+    "services/work_context.py",
+    "services/work_intent.py",
+    "services/response_preferences.py",
+    "services/work/model.py",
 ]
 ignore_missing_imports = true
 check_untyped_defs = true

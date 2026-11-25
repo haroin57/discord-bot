@@ -16,6 +16,9 @@ import asyncio
 import logging
 import random
 import re
+import hashlib
+import json
+from dataclasses import asdict
 
 from config import (
     DEEP_RESEARCH_MAGI_EFFORT,
@@ -47,11 +50,37 @@ from .prompts import (
 )
 from .agent_runner import ResearchAgentDef, extract_plan, run_subagent
 from .sources import build_final_report
-from .types import LensResult
+from .types import LensResult, SubAgentResult
+from services.work.research import ResearchInterrupted
 
 log = logging.getLogger(__name__)
 
 _STANCE_RE = re.compile(r"^\s*STANCE\s*[:：]\s*(.+)$", re.MULTILINE)
+
+
+async def _run_agent(ctx, **kwargs):
+    journal = getattr(ctx, "journal", None)
+    if journal is None:
+        return await run_subagent(**kwargs)
+    journal.assert_current(ctx.state)
+    from .orchestrator import _requirements_briefing
+    original_briefing = kwargs.get("briefing", "")
+    kwargs["briefing"] = original_briefing + _requirements_briefing(ctx.state)
+    # Cache only public results, keyed by their complete task inputs. Native
+    # provider sessions and hidden reasoning never form part of a checkpoint.
+    key = hashlib.sha256(json.dumps({
+        "agent": asdict(kwargs["defn"]), "briefing": original_briefing,
+        "requirements": ctx.state.requirements,
+        "tools": kwargs.get("tools_for_api", []),
+    }, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    cached = ctx.state.agent_results.get(key)
+    if cached and cached.get("ok"):
+        return SubAgentResult(**cached)
+    result = await run_subagent(**kwargs)
+    journal.assert_current(ctx.state)
+    ctx.state.agent_results[key] = {**asdict(result), "subq": kwargs["defn"].agent_type}
+    journal.save(ctx.state, kwargs["defn"].agent_type)
+    return result
 
 
 def parse_lens_output(text: str) -> str:
@@ -94,7 +123,7 @@ async def run_magi_lens(
             idle_timeout_s=DEEP_RESEARCH_SEARCHER_IDLE_TIMEOUT_S,
         )
         async with sema:
-            dres = await run_subagent(
+            dres = await _run_agent(ctx,
                 api_client=ctx.api_client,
                 pool=ctx.pool,
                 server_locks=ctx.server_locks,
@@ -129,7 +158,7 @@ async def run_magi_lens(
 
             async def _worker(subtask: str):
                 async with sema:
-                    return await run_subagent(
+                    return await _run_agent(ctx,
                         api_client=ctx.api_client,
                         pool=ctx.pool,
                         server_locks=ctx.server_locks,
@@ -161,7 +190,7 @@ async def run_magi_lens(
             effort=DEEP_RESEARCH_MAGI_EFFORT,
         )
         async with sema:
-            lres = await run_subagent(
+            lres = await _run_agent(ctx,
                 api_client=ctx.api_client,
                 pool=ctx.pool,
                 server_locks=ctx.server_locks,
@@ -171,7 +200,7 @@ async def run_magi_lens(
                 state=ctx.state,
                 channel_id=ctx.thread.id,
             )
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, ResearchInterrupted):
         raise
     except Exception as exc:  # noqa: BLE001 - 1レンズの失敗で全体を止めない
         log.exception("magi lens %s failed", lens_key)
@@ -239,7 +268,7 @@ async def run_integrator(ctx) -> str | None:
         idle_timeout_s=DEEP_RESEARCH_MAGI_IDLE_TIMEOUT_S,
         effort=DEEP_RESEARCH_MAGI_EFFORT,
     )
-    res = await run_subagent(
+    res = await _run_agent(ctx,
         api_client=ctx.api_client,
         pool=ctx.pool,
         server_locks=ctx.server_locks,
@@ -279,7 +308,7 @@ async def _critic_pass(ctx, integ_def, cq: str, report: str, digest: str) -> str
             max_tool_turns=1,
             idle_timeout_s=DEEP_RESEARCH_SEARCHER_IDLE_TIMEOUT_S,
         )
-        cres = await run_subagent(
+        cres = await _run_agent(ctx,
             api_client=ctx.api_client,
             pool=ctx.pool,
             server_locks=ctx.server_locks,
@@ -294,7 +323,7 @@ async def _critic_pass(ctx, integ_def, cq: str, report: str, digest: str) -> str
             log.info("report critic: PASS (no revision)")
             return report
         log.info("report critic: %d chars of findings; revising once", len(critique))
-        rres = await run_subagent(
+        rres = await _run_agent(ctx,
             api_client=ctx.api_client,
             pool=ctx.pool,
             server_locks=ctx.server_locks,
@@ -309,6 +338,8 @@ async def _critic_pass(ctx, integ_def, cq: str, report: str, digest: str) -> str
         log.warning("report critic revision failed; keeping original report")
         return report
     except asyncio.CancelledError:
+        raise
+    except ResearchInterrupted:
         raise
     except Exception as exc:  # noqa: BLE001 - critic 失敗でレポートを落とさない
         log.warning("report critic pass failed (non-fatal): %s", exc)

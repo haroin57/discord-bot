@@ -1,14 +1,20 @@
 """Semantic search: plain/multi/smart + LLM-based query rewrite & re-rank."""
 
 import asyncio
+import collections
+import contextvars
 import functools
 import logging
 import os
 import re
+import threading
 import time
 import weakref
+from datetime import datetime, timezone
 
+from services.mem0 import assoc
 from services.mem0.format import strip_json_fence
+from services.query_expansion import QueryExpansionSingleFlight
 
 from services.mem0.client import (
     MEM0_RELEVANCE_MAX_DISTANCE,
@@ -23,6 +29,9 @@ from services.oauth_manager import (
 )
 
 log = logging.getLogger(__name__)
+_QUERY_SINGLEFLIGHT = QueryExpansionSingleFlight()
+# Set by retrieval v1 around _expand_queries: its query-text log lines -> DEBUG.
+_QUIET_EXPAND: contextvars.ContextVar[bool] = contextvars.ContextVar("_QUIET_EXPAND", default=False)
 
 
 # Caller-side gate for the Haiku rewrite/rerank stages. The default Discord
@@ -1051,6 +1060,42 @@ async def _finalize_smart_result(
     return merged
 
 
+async def _query_representations(query: str) -> tuple[list[str], str, str]:
+    tasks = [asyncio.create_task(stage(query)) for stage in (
+        _rewrite_query, _generate_hypothetical_fact, _extract_keywords_via_llm,
+    )]
+    try:
+        result = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    return result[0], result[1], result[2]
+
+
+async def _shared_query_representations(query: str, user_id: str) -> tuple[list[str], str, str]:
+    if os.environ.get("MEM0_QUERY_SINGLEFLIGHT_ENABLED", "0").lower() not in {"1", "true", "yes"}:
+        return await _query_representations(query)
+    from config import MEM0_HYDE_ENABLED
+
+    configuration = {
+        "implementation": "legacy",
+        "settings": {name: os.environ.get(name) for name in (
+            "MEM0_REWRITE_MODEL", "MEM0_REWRITE_MAX_TOKENS", "MEM0_HYDE_MODEL",
+            "MEM0_HYDE_MAX_TOKENS", "MEM0_KEYWORD_MODEL", "MEM0_KEYWORD_MAX_TOKENS",
+        )},
+        "hyde_enabled": MEM0_HYDE_ENABLED,
+        "prompts": [_REWRITE_PROMPT, _HYDE_PROMPT, _KEYWORD_EXTRACT_PROMPT],
+        "completion": id(_query_representations),
+    }
+    return await _QUERY_SINGLEFLIGHT.run(
+        user_id=user_id, query=query, configuration=configuration,
+        factory=lambda: _query_representations(query),
+    )
+
+
 async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[str]:
     """Phase A-1/B-1: build the multi-query set from one user query.
 
@@ -1059,13 +1104,16 @@ async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[st
     ``rewrite`` — the Haiku trio (canonical-keyword rewrite, HyDE fact
     paraphrase, LLM keyword extraction) run in parallel. Downstream merge
     dedupes, so redundancy between layers is harmless.
+
+    Under retrieval v1 (``_QUIET_EXPAND`` set) the query-text lines go to DEBUG.
     """
+    _info = log.debug if _QUIET_EXPAND.get() else log.info
     queries = [query]
     # Graph-based alias expansion runs even when LLM rewrite is disabled
     # — it's a cheap sqlite lookup, no extra Anthropic round-trip.
     alias_variants = await _expand_query_via_graph(query, user_id)
     if alias_variants:
-        log.info(
+        _info(
             "alias_expand: %r → +%d variants: %s",
             query,
             len(alias_variants),
@@ -1080,22 +1128,18 @@ async def _expand_queries(query: str, user_id: str, *, rewrite: bool) -> list[st
     # Janome's cold dictionary load and Japanese tokenization are synchronous.
     morpho_variant = await asyncio.to_thread(_expand_query_via_morpho, query)
     if morpho_variant and morpho_variant not in queries:
-        log.info("morpho_expand: %r → %r", (query or "")[:60], morpho_variant)
+        _info("morpho_expand: %r → %r", (query or "")[:60], morpho_variant)
         queries.append(morpho_variant)
     if rewrite:
-        variants, hyde, llm_keywords = await asyncio.gather(
-            _rewrite_query(query),
-            _generate_hypothetical_fact(query),
-            _extract_keywords_via_llm(query),
-        )
+        variants, hyde, llm_keywords = await _shared_query_representations(query, user_id)
         for v in variants:
             if v and v not in queries:
                 queries.append(v)
         if hyde and hyde not in queries:
-            log.info("hyde: %r → %r", (query or "")[:60], hyde[:80])
+            _info("hyde: %r → %r", (query or "")[:60], hyde[:80])
             queries.append(hyde)
         if llm_keywords and llm_keywords not in queries:
-            log.info(
+            _info(
                 "llm_keywords: %r → %r",
                 (query or "")[:60],
                 llm_keywords[:120],
@@ -1232,7 +1276,28 @@ async def search_memories_smart(
     Both ``rewrite`` and ``rerank`` can be disabled for plain search.
     ``include_core=True`` merges the always-inject core facts (imp=5,
     tier Live/Hot) at the head of the result, within the same ``limit``.
+
+    ``MEM0_RETRIEVAL_MODE=v1`` swaps the plain path (``rerank=False``) for
+    ``_search_smart_v1`` (fused direct list + associative extras); the rerank
+    path and the default ``legacy`` mode are unchanged.
     """
+    if not rerank and retrieval_v1_enabled():
+        try:
+            return await _search_smart_v1(
+                query,
+                user_id,
+                limit,
+                rewrite=rewrite,
+                include_core=include_core,
+                current_channel_id=current_channel_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "[MEM0_V1] pipeline failed (%s) — falling back to the legacy plain path",
+                type(exc).__name__,
+            )
     # core memory はクエリ検索と独立なので並行に走らせる（TTL cache 命中時は即返る）。
     core_task = (
         asyncio.create_task(
@@ -1439,6 +1504,569 @@ async def _search_memories_smart_with_core(
     return await _finalize_smart_result(
         filtered, core_task, limit, confidence, fok_block=False
     )
+
+
+# ---------------------------------------------------------------------------
+# Retrieval v1 (MEM0_RETRIEVAL_MODE=v1) — plain path only. Pure logic lives in
+# services/mem0/assoc.py; this section does the I/O around it.
+# ---------------------------------------------------------------------------
+# Per-variant vector over-fetch: the RRF ranking is the top-20 VALID hits
+# (archived facts are skipped, not counted), the rest of the list supplies
+# cosine knowledge (cos = 1 - d/2) for the soft gate.
+_V1_VEC_FETCH = 100
+# BM25 over-fetch before hydration + validity filter (top-20 valid hits are
+# kept). Hydration walks the ranking in batched gets of the missing count plus
+# this slack, so a typical search needs one payload-only get.
+_V1_BM25_FETCH = 100
+_V1_BM25_HYDRATE_SLACK = 5
+# get_all limit for the association index: every fact of the user.
+_V1_INDEX_FETCH = 100_000
+# Stale index entries are refreshed by a background thread (no request pays
+# for a rebuild once the first index exists).
+_V1_INDEX_BACKGROUND_REFRESH = True
+# How long a request waits for the index AFTER its searches finished when no
+# usable index is cached (cold start): the build keeps running in its worker
+# thread and fills the cache for the next request; this one skips associates.
+_V1_INDEX_WAIT_S = 0.3
+_ASSOC_INDEX_CACHE = assoc.IndexCache()
+_ASSOC_VIA = {(True, False): "tag", (False, True): "ent", (True, True): "tag+ent"}
+_PROMOTED_PAYLOAD_KEYS = ("user_id", "agent_id", "run_id", "actor_id", "role")
+_RECORDER_LOCK = threading.Lock()
+
+
+def retrieval_mode() -> str:
+    """``MEM0_RETRIEVAL_MODE`` read at call time: ``v1`` or ``legacy`` (default)."""
+    mode = (os.environ.get("MEM0_RETRIEVAL_MODE") or "legacy").strip().lower()
+    return "v1" if mode == "v1" else "legacy"
+
+
+_V1_INTEGRITY_WARNED = False
+
+
+def retrieval_v1_enabled() -> bool:
+    global _V1_INTEGRITY_WARNED
+    if retrieval_mode() != "v1":
+        return False
+    # Managed integrity modes key the BM25 / graph projections by canonical id,
+    # while v1 hydrates BM25 hits by vector-store id: stay on the legacy path.
+    if os.environ.get("MEM0_INTEGRITY_MODE", "legacy").lower() != "legacy":
+        if not _V1_INTEGRITY_WARNED:
+            _V1_INTEGRITY_WARNED = True
+            log.warning("[MEM0_V1] disabled: MEM0_INTEGRITY_MODE is not legacy")
+        return False
+    return True
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "").strip())
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip())
+    except ValueError:
+        return default
+
+
+def _hide_archived() -> bool:
+    try:
+        from config import MEM0_HIDE_ARCHIVED
+    except Exception:
+        MEM0_HIDE_ARCHIVED = True
+    return bool(MEM0_HIDE_ARCHIVED)
+
+
+class _EmbedRecorder:
+    """Transparent wrapper of ``embedding_model.embed``: every call goes to the
+    real embedder (behaviour unchanged); the vectors of ``"search"`` calls are
+    remembered briefly by text so v1 can reuse the query embedding mem0 has
+    just computed instead of paying a second embedding API call."""
+
+    def __init__(self, inner, *, maxsize: int = 64, ttl_s: float = 300.0) -> None:
+        self._inner = inner
+        self._maxsize = maxsize
+        self._ttl_s = ttl_s
+        self._lock = threading.Lock()
+        self._items: collections.OrderedDict = collections.OrderedDict()
+
+    def __call__(self, text, memory_action=None):
+        vec = self._inner(text, memory_action)
+        if memory_action == "search" and isinstance(text, str):
+            with self._lock:
+                self._items[text] = (time.monotonic(), vec)
+                self._items.move_to_end(text)
+                while len(self._items) > self._maxsize:
+                    self._items.popitem(last=False)
+        return vec
+
+    def lookup(self, text: str):
+        with self._lock:
+            hit = self._items.get(text)
+        if hit is None or time.monotonic() - hit[0] > self._ttl_s:
+            return None
+        return hit[1]
+
+
+def _embed_recorder(mem) -> "_EmbedRecorder | None":
+    """Install (once per embedder instance) and return the embedding recorder."""
+    try:
+        model = getattr(mem, "embedding_model", None)
+        if model is None:
+            return None
+        with _RECORDER_LOCK:
+            current = getattr(model, "embed", None)
+            if isinstance(current, _EmbedRecorder):
+                return current
+            if not callable(current):
+                return None
+            recorder = _EmbedRecorder(current)
+            setattr(model, "embed", recorder)
+            return recorder
+    except Exception:
+        return None
+
+
+def _iso_utc(ts):
+    """mem0's created_at/updated_at normalisation (aware ISO strings -> UTC)."""
+    if not ts:
+        return ts
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return ts
+    if parsed.tzinfo is None:
+        return ts
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _record_from_payload(fact_id: str, payload) -> dict:
+    """Shape a raw vector-store payload like ``Memory.get`` does."""
+    p = payload if isinstance(payload, dict) else {}
+    core_keys = {"data", "hash", "created_at", "updated_at", "id", *_PROMOTED_PAYLOAD_KEYS}
+    rec = {
+        "id": fact_id,
+        "memory": p.get("data", ""),
+        "hash": p.get("hash"),
+        "metadata": None,
+        "score": None,
+        "created_at": _iso_utc(p.get("created_at")),
+        "updated_at": _iso_utc(p.get("updated_at")),
+    }
+    for key in _PROMOTED_PAYLOAD_KEYS:
+        if key in p:
+            rec[key] = p[key]
+    extra = {k: v for k, v in p.items() if k not in core_keys}
+    if extra:
+        rec["metadata"] = extra
+    return rec
+
+
+def _owned(rec: dict, user_id: str) -> bool:
+    # collection.get(ids=...) bypasses mem0's user filter: fail closed.
+    owner = rec.get("user_id")
+    return owner is not None and str(owner) == str(user_id)
+
+
+def _v1_vector_hits(mem, query: str, user_id: str, current_channel_id) -> list[dict]:
+    """One variant: over-fetched vector hits, validity-filtered, distance order."""
+    raw = mem.search(query=query, user_id=user_id, limit=_V1_VEC_FETCH)
+    results = (
+        raw.get("results", [])
+        if isinstance(raw, dict)
+        else (raw if isinstance(raw, list) else [])
+    )
+    return [
+        r
+        for r in results
+        if isinstance(r, dict)
+        and r.get("id")
+        and _is_fact_valid(r, current_channel_id, expected_user_id=str(user_id))
+    ]
+
+
+def _v1_bm25_hits(query: str, user_id: str, current_channel_id) -> list[dict]:
+    try:
+        from config import MEM0_HYBRID_ENABLED
+    except Exception:
+        MEM0_HYBRID_ENABLED = True
+    if not MEM0_HYBRID_ENABLED:
+        return []
+    from services.mem0 import bm25_index
+
+    return bm25_index.search_bm25(
+        query, user_id, _V1_BM25_FETCH, current_channel_id=current_channel_id
+    )
+
+
+def _v1_bm25_ranking(mem, query: str, user_id: str, current_channel_id) -> tuple[list[dict], int]:
+    """The ONE BM25 ranking: the old ``search_bm25`` over-fetched, hydrated from
+    the vector store (batched payload-only gets) and validity-filtered, top
+    ``assoc.TOPN``. Orphan index rows (fact gone from the store), foreign and
+    archived/out-of-scope facts are skipped without consuming a rank.
+    Returns ``(records in BM25 order, number of vector-store gets)``."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for h in _v1_bm25_hits(query, user_id, current_channel_id):
+        fid = str(h.get("id") or "") if isinstance(h, dict) else ""
+        if fid and fid not in seen:
+            seen.add(fid)
+            ids.append(fid)
+    out: list[dict] = []
+    gets = 0
+    pos = 0
+    while len(out) < assoc.TOPN and pos < len(ids):
+        chunk = ids[pos : pos + assoc.TOPN - len(out) + _V1_BM25_HYDRATE_SLACK]
+        pos += len(chunk)
+        fetched = _v1_fetch(mem, chunk, False)
+        gets += 1
+        for fid in chunk:
+            got = fetched.get(fid)
+            if got is None:
+                continue
+            rec = _record_from_payload(fid, got[1])
+            if _owned(rec, user_id) and _is_fact_valid(
+                rec, current_channel_id, expected_user_id=str(user_id)
+            ):
+                out.append(rec)
+                if len(out) >= assoc.TOPN:
+                    break
+    return out, gets
+
+
+def _fact_entity_edges() -> list[tuple[str, int]]:
+    from services.mem0 import graph
+
+    try:
+        with graph._conn() as c:
+            rows = c.execute("SELECT fact_id, entity_id FROM fact_entity_edges").fetchall()
+    except Exception as exc:
+        log.warning("assoc index: graph edges unavailable (non-fatal): %s", type(exc).__name__)
+        return []
+    return [(str(r[0]), int(r[1])) for r in rows if r[0] is not None and r[1] is not None]
+
+
+def _build_assoc_index(mem, user_id: str) -> assoc.AssocIndex:
+    raw = mem.get_all(user_id=user_id, limit=_V1_INDEX_FETCH)
+    rows = (
+        raw.get("results", [])
+        if isinstance(raw, dict)
+        else (raw if isinstance(raw, list) else [])
+    )
+    return assoc.AssocIndex(rows, _fact_entity_edges(), built_at=time.time())
+
+
+def _v1_index(mem, user_id: str) -> "assoc.AssocIndex | None":
+    """Per-user association index (TTL ``MEM0_ASSOC_INDEX_TTL_S``, default 600 s)."""
+    ttl = max(_env_float("MEM0_ASSOC_INDEX_TTL_S", assoc.INDEX_TTL_S), 0.0)
+    return _ASSOC_INDEX_CACHE.get_or_refresh(
+        user_id,
+        functools.partial(_build_assoc_index, mem, user_id),
+        ttl_s=ttl,
+        background=_V1_INDEX_BACKGROUND_REFRESH,
+    )
+
+
+def _v1_fetch(mem, ids: list[str], with_embeddings: bool) -> dict[str, tuple]:
+    """ONE batched vector-store get: ``{id: (embedding | None, payload)}``."""
+    if not ids:
+        return {}
+    collection = getattr(getattr(mem, "vector_store", None), "collection", None)
+    if collection is None:
+        raise RuntimeError("vector store exposes no collection")
+    include = ["embeddings", "metadatas"] if with_embeddings else ["metadatas"]
+    res = collection.get(ids=list(ids), include=include)
+    got = res.get("ids") or []
+    embeddings = res.get("embeddings") if with_embeddings else None
+    metadatas = res.get("metadatas")
+    out: dict[str, tuple] = {}
+    for j, fid in enumerate(got):
+        emb = embeddings[j] if embeddings is not None and j < len(embeddings) else None
+        payload = metadatas[j] if metadatas is not None and j < len(metadatas) else None
+        out[str(fid)] = (emb, payload)
+    return out
+
+
+async def _v1_associates(
+    mem,
+    recorder,
+    index: "assoc.AssocIndex",
+    query: str,
+    uid: str,
+    current_channel_id,
+    *,
+    kept: list,
+    direct: list,
+    core_ids: set,
+    records: dict,
+    stats: dict,
+    qcos_min: float,
+    assoc_max: int,
+    may_reembed: bool,
+) -> list[dict]:
+    """Associates (A_tag U A_ent) of the first 3 gated hits; extra slots only."""
+    seeds = assoc.seed_weights(kept)
+    if not seeds:
+        return []
+    excl = {c.fid for c in direct} | core_ids | {fid for fid, _ in seeds}
+    live = index.live_mask(int(time.time()), hide_archived=_hide_archived())
+    seed_tags = {
+        fid: assoc.norm_tags(((records.get(fid) or {}).get("metadata") or {}).get("tags"))
+        for fid, _ in seeds
+        if fid not in index
+    }
+    tag_s = assoc.tag_scores(index, seeds, exclude=excl, live=live, seed_tags=seed_tags)
+    ent_s = assoc.entity_scores(index, seeds, exclude=excl, live=live)
+    want = sorted(set(assoc.tie_group(tag_s)) | set(assoc.tie_group(ent_s)))
+    stats["assoc_cand"] = len(want)
+    if not want:
+        return []
+    # ONE batched get of the association candidates' embeddings + payloads.
+    fetched: dict[str, tuple] = {}
+    try:
+        fetched = await asyncio.to_thread(_v1_fetch, mem, want, True)
+        stats["gets"] += 1
+    except Exception as exc:
+        log.warning("[MEM0_V1] batched get failed (non-fatal): %s", type(exc).__name__)
+    cand_vecs: dict[str, object] = {}
+    cand_recs: dict[str, dict] = {}
+    for fid in want:
+        got = fetched.get(fid)
+        if got is None or got[0] is None:
+            continue
+        rec = _record_from_payload(fid, got[1])
+        if not (_owned(rec, uid) and _is_fact_valid(rec, current_channel_id, expected_user_id=uid)):
+            continue
+        cand_vecs[fid] = got[0]
+        cand_recs[fid] = rec
+    qvec = recorder.lookup(query) if recorder is not None else None
+    # Re-embed only on a recorder miss after a SUCCESSFUL query search; when the
+    # query's own embedding failed, a second call would just fail again.
+    if qvec is None and cand_vecs and may_reembed:
+        stats["reembed"] = 1
+        try:
+            qvec = await asyncio.to_thread(mem.embedding_model.embed, query, "search")
+        except Exception as exc:
+            log.warning("[MEM0_V1] query embedding unavailable (non-fatal): %s", type(exc).__name__)
+            qvec = None
+    qcos = assoc.query_cosines(qvec, cand_vecs)
+    picks = assoc.select_associates(tag_s, ent_s, qcos, qcos_min=qcos_min, max_n=assoc_max)
+    extras: list[dict] = []
+    for fid in picks:
+        rec = dict(cand_recs[fid])
+        rec["_assoc"] = True
+        rec["_assoc_qcos"] = round(qcos[fid], 4)
+        rec["_assoc_via"] = _ASSOC_VIA.get((fid in tag_s, fid in ent_s), "")
+        extras.append(rec)
+    return extras
+
+
+async def _search_smart_v1(
+    query: str,
+    user_id: str,
+    limit: int,
+    *,
+    rewrite: bool,
+    include_core: bool,
+    current_channel_id: str | None,
+) -> list[dict]:
+    """Retrieval v1 plain path: fused direct list (arm B1) + associates (A_tag ∪ A_ent).
+
+    Embedding API calls: one per query variant inside ``mem.search`` (as the
+    legacy path); the query embedding for qcos is reused via _EmbedRecorder.
+    Vector-store calls besides the searches: one payload-only batched ``get``
+    hydrating the BM25 ranking (runs concurrently with the vector searches)
+    and one batched ``get`` of the association candidates' embeddings.
+    """
+    core_task = (
+        asyncio.create_task(
+            get_core_memories(user_id, current_channel_id=current_channel_id)
+        )
+        if include_core
+        else None
+    )
+    try:
+        return await _search_smart_v1_inner(
+            query,
+            user_id,
+            limit,
+            rewrite=rewrite,
+            core_task=core_task,
+            current_channel_id=current_channel_id,
+        )
+    finally:
+        if core_task is not None and not core_task.done():
+            core_task.cancel()
+
+
+async def _search_smart_v1_inner(
+    query: str,
+    user_id: str,
+    limit: int,
+    *,
+    rewrite: bool,
+    core_task,
+    current_channel_id: str | None,
+) -> list[dict]:
+    t0 = time.perf_counter()
+    uid = str(user_id)
+    limit = max(int(limit), 0)
+    stats: dict = {"variants": 0, "cand": 0, "bm25": 0, "drops": 0, "gets": 0,
+                   "assoc_cand": 0, "idx": "none", "reembed": 0}
+
+    async def _core() -> list[dict]:
+        return (await core_task) if core_task is not None else []
+
+    def _log(direct: list[dict], extras: list[dict], core: list[dict], note: str = "") -> None:
+        log.info(
+            "[MEM0_V1 variants=%d cand=%d bm25=%d gate_drop=%d core=%d direct=%d "
+            "assoc=%d assoc_qcos=%s assoc_cand=%d gets=%d index=%s reembed=%d%s ms=%.1f]",
+            stats["variants"], stats["cand"], stats["bm25"], stats["drops"], len(core),
+            len(direct), len(extras),
+            ",".join(f"{r.get('_assoc_qcos', 0.0):.3f}" for r in extras) or "-",
+            stats["assoc_cand"], stats["gets"], stats["idx"], stats["reembed"],
+            f" {note}" if note else "", (time.perf_counter() - t0) * 1000.0,
+        )
+
+    quiet = _QUIET_EXPAND.set(True)
+    try:
+        queries = await _expand_queries(query, user_id, rewrite=rewrite)
+    finally:
+        _QUIET_EXPAND.reset(quiet)
+    stats["variants"] = len(queries)
+    mem = await asyncio.to_thread(_get_mem0)
+    if not mem:
+        core = await _core()
+        _log([], [], core, "store=unavailable")
+        return _merge_core_first(core, [], limit)
+    try:
+        await ensure_valid_token()
+        _refresh_mem0_client_token()
+    except Exception as exc:
+        log.warning("[MEM0_V1] token refresh failed (non-fatal): %s", type(exc).__name__)
+    recorder = _embed_recorder(mem)
+    assoc_on = _env_flag("MEM0_ASSOC_ENABLED", True)
+    cos_min = _env_float("MEM0_DIRECT_COS_MIN", assoc.DIRECT_COS_MIN)
+    bypass = _env_int("MEM0_DIRECT_BM25_BYPASS_RANK", assoc.DIRECT_BM25_BYPASS_RANK)
+    qcos_min = _env_float("MEM0_ASSOC_QCOS_MIN", assoc.ASSOC_QCOS_MIN)
+    assoc_max = max(_env_int("MEM0_ASSOC_MAX", assoc.ASSOC_MAX), 0)
+    assoc_wanted = assoc_on and assoc_max > 0 and limit > 0
+
+    # The index lookup never sits on the direct list's critical path: it runs
+    # beside the searches and is only awaited (briefly) once they are done.
+    index_task = (
+        asyncio.ensure_future(asyncio.to_thread(_v1_index, mem, uid)) if assoc_wanted else None
+    )
+    if index_task is not None:
+        # outlives this request when it is still building (or when we are cancelled)
+        index_task.add_done_callback(lambda t: t.cancelled() or t.exception())
+    gathered = await asyncio.gather(
+        *(
+            asyncio.to_thread(_v1_vector_hits, mem, q, uid, current_channel_id)
+            for q in queries
+        ),
+        asyncio.to_thread(_v1_bm25_ranking, mem, query, uid, current_channel_id),
+        return_exceptions=True,
+    )
+    vec_lists: list[list[dict]] = []
+    for res in gathered[: len(queries)]:
+        if isinstance(res, BaseException):
+            log.warning("[MEM0_V1] vector search failed (non-fatal): %s", type(res).__name__)
+            res = []
+        vec_lists.append(res)
+    query_search_ok = bool(queries) and not isinstance(gathered[0], BaseException)
+    bm25 = gathered[len(queries)]
+    if isinstance(bm25, BaseException):
+        log.warning("[MEM0_V1] bm25 search failed (non-fatal): %s", type(bm25).__name__)
+        bm25 = ([], 0)
+    bm25_recs, stats["gets"] = bm25
+    index = None
+    if index_task is not None:
+        wait_s = max(_env_float("MEM0_ASSOC_INDEX_WAIT_S", _V1_INDEX_WAIT_S), 0.0)
+        done, _ = await asyncio.wait({index_task}, timeout=wait_s)
+        if index_task in done:
+            exc = index_task.exception()
+            if exc is not None:
+                log.warning("[MEM0_V1] assoc index unavailable (non-fatal): %s", type(exc).__name__)
+            else:
+                index = index_task.result()
+        else:
+            stats["idx"] = "pending"  # finishes in its worker thread and fills the cache
+    if index is not None:
+        stats["idx"] = str(len(index))
+
+    # Full records of every fused candidate: valid vector hits (first variant
+    # wins) and the hydrated BM25 ranking.
+    records: dict[str, dict] = {}
+    for hits in vec_lists:
+        for r in hits:
+            records.setdefault(str(r["id"]), r)
+    for r in bm25_recs:
+        records.setdefault(str(r["id"]), r)
+    bm25_ids = [str(r["id"]) for r in bm25_recs]
+    stats["bm25"] = len(bm25_ids)
+
+    fused = assoc.fuse(
+        [[(str(r["id"]), r.get("score")) for r in hits] for hits in vec_lists],
+        bm25_ids,
+    )
+    stats["cand"] = len(fused)
+    ordered = assoc.order_fused(fused.values())
+    core = await _core()
+    core_ids = {str(c.get("id")) for c in core if c.get("id")}
+    slots = max(limit - len(core), 0)
+    kept, stats["drops"] = assoc.gate(
+        ordered, exclude=core_ids, slots=slots, cos_min=cos_min, bypass_rank=bypass
+    )
+    direct = kept[:slots]
+
+    try:
+        from config import MEM0_FOK_ENABLED
+    except Exception:
+        MEM0_FOK_ENABLED = False
+    if MEM0_FOK_ENABLED:
+        confidence = assess_recall_confidence(
+            [{"score": c.best_distance} for c in fused.values()]
+        )
+        if confidence["status"] == "no_memory":
+            _log([], [], core, "fok=no_memory")
+            return _merge_core_first(core, [], limit) + [
+                {"_fok_no_memory": True, "best_distance": confidence.get("best_distance")}
+            ]
+
+    direct_records: list[dict] = []
+    for c in direct:
+        rec = dict(records[c.fid])
+        rec["score"] = c.best_distance  # min stored distance; None for BM25-only hits
+        rec["rrf_score"] = c.rrf
+        direct_records.append(rec)
+
+    # Associates are best-effort extras: any failure here keeps the direct list.
+    extras: list[dict] = []
+    if assoc_wanted and slots > 0 and index is not None:
+        try:
+            extras = await _v1_associates(
+                mem, recorder, index, query, uid, current_channel_id,
+                kept=kept, direct=direct, core_ids=core_ids, records=records, stats=stats,
+                qcos_min=qcos_min, assoc_max=assoc_max, may_reembed=query_search_ok,
+            )
+        except Exception as exc:
+            log.warning("[MEM0_V1] associates failed (non-fatal): %s", type(exc).__name__)
+            extras = []
+
+    result = _merge_core_first(core, direct_records, limit) + extras
+    _fire_recall_reinforcement(direct_records)
+    _log(direct_records, extras, core)
+    return result
 
 
 # Phase ④: spreading-activation graph expansion tunables. See

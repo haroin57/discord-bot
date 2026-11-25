@@ -20,6 +20,7 @@ _URL_RE = re.compile(r'https?://[^\s"\'<>)\]}]+')
 _URL_KEYS = ("url", "URL", "link", "href", "uri", "permalink")
 _TITLE_KEYS = ("title", "name", "heading")
 _SNIPPET_KEYS = ("description", "snippet", "content", "text", "summary", "body")
+_AS_OF_KEYS = ("as_of", "asOf", "datePublished", "published_at", "published_date", "publication_date", "date")
 _LOCAL_RECORD_SPLIT_RE = re.compile(r"\s*(?:[;；|]|\s[-–—]\s)\s*")
 
 
@@ -141,6 +142,24 @@ def parse_sources(
     from .evidence_registry import EvidenceRegistry
 
     registry = EvidenceRegistry(state)
+    dates: dict[str, str] = {}
+
+    def collect_dates(node):
+        if isinstance(node, dict):
+            url, stamp = _first(node, _URL_KEYS), _first(node, _AS_OF_KEYS)
+            if url and stamp:
+                dates[url] = stamp
+            for value in node.values():
+                collect_dates(value)
+        elif isinstance(node, list):
+            for value in node:
+                collect_dates(value)
+
+    try:
+        collect_dates(json.loads(raw_result))
+    except (ValueError, TypeError):
+        pass
+    volatile = any(key in tool_name.lower() for key in ("news", "quote", "price", "market", "weather", "schedule"))
     refs: list[SourceRef] = []
     for title, url, snippet in found:
         ref = registry.register(
@@ -148,6 +167,8 @@ def parse_sources(
             title=title,
             source_type=source_type,
             snippet=snippet,
+            as_of=dates.get(url),
+            fresh_for_s=86400.0 if volatile else None,
         )
         if ref is not None:
             refs.append(ref)
@@ -172,7 +193,7 @@ def format_sources_block(state: ResearchState, *, limit: int = 40) -> str:
     lines = ["**情報ソース（自動収集）**"]
     for ref in list(state.sources.values())[:limit]:
         title = ref.title or ref.url
-        lines.append(f"- [{ref.sid}] {title} — <{ref.url}>")
+        lines.append(f"- [{ref.sid}] {title} — <{ref.url}>（取得: {ref.fetched_at} / 対象時点: {ref.as_of or '不明'}）")
     return "\n".join(lines)
 
 
@@ -217,7 +238,7 @@ def _format_source_list(state: ResearchState, sids: list[str]) -> str:
     for sid in sids:
         ref = by_sid.get(sid)
         if ref is not None:
-            lines.append(f"- [{ref.sid}] {ref.title or ref.url} — <{ref.url}>")
+            lines.append(f"- [{ref.sid}] {ref.title or ref.url} — <{ref.url}>（取得: {ref.fetched_at} / 対象時点: {ref.as_of or '不明'}）")
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
