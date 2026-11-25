@@ -1084,7 +1084,7 @@ class TestOrchestrator:
         assert sent_text == "# レポート本文"
 
     @pytest.mark.asyncio
-    async def test_clarify_reaction_skips_to_default_scope(self):
+    async def test_optional_clarify_reaction_adopts_stated_default(self):
         # deadline 内のリアクションで「確認なし・既定スコープ続行」。
         channel, origin, thread, anchor = _make_channel()
         deps = _make_deps()
@@ -1092,7 +1092,7 @@ class TestOrchestrator:
         async def _wf(event, *, check=None, timeout=None):
             assert timeout is None  # deadline は adapter の OR 待ち全体に適用
             if event == "raw_reaction_add":
-                return SimpleNamespace(message_id=1, user_id=1)
+                return SimpleNamespace(message_id=1, user_id=1, emoji="✅")
             await asyncio.Event().wait()  # message は reaction 勝利時に回収される
 
         deps.bot.wait_for = _wf
@@ -1104,7 +1104,7 @@ class TestOrchestrator:
 
         async def fake_clarify_loop(prompt, channel_id, **kwargs):
             res = MagicMock()
-            res.text = "- 期間は？\n- 地域は？"
+            res.text = '{"questions":[{"text":"期間は指定しますか。", "required":false, "default":"指定期間なし"}]}'
             res.usage_total = None
             return res
 
@@ -1131,7 +1131,7 @@ class TestOrchestrator:
 
         sends = [str(c.args[0]) for c in thread.send.call_args_list]
         assert any(
-            "確認" in s and f"{orch.DEEP_RESEARCH_CLARIFY_TIMEOUT_S}秒以内" in s
+            "確認" in s and "回答待ち" in s
             for s in sends
         )
         assert any("既定スコープ" in s for s in sends)
@@ -2565,7 +2565,7 @@ class TestMem0InjectionScope:
         async def fake_clarify_loop(prompt, channel_id, **kwargs):
             briefings["clarify"] = prompt
             res = MagicMock()
-            res.text = "- 期間は？"
+            res.text = '{"questions":[{"text":"期間は指定しますか。", "required":false, "default":"指定期間なし"}]}'
             res.usage_total = None
             return res
 
@@ -3186,7 +3186,7 @@ class TestMagiHelpers:
         await orch._central_question_gate(ctx)  # should not raise / not hang
 
     @pytest.mark.asyncio
-    async def test_gate_timeout_proceeds_and_cleans_waiters(self):
+    async def test_gate_timeout_preserves_waiting_and_cleans_waiters(self):
         async def wait_forever(event, *, check=None, timeout=None):
             await asyncio.Event().wait()
 
@@ -3206,9 +3206,9 @@ class TestMagiHelpers:
         )
         ctx.run = run
         with patch.object(orch, "DEEP_RESEARCH_CLARIFY_TIMEOUT_S", 0.01):
-            await asyncio.wait_for(orch._central_question_gate(ctx), timeout=1)
-        sent = [str(call.args[0]) for call in thread.send.await_args_list]
-        assert any("タイムアウト" in text and "続行" in text for text in sent)
+            with pytest.raises(orch.ResearchInterrupted, match="回答待ち"):
+                await asyncio.wait_for(orch._central_question_gate(ctx), timeout=1)
+        assert state.phase == "waiting_input"
         await asyncio.sleep(0)
         assert run._tasks == set()
 
@@ -3281,8 +3281,8 @@ class TestMagiHelpers:
         assert "機会損失" in text
 
     @pytest.mark.asyncio
-    async def test_await_gate_pure_mention_without_reply_approves(self):
-        # 純粋な @ メンション（reference 無し）は従来通り approve。
+    async def test_await_gate_pure_mention_is_not_approval(self):
+        # Mention presence is not an answer to a specific pending question.
         thread = SimpleNamespace(id=42)
         bot_user = SimpleNamespace(id=999)
         msg = SimpleNamespace(
@@ -3308,13 +3308,13 @@ class TestMagiHelpers:
             thread=thread,
         )
         decision, _ = await orch._await_gate_response(ctx, SimpleNamespace(id=1))
-        assert decision == "approve"
+        assert decision == "correct"
 
     @pytest.mark.asyncio
-    async def test_await_gate_mention_approves(self):
+    async def test_await_gate_explicit_approval_text(self):
         thread = SimpleNamespace(id=42)
         msg = SimpleNamespace(
-            content="@bot いいね",
+            content="承認",
             mentions=[SimpleNamespace(id=999)],
             channel=SimpleNamespace(id=42),
             author=SimpleNamespace(id=7, bot=False),
@@ -3339,7 +3339,7 @@ class TestMagiHelpers:
         assert decision == "approve"
 
     @pytest.mark.asyncio
-    async def test_gate_wait_exception_proceeds(self):
+    async def test_gate_wait_exception_preserves_waiting(self):
         bot = MagicMock()
         bot.wait_for = AsyncMock()
         bot.user = SimpleNamespace(id=9)
@@ -3355,7 +3355,8 @@ class TestMagiHelpers:
         with patch.object(
             orch, "_await_gate_response", side_effect=RuntimeError("blew up")
         ):
-            await orch._central_question_gate(ctx)  # 例外は握って続行（詰まらせない）
+            with pytest.raises(orch.ResearchInterrupted, match="回答待ち"):
+                await orch._central_question_gate(ctx)
 
     @pytest.mark.asyncio
     async def test_parse_refined_cq_fallback_first_line(self):
@@ -3373,7 +3374,7 @@ class TestMagiHelpers:
         assert await orch._present_cq(ctx) is None
 
     @pytest.mark.asyncio
-    async def test_gate_returns_when_cannot_present(self):
+    async def test_gate_waits_when_cannot_present(self):
         import discord
 
         thread = MagicMock()
@@ -3387,9 +3388,8 @@ class TestMagiHelpers:
             user=SimpleNamespace(id=7),
             thread=thread,
         )
-        await orch._central_question_gate(
-            ctx
-        )  # present None → return（無限ループしない）
+        with pytest.raises(orch.ResearchInterrupted, match="提示が未完了"):
+            await orch._central_question_gate(ctx)
         bot.wait_for.assert_not_called()
 
     @pytest.mark.asyncio
@@ -3476,7 +3476,7 @@ class TestMagiHelpers:
 
 class TestCqCorrectionCap:
     @pytest.mark.asyncio
-    async def test_gate_auto_proceeds_after_max_corrections(self):
+    async def test_gate_persists_wait_after_max_corrections(self):
         state = ResearchState(query="q", central_question="CQ")
         ctx = SimpleNamespace(
             deps=SimpleNamespace(bot=MagicMock()),
@@ -3499,8 +3499,9 @@ class TestCqCorrectionCap:
             patch.object(orch, "DEEP_RESEARCH_MAX_CQ_CORRECTIONS", 2),
         ):
             # 訂正しか返ってこなくても while が有限で終わること
-            await asyncio.wait_for(orch._central_question_gate(ctx), timeout=5)
-        assert refine.await_count == 2  # cap 回だけ研ぎ直して自動続行
+            with pytest.raises(orch.ResearchInterrupted, match="回答待ち"):
+                await asyncio.wait_for(orch._central_question_gate(ctx), timeout=5)
+        assert refine.await_count == 2
         assert state.central_question.count("ユーザーの訂正指示") == 2
 
     @pytest.mark.asyncio
