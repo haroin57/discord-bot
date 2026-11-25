@@ -164,6 +164,15 @@ _SPECS: dict[str, _Spec] = {
     "MEM0_FOK_ENABLED": _Spec(False, _parse_bool),
     "MEM0_FOK_NO_MEMORY_DISTANCE": _Spec(1.1, float),
     "MEM0_FOK_WEAK_DISTANCE": _Spec(0.75, float),
+    # explore-C #2: cheap-first recall escalation. When enabled, smart search
+    # runs the LLM-free layers (graph alias + morpho + hybrid vector/BM25)
+    # first and only escalates to the rewrite+HyDE+keywords+rerank helper tier
+    # when the cheap read's best raw distance is at/above ESCALATE_DISTANCE
+    # (or empty). Off by default; flag-off is byte-identical to the
+    # unconditional helper pipeline. Escalation is a deterministic pure
+    # function of the cheap confidence read.
+    "MEM0_CHEAP_FIRST_ENABLED": _Spec(False, _parse_bool),
+    "MEM0_CHEAP_FIRST_ESCALATE_DISTANCE": _Spec(0.75, float),
 
     # --- Phase ② forgetting (decay.py) ---------------------------------------
     # Tier thresholds in ACT-R activation units, calibrated against the
