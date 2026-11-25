@@ -38,8 +38,13 @@ jobs:
         #   PYSEC-2026-3552/3553/3554  cryptography 48.0.1 -> 49/50 (two major
         #     bumps). It underpins TLS, OAuth and JWT paths, so the upgrade
         #     needs its own verification pass instead of riding a bugfix PR.
+        # pip_audit covers third-party PyPI dependencies. The in-tree vendored
+        # package (./vendor/mem0-alpha) is our own source, not on PyPI, so
+        # --strict errors "not found on PyPI"; strip local-path requirements
+        # before auditing. Its third-party deps stay pinned above and audited.
         run: >-
-          python -m pip_audit -r requirements.lock --strict
+          grep -vE '^[[:space:]]*(\./|/|-e |file:)' requirements.lock > /tmp/pip-audit-reqs.txt &&
+          python -m pip_audit -r /tmp/pip-audit-reqs.txt --strict
           --ignore-vuln PYSEC-2026-311
           --ignore-vuln PYSEC-2026-2636
           --ignore-vuln PYSEC-2026-3813
