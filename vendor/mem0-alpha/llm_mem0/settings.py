@@ -140,6 +140,15 @@ _SPECS: dict[str, _Spec] = {
     # surfaced by smart search; rate-limited per fact (spacing effect).
     "MEM0_RECALL_REINFORCE_ENABLED": _Spec(False, _parse_bool),
     "MEM0_RECALL_REINFORCE_MIN_INTERVAL_SEC": _Spec(6 * 3600, int),
+    # Reinforcement in the hybrid ranking key. "legacy" (default): the boost
+    # only shrinks vector distance, which RRF-first ordering ignores except on
+    # exact ties. "multiplicative": rrf_score * (1 + weight * boost) so
+    # reinforced facts win comparable relevance (kanae tuning; off by default).
+    "MEM0_REINFORCE_RANK_MODE": _Spec("legacy", str),
+    "MEM0_REINFORCE_RANK_WEIGHT": _Spec(2.0, float),
+    # Near-identical neighbours (same domain, no numeric/negation/value diff)
+    # are duplicates without an LLM verdict. Off by default (kanae tuning).
+    "MEM0_DEDUP_HARD_DROP_ENABLED": _Spec(False, _parse_bool),
     # Phase ④: spreading-activation graph expansion (Collins & Loftus-style
     # activation decaying with graph distance; see search._graph_expand_candidates).
     "MEM0_GRAPH_SPREAD_MAX_HOPS": _Spec(2, int),

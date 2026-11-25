@@ -277,6 +277,14 @@ async def check_near_dup(
         old_value, new_value = md.get("value_json") or md.get("value"), candidate_md.get("value_json") or candidate_md.get("value")
         if old_value and new_value and old_value != new_value:
             changed = True
+        if (not changed and score <= DEDUP_HARD_DROP_DISTANCE
+                and settings.MEM0_DEDUP_HARD_DROP_ENABLED
+                and len(candidate_text.strip()) <= len(text.strip()) * 1.1):
+            # Near-identical and not longer (no added detail to lose): the
+            # existing fact is re-confirmed; no LLM verdict needed. Gated OFF by
+            # default so vendor/public behaviour is unchanged (kanae tuning).
+            return (not dry_run, "dry_run_would_near_identical" if dry_run else "near_identical",
+                    fid, None, None)
         relation = "different" if changed else await judge_fact_relation(text, candidate_text)
         if relation == "paraphrase":
             return (not dry_run, "dry_run_would_paraphrase" if dry_run else "paraphrase", fid, None, None)

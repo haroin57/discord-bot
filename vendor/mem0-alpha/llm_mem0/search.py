@@ -130,6 +130,13 @@ def _rank_key(row: dict) -> tuple:
     ranking_distance = row.get("ranking_distance", distance)
     fused = row.get("rrf_score")
     if isinstance(fused, (int, float)) and math.isfinite(fused):
+        boost = row.get("reinforcement_boost")
+        if (isinstance(boost, (int, float)) and boost > 0
+                and settings.MEM0_REINFORCE_RANK_MODE == "multiplicative"):
+            # Without this the reinforcement boost only broke exact RRF ties.
+            # Gated to "legacy" by default so vendor/public ordering is
+            # unchanged (kanae tuning: MEM0_REINFORCE_RANK_MODE=multiplicative).
+            fused = fused * (1.0 + settings.MEM0_REINFORCE_RANK_WEIGHT * boost)
         return (0, -fused, ranking_distance if ranking_distance is not None else 99, str(row.get("id") or row.get("memory") or ""))
     if row.get("_graph_expanded"):
         return (2, row.get("graph_distance", 99), 0, str(row.get("id") or ""))
