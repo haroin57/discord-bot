@@ -7,7 +7,8 @@ verifier → revise のパイプラインが走る。判定は bot.py（admin �
 
 ユーザー決定（2026-07-02）: **積極自動** — 閾値低め（依頼型キーワード単発で
 deliberate）。streaming 消失が増えるトレードオフは許容。明示ネガマーカー
-（「さくっと」等）は即 chat。全決定を log に残して閾値チューニングの材料にする。
+（「さくっと」等）は、明示した検証水準を維持したうえで待ち時間に反映する。
+表示量だけでは tier を下げない。全決定を log に残す。
 
 v1 はヒューリスティック純関数。`DELIB_ROUTER_MODE="llm"` は将来の Haiku 分類の
 差し替え口（decide_tier の interface は変えない）。
@@ -18,11 +19,13 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from collections.abc import Mapping
 
 from config import (
     DELIB_ROUTER_MIN_CHARS,
     DELIB_ROUTER_SCORE_THRESHOLD,
 )
+from services.response_preferences import ResponsePreferences, infer_preferences
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +43,7 @@ class RouteDecision:
 
 # 明示マーカー（最優先・即決）
 _FORCE_DELIB = ("じっくり", "熟考", "徹底的", "網羅的", "深掘り", "ちゃんと調べ")
-_FORCE_CHAT = ("さくっと", "ざっくりでいい", "一言で", "手短に", "簡潔に一言", "パッと")
+_FORCE_CHAT = ("さくっと", "パッと", "即答", "今すぐ", "すぐ答え", "quickly", "immediately")
 
 # 依頼型キーワード（+2）: 調査・分析・制作系の動詞/名詞
 _TASK_KEYWORDS = (
@@ -59,6 +62,7 @@ _JUDGMENT_RE = re.compile(
 def route_request(
     raw_user_text: str, *, has_attachments: bool = False,
     auto_enabled: bool = True,
+    preferences: ResponsePreferences | Mapping[str, object] | None = None,
 ) -> RouteDecision:
     """ヒューリスティック tier 判定（純関数・同期）。
 
@@ -72,12 +76,20 @@ def route_request(
     judgment = bool(_JUDGMENT_RE.search(text))
     reasons: list[str] = []
 
-    for m in _FORCE_CHAT:
-        if m in text:
-            return RouteDecision(TIER_CHAT, -99.0, f"force_chat:{m}", judgment)
-    for m in _FORCE_DELIB:
-        if m in text:
-            return RouteDecision(TIER_DELIBERATE, 99.0, f"force_delib:{m}", judgment)
+    # ``preferences`` is the already resolved turn/work specification when
+    # supplied. A short display or fast first result does not waive verification.
+    prefs = (
+        preferences if isinstance(preferences, ResponsePreferences)
+        else ResponsePreferences.from_dict(preferences) if preferences is not None
+        else infer_preferences(text)
+    )
+    if prefs.evidence == "independent":
+        marker = next((m for m in _FORCE_DELIB if m in text), "evidence:independent")
+        return RouteDecision(TIER_DELIBERATE, 99.0, f"force_delib:{marker}", judgment)
+    if prefs.wait == "immediate":
+        for marker in _FORCE_CHAT:
+            if marker in lower:
+                return RouteDecision(TIER_CHAT, -99.0, f"force_chat:{marker}", judgment)
 
     if not auto_enabled:
         return RouteDecision(TIER_CHAT, 0.0, "auto_routing_disabled", judgment)
@@ -116,11 +128,13 @@ def route_request(
 async def decide_tier(
     raw_user_text: str, *, has_attachments: bool = False,
     auto_enabled: bool = True,
+    preferences: ResponsePreferences | Mapping[str, object] | None = None,
 ) -> RouteDecision:
     """判定の呼び出し口（最初から async — 将来の LLM 分類差し替えのため）。"""
     decision = route_request(
         raw_user_text, has_attachments=has_attachments,
         auto_enabled=auto_enabled,
+        preferences=preferences,
     )
     log.info(
         "delib_router tier=%s score=%.1f judgment=%s reason=%s auto=%s",

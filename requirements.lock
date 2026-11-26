@@ -170,6 +170,8 @@ xxhash==3.7.0
 yarl==1.25.1
 zipp==3.23.0
 
+Brotli==1.2.1  # decode Claude API br responses (client advertises accept-encoding: br)
+
 # Vendored Mem0α (import name: llm_mem0). Installed from the in-tree source so
 # every release venv and CI env gets it via the existing requirements.lock
 # install step, without depending on a build-library change (which auto_deploy

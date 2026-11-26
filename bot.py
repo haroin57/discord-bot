@@ -13,6 +13,7 @@ import os
 import re
 import time
 from collections import OrderedDict, deque
+from functools import wraps
 from types import SimpleNamespace
 
 import aiohttp
@@ -39,7 +40,6 @@ from config import (
     CLAUDE_TAG_EMOJI_ID,
     CLAUDE_TAG_EMOJI_NAME,
     CLAUDE_TAG_ENABLED,
-    DEEP_RESEARCH_ENABLED,
     DELIB_ROUTER_ENABLED,
     SPINNER_MODE,
     BOT_IGNORED_ROLE_IDS,
@@ -96,7 +96,6 @@ from services.skills import SkillError, render_active_skill_prompt
 
 from services.oauth_manager import OAuthRefreshFailed
 from services import claude_tag
-from services import deep_research
 from services import r2_archive
 from services.mem0 import (
     add_memories,
@@ -356,6 +355,9 @@ _runtime_resources = RuntimeResources(
     force_cancel_timeout_s=SHUTDOWN_FORCE_CLEANUP_TIMEOUT_S,
 )
 _turn_outbox = TurnOutbox(os.path.join(STATE_DIR, "bot_turn_outbox.json"))
+# Conversation-privacy registry was populated by the removed Work runtime; it
+# now stays None so the remaining `is not None` guards cleanly no-op.
+_conversation_policy_registry = None
 
 
 def _serialize_session_info(info) -> dict | str | None:
@@ -692,13 +694,6 @@ async def on_ready():
             "CLAUDE_TAG_EMOJI_ID in .env to pin the exact emoji.",
             CLAUDE_TAG_EMOJI_NAME,
         )
-    # Deep Research (ADR-0028): /research needs a general web backend.
-    if DEEP_RESEARCH_ENABLED and not deep_research.has_required_web_backend():
-        log.warning(
-            "DEEP_RESEARCH_ENABLED but no general web backend (brave-search / "
-            "tavily) is configured; /research will refuse. Set BRAVE_API_KEY or "
-            "TAVILY_API_KEY in .env."
-        )
     # D5: cleanup_stale_attachments was previously called synchronously from
     # main.py before bot.run(). For a tmpdir with thousands of files the
     # scan+stat loop blocked startup. Schedule it as a fire-and-forget
@@ -885,6 +880,18 @@ def _guild_message_addresses_bot(message: discord.Message) -> bool:
     )
 
 
+def _conversation_scoped(handler):
+    @wraps(handler)
+    async def wrapped(message):
+        from services.work_context import current_conversation
+        token = current_conversation.set(None)
+        try:
+            await handler(message)
+        finally:
+            current_conversation.reset(token)
+    return wrapped
+
+
 @bot.event
 async def on_raw_message_delete(payload):
     from services import guild_context
@@ -904,6 +911,7 @@ async def on_raw_message_edit(payload):
 
 
 @bot.event
+@_conversation_scoped
 async def on_message(message: discord.Message):
     # Own the dispatch before admission awaits or spawns indexing work. This
     # closes the phase gap where a SIGTERM could otherwise miss a task that had
@@ -921,7 +929,7 @@ async def on_message(message: discord.Message):
         dm_channel_types=(discord.DMChannel, discord.GroupChannel),
         deps=bot_admission.AdmissionDeps(
             is_admin=is_admin,
-            is_active_research_thread=deep_research.is_active_research_thread,
+            is_active_research_thread=lambda _cid: False,
             new_request_id=new_request_id,
             get_request_id=get_request_id,
             guild_message_addresses_bot=_guild_message_addresses_bot,
@@ -954,6 +962,24 @@ async def on_message(message: discord.Message):
     is_dm = admitted.is_dm
     raw_user_text = admitted.raw_user_text
     prompt = raw_user_text
+
+    if caller_is_admin:
+        from services.memory_policy import handle_control
+        private = is_dm
+        control = await handle_control(raw_user_text, str(message.author.id),
+            str(message.channel.id), private, source_message_id=str(message.id),
+            source_timestamp=getattr(message, "created_at", None))
+        if control is not None:
+            destination = message.channel
+            if control.private_response and not private:
+                try:
+                    destination = await message.author.create_dm()
+                except discord.HTTPException:
+                    await message.channel.send(control.message,
+                        allowed_mentions=discord.AllowedMentions.none())
+                    return
+            await destination.send(control.message, allowed_mentions=discord.AllowedMentions.none())
+            return
 
     _request_key = (message.channel.id, message.author.id)
     _forced_model = _MODEL_OVERRIDES.get(_request_key)
@@ -1141,6 +1167,15 @@ async def on_message(message: discord.Message):
             },
         )
         job.phase = JobPhase.PREPROCESSING
+        from services.work_context import current_conversation
+        privacy = current_conversation.get()
+        if privacy is not None and _conversation_policy_registry is not None:
+            privacy = _conversation_policy_registry.begin(message.author.id,
+                message.channel.id, privacy.private, source_message_id=str(message.id))
+            current_conversation.set(privacy)
+        if privacy is not None and privacy.rebuild:
+            from services.conversation_policy import retire_native_context
+            await retire_native_context(message.channel.id, message.author.id)
         if was_queued:
             await status.update("⏳ 考え中...")
             # Swap ⏳→👀 now that processing actually starts.
@@ -1319,6 +1354,12 @@ async def on_message(message: discord.Message):
         actually_resumed = model_result.actually_resumed
         _renderer = model_result.renderer
 
+        if privacy is not None:
+            from services.memory_policy import get_memory_policy
+            if not get_memory_policy().is_current(privacy.epoch):
+                await status.edit_final("処理中に記憶または公開範囲が変更されました。古い情報を含む回答を保留しました。新しい指定は次の応答から適用します。")
+                return
+
         job.phase = JobPhase.FINALIZING
         await status.update("🪄 整形中")
 
@@ -1424,6 +1465,8 @@ async def on_message(message: discord.Message):
             raise
         if delivery.body_delivered:
             await _commit_delivered_turn()
+            if privacy is not None and _conversation_policy_registry is not None:
+                _conversation_policy_registry.commit(privacy)
     except asyncio.CancelledError as _cancel:
         job.phase = JobPhase.FAILED
         # ADR-0038: distinguish a real /abort (cancel("user abort")) from a

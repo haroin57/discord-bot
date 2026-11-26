@@ -10,6 +10,10 @@ BEFORE the expensive full LLM compaction, so most gaps never need a summary.
 """
 from __future__ import annotations
 
+import threading
+import time
+from collections import OrderedDict
+
 PLACEHOLDER = "[Old tool result content cleared]"
 
 # free-code parity (microCompact.ts:41-50 COMPACTABLE_TOOLS): time-based MC only
@@ -95,8 +99,10 @@ def microcompact_tool_results(
     if len(target_ids) <= keep_recent:
         return messages, 0
     keep = set(target_ids[-keep_recent:]) if keep_recent > 0 else set()
-    clearable = set(target_ids) - keep
+    return _clear_tool_results(messages, set(target_ids) - keep)
 
+
+def _clear_tool_results(messages: list[dict], clearable: set) -> tuple[list[dict], int]:
     saved = 0
     out: list[dict] = []
     for m in messages:
@@ -119,4 +125,51 @@ def microcompact_tool_results(
             else:
                 new_content.append(b)
         out.append({**m, "content": new_content} if changed else m)
+    return out, saved
+
+
+# Sticky decisions (2026-10-11): the idle gap is measured from the latest
+# context snapshot, which a warm follow-up turn refreshes. The decision then
+# flipped between consecutive warm requests (02:36 cleared, 03:35 restored),
+# changing messages[8] and re-creating ~238k cached tokens. While the cache is
+# warm, repeat exactly the previous clearing; decide afresh only when cold.
+_STICKY_WARM_S = 3600  # = prompt cache TTL (1h, refreshed on every hit)
+_sticky: OrderedDict = OrderedDict()
+_sticky_lock = threading.Lock()
+
+
+def _cleared_ids(messages: list[dict]) -> set:
+    return {
+        b.get("tool_use_id")
+        for m in messages if m.get("role") == "user" and isinstance(m.get("content"), list)
+        for b in m["content"]
+        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("content") == PLACEHOLDER
+    }
+
+
+def sticky_microcompact(
+    channel_id: int,
+    messages: list[dict],
+    *,
+    gap_minutes: float,
+    gap_threshold_min: float = 60.0,
+    keep_recent: int = 5,
+    clock=time.monotonic,
+) -> tuple[list[dict], int]:
+    now = clock()
+    with _sticky_lock:
+        previous = _sticky.pop(channel_id, None)
+    if previous is not None and now - previous[1] < _STICKY_WARM_S:
+        out, saved = _clear_tool_results(messages, set(previous[0]))
+        decided = previous[0]
+    else:
+        out, saved = microcompact_tool_results(
+            messages, gap_minutes=gap_minutes,
+            gap_threshold_min=gap_threshold_min, keep_recent=keep_recent,
+        )
+        decided = frozenset(_cleared_ids(out) - _cleared_ids(messages))
+    with _sticky_lock:
+        _sticky[channel_id] = (decided, now)
+        while len(_sticky) > 256:
+            _sticky.popitem(last=False)
     return out, saved

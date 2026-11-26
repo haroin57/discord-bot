@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 # run daily). DO NOT edit between the marker comments; manual edits will be
 # clobbered on the next refresh run.
 # AUTO-CAPTURE-START
-CC_VERSION = "2.1.177"
+CC_VERSION = "2.1.331"
 CC_ENTRYPOINT = "sdk-cli"
 MODEL_BETAS = [
     "claude-code-20250219",
@@ -28,12 +28,18 @@ MODEL_BETAS = [
     "interleaved-thinking-2025-05-14",
     "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
-    "mid-conversation-system-2026-04-07",
+    "per-turn-control-2026-07-01",
+    "mid-conversation-tool-changes-2026-07-01",
+    "tool-provenance-2026-10-26",
+    "thinking-token-count-2026-05-13",
     "advanced-tool-use-2025-11-20",
+    "mid-conversation-system-clear-at-2026-08-21",
     "effort-2025-11-24",
-    "server-side-fallback-2026-06-01",
-    "fallback-credit-2026-06-01",
+    "dangerous-tool-use-2026-09-03",
+    "thinking-binding-controls-2026-08-01",
+    "afk-mode-2026-01-31",
     "extended-cache-ttl-2025-04-11",
+    "cache-diagnosis-2026-04-07",
 ]
 CLI_IDENTITY_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 # AUTO-CAPTURE-END
@@ -45,6 +51,7 @@ CLI_IDENTITY_TEXT = "You are a Claude agent, built on Anthropic's Claude Agent S
 # overflow before compaction ever fires. Gated on CONTEXT_1M_ENABLED so it can
 # be turned off in one place if the subscription/model rejects the beta.
 _EXTRA_BETAS = []
+_EXTRA_BETAS.append("advanced-tool-use-2025-11-20")
 if os.environ.get("CONTEXT_1M_ENABLED", "1") not in ("0", "false", "False", ""):
     _EXTRA_BETAS.append("context-1m-2025-08-07")
 # Server-side model fallback betas (ADR-0015). A minimal `claude -p` capture

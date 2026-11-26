@@ -72,6 +72,12 @@ async def _install_permission_handler(data: ModelInput, config: ModelConfig) -> 
         detail: str,
         rule: str,
     ) -> bool:
+        from services.work_context import current_conversation
+        privacy = current_conversation.get()
+        if privacy is not None:
+            from services.memory_policy import get_memory_policy
+            if not get_memory_policy().is_current(privacy.epoch):
+                return False
         approval_message = await data.message.channel.send(
             f"🔐 **ツール承認待ち** `{tool_name}`（rule: `{rule}`）\n"
             f"```\n{detail[:800]}\n```\n"
@@ -239,11 +245,22 @@ async def invoke_model(
             log.warning("delib_router failed (chat 扱い): %s", exc)
 
     deliberate = tier == "deliberate"
+    from services.work_context import current_conversation
+    privacy_guarded = current_conversation.get() is not None
+    buffered = deliberate or privacy_guarded
     if deliberate:
         await data.status.update("🧠 熟考モード")
     if data.caller_is_admin:
         await _install_permission_handler(data, config)
 
+    # The observation log keys idempotency to the Discord message being
+    # answered (read by services.observation_scope.scope_mcp_configs).
+    from services.observation_scope import current_source_message_id
+
+    message_id = getattr(data.message, "id", None)
+    source_token = current_source_message_id.set(
+        str(message_id) if message_id is not None else None
+    )
     data.status.spin_start(mode=config.spinner_mode)
     try:
         response_text, session_info, actually_resumed = await deps.call_with_tools(
@@ -252,15 +269,15 @@ async def invoke_model(
             data.sessions,
             provider=data.provider,
             status_callback=data.status.update,
-            incremental_text_callback=None if deliberate else incremental_send,
-            text_stream_callback=None if deliberate else stream_preview,
-            tool_invocation_callback=tool_invocation_send,
-            scratch_stream_callback=scratch_stream,
-            scratch_finalize_callback=scratch_finalize,
-            thinking_stream_callback=plan_stream,
-            thinking_finalize_callback=plan_finalize,
-            verify_stream_callback=verify_stream,
-            verify_finalize_callback=plan_finalize,
+            incremental_text_callback=None if buffered else incremental_send,
+            text_stream_callback=None if buffered else stream_preview,
+            tool_invocation_callback=None if privacy_guarded else tool_invocation_send,
+            scratch_stream_callback=None if privacy_guarded else scratch_stream,
+            scratch_finalize_callback=None if privacy_guarded else scratch_finalize,
+            thinking_stream_callback=None if privacy_guarded else plan_stream,
+            thinking_finalize_callback=None if privacy_guarded else plan_finalize,
+            verify_stream_callback=None if privacy_guarded else verify_stream,
+            verify_finalize_callback=None if privacy_guarded else plan_finalize,
             progress=data.status.prog,
             tier=tier,
             route_judgment=route_judgment,
@@ -276,6 +293,7 @@ async def invoke_model(
         )
     finally:
         data.status.spin_stop()
+        current_source_message_id.reset(source_token)
 
     return ModelResult(
         response_text=response_text,

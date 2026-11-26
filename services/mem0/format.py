@@ -27,6 +27,10 @@ def _scrub_fact_text(text: str) -> str:
 
 _TIER_LABELS = {0: "Live", 1: "Hot", 2: "Warm", 3: "Cold"}
 
+# Retrieval v1 associates (``_assoc=True``): extra facts linked to the direct
+# hits by shared tags / graph entities rather than matched by the query.
+ASSOC_PREFIX = "関連: "
+
 
 def _format_epoch(ts) -> str | None:
     """unix 秒を YYYY-MM-DD に。壊れた値は None（メタ無し扱い）。"""
@@ -109,13 +113,15 @@ def format_memories_for_prompt(memories: list[dict]) -> str:
         "[条件: ...]=その条件下でのみ成り立つ事実)",
     ]
     # core memory（常時注入枠）を先頭に固定し、クエリ依存の recall と区別する。
+    # v1 associates（_assoc）は直接ヒットの後ろに「関連: 」付きで並べる。
     ordered = sorted(
-        real, key=lambda m: 0 if m.get("_core") else 1,
+        real, key=lambda m: 0 if m.get("_core") else (2 if m.get("_assoc") else 1),
     )
     for m in ordered:
         text = m.get("memory", m.get("text", ""))
         if text:
-            lines.append(f"- {_scrub_fact_text(text)}{_fact_meta_suffix(m)}")
+            prefix = ASSOC_PREFIX if m.get("_assoc") else ""
+            lines.append(f"- {prefix}{_scrub_fact_text(text)}{_fact_meta_suffix(m)}")
     if fok_entry:
         lines.append(
             "(このクエリに一致する具体的な記憶は見つからなかった。"

@@ -20,6 +20,7 @@ graceful degrade（entry.py 側で検知して disable_tool_search() を呼ぶ�
 from __future__ import annotations
 
 import logging
+import os
 
 from config import (
     ADMIN_USER_IDS,
@@ -159,6 +160,19 @@ def build_advertised_tools(
     tools += builtin_tools_for_api(restricted=False)
     if agent_tool_schema is not None:
         tools.append(agent_tool_schema)
+
+    if os.environ.get("TOOL_HOT_SET_STABLE", "0") == "1":
+        # Non-deferred tools are part of the cached prefix: a selector adding
+        # one server (e.g. context7 for a link) re-created ~270k tokens. Keep
+        # the hot set to always-advertised static schemas; selector choices
+        # stay discoverable as deferred tools (outside the prefix). Servers
+        # without a static schema cannot be deferred and stay hot.
+        stable_handles = {
+            key: handle for key, handle in live_handles.items()
+            if key in hot_keys and key not in STATIC_MCP_TOOL_SCHEMAS
+        }
+        live_handles = stable_handles
+        hot_keys = always_keys | {key for key in hot_keys if key not in STATIC_MCP_TOOL_SCHEMAS}
 
     seen: set[str] = {t.get("name", "") for t in tools}
 

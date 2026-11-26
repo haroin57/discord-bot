@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from bot_pipeline.attachment_types import AttachmentArtifacts
@@ -322,6 +322,10 @@ async def _inject_recent_history(
         recent = await asyncio.to_thread(load_history_channel, channel_id)
         if not recent:
             return
+        from services.conversation_policy import filter_rows
+        recent = filter_rows(recent)
+        if not recent:
+            return
         history_lines: list[str] = []
         total_chars = 0
         for item in reversed(recent[-HISTORY_INJECTION_COUNT:]):
@@ -533,6 +537,32 @@ async def build_prompt(
 ) -> PromptResult:
     """Assemble the canonical provider prompt without changing source order."""
     breakdown: dict[str, int | str] = {}
+
+    # Privacy guard (owner-scoped). Inert unless an active conversation policy is
+    # bound (Work/privacy subsystem); current_conversation is None for the
+    # default public runtime, so context filtering is a no-op there.
+    from services.work_context import current_conversation
+    privacy = current_conversation.get()
+    if privacy is not None:
+        from services.conversation_policy import sanitize_derived
+        from services.memory_policy import get_memory_policy
+        policy = get_memory_policy()
+
+        def filtered_context(value):
+            if isinstance(value, ContextBlock):
+                rows = [{"content": item.body, "author_id": item.author_id} for item in value.items]
+                allowed = policy.filter_context_rows(rows, privacy.owner_id,
+                    channel_id=privacy.channel_id, is_private=privacy.private)
+                allowed_ids = {id(row) for row in allowed}
+                items = tuple(item for item, row in zip(value.items, rows) if id(row) in allowed_ids)
+                return ContextBlock("\n".join(item.rendered for item in items), items=items, label=value.label)
+            return sanitize_derived(str(value or ""))
+
+        data = replace(data, conv_context=filtered_context(data.conv_context),
+            cross_thread_context=filtered_context(data.cross_thread_context),
+            reply_context=sanitize_derived(data.reply_context),
+            forwarded_context=sanitize_derived(data.forwarded_context))
+
     prompt, path_label = await _build_base_prompt(
         data,
         config=config,
@@ -563,6 +593,9 @@ async def build_prompt(
                     MEM0_RECALL_TIMEOUT_S,
                 )
                 memory_results = []
+            if privacy is not None:
+                from services.conversation_policy import filter_memories
+                memory_results = filter_memories(memory_results or [])
             memory_block = deps.format_memories_for_prompt(memory_results)
             if memory_block:
                 wrapped = (
@@ -579,6 +612,12 @@ async def build_prompt(
                 )
         except Exception as exc:
             log.warning("Mem0 recall failed (non-fatal): %s", exc)
+
+    if privacy is not None:
+        from services.response_preferences import infer_preferences, build_prompt_guidance
+        guidance = build_prompt_guidance(infer_preferences(str(data.message.content or "")))
+        if guidance:
+            prompt += "\n\n" + guidance
 
     if data.invest_kb_task is not None:
         try:
