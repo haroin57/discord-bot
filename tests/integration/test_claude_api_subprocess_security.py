@@ -21,9 +21,6 @@ from services.claude_api.subprocess_runner import (
     wait_or_terminate_process_group,
 )
 from services.claude_api.tools import ToolContext, execute_builtin_tool
-import services.deep_research.run_state as run_state_mod
-from services.deep_research.run_state import ResearchRun
-from services.deep_research.types import ResearchState
 
 
 async def test_real_stdio_startup_failure_does_not_cancel_caller() -> None:
@@ -189,61 +186,6 @@ os._exit(0)
         except ProcessLookupError:
             pass
         await asyncio.gather(process.wait(), return_exceptions=True)
-
-
-@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
-async def test_concurrent_run_cleanup_signals_exact_group_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    process = await spawn_process(
-        [sys.executable, "-c", "import time; time.sleep(60)"],
-        env=dict(os.environ),
-        cwd=None,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    run = ResearchRun(state=ResearchState(query="q"), run_id="concurrent-real")
-    run.require_mcp_cleanup()
-    run.register_mcp_process(process)
-    stack = SimpleNamespace(aclose=AsyncMock(return_value=None))
-    cleanup_started = asyncio.Event()
-    release_cleanup = asyncio.Event()
-    cleanup_calls = 0
-    original_cleanup = run_state_mod.wait_or_terminate_process_group
-
-    async def controlled_cleanup(owned_process):
-        nonlocal cleanup_calls
-        cleanup_calls += 1
-        cleanup_started.set()
-        await release_cleanup.wait()
-        await original_cleanup(owned_process, grace_s=0.1)
-
-    monkeypatch.setattr(
-        run_state_mod,
-        "wait_or_terminate_process_group",
-        controlled_cleanup,
-    )
-    first = asyncio.create_task(run.close_owned_stack(stack.aclose))
-    await asyncio.wait_for(cleanup_started.wait(), timeout=2)
-    shared_task = run._stack_cleanup_task
-    second = asyncio.create_task(run.close_owned_stack(stack.aclose))
-    await asyncio.sleep(0)
-
-    try:
-        assert run._stack_cleanup_task is shared_task
-        release_cleanup.set()
-        await asyncio.gather(first, second)
-
-        assert cleanup_calls == 1
-        assert stack.aclose.await_count == 1
-        assert process.returncode is not None
-        with pytest.raises(ProcessLookupError):
-            os.killpg(process.pid, 0)
-    finally:
-        if process.returncode is None:
-            process.kill()
-            await process.wait()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")

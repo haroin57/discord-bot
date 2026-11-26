@@ -29,7 +29,6 @@ import httpx
 
 from config import (
     ADMIN_MAX_TURNS,
-    SUBAGENT_ENABLED,
     ATTACHMENT_DIR,
     CLAUDE_MAX_PARALLEL,
     CLAUDE_MODEL,
@@ -52,7 +51,6 @@ from config import (
     DELIB_VERIFIER_MODEL,
     DELIB_VERIFY_MAX_REVISIONS,
     EVAL_MCP_ENABLED,
-    MAGI_LITE_ENABLED,
     MCP_SERVERS,
     SYSTEM_PROMPT,
     TOOL_SEARCH_ENABLED,
@@ -722,12 +720,10 @@ async def call_with_tools(
                 if eager_keys:
                     await pool.spawn_eager(eager_keys)
 
-            # Agent tool（メインパイプライン subagent。CLI 純正と足並み）。admin のみ。
+            # Agent tool（メインパイプライン subagent）は撤去済み。実体が
+            # deep_research.run_subagent に依存していたため、Work/deep_research
+            # 撤去に伴い廃止した。schema は常に None（= 広告しない）。
             _agent_schema: dict | None = None
-            if SUBAGENT_ENABLED and not restricted:
-                from services.claude_api.agent_tool import agent_tool_schema
-
-                _agent_schema = agent_tool_schema()
 
             def _build_tools() -> list[dict]:
                 """広告 tools 配列を（再）構築する。
@@ -763,26 +759,6 @@ async def call_with_tools(
             }
 
             async def _execute_tool(name: str, args: dict) -> str:
-                if name == "Agent" and SUBAGENT_ENABLED and not restricted:
-                    if _agent_dispatch["api_client"] is None:
-                        return "<tool_use_error>Agent: dispatcher not initialised</tool_use_error>"
-                    from services.claude_api.agent_tool import (
-                        AgentToolCtx,
-                        execute_agent_tool,
-                    )
-
-                    return await execute_agent_tool(
-                        args,
-                        AgentToolCtx(
-                            api_client=_agent_dispatch["api_client"],
-                            pool=pool,
-                            tools_for_api=advertised_tools,
-                            channel_id=channel_id,
-                            parent_model=_agent_dispatch["model"] or "",
-                            depth=0,
-                            parent_watchdog=_agent_dispatch["watchdog"],
-                        ),
-                    )
                 if name.startswith("mcp__"):
                     return await pool.call_tool(name, args)
                 return await execute_builtin_tool(name, args, tool_ctx)
@@ -1783,38 +1759,7 @@ async def call_with_tools(
                             **_revise_kw,
                         )
 
-                # P5: MAGI-lite（判断系の問いのみ）— 3レンズ独立見解 + 合意度を
-                # ガイダンスとして 1 回だけ反映する。失敗は無視（fail-open）。
-                if MAGI_LITE_ENABLED and route_judgment and evidence is not None:
-                    try:
-                        from services.claude_api.magi_lite import (
-                            build_lens_revise_prompt,
-                            run_lenses,
-                        )
-
-                        await _safe_status(status_callback, "🧠 多視点で再考中")
-                        magi = await run_lenses(
-                            question=raw_user_text or prompt,
-                            evidence_digest=evidence.digest(),
-                            channel_id=channel_id,
-                            model=effective_model,
-                        )
-                        if magi is not None and not magi.degraded:
-                            r2 = await _run_revision(build_lens_revise_prompt(magi))
-                            if (
-                                r2.synthetic_session_id
-                                and r2.text.strip()
-                                and not is_non_persistable_reply(r2.text)
-                            ):
-                                result = r2
-                                response_text = r2.text
-                                _revise_kw["active_mcp_keys"] = r2.active_mcp_keys
-                    except Exception as exc:
-                        log.warning(
-                            "[ch=%d] magi_lite failed (non-fatal): %s",
-                            channel_id,
-                            exc,
-                        )
+                # P5: MAGI-lite は撤去済み（deep_research 依存のため）。
 
                 # P2: verifier → revise（最大 DELIB_VERIFY_MAX_REVISIONS 回）→
                 # まだ fail なら caveat を付けて正直に degrade。

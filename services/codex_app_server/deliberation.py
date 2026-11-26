@@ -36,7 +36,7 @@ async def run(*, prompt, user_request: str, model: str, channel_id: int, execute
               scratch_stream_callback=None, scratch_finalize_callback=None,
               verify_stream_callback=None, verify_finalize_callback=None):
     from config import (DELIB_PLANNER_ENABLED, DELIB_VERIFIER_ENABLED, DELIB_VERIFY_MAX_REVISIONS,
-                        MAGI_LITE_ENABLED, DELIB_VERIFIER_MAX_TURNS)
+                        DELIB_VERIFIER_MAX_TURNS)
     from services.claude_api.planner import generate_plan, render_plan_block
     from services.claude_api.verifier import _VERIFIER_SYSTEM, _parse_verdict, build_revise_prompt, build_caveat
 
@@ -52,15 +52,7 @@ async def run(*, prompt, user_request: str, model: str, channel_id: int, execute
             await _invoke(scratch_stream_callback, '計画', block, 'write')
             await _invoke(scratch_finalize_callback)
     result = await execute(prompt)
-    if MAGI_LITE_ENABLED and route_judgment:
-        from services.claude_api.magi_lite import run_lenses, build_lens_revise_prompt
-        await _invoke(status_callback, '独立した3視点で検討しています。')
-        magi = await run_lenses(question=user_request, evidence_digest=evidence.digest(), channel_id=channel_id, model=model)
-        if magi is not None and not magi.degraded:
-            try:
-                result = await execute(build_lens_revise_prompt(magi))
-            except Exception:
-                log.warning('Codex lens revision failed; retaining draft', exc_info=True)
+    # MAGI-lite は撤去済み（deep_research 依存のため）。
     if not DELIB_VERIFIER_ENABLED:
         return result
 

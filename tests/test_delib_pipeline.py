@@ -9,7 +9,6 @@ import pytest
 from services.claude_api import router as rt
 from services.claude_api import verifier as vf
 from services.claude_api import planner as pl
-from services.claude_api import magi_lite as ml
 from services.claude_api import second_opinion as so
 
 
@@ -449,61 +448,3 @@ class TestSecondOpinion:
         text, route = await so._ask_gemini("q")
         assert text == "API経由"
         avail.assert_not_awaited()  # agy は一切触らない
-
-
-# ---------------------------------------------------------------------------
-# P5: magi_lite
-# ---------------------------------------------------------------------------
-
-class TestMagiLite:
-    def test_parse_integration(self):
-        r = ml._parse_integration(
-            '{"consensus": 0.35, "divergences": ["リスク評価"], '
-            '"guidance": "両論併記せよ"}')
-        assert r.consensus == 0.35 and r.divergences == ["リスク評価"]
-
-    def test_parse_clamps_consensus(self):
-        assert ml._parse_integration('{"consensus": 7}').consensus == 1.0
-
-    @pytest.mark.asyncio
-    async def test_run_lenses_full_flow(self, monkeypatch):
-        calls = {"n": 0}
-
-        async def fake_cli(client, *, model, max_tokens, user_message,
-                           task_prompt):
-            calls["n"] += 1
-            if "integrate" in task_prompt.lower() or "統合" in user_message:
-                return _resp('{"consensus": 0.4, "divergences": ["X"], '
-                             '"guidance": "G"}')
-            return _resp(f"lens view {calls['n']}")
-
-        monkeypatch.setattr(
-            "services.mem0.client.get_anthropic_client",
-            AsyncMock(return_value=object()))
-        monkeypatch.setattr(
-            "services.mem0.cli_compat.cli_messages_create", fake_cli)
-        r = await ml.run_lenses(
-            question="どっちがいい？", evidence_digest="[E1] ...",
-            channel_id=1, model="m")
-        assert r is not None and not r.degraded
-        assert r.consensus == 0.4 and len(r.lens_bodies) == 3
-
-    @pytest.mark.asyncio
-    async def test_lens_failures_degrade(self, monkeypatch):
-        monkeypatch.setattr(
-            "services.mem0.client.get_anthropic_client",
-            AsyncMock(return_value=object()))
-        monkeypatch.setattr(
-            "services.mem0.cli_compat.cli_messages_create",
-            AsyncMock(side_effect=RuntimeError("down")))
-        r = await ml.run_lenses(
-            question="q", evidence_digest="", channel_id=1, model="m")
-        assert r is not None and r.degraded is True
-
-    def test_low_consensus_mandates_uncertainty(self):
-        r = ml.MagiLiteResult(consensus=0.3, divergences=["論点A"],
-                              guidance="G")
-        prompt = ml.build_lens_revise_prompt(r)
-        assert "合意度が低い" in prompt and "断定を避け" in prompt
-        r2 = ml.MagiLiteResult(consensus=0.9, guidance="G")
-        assert "合意度が低い" not in ml.build_lens_revise_prompt(r2)

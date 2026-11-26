@@ -1,12 +1,10 @@
-"""/abort /research /help — 運用系コマンド."""
+"""/abort /help — 運用系コマンド."""
 
 from __future__ import annotations
 
 import discord
 from discord import app_commands
 
-from config import DEEP_RESEARCH_ENABLED
-from services import deep_research
 from services.job_state import cancel_channel_jobs
 
 from bot_commands._deps import CommandDeps
@@ -21,12 +19,6 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
 
         channel_id = interaction.channel_id
         cancelled = cancel_channel_jobs(channel_id) if channel_id is not None else 0
-        if channel_id is not None:
-            try:
-                from services.work.runtime import get_work_runtime
-                cancelled += get_work_runtime().interrupt_channel(str(channel_id))
-            except RuntimeError:
-                pass
         if cancelled == 0:
             await interaction.response.send_message(
                 "中断対象なし (進行中・待機中の応答はありません)", ephemeral=True,
@@ -34,72 +26,6 @@ def register(tree: app_commands.CommandTree, deps: CommandDeps) -> None:
             return
         await interaction.response.send_message(
             f"中断要求を送りました({cancelled}件: 実行中と待機中のジョブを含む)",
-            ephemeral=True,
-        )
-
-    @tree.command(
-        name="research",
-        description="Deep Research: 多段 Web 調査で引用付きレポートを生成 (admin only)",
-    )
-    @app_commands.describe(
-        query="調査したいテーマ",
-        skip_clarify="明確化質問をスキップして即実行する",
-    )
-    async def research_cmd(
-        interaction: discord.Interaction,
-        query: str,
-        skip_clarify: bool = False,
-    ):
-        if not deps.is_admin(interaction.user):
-            await interaction.response.send_message("admin only", ephemeral=True)
-            return
-        if not DEEP_RESEARCH_ENABLED:
-            await interaction.response.send_message(
-                "Deep Research は現在無効です (DEEP_RESEARCH_ENABLED=false)。", ephemeral=True,
-            )
-            return
-        if not deep_research.has_required_web_backend():
-            await interaction.response.send_message(
-                "一般 Web 検索バックエンド (brave-search / tavily) が未設定です。"
-                ".env に BRAVE_API_KEY か TAVILY_API_KEY を設定してください。",
-                ephemeral=True,
-            )
-            return
-        query = (query or "").strip()
-        if not query:
-            await interaction.response.send_message("query を入力してください。", ephemeral=True)
-            return
-        channel = interaction.channel
-        if channel is None or not hasattr(channel, "create_thread"):
-            await interaction.response.send_message(
-                "このチャンネルではスレッドを作成できません。サーバーのテキストチャンネルで実行してください。",
-                ephemeral=True,
-            )
-            return
-        await interaction.response.defer(ephemeral=True)
-        dr_deps = deep_research.DeepResearchDeps(
-            bot=deps.bot,
-            send_segmented=deps.send_segmented,
-            get_http_session=deps.get_http_session,
-            track_task=deps.track_task,
-        )
-        from services.work.store import get_work_store
-        from services.memory_policy import get_memory_policy
-        dr_deps.work_store = get_work_store()
-        dr_deps.memory_policy = get_memory_policy()
-        work = dr_deps.work_store.create(str(interaction.user.id), str(channel.id), query,
-            f"research:{interaction.id}", guild_id=str(interaction.guild_id) if interaction.guild_id else None)
-        dr_deps.work_id = work.id
-        dr_deps.work_store.record_event(work.id, "research_requested", {"skip_clarify": skip_clarify})
-        from services.work.runtime import get_work_runtime
-        try:
-            runtime = get_work_runtime()
-        except RuntimeError:
-            await interaction.followup.send(f"用件 {work.id} を保存しました。実行基盤の起動後に /work resume で再開できます。", ephemeral=True)
-            return
-        await runtime.start(work.id, str(interaction.user.id), channel)
-        await interaction.followup.send(
-            f"用件 {work.id} を保存しました。調査はスレッドで進行します。",
             ephemeral=True,
         )
 

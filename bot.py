@@ -40,7 +40,6 @@ from config import (
     CLAUDE_TAG_EMOJI_ID,
     CLAUDE_TAG_EMOJI_NAME,
     CLAUDE_TAG_ENABLED,
-    DEEP_RESEARCH_ENABLED,
     DELIB_ROUTER_ENABLED,
     SPINNER_MODE,
     BOT_IGNORED_ROLE_IDS,
@@ -97,7 +96,6 @@ from services.skills import SkillError, render_active_skill_prompt
 
 from services.oauth_manager import OAuthRefreshFailed
 from services import claude_tag
-from services import deep_research
 from services import r2_archive
 from services.mem0 import (
     add_memories,
@@ -357,9 +355,9 @@ _runtime_resources = RuntimeResources(
     force_cancel_timeout_s=SHUTDOWN_FORCE_CLEANUP_TIMEOUT_S,
 )
 _turn_outbox = TurnOutbox(os.path.join(STATE_DIR, "bot_turn_outbox.json"))
-_work_runtime = None
+# Conversation-privacy registry was populated by the removed Work runtime; it
+# now stays None so the remaining `is not None` guards cleanly no-op.
 _conversation_policy_registry = None
-_work_schedule_stop = asyncio.Event()
 
 
 def _serialize_session_info(info) -> dict | str | None:
@@ -594,9 +592,6 @@ async def _patched_close() -> None:
     global _http_session
     log.info("Closing bot and cleaning up resources...")
     _begin_drain()
-    _work_schedule_stop.set()
-    if _work_runtime is not None:
-        await _work_runtime.close()
     try:
         await _runtime_resources.close()
     finally:
@@ -699,13 +694,6 @@ async def on_ready():
             "CLAUDE_TAG_EMOJI_ID in .env to pin the exact emoji.",
             CLAUDE_TAG_EMOJI_NAME,
         )
-    # Deep Research (ADR-0028): /research needs a general web backend.
-    if DEEP_RESEARCH_ENABLED and not deep_research.has_required_web_backend():
-        log.warning(
-            "DEEP_RESEARCH_ENABLED but no general web backend (brave-search / "
-            "tavily) is configured; /research will refuse. Set BRAVE_API_KEY or "
-            "TAVILY_API_KEY in .env."
-        )
     # D5: cleanup_stale_attachments was previously called synchronously from
     # main.py before bot.run(). For a tmpdir with thousands of files the
     # scan+stat loop blocked startup. Schedule it as a fire-and-forget
@@ -729,40 +717,6 @@ async def on_ready():
         _track_task(bot_record.alpha_recovery_worker(
             add_memories=add_memories, allowed_user_ids=ADMIN_USER_IDS,
         ), name="mem0_batch_recovery")
-        from services.work.bootstrap import enabled, build_runtime
-        if enabled():
-            global _work_runtime, _conversation_policy_registry
-            from services.conversation_policy import ConversationPolicyRegistry
-            from services.memory_policy import get_memory_policy
-
-            def work_provider_options(channel_id, actor_id):
-                key = (int(channel_id), int(actor_id))
-                return {"provider": resolve_provider(explicit=_PROVIDER_OVERRIDES.get(key),
-                            model=_MODEL_OVERRIDES.get(key), restricted=False),
-                        "model": _MODEL_OVERRIDES.get(key), "effort": _EFFORT_OVERRIDES.get(key)}
-
-            async def resume_research(work_id, actor_id, channel):
-                from services.deep_research.orchestrator import resume_deep_research
-                from services.work.store import get_work_store
-                from services.work.research import is_research_work
-                user = bot.get_user(int(actor_id)) or await bot.fetch_user(int(actor_id))
-                deps = deep_research.DeepResearchDeps(bot=bot, send_segmented=_send_segmented,
-                    get_http_session=get_http_session, track_task=_track_task,
-                    work_store=get_work_store(), memory_policy=get_memory_policy(), work_id=work_id)
-                if is_research_work(deps.work_store, work_id, actor_id):
-                    await resume_deep_research(channel, user, work_id, deps)
-                else:
-                    requested = [event for event in deps.work_store.list_events(work_id, limit=1000)
-                                 if event["kind"] == "research_requested"]
-                    skip = bool(requested[-1]["payload"].get("skip_clarify")) if requested else False
-                    work = deps.work_store.get(work_id, actor_id)
-                    await deep_research.run_deep_research(channel, user, work.goal, deps, skip_clarify=skip)
-
-            _work_runtime = build_runtime(bot=bot, task_factory=_track_task,
-                provider_options=work_provider_options, research_resume=resume_research)
-            _conversation_policy_registry = ConversationPolicyRegistry(
-                os.path.join(STATE_DIR, "conversation_policy.sqlite3"), get_memory_policy())
-            _track_task(_work_runtime.schedules.run(_work_schedule_stop), name="work_schedules")
 
 
 # ---------------------------------------------------------------------------
@@ -969,21 +923,13 @@ async def on_message(message: discord.Message):
     # Receipt precedes admission: a correction addressed to another speaker
     # must still be visible to subsequent turns, without making the bot reply.
     await guild_context.observe(message)
-    if (_work_runtime is not None and not message.author.bot and is_admin(message.author)
-            and deep_research.is_active_research_thread(message.channel.id)):
-        from services.work_intent import classify_work_intent
-        control_text = strip_mention(message.content, bot.user.id).strip()
-        intent = classify_work_intent(control_text)
-        if intent.action in {"amend", "status", "pause", "cancel", "resume", "followup", "answer", "list"}:
-            if await _work_runtime.handle_message(message, control_text, caller_is_admin=True):
-                return
     admitted = await bot_admission.admit_message(
         message,
         bot=bot,
         dm_channel_types=(discord.DMChannel, discord.GroupChannel),
         deps=bot_admission.AdmissionDeps(
             is_admin=is_admin,
-            is_active_research_thread=deep_research.is_active_research_thread,
+            is_active_research_thread=lambda _cid: False,
             new_request_id=new_request_id,
             get_request_id=get_request_id,
             guild_message_addresses_bot=_guild_message_addresses_bot,
@@ -1017,31 +963,23 @@ async def on_message(message: discord.Message):
     raw_user_text = admitted.raw_user_text
     prompt = raw_user_text
 
-    if _work_runtime is not None:
+    if caller_is_admin:
         from services.memory_policy import handle_control
-        from services.work_context import current_conversation
-        private = _work_runtime._private(message.channel, str(message.author.id))
-        if caller_is_admin:
-            control = await handle_control(raw_user_text, str(message.author.id),
-                str(message.channel.id), private, source_message_id=str(message.id),
-                source_timestamp=getattr(message, "created_at", None))
-            if control is not None:
-                destination = message.channel
-                if control.private_response and not private:
-                    try:
-                        destination = await message.author.create_dm()
-                    except discord.HTTPException:
-                        await message.channel.send(control.message,
-                            allowed_mentions=discord.AllowedMentions.none())
-                        return
-                await destination.send(control.message, allowed_mentions=discord.AllowedMentions.none())
-                return
-        if await _work_runtime.handle_message(message, raw_user_text, caller_is_admin=caller_is_admin):
+        private = is_dm
+        control = await handle_control(raw_user_text, str(message.author.id),
+            str(message.channel.id), private, source_message_id=str(message.id),
+            source_timestamp=getattr(message, "created_at", None))
+        if control is not None:
+            destination = message.channel
+            if control.private_response and not private:
+                try:
+                    destination = await message.author.create_dm()
+                except discord.HTTPException:
+                    await message.channel.send(control.message,
+                        allowed_mentions=discord.AllowedMentions.none())
+                    return
+            await destination.send(control.message, allowed_mentions=discord.AllowedMentions.none())
             return
-        if _conversation_policy_registry is not None:
-            privacy = _conversation_policy_registry.begin(message.author.id, message.channel.id, private,
-                source_message_id=str(message.id))
-            current_conversation.set(privacy)
 
     _request_key = (message.channel.id, message.author.id)
     _forced_model = _MODEL_OVERRIDES.get(_request_key)

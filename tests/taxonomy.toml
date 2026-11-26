@@ -1,7 +1,6 @@
 version = 1
 
 [files]
-"test_agent_tool.py" = "unit"
 "test_agy_runner.py" = "unit"
 "test_atomic_write.py" = "unit"
 "test_attachments.py" = "unit"
@@ -53,7 +52,6 @@ version = 1
 "test_correlation.py" = "unit"
 "test_correlation_integration.py" = "integration"
 "test_coverage_improvements.py" = "unit"
-"test_deep_research.py" = "unit"
 "test_delib_pipeline.py" = "unit"
 "test_discord_helpers.py" = "unit"
 "test_e2e_harness.py" = "unit"

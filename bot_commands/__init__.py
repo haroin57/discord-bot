@@ -19,8 +19,6 @@ from bot_commands import (
     prefix,
     session_cmds,
     skills,
-    work,
-    watch,
 )
 from bot_commands._deps import CommandDeps
 
@@ -37,5 +35,3 @@ def register_all(tree, deps: CommandDeps) -> None:
     free_code_slash.register(tree, deps)
     mcp.register(tree, deps)
     skills.register(tree, deps)
-    work.register(tree, deps)
-    watch.register(tree, deps)

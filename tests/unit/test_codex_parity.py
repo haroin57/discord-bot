@@ -367,25 +367,6 @@ async def test_entry_records_failure_and_revision_turn_without_streaming_drafts(
 
 
 @pytest.mark.asyncio
-async def test_deliberate_planner_and_magi_feed_revision_and_scratch(monkeypatch, deliberate):
-    from services.claude_api.planner import Plan
-    monkeypatch.setattr('config.DELIB_PLANNER_ENABLED', True)
-    monkeypatch.setattr('config.MAGI_LITE_ENABLED', True)
-    monkeypatch.setattr('config.DELIB_VERIFIER_ENABLED', False)
-    monkeypatch.setattr('services.claude_api.planner.generate_plan', AsyncMock(return_value=Plan(goal='check requirements')))
-    monkeypatch.setattr('services.claude_api.magi_lite.run_lenses', AsyncMock(return_value=SimpleNamespace(degraded=False)))
-    monkeypatch.setattr('services.claude_api.magi_lite.build_lens_revise_prompt', lambda _: 'independent critique')
-    scratch, finalized = [], []
-    output = await deliberation.run(**{**deliberate, 'route_judgment': True},
-        scratch_stream_callback=lambda *args: scratch.append(args),
-        scratch_finalize_callback=lambda: finalized.append(True))
-    assert output.final_text == 'revised'
-    assert 'check requirements' in deliberate['execute'].await_args_list[0].args[0]
-    assert deliberate['execute'].await_args_list[1].args[0] == 'independent critique'
-    assert scratch[0][0] == '計画' and scratch[0][2] == 'write' and finalized == [True]
-
-
-@pytest.mark.asyncio
 async def test_restricted_codex_never_creates_admin_manager(monkeypatch):
     import config
     monkeypatch.setenv('CODEX_RESTRICTED_ENABLED', 'true')
